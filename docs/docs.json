@@ -344,7 +344,8 @@
               "sdk-reference/browser-sessions/create-browser-session",
               "sdk-reference/browser-sessions/get-browser-session",
               "sdk-reference/browser-sessions/get-browser-sessions",
-              "sdk-reference/browser-sessions/close-browser-session"
+              "sdk-reference/browser-sessions/close-browser-session",
+              "sdk-reference/browser-sessions/extend-browser-session"
             ]
           },
           {

@@ -583,7 +583,7 @@ function GettingStartedTrack({
   const isLocked = (item: OnboardingTrackItemV1) =>
     item.key === "credential_saved" && !credentialUnlocked;
   const counted = countedTrackItems(track, credentialUnlocked);
-  // Null progress = first-agent data unavailable: omit the group, count track rows only.
+  // Unknown first-agent progress cannot supply a cumulative count.
   const hasProgress = progress !== null;
   const firstAgentCreatedAt = progress?.first_agent_created ?? null;
   const firstSuccessfulRunAt = progress?.first_successful_run ?? null;
@@ -630,12 +630,14 @@ function GettingStartedTrack({
       <header className="space-y-3">
         <div className="flex items-baseline justify-between gap-4">
           {heading}
-          <p className="text-[13px] tabular-nums text-muted-foreground">
-            <span className="sr-only">Progress: </span>
-            {done} of {total} done
-          </p>
+          {hasProgress ? (
+            <p className="text-[13px] tabular-nums text-muted-foreground">
+              <span className="sr-only">Progress: </span>
+              {done} of {total} done
+            </p>
+          ) : null}
         </div>
-        <ProgressBar done={done} total={total} />
+        {hasProgress ? <ProgressBar done={done} total={total} /> : null}
       </header>
 
       {hasProgress ? (

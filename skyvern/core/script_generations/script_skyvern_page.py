@@ -1113,8 +1113,10 @@ class ScriptSkyvernPage(SkyvernPage):
     ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
-            # Fallback: solve directly without DB context
-            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
+            # Fallback: solve directly without DB context. Arm the vendor solver lifecycle around the
+            # solve so a factory-created (solver-off) session is armed on this path too.
+            async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
+                await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)

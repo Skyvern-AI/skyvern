@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     inspect_locator_matches,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.work_plan import WorkPlanArguments, set_work_plan
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
 )
@@ -214,6 +215,7 @@ from .run_execution import (
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .run_execution import (
     finalize_build_test_result,
+    run_workflow_end_to_end,
 )
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
@@ -848,6 +850,26 @@ async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionIn
     return json.dumps(await ask_user(ctx.context, AskUserArguments(parts=parts), ctx.tool_call_id))
 
 
+# This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
+# Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
+@function_tool(name_override="set_work_plan")
+async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str]) -> str:
+    """Replace your own work plan for this chat with `items`, in the order you mean to do them.
+
+    This is your working memory, not a report to the user and not evidence of anything: nothing
+    you write here satisfies a requirement, proves an output, or changes what gets tested or run.
+    It survives across turns and comes back to you at the start of every later model call, so use
+    it to hold onto responsibilities you have not reached yet — the steps past the one you are
+    working on right now.
+
+    Every call replaces the whole list; there is no append and no per-item update, so send the
+    full plan as you now believe it, and send an empty list to clear it. Rewrite it whenever what
+    you learned changes what is left: after scouting, after authoring, after a test, after a
+    repair.
+    """
+    return json.dumps(await set_work_plan(ctx.context, WorkPlanArguments(items=items)))
+
+
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
@@ -993,6 +1015,34 @@ async def run_blocks_tool(
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     return json.dumps(sanitized)
+
+
+@function_tool(
+    name_override="test_workflow_from_blank_browser", timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS, strict_mode=False
+)
+async def test_workflow_from_blank_browser_tool(
+    ctx: RunContextWrapper, parameters: dict[str, Any] | None = None
+) -> str:
+    """Test every block of the staged candidate, or current canonical workflow, in order.
+
+    Uses a separate blank browser with no scouting state and no restored saved browser profile.
+    This tests code-established prerequisites, not configured authenticated-profile behavior;
+    the workflow's saved profile settings are retained. Choose this test when useful; ordinary
+    partial-run tools keep their current scope. Supply runtime workflow inputs in parameters.
+    For secrets, use saved credential references rather than raw passwords or one-time codes.
+    """
+    copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
+    result = await run_workflow_end_to_end(copilot_ctx, parameters=parameters)
+    record_tool_step_result_for_ctx(
+        copilot_ctx, "test_workflow_from_blank_browser", {"parameters": parameters or {}}, result
+    )
+    enqueue_screenshot_from_result(
+        copilot_ctx,
+        result,
+        provenance=_run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
+    )
+    return json.dumps(sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result))
 
 
 @function_tool(name_override="get_run_results")
@@ -1585,6 +1635,7 @@ inspect_locator_matches_tool = FunctionTool(
 
 NATIVE_TOOLS = [
     ask_user_tool,
+    set_work_plan_tool,
     update_workflow_tool,
     edit_block_tool,
     edit_block_and_run_tool,
@@ -1593,6 +1644,7 @@ NATIVE_TOOLS = [
     list_credentials_tool,
     list_integrations_tool,
     run_blocks_tool,
+    test_workflow_from_blank_browser_tool,
     get_run_results_tool,
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,

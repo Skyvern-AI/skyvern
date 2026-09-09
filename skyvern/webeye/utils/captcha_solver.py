@@ -80,9 +80,9 @@ _HCAPTCHA_ARM_TIMEOUT_SECONDS = 90
 _TOKEN_ARM_TIMEOUT_SECONDS = 90
 _WIDGET_RESET_TIMEOUT_SECONDS = 3
 # Sum of the bounded arms on a non-hCaptcha page (anchor 5 + reset 3 + extension 12 + token 90); the token
-# arm is clamped to what remains so a 90s hCaptcha extension arm cannot push the bounded arms past the v3
-# tool's 120s ceiling. On a page carrying both hCaptcha and reCAPTCHA markers the token arm may therefore
-# get less than a full solve needs; hCaptcha is the visible gate there.
+# arm is clamped to whatever global budget remains, and a deployment may widen the extension arm
+# (resolve_captcha_solver_extension_timeout); a widened extension can never push the bounded arms past the
+# v3 tool's 120s ceiling — the token arm then gets less than a full solve needs, and the wider arm gates.
 _LADDER_BUDGET_SECONDS = 110
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
@@ -130,6 +130,29 @@ async def _recaptcha_token_populated(scope: Frame | Page | RecordingPage) -> boo
 
 
 async def solve_challenge_ladder(
+    page: Page | RecordingPage,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
+) -> bool:
+    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
+
+    Thin public entry: it enters the ``AGENT_FUNCTION`` captcha-solver lifecycle scope exactly once
+    around the ladder, so a deployment can bind a page-scoped solver lifecycle for the whole solve
+    (its self-heal/teardown owned by that scope). Signature, return value, and the
+    ``CaptchaChallengeUnsolvedError`` it raises are unchanged for every caller.
+    """
+    async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(page):
+        return await _solve_challenge_ladder_impl(
+            page,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+        )
+
+
+async def _solve_challenge_ladder_impl(
     page: Page | RecordingPage,
     *,
     organization_id: str | None = None,
@@ -208,6 +231,7 @@ async def solve_challenge_ladder(
                     await candidate.get_attribute("aria-checked") == "true"
                     and token_was_populated is False
                     and token_is_populated is True
+                    and await app.AGENT_FUNCTION.is_captcha_solver_completion_confirmed(page, default_result=True)
                 ):
                     LOG.info("CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
                     return True
@@ -238,7 +262,10 @@ async def solve_challenge_ladder(
             LOG.info("CAPTCHA widget reset did not run", arm="recaptcha_anchor_frame")
 
     hcaptcha_present = await _bounded_locator_count(page.locator(_HCAPTCHA_MARKER_SELECTOR)) > 0
-    extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
+    default_extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
+    # Resolved inside the already-entered lifecycle scope so a deployment can widen this arm for a solver
+    # it armed on scope entry, instead of cutting a slow legitimate solve at the generic bound.
+    extension_timeout = app.AGENT_FUNCTION.resolve_captcha_solver_extension_timeout(page, default_extension_timeout)
     try:
         async with asyncio.timeout(extension_timeout):
             if await app.AGENT_FUNCTION.auto_solve_captchas(page):

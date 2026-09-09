@@ -326,7 +326,7 @@ class TestScopedXhrDownloadCapture:
 
         assert capture._child_pages_with_bootstrap_allowance == set()
 
-    def test_cdp_interceptor_skips_response_capture_but_tracks_request_lifecycle(self) -> None:
+    def test_cdp_interceptor_attaches_response_listener_for_passive_observation(self) -> None:
         page = _make_page(cdp_active=True)
         capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
         capture.enable()
@@ -334,8 +334,29 @@ class TestScopedXhrDownloadCapture:
         page.on.assert_any_call("request", capture._on_request)
         page.on.assert_any_call("requestfinished", capture._on_request_finished)
         page.on.assert_any_call("requestfailed", capture._on_request_finished)
-        assert not any(call.args[0] == "response" for call in page.on.call_args_list)
+        # Passive status observation is always on, so the response listener attaches even on the CDP
+        # lane; body capture stays gated off there.
+        page.on.assert_any_call("response", capture._on_response_event)
+        assert capture._capture_responses is False
         assert capture._active
+
+    def test_cdp_interceptor_detaches_response_listener_symmetrically(self) -> None:
+        page = _make_page(cdp_active=True)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        capture.enable()
+        capture.disable()
+
+        page.remove_listener.assert_any_call("response", capture._on_response_event)
+
+    def test_cdp_interceptor_response_event_schedules_no_body_capture_task(self) -> None:
+        page = _make_page(cdp_active=True)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response()
+        _admit_response(capture, response)
+
+        capture._on_response_event(response)
+
+        assert capture._response_tasks == set()
 
     def test_enable_uses_current_cdp_interceptor_state(self) -> None:
         page = _make_page(cdp_active=False)
@@ -344,9 +365,11 @@ class TestScopedXhrDownloadCapture:
 
         capture.enable()
 
-        assert not any(call.args[0] == "response" for call in page.on.call_args_list)
+        assert capture._capture_responses is False
+        # Response listener still attaches on the CDP lane for passive status observation.
+        page.on.assert_any_call("response", capture._on_response_event)
         capture.disable()
-        assert not any(call.args[0] == "response" for call in page.remove_listener.call_args_list)
+        page.remove_listener.assert_any_call("response", capture._on_response_event)
 
     def test_disable_noop_when_not_enabled(self) -> None:
         page = _make_page(cdp_active=True)
@@ -758,3 +781,79 @@ class TestScopedXhrDownloadCapture:
         assert body_cancelled.is_set()
         assert capture._response_tasks == set()
         assert capture._drained.is_set()
+
+
+_ADMITTED_URL = "https://synthetic.test/authorized/statement"
+_ADMITTED_HOST_CANARY = "synthetic.test"
+
+
+class TestScopedXhrDownloadFailureStatusObserver:
+    def _admitted_capture(
+        self, *, cdp_active: bool = False, url: str = _ADMITTED_URL, status: int = 500
+    ) -> tuple[ScopedXhrDownloadCapture, MagicMock]:
+        page = _make_page(cdp_active=cdp_active)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(url=url, status=status, content_type="application/json", content_disposition="")
+        _admit_response(capture, response)
+        return capture, response
+
+    def test_observes_5xx_for_admitted_request(self) -> None:
+        capture, response = self._admitted_capture(status=500)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 500
+
+    def test_observes_5xx_for_any_admitted_url(self) -> None:
+        # Genericity: no site/URL filter — any admitted 5xx is recorded regardless of its URL.
+        capture, response = self._admitted_capture(url="https://unrelated.example/api/export", status=503)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 503
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_observes_safe_5xx_variants(self, status: int) -> None:
+        capture, response = self._admitted_capture(status=status)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == status
+
+    @pytest.mark.parametrize("status", [501, 505, 507])
+    def test_does_not_observe_out_of_contract_5xx(self, status: int) -> None:
+        capture, response = self._admitted_capture(status=status)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_observes_5xx_on_cdp_active_interceptor_lane(self) -> None:
+        capture, response = self._admitted_capture(cdp_active=True, status=503)
+        # Drive the real response event: on the interceptor lane it schedules no body-capture task,
+        # so observation is proven to run through the same seam that production CDP lanes hit.
+        capture._on_response_event(response)
+        assert capture.observed_download_failure_status == 503
+        assert capture._response_tasks == set()
+
+    def test_does_not_observe_unadmitted_5xx(self) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        capture.enable()
+        # Response arrives without the request ever being admitted (e.g. before the click window).
+        response = _make_response(
+            url=_ADMITTED_URL, status=500, content_type="application/json", content_disposition=""
+        )
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_does_not_observe_4xx(self) -> None:
+        capture, response = self._admitted_capture(status=404)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_does_not_observe_2xx(self) -> None:
+        capture, response = self._admitted_capture(status=200)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_only_integer_status_retained_no_url_or_host(self) -> None:
+        capture, response = self._admitted_capture(status=500)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 500
+        # Privacy canary: the observed URL/host must never be persisted on the capture.
+        serialized = repr(vars(capture))
+        assert _ADMITTED_URL not in serialized
+        assert _ADMITTED_HOST_CANARY not in serialized

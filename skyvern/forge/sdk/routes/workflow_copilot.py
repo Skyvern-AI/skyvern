@@ -598,6 +598,7 @@ def _build_recoverable_route_agent_result(
     *,
     workflow_modified: bool,
     clear_proposed_workflow: bool,
+    authoring_barred: bool = False,
     global_llm_context: str | None,
     turn_id: str | None = None,
     turn_index: int | None = None,
@@ -617,7 +618,8 @@ def _build_recoverable_route_agent_result(
         global_llm_context=clear_proposed_credential(merge_failure_into_context(global_llm_context, failure)),
         workflow_was_persisted=False,
         proposal_disposition="no_proposal",
-        clear_proposed_workflow=clear_proposed_workflow,
+        clear_proposed_workflow=clear_proposed_workflow and not authoring_barred,
+        authoring_barred=authoring_barred,
         turn_id=turn_id,
         narrative_payload=narrative_payload,
         turn_outcome=build_minimal_turn_outcome(
@@ -706,6 +708,7 @@ async def _persist_proposed_workflow_state(
         and chat.proposed_workflow is not None
         and chat.proposed_workflow.get("_copilot_unvalidated") is True
         and not _output_policy_blocked_final_response(agent_result)
+        and not agent_result.authoring_barred
     ):
         # The leftover unvalidated proposal is no longer attached to the chat
         # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.
@@ -1164,6 +1167,7 @@ async def _persist_cancel_turn(
                     turn_id=response_turn_id,
                     narrative_summary=narrative_summary,
                     narrative_payload=narrative_payload,
+                    work_plan=agent_result.work_plan if agent_result is not None else None,
                 )
             )
         )
@@ -1288,6 +1292,7 @@ async def _finalise_normal_turn(
         "turn_id": agent_result.turn_id,
         "narrative_summary": narrative_summary,
         "narrative_payload": narrative_payload,
+        "work_plan": agent_result.work_plan,
     }
     browser_ablation_metadata = (
         agent_result.browser_ablation_metadata if isinstance(agent_result, AgentResult) else None
@@ -1692,6 +1697,7 @@ async def _new_copilot_chat_post(
                         # older, legitimately keep_pending_proposal-protected proposal must survive.
                         or chat.proposed_workflow is not proposed_workflow_at_turn_start
                     ),
+                    authoring_barred=agent_result is not None and agent_result.authoring_barred,
                     global_llm_context=global_llm_context,
                     turn_id=turn_id,
                     turn_index=turn_index,
@@ -2606,6 +2612,7 @@ async def workflow_copilot_chat_history(
         chat_history=convert_to_history_messages(chat_messages),
         proposed_workflow=chat.proposed_workflow if chat else None,
         auto_accept=chat.auto_accept if chat else None,
+        work_plan=chat.work_plan if chat else [],
     )
 
 

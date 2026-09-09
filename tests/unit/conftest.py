@@ -6,7 +6,8 @@ import logging
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -538,3 +540,49 @@ class FakeSearchBrowserContext:
 
 def read_unit_data_fixture(name: str) -> str:
     return (Path(__file__).parent / "data" / name).read_text()
+
+
+class ScopeRecordingAgentFunction(AgentFunction):
+    """Records the captcha-solver lifecycle scope's enter/exit and — when ``record_arms`` — the extension
+    resolver, the completion-confirmation probe, and each solver arm, proving the ladder resolves and confirms
+    inside the open scope. ``record_arms=False`` silences those; ``confirm`` overrides the anchor arm's
+    completion verdict (``None`` hands the ladder's own default back, like the OSS base)."""
+
+    def __init__(self, *, auto_solve: bool = False, record_arms: bool = True, confirm: bool | None = None) -> None:
+        self.events: list[str] = []
+        self._auto_solve = auto_solve
+        self._record_arms = record_arms
+        self._confirm = confirm
+
+    def captcha_solver_lifecycle_scope(self, page: object) -> AbstractAsyncContextManager[None]:
+        events = self.events
+
+        @asynccontextmanager
+        async def _scope() -> AsyncIterator[None]:
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        return _scope()
+
+    def resolve_captcha_solver_extension_timeout(self, page: object, default_timeout: float) -> float:
+        if self._record_arms:
+            self.events.append("resolve")
+        return default_timeout
+
+    async def is_captcha_solver_completion_confirmed(self, page: object, default_result: bool) -> bool:
+        if self._record_arms:
+            self.events.append("confirm")
+        return default_result if self._confirm is None else self._confirm
+
+    async def auto_solve_captchas(self, page: object) -> bool:
+        if self._record_arms:
+            self.events.append("solve")
+        return self._auto_solve
+
+    async def solve_recaptcha_token(self, page: object, **kwargs: object) -> bool:
+        if self._record_arms:
+            self.events.append("token")
+        return False

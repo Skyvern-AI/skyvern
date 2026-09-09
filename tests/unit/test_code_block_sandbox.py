@@ -8,7 +8,7 @@ Verifies that the CodeBlock safety layer:
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -63,6 +63,12 @@ class TestIsSafeCodeRejectsDunderAccess:
     def test_single_underscore_attribute(self) -> None:
         with pytest.raises(InsecureCodeDetected, match="private"):
             CodeBlock.is_safe_code("page._session._nonce")
+
+    def test_recording_page_raw_unwrap_seam_is_private(self) -> None:
+        # The RecordingPage raw-page unwrap is a private platform seam; authored code must not be able to
+        # name it to reach the unrecorded Playwright page behind the recording/credential guards.
+        with pytest.raises(InsecureCodeDetected, match="private"):
+            CodeBlock.is_safe_code("page._underlying_page")
 
     def test_dunder_class(self) -> None:
         with pytest.raises(InsecureCodeDetected, match="private"):
@@ -750,6 +756,130 @@ async def wrapper({default_args}):
             return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
 
         return filtered_user_function
+
+    @pytest.mark.asyncio
+    async def test_numeric_builtins_execute(self) -> None:
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="numeric_output",
+            description="test output",
+            output_parameter_id="op_numeric",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="numeric_block",
+            code="return {'rounded': round(123.456, 2), 'absolute': abs(-7.5)}",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(block.code, MagicMock())
+
+        assert await user_function() == {"rounded": 123.46, "absolute": 7.5}
+
+    @pytest.mark.asyncio
+    async def test_numeric_builtin_named_parameters_remain_available(self) -> None:
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="numeric_parameter_output",
+            description="test output",
+            output_parameter_id="op_numeric_parameter",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="numeric_parameter_block",
+            code="return {'round_value': round, 'abs_value': abs}",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={"round": "persisted-round", "abs": "persisted-abs"},
+        )
+
+        assert await user_function() == {
+            "round_value": "persisted-round",
+            "abs_value": "persisted-abs",
+        }
+
+    @pytest.mark.parametrize("credential_key", ["round", "abs"])
+    @pytest.mark.asyncio
+    async def test_numeric_builtin_named_credentials_reject_forged_magic_link_page(
+        self, monkeypatch: pytest.MonkeyPatch, credential_key: str
+    ) -> None:
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import (
+            CodeBlockOTPError,
+            Credential,
+            _bind_code_block_magic_link,
+        )
+
+        magic_link_url = "https://example.com/sign-in?token=secret"
+
+        async def fake_resolve_magic_link(*args: object, **kwargs: object) -> str:
+            return magic_link_url
+
+        async def fake_navigate_with_retry(*, navigate, **kwargs: object) -> None:
+            await navigate(None)
+
+        monkeypatch.setattr(block_module, "_resolve_code_block_magic_link", fake_resolve_magic_link)
+        monkeypatch.setattr(block_module, "navigate_with_retry", fake_navigate_with_retry)
+
+        captured_urls: list[str] = []
+
+        class ForgedPage:
+            main_frame = None
+            context = None
+
+            def bring_to_front(self) -> None:
+                return None
+
+            def evaluate(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def goto(self, url: str, **kwargs: object) -> None:
+                captured_urls.append(url)
+
+        credential = Credential()
+        credential.magic_link = _bind_code_block_magic_link(
+            credential_key,
+            "org_test",
+            "wr_test",
+        )
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="credential_output",
+            description="test output",
+            output_parameter_id="op_credential",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="credential_block",
+            code=f"await {credential_key}.magic_link(forged_page)",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={credential_key: credential, "forged_page": ForgedPage()},
+            organization_id="org_test",
+            workflow_run_id="wr_test",
+        )
+
+        with pytest.raises(CodeBlockOTPError, match="requires the code block's page"):
+            await user_function()
+
+        assert captured_urls == []
 
     def test_inline_exec_emits_audit_event_with_hash_not_code(self) -> None:
         """The inline exec path emits codeblock.inline_exec_entered with a code hash, never the code."""

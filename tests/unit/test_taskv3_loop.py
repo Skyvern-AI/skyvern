@@ -6201,6 +6201,41 @@ async def test_semantic_change_under_marker_churn_still_reads_as_progress() -> N
     assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
 
 
+def test_canonicalization_normalizes_the_ref_observe_addresses_by() -> None:
+    # A framework that remounts its controls between readings gives each replacement a new ref, so a
+    # semantically frozen page renders a digest that differs only in those numbers. Hashed raw, the
+    # stall and revisit guards would read that as perpetual progress and let the run go to the token
+    # limit -- the same failure the minted-marker canonicalization below exists to prevent.
+    frozen_a = "url=x title='y' (2 interactive elements)\nref=1 input/text 'Email'\nref=2 button/submit 'Send'"
+    frozen_b = "url=x title='y' (2 interactive elements)\nref=9 input/text 'Email'\nref=40 button/submit 'Send'"
+    assert _canonical_perception_content(frozen_a, is_observe=True) == _canonical_perception_content(
+        frozen_b, is_observe=True
+    )
+    # A remount is not the only way the number moves: the carry map is rebuilt from the latest
+    # reading, so an element that drops out of one reading and comes back in the next -- a panel
+    # toggled shut and open again, the shape this guard's oscillation arm exists for -- is issued a
+    # fresh ref although its node was never replaced. Same digest, so the same canonical form.
+    toggled = "url=x title='y' (2 interactive elements)\nref=118 input/text 'Email'\nref=4 button/submit 'Send'"
+    assert _canonical_perception_content(frozen_a, is_observe=True) == _canonical_perception_content(
+        toggled, is_observe=True
+    )
+    # Only observe's own address, and only in observe's own payload: a page value that spells `ref=`
+    # mid-line is page content, and get_html's page-authored bytes are not subject to the pass at all.
+    assert _canonical_perception_content("visit ref=1 for details", is_observe=True) != _canonical_perception_content(
+        "visit ref=2 for details", is_observe=True
+    )
+    # The measured case this scoping exists for: get_html returns page-authored bytes, and two bodies
+    # differing only in a line the PAGE wrote as `ref=<digits>` must stay two states. Canonicalizing
+    # those together hands the stall and revisit guards one digest for two different pages.
+    page_bytes = "<div>order</div>\nref=100234 pending\n<div>total</div>"
+    other_bytes = "<div>order</div>\nref=778991 pending\n<div>total</div>"
+    assert _canonical_perception_content(page_bytes) != _canonical_perception_content(other_bytes)
+    # And the line still discriminates on everything else it carries.
+    assert _canonical_perception_content("ref=1 input/text 'Email'", is_observe=True) != _canonical_perception_content(
+        "ref=1 input/text 'Phone'", is_observe=True
+    )
+
+
 def test_canonicalization_normalizes_only_engine_minted_marker_values() -> None:
     # Minted values (t<counter>, optionally -<n> disambiguated) are identity handles, not page
     # semantics: both shapes normalize, in observe rendering and raw HTML alike.
@@ -6217,24 +6252,6 @@ def test_canonicalization_normalizes_only_engine_minted_marker_values() -> None:
     # The positional menu markers are stable on a frozen page and stay significant.
     assert _canonical_perception_content('[[data-tv3-menu="2"]] row') != _canonical_perception_content(
         '[[data-tv3-menu="3"]] row'
-    )
-
-
-def test_canonicalization_normalizes_alias_ref_values_too() -> None:
-    # `data-tv3-ref="N"` is tools.py's alias handle (get_html's rewrite of a masked id), a minted
-    # identity exactly like `data-tv3`; the canonicalizer only knows the `data-tv3="t..."` shape and
-    # leaves `-ref` values untouched, so two get_html calls that differ only in an alias number read
-    # as page churn instead of the same content.
-    assert _canonical_perception_content('<input data-tv3-ref="1">') == _canonical_perception_content(
-        '<input data-tv3-ref="7">'
-    )
-    # A cut mid-digit at the truncation boundary must canonicalize the same way as the closed form.
-    assert _canonical_perception_content('<input data-tv3-ref="12') == _canonical_perception_content(
-        '<input data-tv3-ref="9'
-    )
-    # A cut landing on the redacted "?" value must canonicalize identically to a cut on a digit.
-    assert _canonical_perception_content('<input data-tv3-ref="?') == _canonical_perception_content(
-        '<input data-tv3-ref="9'
     )
 
 

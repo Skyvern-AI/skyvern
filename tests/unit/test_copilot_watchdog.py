@@ -59,8 +59,11 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
+from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
 
 
 def _fake_run(status: str = "running", modified_at: datetime | None = None) -> Any:
@@ -666,6 +669,53 @@ async def test_tool_cancelled_while_paused_leaves_the_run_alive(monkeypatch: pyt
 
     adopted[0].cancel()
     await asyncio.gather(*adopted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
+        polled_status="running",
+        terminal_blocks=[
+            terminal_extraction_block(
+                "failed",
+                label="select_first_result",
+                final_url="https://fixture.test/results/widget",
+                task_id="tsk_select",
+            ),
+            terminal_extraction_block(
+                "completed",
+                label="run_search",
+                final_url="https://fixture.test/results/widget/page-1",
+                task_id="tsk_search",
+            ),
+        ],
+        recent_actions=[
+            run_result_action_row("tsk_select", ActionType.WAIT, ActionStatus.failed, code_line=9),
+            run_result_action_row("tsk_search", ActionType.CLICK, ActionStatus.completed),
+        ],
+    )
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_STAGNATION_WINDOW_SECONDS", 0)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["run_search", "select_first_result"], "parameters": {}}, ctx
+    )
+    data = result["data"]
+
+    assert data["control_signal"]["kind"] == "watchdog_stagnation"
+    assert data["observed_block_end_urls"] == {
+        "run_search": "https://fixture.test/results/widget/page-1",
+        "select_first_result": "https://fixture.test/results/widget",
+    }
+    assert data["per_block_action_observations"]["run_search"] == ["click completed"]
+    assert data["per_block_action_observations"]["select_first_result"] == ["wait failed code_line=9"]
+    assert all("action_trace" not in block for block in data["blocks"])
 
 
 @pytest.mark.asyncio

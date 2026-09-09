@@ -4131,6 +4131,109 @@
         ]
       }
     },
+    "/v1/browser_sessions/{browser_session_id}/extend": {
+      "post": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Extend a session",
+        "description": "Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.",
+        "operationId": "extend_browser_session_v1_browser_sessions__browser_session_id__extend_post",
+        "parameters": [
+          {
+            "name": "browser_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser session. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
+              "title": "Browser Session Id"
+            },
+            "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtendBrowserSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully extended browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "409": {
+            "description": "Conflict - the browser session has ended, is about to expire, is already at its maximum lifetime, or runs on infrastructure whose lifetime is fixed at creation"
+          },
+          "202": {
+            "description": "Accepted - the extension was requested but its effect could not be confirmed yet. The body carries the session as last recorded and a `warning`; read `timeout` back with a GET rather than retrying, because each retry adds again."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "extend_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.extend_browser_session(browser_session_id=\"pbs_123\", additional_minutes=30)\nprint(browser_session.timeout)  # the session's new total budget in minutes\n"
+              },
+              {
+                "sdk": "curl",
+                "code": "curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_123/extend \\\n  -H \"x-api-key: YOUR_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"additional_minutes\": 30}'\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/browser_sessions/{browser_session_id}": {
       "patch": {
         "tags": [
@@ -7586,6 +7689,338 @@
           }
         }
       }
+    },
+    "/v1/recipes/jobs/extract": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Extract a job application posting",
+        "description": "Start a workflow run that extracts structured details from a job posting.",
+        "operationId": "extract_job_application_v1_recipes_jobs_extract_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url"
+                ],
+                "title": "JobRecipeExtractRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully started job application extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "422": {
+            "description": "Invalid extract request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Workflow launch failed"
+          }
+        },
+        "x-fern-sdk-method-name": "extract_job_application"
+      }
+    },
+    "/v1/recipes/jobs/apply": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Apply to a job",
+        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
+        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  },
+                  "custom_prompt": {
+                    "type": "string",
+                    "title": "Custom Prompt"
+                  },
+                  "resume_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Resume Url"
+                  },
+                  "other_information": {
+                    "title": "Other Information"
+                  },
+                  "username": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Username"
+                  },
+                  "password": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Password"
+                  },
+                  "persist_credentials": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Persist Credentials"
+                  },
+                  "2fa_identifier": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "2Fa Identifier"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url",
+                  "custom_prompt",
+                  "resume_url"
+                ],
+                "title": "JobRecipeApplyJSONRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  },
+                  "custom_prompt": {
+                    "type": "string",
+                    "title": "Custom Prompt"
+                  },
+                  "resume_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "title": "Resume File"
+                  },
+                  "other_information": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Other Information"
+                  },
+                  "username": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Username"
+                  },
+                  "password": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Password"
+                  },
+                  "persist_credentials": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^true$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Persist Credentials"
+                  },
+                  "2fa_identifier": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "2Fa Identifier"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url",
+                  "custom_prompt",
+                  "resume_file"
+                ],
+                "title": "JobRecipeApplyMultipartRequest",
+                "description": "OpenAPI representation of the text and file parts accepted by Apply."
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully started job application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid multipart structure"
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "413": {
+            "description": "Résumé file exceeds the upload limit"
+          },
+          "422": {
+            "description": "Invalid apply request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Upload or workflow launch failed"
+          },
+          "502": {
+            "description": "Credential service failed"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_to_job"
+      }
+    },
+    "/v1/recipes/jobs/runs": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "List job recipe runs",
+        "description": "List workflow runs started by job recipe requests.",
+        "operationId": "list_job_recipe_runs_v1_recipes_jobs_runs_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Number of runs per page.",
+              "default": 25,
+              "title": "Page Size"
+            },
+            "description": "Number of runs per page."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "422": {
+            "description": "Invalid pagination parameters"
+          }
+        },
+        "x-fern-sdk-method-name": "list_job_recipe_runs"
+      }
     }
   },
   "components": {
@@ -10451,7 +10886,7 @@
               }
             ],
             "title": "Warning",
-            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped; null otherwise."
+            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
           }
         },
         "type": "object",
@@ -13496,6 +13931,21 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "ExtendBrowserSessionRequest": {
+        "properties": {
+          "additional_minutes": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Additional Minutes",
+            "description": "Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning."
+          }
+        },
+        "type": "object",
+        "required": [
+          "additional_minutes"
+        ],
+        "title": "ExtendBrowserSessionRequest"
       },
       "Extensions": {
         "type": "string",
@@ -18394,6 +18844,117 @@
         ],
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
+      },
+      "JobRecipeRunListResponse": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/JobRecipeRunSummary"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "has_next": {
+            "type": "boolean",
+            "title": "Has Next"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "runs",
+          "page",
+          "page_size",
+          "has_next"
+        ],
+        "title": "JobRecipeRunListResponse"
+      },
+      "JobRecipeRunResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "pattern": "^wr_",
+            "title": "Workflow Run Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "JobRecipeRunResponse"
+      },
+      "JobRecipeRunSummary": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "pattern": "^wr_",
+            "title": "Workflow Run Id"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "recipe": {
+            "type": "string",
+            "enum": [
+              "apply",
+              "extract"
+            ],
+            "title": "Recipe"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "job_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Url"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "workflow_permanent_id",
+          "recipe",
+          "status",
+          "created_at",
+          "job_url",
+          "failure_reason"
+        ],
+        "title": "JobRecipeRunSummary"
       },
       "LocateElementAction": {
         "properties": {
@@ -30971,10 +31532,12 @@
           "mcp",
           "api",
           "scheduled",
-          "webhook"
+          "webhook",
+          "job_recipe_extract",
+          "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {

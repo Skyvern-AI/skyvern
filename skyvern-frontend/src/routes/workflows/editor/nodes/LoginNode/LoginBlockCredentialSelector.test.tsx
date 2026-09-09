@@ -33,7 +33,11 @@ const mocks = vi.hoisted(() => ({
   useCredentialsQuery: vi.fn(),
   onePasswordItems: {
     data: undefined as
-      | { configured: boolean; items: Array<OnePasswordItemApiResponse> }
+      | {
+          configured: boolean;
+          source: "organization" | "instance_default" | null;
+          items: Array<OnePasswordItemApiResponse>;
+        }
       | undefined,
     isLoading: false,
     isError: false,
@@ -581,6 +585,7 @@ describe("LoginBlockCredentialSelector 1Password items", () => {
     });
     mocks.onePasswordItems.data = {
       configured: true,
+      source: "organization",
       items: [loginItem, cardItem],
     };
   });

@@ -6,15 +6,22 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  MinusCircledIcon,
+} from "@radix-ui/react-icons";
+import {
   cleanup,
   fireEvent,
   render,
   screen,
   within,
 } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status } from "@/api/types";
+import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
@@ -23,6 +30,7 @@ import type {
 import type { CodeBlockStep } from "../types/workflowTypes";
 import {
   TIMELINE_DESCRIPTOR_SEPARATOR,
+  StatusDot,
   WorkflowRunTimelineBlockItem,
 } from "./WorkflowRunTimelineBlockItem";
 
@@ -92,11 +100,145 @@ function expectRowSummary(name: string, descriptor: string) {
   return row;
 }
 
+function standaloneIconInnerHTML(icon: ReactElement): string {
+  const { container } = render(icon);
+  const renderedIcon = container.querySelector("svg");
+  if (renderedIcon === null) {
+    throw new Error("Expected the standalone icon to render an element");
+  }
+  return renderedIcon.innerHTML;
+}
+
+function expectedStatusIconInnerHTML(status: Status): string {
+  switch (status) {
+    case Status.Completed:
+      return standaloneIconInnerHTML(<CheckCircledIcon />);
+    case Status.Skipped:
+      return standaloneIconInnerHTML(<MinusCircledIcon />);
+    case Status.Failed:
+      return standaloneIconInnerHTML(<CrossCircledIcon />);
+    case Status.Terminated:
+      return standaloneIconInnerHTML(<TerminatedIcon />);
+    default:
+      throw new Error(`No expected icon configured for ${status}`);
+  }
+}
+
+const statusDotCases: Array<[Status | null, boolean]> = [
+  ...Object.values(Status).flatMap(
+    (status) =>
+      [
+        [status, true],
+        [status, false],
+      ] as Array<[Status, boolean]>,
+  ),
+  [null, true],
+  [null, false],
+];
+
 afterEach(() => {
   cleanup();
 });
 
 describe("WorkflowRunTimelineBlockItem", () => {
+  it.each(statusDotCases)(
+    "renders a labeled status glyph for %s when finalized=%s",
+    (status, isFinalized) => {
+      render(<StatusDot status={status} isFinalized={isFinalized} />);
+
+      const expectedTitle = status
+        ? status.replace("_", " ")
+        : isFinalized
+          ? "did not execute"
+          : "not started";
+      const wrapper = screen.getByTitle(expectedTitle);
+      expect(wrapper.getAttribute("role")).toBe("img");
+      expect(wrapper.getAttribute("aria-label")).toBe(expectedTitle);
+      const glyph = wrapper.firstElementChild;
+      expect(glyph).not.toBeNull();
+
+      if (glyph === null) {
+        return;
+      }
+
+      if (status === Status.Completed) {
+        expect(glyph.getAttribute("class")).toContain("text-success");
+      }
+      if (status === Status.Skipped) {
+        expect(glyph.tagName).toBe("svg");
+        expect(glyph.getAttribute("class")).toContain("text-muted-foreground");
+      }
+      if (status === Status.Failed) {
+        expect(glyph.getAttribute("class")).toContain("text-destructive");
+      }
+      if (status === Status.Terminated) {
+        expect(glyph.getAttribute("class")).toContain(terminatedTone);
+      }
+      if (
+        status === Status.Completed ||
+        status === Status.Skipped ||
+        status === Status.Failed ||
+        status === Status.Terminated
+      ) {
+        expect(glyph.innerHTML).toBe(expectedStatusIconInnerHTML(status));
+      }
+      if (
+        status === null ||
+        status === Status.Created ||
+        status === Status.Queued ||
+        status === Status.Paused ||
+        (status === Status.Running && isFinalized)
+      ) {
+        expect(glyph.tagName).toBe("DIV");
+        expect(glyph.getAttribute("class")).toContain("bg-muted-foreground");
+        expect(glyph.getAttribute("class")).toContain("dark:bg-slate-600");
+      }
+    },
+  );
+
+  it("labels skipped and completed action rows with distinct glyphs", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_status_actions",
+      block_type: "login",
+      label: "Sign in",
+      status: Status.Created,
+      actions: [
+        {
+          action_id: "act_skipped",
+          action_type: ActionTypes.Click,
+          status: Status.Skipped,
+          reasoning: "Skip the already-completed action",
+          created_by: null,
+          confidence_float: null,
+        },
+        {
+          action_id: "act_completed",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: "Click the sign-in button",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const skippedWrapper = screen.getByTitle("skipped");
+    expect(screen.getByTitle("completed")).toBeDefined();
+    expect(
+      skippedWrapper.firstElementChild?.getAttribute("class"),
+    ).not.toContain("text-success");
+  });
+
   it("highlights the block row when activeItem matches the block id", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_active",

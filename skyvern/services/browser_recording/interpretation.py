@@ -28,6 +28,7 @@ from skyvern.services.browser_recording.types import (
     ActionClick,
     ActionInputText,
     ActionKind,
+    ActionPressKey,
     CredentialKind,
     ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
@@ -213,6 +214,7 @@ _PLACEHOLDER_VERBS: dict[ActionKind, str] = {
     ActionKind.CLICK: "Click",
     ActionKind.HOVER: "Hover over",
     ActionKind.INPUT_TEXT: "Fill",
+    ActionKind.PRESS_KEY: "Press",
 }
 
 
@@ -227,7 +229,7 @@ def _placeholder_step_from_action(
     immediately while LLM enrichment runs in the background.
     """
     step_id = f"{browser_session_id}-recording-step-{action_index}"
-    text = _action_display_text(action)
+    text = action.key if isinstance(action, ActionPressKey) else _action_display_text(action)
     verb = _PLACEHOLDER_VERBS[action.kind]
     title = f"{verb} '{text}'"
 
@@ -304,6 +306,9 @@ class RecordingInterpretationSession:
             sm.Hover(),
             sm.InputText(),
             sm.Select(),
+            # After InputText: an Enter that submits a field must record as the fill
+            # followed by the keypress, not replace it.
+            sm.PressKey(),
             sm.UrlChange(),
             sm.Wait(),
         ]
@@ -462,7 +467,7 @@ class RecordingInterpretationSession:
         (goto_url, wait) come back final; agent-action kinds come back as
         placeholders with LLM enrichment scheduled in the background.
         """
-        if action.kind in (ActionKind.CLICK, ActionKind.HOVER, ActionKind.INPUT_TEXT):
+        if action.kind in (ActionKind.CLICK, ActionKind.HOVER, ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY):
             blockable = t.cast(ActionBlockable, action)
             step = _placeholder_step_from_action(
                 browser_session_id=self.browser_session_id,

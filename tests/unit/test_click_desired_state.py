@@ -3,10 +3,11 @@
 
 The level-triggered toggle guard lives in the shared OSS click handler: it reads
 one live selected-state observable after the element is resolved and before the
-physical click, then suppresses the click when the control already holds the
-desired state, drives a native checkbox/radio to the desired state, or falls
-through to a single ordinary click for a custom-control mismatch or an unreadable
-state. Role never implies intent — it only chooses which observable to read.
+physical click, then suppresses the click when the control already holds the desired state, drives a
+native checkbox/radio to the desired state with a verified read-back, fails safely when that read-back
+is unknown, or falls through to a single ordinary click for a custom-control mismatch or an unreadable
+state. A checked radio requested to be unchecked fails instead of dispatching a doomed click. Role
+never implies intent — it only chooses which observable to read.
 """
 
 from __future__ import annotations
@@ -14,15 +15,18 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from playwright.async_api import Page, async_playwright
 
 from skyvern.webeye.actions import handler
-from skyvern.webeye.actions.actions import ClickAction, ClickContext
-from skyvern.webeye.actions.responses import ActionAbort, ActionResult, ActionSuccess
+from skyvern.webeye.actions.actions import ActionStatus, ClickAction, ClickContext
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess, StaleActionAbort
+from skyvern.webeye.utils import dom as dom_utils
 from skyvern.webeye.utils.dom import SkyvernElement
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _has_playwright_browser() -> bool:
@@ -41,6 +45,22 @@ _skip_no_browser = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([ActionSuccess()], ActionStatus.completed),
+        ([ActionAbort()], ActionStatus.skipped),
+        ([ActionAbort(desired_state_reached=True)], ActionStatus.completed),
+        ([ActionAbort(setup_performed=True)], ActionStatus.completed),
+        ([StaleActionAbort()], ActionStatus.skipped),
+        ([ActionFailure(Exception("x"))], ActionStatus.failed),
+        ([], ActionStatus.failed),
+    ],
+)
+def test_terminal_action_status(results: list[ActionResult], expected: ActionStatus) -> None:
+    assert handler._terminal_action_status(results) is expected
+
+
 class FakeLabelLocator:
     def __init__(
         self,
@@ -49,12 +69,14 @@ class FakeLabelLocator:
         exists: bool = True,
         present_descendants: list[str] | None = None,
         descendant_inspection_error: Exception | None = None,
+        click_error: Exception | None = None,
     ) -> None:
         self.checkbox_locator = checkbox_locator
         self.visible = visible
         self.exists = exists
         self.present_descendants = present_descendants or []
         self.descendant_inspection_error = descendant_inspection_error
+        self.click_error = click_error
         self.click_count = 0
 
     @property
@@ -69,7 +91,10 @@ class FakeLabelLocator:
 
     async def click(self, timeout: int | None = None, position: dict[str, int] | None = None) -> None:
         self.click_count += 1
-        self.checkbox_locator.checked = not self.checkbox_locator.checked
+        if getattr(self.checkbox_locator, "label_click_toggles", True):
+            self.checkbox_locator.checked = not self.checkbox_locator.checked
+        if self.click_error is not None:
+            raise self.click_error
 
     def locator(self, selector: str) -> FakeInteractiveDescendantLocator:
         return FakeInteractiveDescendantLocator(
@@ -93,11 +118,24 @@ class FakeInteractiveDescendantLocator:
 
 
 class FakeCheckboxLocator:
-    def __init__(self, checked: bool) -> None:
+    def __init__(
+        self,
+        checked: bool,
+        *,
+        is_checked_results: list[bool | Exception] | None = None,
+        label_click_toggles: bool = True,
+    ) -> None:
         self.checked = checked
+        self._is_checked_results = list(is_checked_results or [])
+        self.label_click_toggles = label_click_toggles
         self.label_locator = FakeLabelLocator(self)
 
     async def is_checked(self, timeout: int | None = None) -> bool:
+        if self._is_checked_results:
+            result = self._is_checked_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return self.checked
 
     def locator(self, selector: str) -> FakeLabelLocator:
@@ -108,9 +146,21 @@ class FakeCheckboxLocator:
 class FakeCheckboxElement:
     """Minimal SkyvernElement stand-in for driving ``_set_native_checkbox_state``."""
 
-    def __init__(self, checked: bool, input_toggle_fails: bool = False) -> None:
-        self.locator = FakeCheckboxLocator(checked)
-        self.explicit_label_locator = FakeLabelLocator(self.locator)
+    def __init__(
+        self,
+        checked: bool,
+        input_toggle_fails: bool = False,
+        label_click_error: Exception | None = None,
+        is_checked_results: list[bool | Exception] | None = None,
+        label_click_toggles: bool = True,
+    ) -> None:
+        self.locator = FakeCheckboxLocator(
+            checked,
+            is_checked_results=is_checked_results,
+            label_click_toggles=label_click_toggles,
+        )
+        self.locator.label_locator.click_error = label_click_error
+        self.explicit_label_locator = FakeLabelLocator(self.locator, click_error=label_click_error)
         self.input_toggle_fails = input_toggle_fails
         self.check_count = 0
         self.uncheck_count = 0
@@ -139,6 +189,79 @@ class FakeCheckboxElement:
         if self.input_toggle_fails:
             raise RuntimeError("input is not visible")
         self.locator.checked = False
+
+
+class ScriptedCheckboxLocator:
+    """Small async locator fake for exercising ``SkyvernElement.check()`` and its retry path."""
+
+    def __init__(
+        self,
+        is_checked_results: list[bool | Exception],
+        *,
+        check_error: Exception | None = None,
+        check_error_after_set: Exception | None = None,
+        uncheck_error: Exception | None = None,
+        count_results: list[int] | None = None,
+        set_on_check: bool = True,
+        label_exists: bool = True,
+    ) -> None:
+        self.checked = False
+        self._is_checked_results = list(is_checked_results)
+        self._check_error = check_error
+        self._check_error_after_set = check_error_after_set
+        self._uncheck_error = uncheck_error
+        self._count_results = list(count_results or [])
+        self._set_on_check = set_on_check
+        self.label_locator = FakeLabelLocator(self, exists=label_exists)
+        self.check_count = 0
+        self.uncheck_count = 0
+
+    async def is_checked(self, timeout: int | None = None) -> bool:
+        result = self._is_checked_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def check(self, timeout: int | None = None) -> None:
+        self.check_count += 1
+        if self._check_error is not None:
+            raise self._check_error
+        if self._set_on_check:
+            self.checked = True
+        if self._check_error_after_set is not None:
+            raise self._check_error_after_set
+
+    async def uncheck(self, timeout: int | None = None) -> None:
+        self.uncheck_count += 1
+        if self._uncheck_error is not None:
+            raise self._uncheck_error
+        self.checked = False
+
+    async def count(self) -> int:
+        if self._count_results:
+            return self._count_results.pop(0)
+        return 1
+
+    async def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
+        return None
+
+    async def click(self, timeout: int | None = None, position: dict[str, int] | None = None) -> None:
+        self.checked = not self.checked
+
+    async def is_visible(self) -> bool:
+        return True
+
+    def locator(self, selector: str) -> FakeLabelLocator:
+        assert selector == "xpath=ancestor::label[1]"
+        return self.label_locator
+
+
+def _scripted_checkbox_element(locator: ScriptedCheckboxLocator) -> SkyvernElement:
+    return SkyvernElement(
+        locator,
+        MagicMock(),
+        {"id": "checkbox-id", "tagName": "input", "attributes": {"type": "checkbox", "id": "checkbox-id"}},
+    )
 
 
 class FakeFrame:
@@ -224,6 +347,8 @@ class FakeToggleElement:
         attributes: dict[str, str] | None = None,
         *,
         checked: bool | None = None,
+        checked_results: list[bool | None] | None = None,
+        type_results: list[str | Exception] | None = None,
         attr_error: Exception | None = None,
         multiselectable_ancestor: str | None = None,
         grid_snapshot: object = _GRID_SNAPSHOT_DEFAULT,
@@ -232,6 +357,9 @@ class FakeToggleElement:
         self._tag_name = tag_name
         self._attributes = attributes or {}
         self._checked = checked
+        self._checked_results = list(checked_results) if checked_results is not None else None
+        self._type_results = list(type_results) if type_results is not None else None
+        self.type_read_count = 0
         self._attr_error = attr_error
         self._locator = FakeElementLocator(multiselectable_ancestor, grid_snapshot, grid_snapshot_error)
 
@@ -245,12 +373,38 @@ class FakeToggleElement:
         return self._locator
 
     async def get_attr(self, attr_name: str, mode: str = "auto", timeout: float | None = None) -> str | None:
+        if attr_name == "type" and self._type_results is not None:
+            self.type_read_count += 1
+            result = self._type_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         if self._attr_error is not None and attr_name in ("aria-selected", "aria-checked", "aria-pressed"):
             raise self._attr_error
         return self._attributes.get(attr_name)
 
     async def is_checked(self, timeout: float | None = None) -> bool | None:
+        if self._checked_results:
+            return self._checked_results.pop(0)
         return self._checked
+
+    async def is_disabled(self, dynamic: bool = False) -> bool:
+        return False
+
+    async def scroll_into_view(self, timeout: float | None = None) -> None:
+        return None
+
+    async def get_element_handler(self, timeout: float | None = None) -> MagicMock:
+        return MagicMock()
+
+    async def has_attr(self, attr_name: str, mode: str = "auto") -> bool:
+        return False
+
+    def get_frame(self) -> MagicMock:
+        return MagicMock()
+
+    async def is_explicit_submit(self) -> bool:
+        return False
 
 
 def _click_action() -> ClickAction:
@@ -334,7 +488,7 @@ async def test_resolve_control_without_boolean_observable_returns_none(attribute
 
 
 # ---------------------------------------------------------------------------
-# _apply_desired_click_state — [ActionAbort()] suppresses; None falls through
+# _apply_desired_click_state — [ActionAbort()] suppresses; ActionFailure fails; None falls through
 # ---------------------------------------------------------------------------
 
 
@@ -373,7 +527,7 @@ async def test_apply_single_select_option_aria_selected_false_desired_false_supp
 @pytest.mark.asyncio
 async def test_apply_custom_control_mismatch_false_falls_through_without_checking() -> None:
     element = FakeToggleElement("button", {"aria-pressed": "true"})
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         assert await handler._apply_desired_click_state(_click_action(), element, False, MagicMock()) is None
     set_state.assert_not_awaited()
@@ -408,10 +562,11 @@ async def test_apply_desired_state_on_non_selectable_control_falls_open(
 @pytest.mark.asyncio
 async def test_apply_native_input_desired_true_when_unchecked_sets_and_suppresses(input_type: str) -> None:
     element = FakeToggleElement("input", {"type": input_type}, checked=False)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    assert result[0].desired_state_reached is True
     set_state.assert_awaited_once()
     assert set_state.await_args.kwargs["should_check"] is True
 
@@ -419,7 +574,7 @@ async def test_apply_native_input_desired_true_when_unchecked_sets_and_suppresse
 @pytest.mark.asyncio
 async def test_apply_native_checkbox_desired_false_when_checked_unsets_and_suppresses() -> None:
     element = FakeToggleElement("input", {"type": "checkbox"}, checked=True)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
@@ -428,31 +583,53 @@ async def test_apply_native_checkbox_desired_false_when_checked_unsets_and_suppr
 
 
 @pytest.mark.asyncio
-async def test_apply_native_radio_desired_false_when_checked_falls_through_without_setter() -> None:
+async def test_apply_native_radio_desired_false_when_checked_fails_without_setter() -> None:
     # A radio can't be turned off by clicking it (only selecting another radio clears it), so an
-    # explicit desired_state=False on a checked radio must skip the doomed uncheck() and fall
-    # through to a single ordinary click rather than a wasted state-setter attempt.
+    # explicit desired_state=False on a checked radio fails instead of dispatching a doomed click.
     element = FakeToggleElement("input", {"type": "radio"}, checked=True)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
-        assert await handler._apply_desired_click_state(_click_action(), element, False, MagicMock()) is None
+        result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == "FailToClick"
     set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_apply_native_checkbox_matches_live_suppresses_without_setter() -> None:
-    element = FakeToggleElement("input", {"type": "checkbox"}, checked=True)
-    set_state = AsyncMock(return_value=True)
+async def test_apply_native_radio_refusal_uses_initial_live_state() -> None:
+    element = FakeToggleElement(
+        "input",
+        {"type": "radio"},
+        checked=True,
+        type_results=[RuntimeError("transient type read failure"), "radio"],
+        checked_results=[True, None],
+    )
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
+    with patch.object(handler, "_set_native_checkbox_state", set_state):
+        result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
+
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == "FailToClick"
+    set_state.assert_not_awaited()
+    assert element.type_read_count == 2
+
+
+@pytest.mark.parametrize("input_type", ["checkbox", "radio"])
+@pytest.mark.asyncio
+async def test_apply_native_input_matches_live_suppresses_without_setter(input_type: str) -> None:
+    element = FakeToggleElement("input", {"type": input_type}, checked=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    assert result[0].desired_state_reached is True
     set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_apply_native_checkbox_unreadable_live_state_falls_open() -> None:
     element = FakeToggleElement("input", {"type": "checkbox"}, checked=None)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         assert await handler._apply_desired_click_state(_click_action(), element, True, MagicMock()) is None
     set_state.assert_not_awaited()
@@ -461,9 +638,22 @@ async def test_apply_native_checkbox_unreadable_live_state_falls_open() -> None:
 @pytest.mark.asyncio
 async def test_apply_native_checkbox_setter_failure_falls_through() -> None:
     element = FakeToggleElement("input", {"type": "checkbox"}, checked=False)
-    set_state = AsyncMock(return_value=False)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.MISMATCH)
     with patch.object(handler, "_set_native_checkbox_state", set_state):
         assert await handler._apply_desired_click_state(_click_action(), element, True, MagicMock()) is None
+    set_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_apply_native_checkbox_unknown_setter_state_fails_without_second_click() -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=False)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.UNKNOWN)
+    with patch.object(handler, "_set_native_checkbox_state", set_state):
+        result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
+
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == "FailToClick"
+    assert "not clicking again" in result[0].exception_message
     set_state.assert_awaited_once()
 
 
@@ -475,7 +665,7 @@ async def test_apply_native_checkbox_setter_failure_falls_through() -> None:
 @pytest.mark.asyncio
 async def test_native_set_uses_input_when_actionable() -> None:
     element = FakeCheckboxElement(checked=False)
-    assert await handler._set_native_checkbox_state(element, should_check=True)
+    assert await handler._set_native_checkbox_state(element, should_check=True) is handler.NativeSetOutcome.VERIFIED
     assert element.locator.checked is True
     assert element.check_count == 1
     assert element.locator.label_locator.click_count == 0
@@ -484,7 +674,7 @@ async def test_native_set_uses_input_when_actionable() -> None:
 @pytest.mark.asyncio
 async def test_native_set_falls_back_to_visible_label_for_hidden_input() -> None:
     element = FakeCheckboxElement(checked=False, input_toggle_fails=True)
-    assert await handler._set_native_checkbox_state(element, should_check=True)
+    assert await handler._set_native_checkbox_state(element, should_check=True) is handler.NativeSetOutcome.VERIFIED
     assert element.locator.checked is True
     assert element.locator.label_locator.click_count == 1
 
@@ -492,10 +682,116 @@ async def test_native_set_falls_back_to_visible_label_for_hidden_input() -> None
 @pytest.mark.asyncio
 async def test_native_set_skips_when_already_matching() -> None:
     element = FakeCheckboxElement(checked=True)
-    assert await handler._set_native_checkbox_state(element, should_check=True)
+    assert await handler._set_native_checkbox_state(element, should_check=True) is handler.NativeSetOutcome.VERIFIED
     assert element.check_count == 0
     assert element.uncheck_count == 0
     assert element.locator.label_locator.click_count == 0
+
+
+@pytest.mark.asyncio
+async def test_native_set_read_after_set_detects_mismatch_through_real_skyvern_element() -> None:
+    locator = ScriptedCheckboxLocator([False, False], set_on_check=False)
+
+    result = await handler._set_native_checkbox_state(_scripted_checkbox_element(locator), should_check=True)
+
+    assert result is handler.NativeSetOutcome.MISMATCH
+    assert locator.check_count == 1
+
+
+@pytest.mark.asyncio
+async def test_native_set_exception_after_dispatch_confirms_state_without_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = ScriptedCheckboxLocator(
+        [False, True],
+        check_error_after_set=RuntimeError("detached after dispatch"),
+        count_results=[1],
+        label_exists=False,
+    )
+
+    monkeypatch.setattr(dom_utils, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with patch("skyvern.webeye.utils.dom.get_or_create_wait_config", new=AsyncMock(return_value=None)):
+        result = await handler._set_native_checkbox_state(_scripted_checkbox_element(locator), should_check=True)
+
+    assert result is handler.NativeSetOutcome.VERIFIED
+    assert locator.checked is True
+    assert locator.check_count == 2
+
+
+@pytest.mark.asyncio
+async def test_native_set_read_after_set_unknown_when_skyvern_element_swallows_detached_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = ScriptedCheckboxLocator(
+        [False, RuntimeError("detached")],
+        check_error=RuntimeError("detached"),
+        count_results=[0],
+    )
+
+    monkeypatch.setattr(dom_utils, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with patch("skyvern.webeye.utils.dom.get_or_create_wait_config", new=AsyncMock(return_value=None)):
+        result = await handler._set_native_checkbox_state(_scripted_checkbox_element(locator), should_check=True)
+
+    assert result is handler.NativeSetOutcome.UNKNOWN
+    assert locator.check_count == 1
+
+
+@pytest.mark.asyncio
+async def test_native_set_label_click_exception_after_dispatch_confirms_state() -> None:
+    element = FakeCheckboxElement(
+        checked=False,
+        input_toggle_fails=True,
+        label_click_error=RuntimeError("label detached after dispatch"),
+    )
+
+    result = await handler._set_native_checkbox_state(element, should_check=True)
+
+    assert result is handler.NativeSetOutcome.VERIFIED
+    assert element.locator.label_locator.click_count == 1
+    assert element.locator.checked is True
+
+
+@pytest.mark.asyncio
+async def test_native_set_label_click_exception_then_unreadable_state_is_unknown() -> None:
+    element = FakeCheckboxElement(
+        checked=False,
+        input_toggle_fails=True,
+        label_click_error=RuntimeError("label detached after dispatch"),
+        is_checked_results=[False, False, RuntimeError("label state unreadable")],
+    )
+
+    result = await handler._set_native_checkbox_state(element, should_check=True)
+
+    assert result is handler.NativeSetOutcome.UNKNOWN
+    assert element.locator.label_locator.click_count == 1
+    assert element.locator.checked is True
+
+
+@pytest.mark.asyncio
+async def test_native_set_label_click_exception_without_toggle_is_mismatch() -> None:
+    element = FakeCheckboxElement(
+        checked=False,
+        input_toggle_fails=True,
+        label_click_error=RuntimeError("label did not dispatch"),
+        label_click_toggles=False,
+    )
+
+    result = await handler._set_native_checkbox_state(element, should_check=True)
+
+    assert result is handler.NativeSetOutcome.MISMATCH
+    assert element.locator.label_locator.click_count == 1
+    assert element.locator.checked is False
+
+
+@pytest.mark.asyncio
+async def test_native_set_label_click_without_toggle_is_mismatch() -> None:
+    element = FakeCheckboxElement(checked=False, input_toggle_fails=True, label_click_toggles=False)
+
+    result = await handler._set_native_checkbox_state(element, should_check=True)
+
+    assert result is handler.NativeSetOutcome.MISMATCH
+    assert element.locator.label_locator.click_count == 1
+    assert element.locator.checked is False
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +890,67 @@ async def test_apply_single_select_option_highlight_falls_open_one_click() -> No
     chain.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_handle_action_fails_checked_radio_uncheck_without_physical_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    element = FakeToggleElement("input", {"type": "radio"}, checked=True)
+    dom = MagicMock()
+    dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
+    page = MagicMock(url="https://example.test/page")
+    task = SimpleNamespace(task_id="task", workflow_run_id="run", organization_id="org")
+    step = SimpleNamespace(order=0, step_id="step")
+    action = ClickAction(element_id="el", click_context=ClickContext(desired_state=False))
+    chain = AsyncMock(return_value=[ActionSuccess()])
+    incremental = MagicMock()
+    incremental.start_listen_dom_increment = AsyncMock()
+    incremental.stop_listen_dom_increment = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    app_mock = MagicMock()
+    app_mock.BROWSER_MANAGER.get_for_task.return_value = None
+    app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock()
+    app_mock.AGENT_FUNCTION.is_recognized_submit_control = AsyncMock(return_value=False)
+    app_mock.DATABASE.workflow_params.create_action = AsyncMock(return_value=SimpleNamespace(action_id="action"))
+    monkeypatch.setattr(handler, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    with (
+        patch.object(handler, "app", app_mock),
+        patch.object(handler, "DomUtil", return_value=dom),
+        patch.object(handler, "preflight_action"),
+        patch.object(handler, "check_for_invalid_web_action", return_value=None),
+        patch.object(handler, "get_or_create_wait_config", new=AsyncMock(return_value=None)),
+        patch.object(handler, "chain_click", new=chain),
+        patch.object(handler, "resolve_engine_selection_for_task", MagicMock(return_value=None)),
+        patch.object(handler.SkyvernFrame, "create_instance", new=AsyncMock(return_value=MagicMock())),
+        patch.object(handler, "IncrementalScrapePage", return_value=incremental),
+        patch.object(handler, "handle_sequential_click_with_submit_bypass", new=AsyncMock(return_value=None)),
+        patch.object(handler.ActionHandler, "_setup_action_types", {}),
+        patch.object(handler.ActionHandler, "_teardown_action_types", {}),
+    ):
+        results = await handler.ActionHandler.handle_action(page, task, step, page, action)
+
+    assert action.status is ActionStatus.failed
+    chain.assert_not_awaited()
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == "FailToClick"
+
+
+@pytest.mark.asyncio
+async def test_handle_click_unknown_native_set_fails_without_physical_click() -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=False)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.UNKNOWN)
+    with patch.object(handler, "_set_native_checkbox_state", set_state):
+        results, chain = await _run_handle_click(
+            click_context=ClickContext(desired_state=True),
+            element=element,
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == "FailToClick"
+    chain.assert_not_awaited()
+    set_state.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # <label> targets — observe the spec-bound control (for= / wrapped input), not the
 # label. Equal suppresses; mismatch / unresolved / unreadable falls through to one
@@ -610,13 +967,16 @@ class FakeLabelElement:
         has_for_attr: bool = False,
         wrapped_state: bool | None = None,
         for_control_state: bool | None = None,
+        control_type: str = "checkbox",
         wrapped_error: Exception | None = None,
     ) -> None:
         self._label_for = label_for
         self.has_for_attr = has_for_attr
         self.wrapped_state = wrapped_state
         self.for_control_state = for_control_state
+        self.control_type = control_type
         self.wrapped_error = wrapped_error
+        self.click = AsyncMock()
 
     def get_tag_name(self) -> str:
         return "label"
@@ -628,20 +988,25 @@ class FakeLabelElement:
         return self._label_for
 
 
-async def _fake_evaluate_element_scoped(element: FakeLabelElement, expression: str, arg: object = None) -> bool | None:
+async def _fake_evaluate_element_scoped(
+    element: FakeLabelElement, expression: str, arg: object = None
+) -> dict[str, object] | None:
     """Stand-in for the in-page label-control read (``_evaluate_element_scoped`` + JS). Models the JS
     outcome from the label's spec so assertions target behavior, not JS text: a configured error
     models a probe failure; an explicit ``for=`` label returns ``el.control``'s checked state
     (``for_control_state`` -- a bool for a resolved hidden toggle, None for a dangling / non-labelable
     / non-toggle control, with no descendant fallback); an implicit label returns ``wrapped_state``
-    (the resolved single labelable descendant, None for zero / multiple / non-toggle). Routed through
-    the real ``_read_label_control_state``, so its exception -> None and non-bool -> None handling is
-    exercised too."""
+    (the resolved single labelable descendant, None for zero / multiple / non-toggle). The returned
+    type mirrors the browser probe so hidden radios can be distinguished from hidden checkboxes.
+    Routed through the real ``_read_label_control_state``, so its exception -> None and malformed
+    result -> None handling is exercised too."""
     if element.wrapped_error is not None:
         raise element.wrapped_error
     if element.has_for_attr:
-        return element.for_control_state
-    return element.wrapped_state
+        state = element.for_control_state
+    else:
+        state = element.wrapped_state
+    return None if state is None else {"checked": state, "type": element.control_type}
 
 
 @pytest.mark.asyncio
@@ -650,6 +1015,7 @@ async def test_apply_label_target_reads_bound_control_state_and_suppresses() -> 
     label = FakeLabelElement(label_for=control)
     result = await handler._apply_desired_click_state(_click_action(), label, True, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    assert result[0].desired_state_reached is True
 
 
 @pytest.mark.asyncio
@@ -657,6 +1023,27 @@ async def test_apply_label_target_mismatch_falls_through_one_click() -> None:
     control = FakeToggleElement("input", {"type": "checkbox"}, checked=False)
     label = FakeLabelElement(label_for=control)
     assert await handler._apply_desired_click_state(_click_action(), label, True, MagicMock()) is None
+
+
+@pytest.mark.asyncio
+async def test_apply_label_checked_radio_desired_false_fails_without_click() -> None:
+    control = FakeToggleElement(
+        "input",
+        {"type": "radio"},
+        checked=True,
+        type_results=["radio", RuntimeError("detached")],
+    )
+    label = FakeLabelElement(label_for=control)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
+
+    with patch.object(handler, "_set_native_checkbox_state", set_state):
+        result = await handler._apply_desired_click_state(_click_action(), label, False, MagicMock())
+
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == "FailToClick"
+    set_state.assert_not_awaited()
+    label.click.assert_not_awaited()
+    assert control.type_read_count == 1
 
 
 @pytest.mark.asyncio
@@ -682,7 +1069,7 @@ async def test_apply_label_wrapped_control_live_state_mismatch_falls_through_one
     # Live state differs from the desired state: fall through to one ordinary label click (whose
     # forwarding performs the single toggle) and never drive the control's state through the label.
     label = FakeLabelElement(wrapped_state=False)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with (
         patch.object(handler, "_evaluate_element_scoped", _fake_evaluate_element_scoped),
         patch.object(handler, "_set_native_checkbox_state", set_state),
@@ -743,11 +1130,27 @@ async def test_apply_label_explicit_for_hidden_control_matches_suppresses() -> N
 
 
 @pytest.mark.asyncio
+async def test_apply_label_explicit_for_hidden_checked_radio_fails_without_click() -> None:
+    # A display:none radio is not mapped into the scraped element tree, so the shared helper must
+    # use the in-page control type as well as checked state before allowing a label click.
+    label = FakeLabelElement(has_for_attr=True, for_control_state=True, control_type="radio")
+    evaluate = AsyncMock(side_effect=[{"checked": True, "type": "radio"}, RuntimeError("detached")])
+
+    with patch.object(handler, "_evaluate_element_scoped", evaluate):
+        result = await handler._apply_desired_click_state(_click_action(), label, False, MagicMock())
+
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == "FailToClick"
+    label.click.assert_not_awaited()
+    evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_apply_label_explicit_for_hidden_control_mismatch_falls_through_one_click() -> None:
     # Explicit hidden control reads the opposite of the desired state: fall through to one ordinary
     # label click (whose forwarding performs the single toggle) and never drive state through the label.
     label = FakeLabelElement(has_for_attr=True, label_for=None, for_control_state=False)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with (
         patch.object(handler, "_evaluate_element_scoped", _fake_evaluate_element_scoped),
         patch.object(handler, "_set_native_checkbox_state", set_state),
@@ -1153,6 +1556,7 @@ async def test_apply_grid_row_already_selected_suppresses_without_driver() -> No
     with patch.object(handler, "_drive_grid_row_selection", drive):
         result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    assert result[0].desired_state_reached is True
     drive.assert_not_awaited()
 
 
@@ -1194,7 +1598,7 @@ async def test_apply_grid_row_mismatch_routes_to_driver(snapshot: dict[str, obje
     element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=snapshot)
     sentinel: list[ActionResult] = [ActionAbort()]
     drive = AsyncMock(return_value=sentinel)
-    set_state = AsyncMock(return_value=True)
+    set_state = AsyncMock(return_value=handler.NativeSetOutcome.VERIFIED)
     with (
         patch.object(handler, "_drive_grid_row_selection", drive),
         patch.object(handler, "_set_native_checkbox_state", set_state),
@@ -1417,6 +1821,14 @@ _GRID_FIXTURE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     <tr role="row" class="data-row"><td role="gridcell" class="sel-cell">
       <input type="checkbox" id="cb-foreign-b"></td><td>Row B</td></tr></tbody></table></div>
 
+<div id="native-rerender-container">
+  <input type="checkbox" id="cb-native-rerender" onchange="this.replaceWith(this.cloneNode(true))">
+</div>
+<div id="native-remove-container" onclick="if (window.__removed) window.__clicks++">
+  <input type="checkbox" id="cb-native-remove" onchange="window.__removed = true; this.remove()">
+</div>
+<script>window.__clicks = 0; window.__removed = false;</script>
+
 <script>
 (function () {
   var model = {};
@@ -1506,7 +1918,7 @@ def _real_checkbox_element(page: Page, css_id: str) -> SkyvernElement:
 @contextlib.asynccontextmanager
 async def _grid_fixture_page() -> AsyncIterator[Page]:
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         try:
             # A tall viewport keeps every stacked grid on-screen so the cell hit-test probes a
             # visible region; per-element clip tests rely on their own `.clip-window`, not the viewport.
@@ -1559,6 +1971,28 @@ def _is_abort(result: list[ActionResult] | None) -> bool:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_native_set_read_after_set_reresolves_replaced_input() -> None:
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-native-rerender", desired_state=True)
+
+        assert _is_abort(result)
+        assert await _native_checked(page, "cb-native-rerender") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_native_set_read_after_set_fails_without_second_click_when_input_is_removed() -> None:
+    async with _grid_fixture_page() as page:
+        with patch("skyvern.webeye.utils.dom.get_or_create_wait_config", new=AsyncMock(return_value=None)):
+            result = await _apply_grid(page, "cb-native-remove", desired_state=True)
+
+        assert result is not None and len(result) == 1 and isinstance(result[0], ActionFailure)
+        assert result[0].exception_type == "FailToClick"
+        assert await page.evaluate("() => window.__clicks") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_grid_readable_unselected_desired_true_drives_selection() -> None:
     # A readable grid (explicit aria-selected): a positively-UNSELECTED row with desired_state=True is
     # driven through the cell to a positively-readable SELECTED post-state, then the duplicate click is
@@ -1566,6 +2000,7 @@ async def test_grid_readable_unselected_desired_true_drives_selection() -> None:
     async with _grid_fixture_page() as page:
         result = await _apply_grid(page, "cb-cell-selects", desired_state=True)
         assert _is_abort(result)
+        assert result[0].desired_state_reached is True
         assert await _row_selected(page, "cb-cell-selects") is True
         assert await _native_checked(page, "cb-cell-selects") is True
 

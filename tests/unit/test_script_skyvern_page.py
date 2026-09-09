@@ -586,6 +586,29 @@ async def test_terminate_raises_script_termination_exception_without_context(moc
 
 
 @pytest.mark.asyncio
+async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scraped_page, mock_ai, monkeypatch):
+    """The context-free solve_captcha fallback (no org/task/step) must arm the vendor solver lifecycle
+    around auto_solve_captchas — enter, solve, exit — or a factory-created (solver-off) session never arms."""
+    from skyvern.forge import app
+    from tests.unit.conftest import ScopeRecordingAgentFunction
+
+    agent_function = ScopeRecordingAgentFunction(auto_solve=True)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+
+    with (
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+            return_value=None,
+        ),
+        patch.object(script_page, "_wait_for_page_ready_before_action", new=AsyncMock()),
+    ):
+        await script_page.solve_captcha()
+
+    assert agent_function.events == ["enter", "solve", "exit"]
+
+
+@pytest.mark.asyncio
 async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
     """
     When context, task, and step are available, terminate() should call
@@ -3372,8 +3395,9 @@ class TestAiClickRunsRegisteredClickSetup:
         delete_spy.assert_not_awaited()
         assert page_ai._record_element_fallback_episode.await_args.kwargs["v3_parent_episode_id"] == "ep_1"
 
+    @pytest.mark.parametrize("handle_result", [[ActionAbort()], [ActionAbort(desired_state_reached=True)]])
     @pytest.mark.asyncio
-    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self):
+    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self, handle_result):
         # SKY-14052: handle_click_action's own ClickContext.desired_state guard can suppress the
         # click with an ActionAbort the same way a registered per-site setup does, but it arrives
         # via `handle_result`, not `setup_result` (no per-site setup is registered here). It must
@@ -3381,7 +3405,7 @@ class TestAiClickRunsRegisteredClickSetup:
         page_ai, _locator = self._build_page_ai()
         page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
         delete_spy = AsyncMock()
-        with self._patched(setup_result=None, handle_result=[ActionAbort()]) as spies:
+        with self._patched(setup_result=None, handle_result=handle_result) as spies:
             with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
                 result = await page_ai.ai_click(selector="#btn", intention="toggle owner")
 

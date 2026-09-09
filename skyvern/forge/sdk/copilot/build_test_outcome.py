@@ -6,7 +6,7 @@ import json
 import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit
 
 import structlog
@@ -77,7 +77,13 @@ BuildTestOutcomeReasonCode = Literal[
 _TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset({"terminal_challenge_blocker"})
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
-BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
+BuildTestPacketWorkflowSource = Literal[
+    "accepted_write_readback",
+    "turn_start_persisted_readback",
+    "unavailable",
+    "staged_execution_snapshot",
+    "canonical_execution_snapshot",
+]
 BuildTestPacketUnfinishedKind = Literal[
     "unverified_block",
     "missing_requested_output",
@@ -113,6 +119,7 @@ _TEXT_MAX = 180
 _REF_TEXT_MAX = 96
 _VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
+_PAGE_RESULT_REF_MAX_ITEMS = 6
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_OPERATION_FAILED: BuildTestFailedOperationKind = "browser_operation_failed"
@@ -131,6 +138,7 @@ INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
         "child_no_request",
         "child_malformed_request",
         "busy",
+        "parameter_transfer_failed",
     }
 )
 
@@ -187,6 +195,8 @@ class BuildTestPacketRun(BaseModel):
     browser_session_id: str | None = None
     status: str | None = None
     browser: BuildTestPacketRunBrowser | None = None
+    execution_source: dict[str, Any] | None = None
+    browser_start: dict[str, Any] | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -354,6 +364,201 @@ class BuildTestPacketUnfinishedItem(BaseModel):
     reason_code: str | None = None
 
 
+SOLVER_ATTEMPT_KEY = "solver_attempt"
+
+
+class ChallengeEffects(BaseModel):
+    """What the product observed and did about an anti-bot wall on this run; facts, not a verdict."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str | None = None
+    solver_available: bool | None = None
+    solver_attempted: bool | None = None
+    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] = "unresolved"
+    solver_failure: str | None = None
+
+
+def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -> list[str]:
+    """Prose facts for the typed record, so a reader that skips the keys still meets them; no ranking."""
+    notices: list[str] = []
+    if challenge is not None:
+        kind = challenge.kind or "unclassified"
+        if challenge.solver_available is True:
+            availability = "the managed captcha solver is available for this run"
+        elif challenge.solver_available is False:
+            availability = (
+                "the managed captcha solver is not available for this page or run (an organization setting or a "
+                "per-site exclusion)"
+            )
+        else:
+            availability = "the managed captcha solver's availability was not resolved"
+        if challenge.solver_result == "attempted":
+            outcome = (
+                "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
+                "itself mean the challenge cleared: the no-solver fallback also returns success"
+            )
+        elif challenge.solver_result == "failed":
+            outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
+            if challenge.solver_failure:
+                outcome += f" ({challenge.solver_failure})"
+        elif challenge.solver_result == "not_attempted":
+            outcome = (
+                "no `solve_captcha(page)` call appears in this run's recorded actions; a code block reaches the "
+                "solver only when its code calls that builtin"
+            )
+        else:
+            outcome = "whether this run called `solve_captcha(page)` is unresolved, so do not state either way"
+        notices.append(f"challenge: {kind}; {availability}; {outcome}.")
+    if levers:
+        names = ", ".join(lever.mechanism for lever in levers)
+        notices.append(
+            f"levers are the product capabilities that exist for this wall ({names}); each `knowledge_topic` is a "
+            "`get_workflow_knowledge` topic id and `availability` is the current state, not a recommendation."
+        )
+    return notices
+
+
+LeverMechanism = Literal[
+    "captcha_solver", "proxy_location", "browser_profile", "credential_totp_or_inbox", "human_interaction"
+]
+LeverTopic = Literal["captcha_solver", "proxy_location", "login_block", "human_interaction_block"]
+
+
+class Lever(BaseModel):
+    """A product capability that exists for this wall, with its availability state; never a recommendation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mechanism: LeverMechanism
+    knowledge_topic: LeverTopic
+    availability: str | None = None
+
+
+_ValueT = TypeVar("_ValueT")
+
+BLOCK_FACT_MAX_LABELS = 12
+BLOCK_FACT_MAX_OBSERVATIONS = 6
+BLOCK_FACT_MAX_CHARS = 300
+# An over-long URL is refused rather than cut everywhere it is bounded: a cut URL still parses, so
+# it would be reported as a page the run reached while being unresumable.
+BLOCK_FACT_URL_MAX_CHARS = 2000
+# A notice describing the map must not outgrow the map: nothing downstream bounds omission_notices.
+BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS = 1000
+
+OBSERVED_BLOCK_END_URLS_WITHHELD = (
+    "observed_block_end_urls withheld: this run touched a sensitive origin, so the pages its blocks "
+    "ended on are not reported."
+)
+OBSERVED_BLOCK_END_URLS_UNREPORTABLE = (
+    "observed_block_end_urls omitted: no recorded per-block end URL reduced to a reportable origin."
+)
+OBSERVED_BLOCK_END_URLS_EMPTY = "observed_block_end_urls empty: no per-block end URL was recorded for this run."
+ACTION_OBSERVATIONS_EMPTY = "action_observations empty: no same-run typed action observation was recorded."
+
+# block.py masks a secret in the at-failure URL before persisting it, so a login/MFA failure can
+# leave a final_url that parses but is not the page: it cannot be resumed and must not be reported.
+URL_SECRET_MASK = "*****"
+
+
+def append_omission_notice(notices: list[str], notice: str) -> None:
+    if notice not in notices:
+        notices.append(notice)
+
+
+def _usable_labelled_entries(
+    value: object,
+    *,
+    field_name: str,
+    notices: list[str] | None,
+) -> list[tuple[str, object]]:
+    """Entries of a label map whose label is present and inside the bound.
+    An over-long label is dropped rather than clipped, because a clipped label can collide with a
+    different block's and silently replace its facts."""
+    if not isinstance(value, dict):
+        return []
+    usable = [
+        (label, item)
+        for label, item in value.items()
+        if isinstance(label, str) and 0 < len(label) <= BLOCK_FACT_MAX_CHARS
+    ]
+    unusable = len(value) - len(usable)
+    if unusable and notices is not None:
+        append_omission_notice(
+            notices, f"{field_name} omitted {unusable} block(s): the recorded label was missing or over-long."
+        )
+    return usable
+
+
+def _newest_capped_entries(
+    entries: list[tuple[str, _ValueT]],
+    *,
+    field_name: str,
+    notices: list[str] | None,
+) -> list[tuple[str, _ValueT]]:
+    dropped = max(len(entries) - BLOCK_FACT_MAX_LABELS, 0)
+    if dropped and notices is not None:
+        append_omission_notice(notices, f"{field_name} shortened: the {dropped} oldest block(s) omitted.")
+    return entries[-BLOCK_FACT_MAX_LABELS:]
+
+
+def coerce_block_end_urls(value: object, notices: list[str] | None = None) -> dict[str, str]:
+    """The newest labelled end URLs a raw run result carries."""
+    entries = _usable_labelled_entries(value, field_name="observed_block_end_urls", notices=notices)
+    kept = [(label, url) for label, url in entries if isinstance(url, str) and 0 < len(url) <= BLOCK_FACT_URL_MAX_CHARS]
+    refused = len(entries) - len(kept)
+    if refused and notices is not None:
+        append_omission_notice(
+            notices,
+            f"observed_block_end_urls omitted {refused} block(s): the recorded URL was missing or exceeded "
+            f"{BLOCK_FACT_URL_MAX_CHARS} characters.",
+        )
+    return dict(_newest_capped_entries(kept, field_name="observed_block_end_urls", notices=notices))
+
+
+def coerce_block_action_observations(value: object, notices: list[str] | None = None) -> dict[str, list[str]]:
+    """The newest labelled action observations a raw run result carries, newest-retained per label
+    so a block's terminal action outlives its filler ones."""
+    entries = _usable_labelled_entries(value, field_name="per_block_action_observations", notices=notices)
+    usable: list[tuple[str, list[str]]] = []
+    unusable = 0
+    for label, observations in entries:
+        if not isinstance(observations, list):
+            unusable += 1
+            continue
+        retained_items = [item for item in observations if isinstance(item, str) and item]
+        if not retained_items:
+            unusable += 1
+            continue
+        usable.append((label, retained_items))
+    if unusable and notices is not None:
+        append_omission_notice(
+            notices,
+            f"per_block_action_observations omitted {unusable} block(s): no recorded observation was reportable.",
+        )
+    coerced: dict[str, list[str]] = {}
+    dropped = 0
+    clipped = 0
+    for label, observations in _newest_capped_entries(
+        usable, field_name="per_block_action_observations", notices=notices
+    ):
+        dropped += max(len(observations) - BLOCK_FACT_MAX_OBSERVATIONS, 0)
+        retained: list[str] = []
+        for item in observations[-BLOCK_FACT_MAX_OBSERVATIONS:]:
+            if len(item) > BLOCK_FACT_MAX_CHARS:
+                clipped += 1
+                item = item[: BLOCK_FACT_MAX_CHARS - 3] + "..."
+            retained.append(item)
+        coerced[label] = retained
+    if notices is not None and dropped:
+        append_omission_notice(
+            notices, f"per_block_action_observations shortened: the {dropped} oldest observation(s) omitted."
+        )
+    if notices is not None and clipped:
+        append_omission_notice(notices, f"per_block_action_observations shortened: {clipped} text value(s) clipped.")
+    return coerced
+
+
 class BuildTestEvidencePacket(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -366,6 +571,8 @@ class BuildTestEvidencePacket(BaseModel):
     executed_block_labels: list[str] = Field(default_factory=list)
     run: BuildTestPacketRun
     action_observations: list[str] = Field(default_factory=list)
+    observed_block_end_urls: dict[str, str] = Field(default_factory=dict)
+    per_block_action_observations: dict[str, list[str]] = Field(default_factory=dict)
     failure: BuildTestPacketFailure | None = None
     page_state: BuildTestPacketPageState | None = None
     page_capture: BuildTestPacketPageCapture | None = None
@@ -375,6 +582,9 @@ class BuildTestEvidencePacket(BaseModel):
     screenshot: BuildTestPacketScreenshot
     unfinished_items: list[BuildTestPacketUnfinishedItem] = Field(default_factory=list)
     omission_notices: list[str] = Field(default_factory=list)
+    challenge: ChallengeEffects | None = None
+    levers: list[Lever] = Field(default_factory=list)
+    challenge_notices: list[str] = Field(default_factory=list)
 
 
 class CodeSafetyRejectionFact(BaseModel):
@@ -1377,7 +1587,7 @@ def recorded_outcome_from_run_blocks_result(
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
-    failed_block = _first_failed_block(blocks)
+    failed_block = _newest_failed_block(blocks)
     failed_operation = failed_operation_from_run_blocks_result(
         result, block_associations_by_label=block_associations_by_label
     )
@@ -1782,7 +1992,7 @@ def failed_operation_from_run_blocks_result(
     """Project the runner's exact browser-operation code without interpreting failure prose."""
 
     data = _dict(result.get("data"))
-    failed_block = _first_failed_block(_block_dicts(data.get("blocks")))
+    failed_block = _newest_failed_block(_block_dicts(data.get("blocks")))
     if failed_block is None:
         return None
     error_codes = failed_block.get("error_codes")
@@ -2018,8 +2228,10 @@ def _block_associations(
     )
 
 
-def _first_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:
-    for block in blocks:
+def _newest_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:
+    """``data["blocks"]`` is chronological, so the run's newest failure is the last match: the
+    failed operation must name the failure the run stopped on, not an earlier survivable one."""
+    for block in reversed(blocks):
         if _safe_str(block.get("status")).lower() in _FAILED_BLOCK_STATUSES:
             return block
     return None
@@ -2199,7 +2411,7 @@ def _page_refs_from_authoring_context(repair_context: CodeAuthoringRepairContext
         refs.append(f"origin:{_bounded_ref(repair_context.current_origin)}")
     for summary in repair_context.page_form_summaries[:3]:
         refs.append(f"form:{_bounded_ref(summary)}")
-    for summary in repair_context.page_result_summaries[:3]:
+    for summary in repair_context.page_result_summaries[:_PAGE_RESULT_REF_MAX_ITEMS]:
         refs.append(f"result:{_bounded_ref(summary)}")
     for summary in repair_context.page_action_summaries[:3]:
         refs.append(f"action:{_bounded_ref(summary)}")

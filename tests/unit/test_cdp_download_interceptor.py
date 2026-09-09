@@ -6,14 +6,18 @@ import base64
 import contextlib
 import gc
 import inspect
+import io
+import json
 import textwrap
 import threading
 import weakref
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
+import structlog
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
@@ -21,9 +25,58 @@ from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectH
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
+    _redacted_request_origin,
     extract_filename,
     is_download_response,
 )
+
+
+def _zip_bytes(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+# Structurally valid binary fixtures for the claimed-type guard (SKY-15653): real containers, not
+# brittle magic-byte prefixes, so the tests exercise Python's actual parsers.
+_VALID_ZIP = _zip_bytes({"readme.txt": b"hello"})
+_EMPTY_ZIP = b"PK\x05\x06" + b"\x00" * 18
+_VALID_XLSX = _zip_bytes({"[Content_Types].xml": b"<Types/>", "xl/workbook.xml": b"<workbook/>", "a": b"1"})
+_ZIP_MISSING_OOXML = _zip_bytes({"random.txt": b"not a spreadsheet"})
+_VALID_XLS = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 512
+
+
+def _zip_with_undecodable_entry_name() -> bytes:
+    # A structurally valid ZIP whose entry name is UTF-8-flagged (auto-set for the non-ASCII name)
+    # but whose stored name bytes are corrupted to invalid UTF-8, so ZipFile.namelist() raises
+    # UnicodeDecodeError rather than BadZipFile.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("é.txt", b"x")
+    return buffer.getvalue().replace(b"\xc3\xa9", b"\xff\xff")
+
+
+_ZIP_WITH_UNDECODABLE_NAME = _zip_with_undecodable_entry_name()
+
+
+def _zip_with_unsupported_version() -> bytes:
+    # A structurally valid ZIP whose central-directory "version needed to extract" is > 63, which
+    # makes ZipFile.namelist() raise NotImplementedError rather than BadZipFile.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("a", b"x")
+    raw = bytearray(buffer.getvalue())
+    idx = raw.find(b"PK\x01\x02")  # central directory file header
+    raw[idx + 6] = 99  # version needed to extract (low byte)
+    raw[idx + 7] = 0
+    return bytes(raw)
+
+
+_ZIP_WITH_UNSUPPORTED_VERSION = _zip_with_unsupported_version()
+# A minimal valid PDF preceded by a UTF-8 BOM — a form base saved and PDFium opens.
+_BOM_PDF = b"\xef\xbb\xbf%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
 def _make_interceptor(
@@ -634,6 +687,20 @@ async def test_fetch_download_bytes_in_page_marker_only_for_active_page() -> Non
 
 
 @pytest.mark.asyncio
+async def test_recovery_returns_first_page_satisfying_claim_not_first_non_html() -> None:
+    # A download click can open a popup: one page still shows the error envelope while another holds
+    # the real file. Recovery must skip the claim-contradicting body and return the satisfying one,
+    # not merely the first non-HTML body.
+    interceptor = _make_interceptor()
+    interceptor._browser_context = MagicMock(pages=[MagicMock(), MagicMock()])
+    error_body = b'{"results": "SYSTEM_ERROR", "message": "#MESSAGE#"}'
+    valid_pdf = b"%PDF-1.4\n%%EOF\n"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(side_effect=[error_body, valid_pdf])):
+        result = await interceptor._fetch_download_bytes_in_page("https://x/a", "application/pdf", "statement.pdf")
+    assert result == valid_pdf
+
+
+@pytest.mark.asyncio
 async def test_response_stage_missing_or_wrong_marker_intercepts_download(tmp_path: Path) -> None:
     interceptor = _make_interceptor(output_dir=str(tmp_path))
     interceptor._recovery_marker = "TOKEN"
@@ -1221,6 +1288,52 @@ class TestConfinedDownloadWrites:
         assert list(original_dir.iterdir()) == []
 
 
+class TestRedactedRequestOrigin:
+    """The authRequired origin redaction reduces a URL to scheme://host, dropping every secret-bearing
+    component (userinfo, port, path, query, fragment) and never raising on malformed input."""
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            pytest.param(
+                "https://user:pass@host.example:8443/dir/file.pdf?sig=SECRET#frag",
+                "https://host.example",
+                id="strips-userinfo-port-path-query-fragment",
+            ),
+            pytest.param("http://[2001:db8::1]:8080/x?token=SECRET", "http://[2001:db8::1]", id="ipv6-with-port"),
+            pytest.param("https://[::1]/path", "https://[::1]", id="ipv6-loopback"),
+            pytest.param("http://[bad", "<unparseable>", id="malformed-ipv6-does-not-raise"),
+            pytest.param("https://host.example:notaport/x", "https://host.example", id="malformed-port-fail-safe"),
+            pytest.param("data:text/plain;base64,SGVsbG8=", "<unknown>", id="no-host-yields-placeholder"),
+        ],
+    )
+    def test_redacted_request_origin(self, url: str, expected: str) -> None:
+        assert _redacted_request_origin(url) == expected
+
+    def test_never_leaks_secret_components(self) -> None:
+        rendered = _redacted_request_origin(
+            "https://leakuser:leaksecret@host.example:9000/a/b?token=LEAKTOKEN#LEAKFRAG"
+        )
+        for secret in ("leakuser", "leaksecret", "LEAKTOKEN", "LEAKFRAG", "9000"):
+            assert secret not in rendered
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(None, id="none"),
+            pytest.param(123, id="int"),
+            pytest.param(b"https://host.example/x", id="bytes"),
+            pytest.param({"url": "https://host.example"}, id="dict"),
+            pytest.param(["https://host.example"], id="list"),
+        ],
+    )
+    def test_non_string_input_yields_placeholder_without_raising(self, value: Any) -> None:
+        """A malformed CDP event can carry a non-string ``request.url`` (e.g. null); the redactor must stay
+        total and return a placeholder rather than raise the ``TypeError``/``AttributeError`` ``urlparse``
+        throws on non-strings, since callers rely on its ``Never raises`` contract for attribution."""
+        assert _redacted_request_origin(value) == "<non-string>"
+
+
 class TestCDPDownloadInterceptorProxyAuth:
     """Tests for CDP proxy authentication handling (Fetch.authRequired + continueWithAuth)."""
 
@@ -1243,6 +1356,32 @@ class TestCDPDownloadInterceptorProxyAuth:
         session.send = AsyncMock()
         session.detach = AsyncMock()
         return session
+
+    @staticmethod
+    def _bind_production_render_chain(monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Swap the module ``LOG`` for a capturing logger driven by the real production render chain
+        (``add_log_context`` → ``escape_reserved_log_keys`` → ``JSONRenderer``) and return the
+        capturing factory whose ``.logger.calls`` hold the rendered JSON lines.
+
+        ``capture_logs`` disables the processor chain, so a kwargs-only test cannot see two production
+        rewrites: ``add_log_context`` overwriting ``request_id`` with the inherited run context, and
+        ``escape_reserved_log_keys`` renaming reserved keys under ``JSON_LOGGING`` (set in production via
+        ``cdp-proxy/values-production.yaml``). Binding a test-local logger runs both while leaving the
+        process-global structlog config untouched — ``structlog.configure``/``reset_defaults`` here would
+        leak processor changes into later tests in the suite.
+        """
+        from structlog.testing import CapturingLoggerFactory
+
+        from skyvern.forge.sdk.forge_log import add_log_context, escape_reserved_log_keys
+
+        capture_factory = CapturingLoggerFactory()
+        local_log = structlog.wrap_logger(
+            capture_factory(),
+            processors=[add_log_context, escape_reserved_log_keys, structlog.processors.JSONRenderer()],
+            cache_logger_on_first_use=False,
+        )
+        monkeypatch.setattr(mod, "LOG", local_log)
+        return capture_factory
 
     @pytest.mark.asyncio
     async def test_proxy_auth_provides_credentials(self) -> None:
@@ -2064,6 +2203,428 @@ class TestCDPDownloadInterceptorProxyAuth:
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
 
+    @pytest.mark.asyncio
+    async def test_proxy_auth_success_log_redacts_url_and_credentials(self) -> None:
+        """The ProvideCredentials path must log only the request origin, never the URL or the proxy password."""
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="PROXYPASS_REDACT_SENTINEL")
+        cdp_session = self._make_cdp_session()
+        secret_url = (
+            "https://redactuser:redactsecret@files.internal.example"
+            "/downloads/report.pdf?sig=REDACTSIGABC123&token=REDACTTOKENXYZ#REDACTFRAG"
+        )
+        # The challenge origin is redacted by the same fail-safe redactor, so its userinfo, port,
+        # and path never reach the log even though CDP normally sends only scheme://host[:port].
+        challenge_origin = "http://challuser:CHALLSECRET_REDACT@proxy.internal.example:18080/p?q=CHALLQUERY_REDACT"
+        event = {
+            "requestId": "req-secret-1",
+            "authChallenge": {"source": "Proxy", "origin": challenge_origin},
+            "request": {"url": secret_url},
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_auth_required(event, cdp_session)
+
+        rendered = repr(logs)
+        for secret in (
+            secret_url,
+            "redactuser",
+            "redactsecret",
+            "REDACTSIGABC123",
+            "REDACTTOKENXYZ",
+            "REDACTFRAG",
+            "PROXYPASS_REDACT_SENTINEL",
+            "challuser",
+            "CHALLSECRET_REDACT",
+            "18080",
+            "CHALLQUERY_REDACT",
+        ):
+            assert secret not in rendered
+        assert "files.internal.example" in rendered
+        info_logs = [e for e in logs if e.get("event") == "CDP proxy auth challenge received, providing credentials"]
+        assert len(info_logs) == 1
+        assert info_logs[0].get("challenge_origin") == "http://proxy.internal.example"
+        # Behavior is unchanged: credentials are still provided to the proxy challenge.
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-secret-1",
+                "authChallengeResponse": {
+                    "response": "ProvideCredentials",
+                    "username": "proxyuser",
+                    "password": "PROXYPASS_REDACT_SENTINEL",
+                },
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_proxy_cancel_log_redacts_url(self) -> None:
+        """The non-proxy cancellation log must carry the redacted origin and source, never the URL."""
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        secret_url = "https://redactuser:redactsecret@app.internal.example/protected?sig=REDACTSIGABC123#REDACTFRAG"
+        event = {
+            "requestId": "req-secret-2",
+            "authChallenge": {"source": "Server", "origin": "https://app.internal.example"},
+            "request": {"url": secret_url},
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_auth_required(event, cdp_session)
+
+        rendered = repr(logs)
+        for secret in (secret_url, "redactuser", "redactsecret", "REDACTSIGABC123", "REDACTFRAG"):
+            assert secret not in rendered
+        assert "app.internal.example" in rendered
+        assert "Server" in rendered
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {"requestId": "req-secret-2", "authChallengeResponse": {"response": "CancelAuth"}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_rejection_cancel_log_redacts_url(self) -> None:
+        """The credentials-rejected retry-loop log must redact the URL while keeping attempts and source."""
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        secret_url = (
+            "https://redactuser:redactsecret@files.internal.example"
+            "/downloads/report.pdf?token=REDACTTOKENXYZ#REDACTFRAG"
+        )
+        event = {
+            "requestId": "req-secret-3",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.internal.example"},
+            "request": {"url": secret_url},
+        }
+
+        await interceptor._handle_auth_required(event, cdp_session)  # first attempt: provides credentials
+        cdp_session.send.reset_mock()
+
+        with capture_logs() as logs:
+            await interceptor._handle_auth_required(event, cdp_session)  # second attempt: rejected -> cancel
+
+        rendered = repr(logs)
+        for secret in (secret_url, "redactuser", "redactsecret", "REDACTTOKENXYZ", "REDACTFRAG"):
+            assert secret not in rendered
+        assert "files.internal.example" in rendered
+        assert "attempts" in rendered
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {"requestId": "req-secret-3", "authChallengeResponse": {"response": "CancelAuth"}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_error_log_excludes_exception_text_and_url(self) -> None:
+        """A failure while handling the challenge must log the exception type/origin, never its text or the URL."""
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        secret_url = "https://files.internal.example/report.pdf?token=URLSECRET_REDACT"
+        cdp_session.send.side_effect = RuntimeError(
+            "continueWithAuth failed: signature=EXCSECRET_REDACT for "
+            "https://redactuser:redactsecret@files.internal.example/x"
+        )
+        event = {
+            "requestId": "req-secret-4",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.internal.example"},
+            "request": {"url": secret_url},
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_auth_required(event, cdp_session)  # must not raise
+
+        rendered = repr(logs)
+        for secret in ("URLSECRET_REDACT", "EXCSECRET_REDACT", "redactsecret"):
+            assert secret not in rendered
+        error_logs = [entry for entry in logs if entry.get("event") == "Error handling CDP auth challenge"]
+        assert len(error_logs) == 1
+        assert error_logs[0].get("error_type") == "RuntimeError"
+        # The failure log still attributes the challenge with its non-secret diagnostics, which are
+        # bound before the risky send so a raise mid-handler cannot drop them or hit UnboundLocalError.
+        # ``cdp_request_id`` (not ``request_id``) survives the ``add_log_context`` overwrite; see
+        # test_auth_error_log_survives_add_log_context_overwrite for the real-chain proof.
+        assert error_logs[0].get("cdp_request_id") == "req-secret-4"
+        assert error_logs[0].get("challenge_source") == "Proxy"
+        assert error_logs[0].get("request_origin") == "https://files.internal.example"
+        # No traceback is emitted: a rendered traceback embeds the exception message (and thus the URL).
+        assert not error_logs[0].get("exc_info")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_challenge_failures_keep_distinct_attribution(self) -> None:
+        """When two distinct challenges fail, each failure log carries its own cdp_request_id/origin."""
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = RuntimeError("continueWithAuth failed: token=EXCSECRET_REDACT")
+        events = [
+            {
+                "requestId": "req-concurrent-a",
+                "authChallenge": {"source": "Proxy", "origin": "http://proxy.internal.example"},
+                "request": {"url": "https://alpha.internal.example/a?sig=SECRETA_REDACT"},
+            },
+            {
+                "requestId": "req-concurrent-b",
+                "authChallenge": {"source": "Server", "origin": "https://beta.internal.example"},
+                "request": {"url": "https://redactuser:redactsecret@beta.internal.example/b?token=SECRETB_REDACT"},
+            },
+        ]
+
+        with capture_logs() as logs:
+            await asyncio.gather(*(interceptor._handle_auth_required(e, cdp_session) for e in events))
+
+        rendered = repr(logs)
+        for secret in ("EXCSECRET_REDACT", "SECRETA_REDACT", "SECRETB_REDACT", "redactsecret"):
+            assert secret not in rendered
+        error_logs = {
+            entry.get("cdp_request_id"): entry
+            for entry in logs
+            if entry.get("event") == "Error handling CDP auth challenge"
+        }
+        assert error_logs["req-concurrent-a"].get("request_origin") == "https://alpha.internal.example"
+        assert error_logs["req-concurrent-a"].get("challenge_source") == "Proxy"
+        assert error_logs["req-concurrent-b"].get("request_origin") == "https://beta.internal.example"
+        assert error_logs["req-concurrent-b"].get("challenge_source") == "Server"
+
+    @pytest.mark.parametrize(
+        ("origin", "expected"),
+        [
+            pytest.param("http://[2001:db8::1]:18080/p", "http://[2001:db8::1]", id="ipv6-with-port"),
+            pytest.param("https://[::1]", "https://[::1]", id="ipv6-loopback-no-port"),
+            pytest.param("http://[bad", "<unparseable>", id="malformed-ipv6-fail-safe"),
+            pytest.param("http://proxy.example:notaport", "http://proxy.example", id="malformed-port-fail-safe"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_provide_credentials_log_redacts_challenge_origin(self, origin: str, expected: str) -> None:
+        """The challenge origin is reduced by the same fail-safe redactor: IPv6 literals are bracketed
+        and malformed origins fall back to a placeholder rather than raising or leaking a port."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+        event = {
+            "requestId": "req-ipv6",
+            "authChallenge": {"source": "Proxy", "origin": origin},
+            "request": {"url": "https://files.internal.example/report.pdf"},
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_auth_required(event, cdp_session)
+
+        info_logs = [e for e in logs if e.get("event") == "CDP proxy auth challenge received, providing credentials"]
+        assert len(info_logs) == 1
+        assert info_logs[0].get("challenge_origin") == expected
+        assert "18080" not in repr(logs)
+        # Behavior is unchanged: credentials are still provided regardless of the origin's shape.
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-ipv6",
+                "authChallengeResponse": {
+                    "response": "ProvideCredentials",
+                    "username": "user1",
+                    "password": "pass1",
+                },
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_error_log_survives_add_log_context_overwrite(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prove the field contract under the *real* processor chain, which ``capture_logs`` skips.
+
+        Two production rewrites are invisible to a ``capture_logs`` test: ``add_log_context`` overwrites
+        ``event_dict['request_id']`` with the inherited run context, and ``escape_reserved_log_keys``
+        renames reserved keys (``source`` → ``event_source``) under ``JSON_LOGGING``. Rendering through the
+        real chain shows ``cdp_request_id`` stays distinct per challenge while ``request_id`` collapses to
+        the shared context, and that the source of the challenge lands under the stable ``challenge_source``
+        key rather than a reserved name the escape processor would silently rewrite — with no secret leaked.
+        """
+        from skyvern.forge.sdk.core import skyvern_context
+        from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = RuntimeError("continueWithAuth failed: token=EXCSECRET_REDACT")
+        events = [
+            {
+                "requestId": "req-real-a",
+                "authChallenge": {"source": "Proxy", "origin": "http://proxy.internal.example"},
+                "request": {"url": "https://alpha.internal.example/a?sig=SECRETA_REDACT"},
+            },
+            {
+                "requestId": "req-real-b",
+                "authChallenge": {"source": "Server", "origin": "https://beta.internal.example"},
+                "request": {"url": "https://redactuser:redactsecret@beta.internal.example/b?token=SECRETB_REDACT"},
+            },
+        ]
+
+        config_before = structlog.get_config()
+        capture_factory = self._bind_production_render_chain(monkeypatch)
+
+        token = skyvern_context._context.set(SkyvernContext(request_id="ctx-shared-request-id"))
+        try:
+            await asyncio.gather(*(interceptor._handle_auth_required(e, cdp_session) for e in events))
+        finally:
+            skyvern_context._context.reset(token)
+
+        # The isolation contract: this test binds its own logger and never mutates global structlog
+        # config, so the config other tests inherit must be byte-for-byte what it was on entry.
+        assert structlog.get_config() == config_before
+
+        rendered_lines = [c.args[0] for c in capture_factory.logger.calls]
+        blob = "\n".join(rendered_lines)
+        for secret in ("EXCSECRET_REDACT", "SECRETA_REDACT", "SECRETB_REDACT", "redactsecret"):
+            assert secret not in blob
+        error_records = [
+            json.loads(line)
+            for line in rendered_lines
+            if json.loads(line).get("event") == "Error handling CDP auth challenge"
+        ]
+        assert len(error_records) == 2
+        # request_id was overwritten by the run context for both records — proving why the
+        # per-challenge id must NOT live under that key.
+        assert {r["request_id"] for r in error_records} == {"ctx-shared-request-id"}
+        # cdp_request_id survived the merge and keeps each failing challenge attributable.
+        by_cdp = {r["cdp_request_id"]: r for r in error_records}
+        assert set(by_cdp) == {"req-real-a", "req-real-b"}
+        assert by_cdp["req-real-a"]["request_origin"] == "https://alpha.internal.example"
+        assert by_cdp["req-real-b"]["request_origin"] == "https://beta.internal.example"
+        # The challenge source lands under the stable, non-reserved key in production. escape_reserved_log_keys
+        # would rewrite a raw ``source`` kwarg to ``event_source``; neither reserved spelling may appear.
+        assert by_cdp["req-real-a"]["challenge_source"] == "Proxy"
+        assert by_cdp["req-real-b"]["challenge_source"] == "Server"
+        for record in error_records:
+            assert "source" not in record
+            assert "event_source" not in record
+
+    @pytest.mark.parametrize(
+        ("source", "is_retry", "warning_event"),
+        [
+            pytest.param(
+                "Server",
+                False,
+                "CDP auth challenge received, cancelling (non-proxy or no credentials)",
+                id="non-proxy-cancel-warning",
+            ),
+            pytest.param(
+                "Proxy",
+                True,
+                "CDP proxy auth credentials rejected, cancelling to prevent retry loop",
+                id="retry-loop-reject-warning",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cancel_warning_challenge_source_survives_escape_processor(
+        self, monkeypatch: pytest.MonkeyPatch, source: str, is_retry: bool, warning_event: str
+    ) -> None:
+        """Both cancellation warnings must key the challenge source under the stable ``challenge_source`` name.
+
+        ``capture_logs`` skips ``escape_reserved_log_keys``, so a raw ``source`` kwarg (reserved, rewritten to
+        ``event_source`` under production ``JSON_LOGGING``) would still pass a kwargs-only test — reverting
+        either warning site to ``source=`` leaves the suite green. Driving each warning branch through the real
+        render chain pins both sites independently: the reject-loop warning (second attempt) and the
+        non-proxy/no-credentials warning each render ``challenge_source`` with neither reserved spelling.
+        """
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+        event = {
+            "requestId": "req-warn",
+            "authChallenge": {"source": source, "origin": "http://proxy.internal.example"},
+            "request": {"url": "https://files.internal.example/report.pdf?token=WARNSECRET_REDACT"},
+        }
+
+        config_before = structlog.get_config()
+        if is_retry:
+            # First attempt provides credentials; only the second lands in the retry-loop reject warning,
+            # so bind the capturing chain after it to isolate the warning record under test.
+            await interceptor._handle_auth_required(event, cdp_session)
+        capture_factory = self._bind_production_render_chain(monkeypatch)
+        await interceptor._handle_auth_required(event, cdp_session)
+        assert structlog.get_config() == config_before
+
+        rendered_lines = [c.args[0] for c in capture_factory.logger.calls]
+        blob = "\n".join(rendered_lines)
+        assert "WARNSECRET_REDACT" not in blob
+        warning_records = [
+            json.loads(line) for line in rendered_lines if json.loads(line).get("event") == warning_event
+        ]
+        assert len(warning_records) == 1
+        record = warning_records[0]
+        assert record["challenge_source"] == source
+        assert record["request_origin"] == "https://files.internal.example"
+        assert "source" not in record
+        assert "event_source" not in record
+
+    @pytest.mark.parametrize(
+        ("malformed_field", "event", "expected_origin"),
+        [
+            pytest.param(
+                "authChallenge",
+                {
+                    "requestId": "req-malformed-chal",
+                    "authChallenge": None,
+                    "request": {"url": "https://files.internal.example/report.pdf?token=MALFORMEDSECRET_REDACT"},
+                },
+                "https://files.internal.example",
+                id="null-authChallenge",
+            ),
+            pytest.param(
+                "request",
+                {
+                    "requestId": "req-malformed-req",
+                    "authChallenge": {"source": "Proxy", "origin": "http://proxy.internal.example"},
+                    "request": None,
+                },
+                "<unknown>",
+                id="null-request",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_event_lands_in_attributed_error_log_through_real_chain(
+        self, monkeypatch: pytest.MonkeyPatch, malformed_field: str, event: dict[str, Any], expected_origin: str
+    ) -> None:
+        """A malformed challenge (``authChallenge`` or ``request`` null) must be caught into the attributed
+        error log, not escape the handler as an unattributed ``_cdp_handler_done`` warning.
+
+        The nested field extraction runs inside the protected block, so the resulting ``AttributeError`` is
+        caught and the failure is still attributed by ``cdp_request_id``. Because the request URL is reduced
+        to its origin *before* the challenge source is extracted, a null ``authChallenge`` (which raises during
+        source extraction) still retains the present request's redacted origin instead of collapsing to the
+        placeholder; a null ``request`` has no usable URL and falls back to the placeholder. Driven through the
+        real render chain to prove the same stable field contract and no raw event/URL content leaks.
+        """
+        interceptor = self._make_interceptor(proxy_username="proxyuser", proxy_password="proxypass")
+        cdp_session = self._make_cdp_session()
+
+        config_before = structlog.get_config()
+        capture_factory = self._bind_production_render_chain(monkeypatch)
+
+        # Must not raise: a malformed event has to be caught, never surface out of the scheduled handler.
+        await interceptor._handle_auth_required(event, cdp_session)
+
+        assert structlog.get_config() == config_before
+        # A malformed challenge cannot be answered, so no continueWithAuth is sent.
+        cdp_session.send.assert_not_called()
+
+        rendered_lines = [c.args[0] for c in capture_factory.logger.calls]
+        blob = "\n".join(rendered_lines)
+        assert "MALFORMEDSECRET_REDACT" not in blob
+        # No raw event dict (which would carry the URL/authChallenge payload) is rendered.
+        assert "authChallenge" not in blob
+
+        error_records = [
+            json.loads(line)
+            for line in rendered_lines
+            if json.loads(line).get("event") == "Error handling CDP auth challenge"
+        ]
+        assert len(error_records) == 1
+        record = error_records[0]
+        assert record["cdp_request_id"] == event["requestId"]
+        assert record["error_type"] == "AttributeError"
+        assert record["request_origin"] == expected_origin
+        # Stable, non-reserved attribution key survives the escape processor untouched.
+        assert "challenge_source" in record
+        assert "source" not in record
+        assert "event_source" not in record
+        assert not record.get("exc_info")
+
 
 class TestStaleInterceptionRace:
     """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
@@ -2256,6 +2817,56 @@ class TestBlobDownloadCapture:
 
         names = sorted(p.name for p in tmp_path.iterdir())
         assert names == ["invoice.pdf", "prior.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_blob_replay_dedupes_identical_and_reports_different(self, tmp_path: Path) -> None:
+        """A byte-identical re-emitted blob dedupes without re-adding its URL, while a same-name different blob still fails closed and is reported."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        payload = b"%PDF-1.4 blob-sink-invoice bytes"
+
+        async def replay(url: str) -> None:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
+
+        read = AsyncMock(side_effect=[payload, payload, b"a different blob, same name"])
+        with patch(self._READ_BLOB, new=read):
+            await replay("blob:https://example.com/one")
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+            assert interceptor.consume_unsolicited_download_error() is None
+
+            await replay("blob:https://example.com/two")  # identical bytes re-emitted under a fresh blob URL
+            assert interceptor.consume_unsolicited_download_error() is None
+            assert len(list(tmp_path.glob("*.pdf"))) == 1
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+            assert interceptor._active_download_attempts == {}
+            assert interceptor._run_download_file_count == 1
+            assert interceptor._run_download_bytes == 2 * len(payload)  # duplicate bytes stay charged (no refund)
+            assert interceptor._downloaded_urls == {"blob:https://example.com/one"}
+
+            await replay("blob:https://example.com/three")  # genuinely different bytes, same name
+        genuine = interceptor.consume_unsolicited_download_error()
+        assert genuine is not None
+        assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+        assert (tmp_path / "report.pdf").read_bytes() == payload
+
+    @pytest.mark.asyncio
+    async def test_blob_dedupe_rejects_a_stale_scope_queued_event(self, tmp_path: Path) -> None:
+        """A blob event queued under a prior scope is not deduped against the rotated directory: it fails closed as scope-invalidated rather than being accepted as a current-scope duplicate."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        payload = b"%PDF-1.4 scoped blob duplicate"
+        (tmp_path / "report.pdf").write_bytes(payload)
+        interceptor._artifact_scope_generation = 1  # a rotation has advanced the scope past the queued event
+        event = {
+            "url": "blob:https://example.com/stale",
+            "suggestedFilename": "report.pdf",
+            mod._ARTIFACT_SCOPE_GENERATION_EVENT_KEY: 0,
+        }
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=payload)):
+            await interceptor._handle_browser_download(event)
+
+        assert interceptor.consume_unsolicited_download_error() is not None
+        assert (tmp_path / "report.pdf").read_bytes() == payload
 
     @pytest.mark.asyncio
     async def test_blob_download_no_context_is_noop(self, tmp_path: Path) -> None:
@@ -3515,6 +4126,11 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         b"<body><form method='post' action='./Login.aspx'></form></body></html>"
     )
 
+    # A portal error envelope returned HTTP 200 under a claimed .pdf name (SKY-15653): the retained
+    # production payload was 51 bytes of JSON, not HTML, so the HTML-only guard let it be saved.
+    _JSON_ERROR = b'{"results": "SYSTEM_ERROR", "message": "#MESSAGE#"}'
+    _MINIMAL_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+
     @pytest.mark.asyncio
     async def test_failed_guarded_helper_does_not_fall_back_to_unenrolled_clients(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
@@ -3546,7 +4162,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         context.request.get = AsyncMock(side_effect=AssertionError("raw BrowserContext request bypass"))
         interceptor._browser_context = context
         guarded_response = MagicMock(
-            body=b"private report",
+            body=b"%PDF-1.4 private report",
             content_type="application/pdf",
             filename="report.pdf",
         )
@@ -3573,14 +4189,45 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             download_scope=None,
             approved_initial_url="https://site.example/report.pdf?sig=secret",
         )
-        assert (tmp_path / "report.pdf").read_bytes() == b"private report"
+        assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1.4 private report"
+
+    @pytest.mark.asyncio
+    async def test_browser_native_replay_dedupes_identical_and_reports_different(self, tmp_path: Path) -> None:
+        """A byte-identical browser-native replay of an already-saved file dedupes with no unsolicited failure, while a same-name different payload still fails closed and is reported."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._redirect_hop_authorizer = AsyncMock()
+        interceptor._browser_context = self._context()
+        payload = b"%PDF-1.7\ndirect-sink-statement\n"
+
+        def resp(body: bytes) -> MagicMock:
+            return MagicMock(body=body, content_type="application/pdf", filename="report.pdf")
+
+        async def replay(url: str) -> None:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
+
+        fetch = AsyncMock(side_effect=[resp(payload), resp(payload), resp(b"a different file, same name")])
+        with patch.object(mod.file_api, "fetch_file_bytes", fetch, create=True):
+            await replay("https://site.example/dl?tok=1")  # first capture saves the file
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+            assert interceptor.consume_unsolicited_download_error() is None
+
+            await replay("https://site.example/dl?tok=2")  # byte-identical replay under a different URL
+            assert interceptor.consume_unsolicited_download_error() is None
+            assert len(list(tmp_path.glob("*.pdf"))) == 1
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+
+            await replay("https://site.example/dl?tok=3")  # genuinely different file, same name
+        genuine = interceptor.consume_unsolicited_download_error()
+        assert genuine is not None
+        assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+        assert (tmp_path / "report.pdf").read_bytes() == payload
 
     @pytest.mark.asyncio
     async def test_html_gate_recovery_uses_post_replacement_run_budget(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         gate = self._LOGIN_HTML
-        recovered = b"%PDF" + b"R" * (1024 * 1024 - 4)
+        recovered = b"%PDF-" + b"R" * (1024 * 1024 - 5)
         interceptor._run_download_bytes = mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered)
         guarded_fetch = self._guarded_fetch(gate, "text/html", "report.pdf")
         in_page = AsyncMock(return_value=recovered)
@@ -3590,7 +4237,10 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         ):
             await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
         in_page.assert_awaited_once_with(
-            "https://site.example/report.pdf", recovery_allowance_bytes=len(recovered) + len(gate)
+            "https://site.example/report.pdf",
+            "text/html",
+            "report.pdf",
+            recovery_allowance_bytes=len(recovered) + len(gate),
         )
         assert len(list(tmp_path.iterdir())) == 1
         assert next(tmp_path.iterdir()).read_bytes() == recovered
@@ -3602,7 +4252,75 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         )
 
     @pytest.mark.asyncio
-    async def test_html_gate_empty_recovery_writes_one_zero_byte_artifact(self, tmp_path: Path) -> None:
+    async def test_recovery_arm_dedupes_identical_replay_and_reports_different(self, tmp_path: Path) -> None:
+        """The in-page HTML-gate recovery write dedupes a byte-identical already-saved payload and still fails closed on different bytes."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._redirect_hop_authorizer = AsyncMock()
+        interceptor._browser_context = self._context()
+        payload = b"%PDF-1.7\nrecovery-sink-statement\n"
+
+        def resp(body: bytes, content_type: str) -> MagicMock:
+            return MagicMock(body=body, content_type=content_type, filename="report.pdf")
+
+        async def replay(url: str) -> None:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
+
+        fetch = AsyncMock(
+            side_effect=[
+                resp(payload, "application/pdf"),  # first capture saves the file directly
+                resp(self._LOGIN_HTML, "text/html"),  # replay hits the session gate, recovery kicks in
+                resp(self._LOGIN_HTML, "text/html"),
+            ]
+        )
+        in_page = AsyncMock(side_effect=[payload, b"a different recovered file, same name"])
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", in_page),
+        ):
+            await replay("https://site.example/dl?tok=1")
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+            assert interceptor.consume_unsolicited_download_error() is None
+
+            await replay("https://site.example/dl?tok=2")  # gate masquerade; recovery returns the identical file
+            assert interceptor.consume_unsolicited_download_error() is None
+            assert len(list(tmp_path.glob("*.pdf"))) == 1
+            assert (tmp_path / "report.pdf").read_bytes() == payload
+            assert interceptor._active_download_attempts == {}
+            assert interceptor._run_download_file_count == 1
+            assert interceptor._run_download_bytes == 2 * len(payload)  # duplicate bytes stay charged (no refund)
+
+            await replay("https://site.example/dl?tok=3")  # gate masquerade; recovery returns different bytes
+        genuine = interceptor.consume_unsolicited_download_error()
+        assert genuine is not None
+        assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+        assert (tmp_path / "report.pdf").read_bytes() == payload
+
+    @pytest.mark.asyncio
+    async def test_direct_dedupe_rejects_a_stale_scope_queued_event(self, tmp_path: Path) -> None:
+        """A browser event queued under a prior scope is not deduped against the rotated directory: it fails closed as scope-invalidated rather than being accepted as a current-scope duplicate."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._redirect_hop_authorizer = AsyncMock()
+        interceptor._browser_context = self._context()
+        payload = b"%PDF-1.7\nscoped-duplicate\n"
+        (tmp_path / "report.pdf").write_bytes(payload)
+        interceptor._artifact_scope_generation = 1  # a rotation has advanced the scope past the queued event
+        event = {
+            "url": "https://site.example/report.pdf",
+            "suggestedFilename": "report.pdf",
+            mod._ARTIFACT_SCOPE_GENERATION_EVENT_KEY: 0,
+        }
+        with patch.object(
+            mod.file_api, "fetch_file_bytes", self._guarded_fetch(payload, "application/pdf", "report.pdf"), create=True
+        ):
+            await interceptor._handle_browser_download(event)
+
+        assert interceptor.consume_unsolicited_download_error() is not None
+        assert (tmp_path / "report.pdf").read_bytes() == payload
+
+    @pytest.mark.asyncio
+    async def test_html_gate_empty_recovery_under_pdf_claim_is_not_saved(self, tmp_path: Path) -> None:
+        # An empty recovery cannot be a valid PDF, so under a .pdf claim it is rejected rather than
+        # written as a zero-byte artifact that would later report as a completed download (SKY-15653).
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         guarded_fetch = self._guarded_fetch(self._LOGIN_HTML, "text/html", "report.pdf")
@@ -3612,12 +4330,9 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         ):
             await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
         recovery.assert_awaited_once()
-        artifacts = list(tmp_path.iterdir())
-        assert len(artifacts) == 1
-        assert artifacts[0].read_bytes() == b""
+        assert list(tmp_path.iterdir()) == []
         assert interceptor._active_download_attempts == {}
-        assert interceptor._run_download_file_count == 1
-        assert interceptor._run_download_bytes == 0
+        assert interceptor._run_download_file_count == 0
 
     @pytest.mark.asyncio
     async def test_html_gate_none_recovery_fails_without_artifact(self, tmp_path: Path) -> None:
@@ -3739,7 +4454,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             pytest.param(_LOGIN_HTML, "text/html", "", "<generated>", id="nameless-html"),
             pytest.param(_LOGIN_HTML, "", "", "<generated>", id="nameless-no-content-type"),
             pytest.param(b"%PDF-1.7 report", "application/pdf", "invoice.pdf", "invoice.pdf", id="binary"),
-            pytest.param(b"PK\x03\x04 archive", "text/html", "archive.zip", "archive.zip", id="mislabeled-binary"),
+            pytest.param(_VALID_ZIP, "text/html", "archive.zip", "archive.zip", id="mislabeled-binary"),
             pytest.param(
                 b"<!-- generated --><!DOCTYPE html><html><body>login</body></html>",
                 "application/octet-stream",
@@ -3795,11 +4510,203 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
                 assert saved[0].name == expected_filename
             assert saved[0].read_bytes() == body
 
+    @pytest.mark.parametrize(
+        ("body", "content_type", "filename"),
+        [
+            pytest.param(_JSON_ERROR, "application/json", "statement.pdf", id="json-error-under-pdf-name"),
+            pytest.param(_JSON_ERROR, "application/pdf", "statement.pdf", id="json-error-mislabeled-as-pdf"),
+            pytest.param(b"Not a PDF at all", "application/pdf", "statement.pdf", id="text-under-pdf-content-type"),
+            pytest.param(_LOGIN_HTML, "application/pdf", "statement.pdf", id="login-html-under-pdf"),
+            pytest.param(b"", "application/pdf", "statement.pdf", id="empty-under-pdf"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_pdf_body_under_pdf_claim_is_not_saved(
+        self, tmp_path: Path, body: bytes, content_type: str, filename: str
+    ) -> None:
+        """A body that cannot be a valid PDF must not be saved under a claimed .pdf/PDF name, and an
+        in-page recovery that returns the same invalid payload must not rescue it either."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(body, content_type, filename)
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=body)),
+        ):
+            await interceptor._download_url_directly(f"https://site.example/{filename}", filename)
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._active_download_attempts == {}
+
+    @pytest.mark.asyncio
+    async def test_error_body_recovered_as_valid_pdf_is_saved(self, tmp_path: Path) -> None:
+        """When the first fetch is an error envelope under a .pdf name but the in-page recovery
+        returns a real PDF, the recovered PDF is saved."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(self._JSON_ERROR, "application/json", "statement.pdf")
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=self._MINIMAL_PDF)),
+        ):
+            await interceptor._download_url_directly("https://site.example/statement.pdf", "statement.pdf")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == self._MINIMAL_PDF
+
+    @pytest.mark.asyncio
+    async def test_valid_pdf_body_under_pdf_claim_is_saved(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(self._MINIMAL_PDF, "application/pdf", "statement.pdf")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly("https://site.example/statement.pdf", "statement.pdf")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == self._MINIMAL_PDF
+
+    @pytest.mark.asyncio
+    async def test_honest_non_target_download_is_saved(self, tmp_path: Path) -> None:
+        """An honest download of a type the guard does not validate (e.g. CSV, which has no reliable
+        magic bytes and is deliberately not validated) is saved unchanged."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        body = b"col1,col2\n1,2\n"
+        guarded_fetch = self._guarded_fetch(body, "text/csv", "export.csv")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == body
+
+    @pytest.mark.parametrize(
+        "content_type",
+        ["text/csv", "application/vnd.ms-excel", "application/zip", "application/pdf"],
+    )
+    @pytest.mark.asyncio
+    async def test_extension_is_authoritative_csv_saved_regardless_of_content_type(
+        self, tmp_path: Path, content_type: str
+    ) -> None:
+        # A filename extension is the authoritative claim: a .csv download must not be revalidated as
+        # XLS/ZIP/PDF just because a server mislabels its Content-Type (e.g. CSV served as
+        # application/vnd.ms-excel), which would drop a download that previously succeeded.
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        body = b"col1,col2\n1,2\n"
+        guarded_fetch = self._guarded_fetch(body, content_type, "export.csv")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == body
+
+    _XLSX_CT = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    @pytest.mark.parametrize(
+        ("body", "content_type", "filename"),
+        [
+            pytest.param(_JSON_ERROR, _XLSX_CT, "book.xlsx", id="json-under-xlsx"),
+            pytest.param(
+                _ZIP_MISSING_OOXML, "application/octet-stream", "book.xlsx", id="zip-without-ooxml-under-xlsx"
+            ),
+            pytest.param(_VALID_XLS, "application/octet-stream", "book.xlsx", id="ole-under-xlsx"),
+            pytest.param(_JSON_ERROR, "application/vnd.ms-excel", "book.xls", id="json-under-xls"),
+            pytest.param(_VALID_ZIP, "application/octet-stream", "book.xls", id="zip-under-xls"),
+            pytest.param(_JSON_ERROR, "application/zip", "archive.zip", id="json-under-zip"),
+            pytest.param(
+                b"PK\x03\x04 not a real zip", "application/octet-stream", "archive.zip", id="truncated-zip-under-zip"
+            ),
+            pytest.param(b"", "application/zip", "archive.zip", id="empty-body-under-zip"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_matching_body_under_office_or_zip_claim_is_not_saved(
+        self, tmp_path: Path, body: bytes, content_type: str, filename: str
+    ) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(body, content_type, filename)
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=body)),
+        ):
+            await interceptor._download_url_directly(f"https://site.example/{filename}", filename)
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._active_download_attempts == {}
+
+    @pytest.mark.parametrize(
+        ("body", "content_type", "filename"),
+        [
+            pytest.param(_VALID_XLSX, _XLSX_CT, "book.xlsx", id="valid-xlsx"),
+            pytest.param(_VALID_XLS, "application/vnd.ms-excel", "book.xls", id="valid-xls"),
+            pytest.param(_VALID_ZIP, "application/zip", "archive.zip", id="valid-zip"),
+            pytest.param(_EMPTY_ZIP, "application/zip", "archive.zip", id="empty-zip-archive"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_valid_office_or_zip_body_under_matching_claim_is_saved(
+        self, tmp_path: Path, body: bytes, content_type: str, filename: str
+    ) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(body, content_type, filename)
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly(f"https://site.example/{filename}", filename)
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == body
+
+    @pytest.mark.asyncio
+    async def test_error_body_recovered_as_valid_xlsx_is_saved(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(self._JSON_ERROR, "application/json", "book.xlsx")
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=_VALID_XLSX)),
+        ):
+            await interceptor._download_url_directly("https://site.example/book.xlsx", "book.xlsx")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == _VALID_XLSX
+
+    def test_xlsx_validator_fails_closed_on_undecodable_entry_name(self) -> None:
+        # A structurally valid ZIP whose UTF-8-flagged entry name holds non-UTF-8 bytes makes
+        # namelist() raise UnicodeDecodeError; the validator must return False, never propagate.
+        payload = _ZIP_WITH_UNDECODABLE_NAME
+        assert zipfile.is_zipfile(io.BytesIO(payload))
+        assert mod._is_valid_xlsx(payload) is False
+
+    def test_xlsx_validator_fails_closed_on_unsupported_zip_version(self) -> None:
+        # version-needed-to-extract > 63 makes namelist() raise NotImplementedError; fail closed.
+        payload = _ZIP_WITH_UNSUPPORTED_VERSION
+        assert zipfile.is_zipfile(io.BytesIO(payload))
+        assert mod._is_valid_xlsx(payload) is False
+
+    def test_looks_like_pdf_accepts_bom_prefixed_header_but_anchors_the_marker(self) -> None:
+        assert mod._looks_like_pdf(_BOM_PDF) is True
+        assert mod._looks_like_pdf(b"%PDF-1.7 tail") is True
+        assert mod._looks_like_pdf(b'{"results": "SYSTEM_ERROR"}') is False
+        # A body that merely mentions the marker later must be rejected (anchored, not a scan).
+        assert mod._looks_like_pdf(b'{"error": "expected a %PDF- header but got json"}') is False
+
+    @pytest.mark.asyncio
+    async def test_bom_prefixed_pdf_under_pdf_claim_is_saved(self, tmp_path: Path) -> None:
+        # A valid PDF preceded by a UTF-8 BOM must be saved, not rejected as a non-PDF; the repo's
+        # existing PDF detector already accepts this form (SKY-15653 review, wintonzheng/codex).
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(_BOM_PDF, "application/pdf", "statement.pdf")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly("https://site.example/statement.pdf", "statement.pdf")
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == _BOM_PDF
+
     @pytest.mark.asyncio
     async def test_direct_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
-        guarded_fetch = self._guarded_fetch(b"private report", "application/pdf", "report.pdf")
+        guarded_fetch = self._guarded_fetch(b"%PDF-1.4 report", "application/pdf", "report.pdf")
         save_path, _ = interceptor._resolve_save_path("report.pdf")
         outside = tmp_path.parent / f"{tmp_path.name}-direct-outside.pdf"
         outside.write_bytes(b"outside")
@@ -4547,3 +5454,201 @@ class TestTwoPathDownloadStreaming:
 
         assert _only_file(tmp_path).read_bytes() == b"P" * 2000  # file saved despite the benign fulfill race
         assert not [log for log in logs if log.get("log_level") == "error"]
+
+
+def test_duplicate_identical_publish_is_not_reported_as_unsolicited_failure(tmp_path: Path) -> None:
+    """A byte-identical duplicate of an already-saved publish dedupes with no unsolicited failure, while a same-name different payload still fails closed and is reported."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nstatement-bytes-A\n"
+
+    saved = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert saved is not None and saved.exists()
+    assert interceptor.consume_unsolicited_download_error() is None
+
+    # Duplicate observation of the identical, already-saved file: not a lost download.
+    duplicate = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert duplicate is not None
+    assert interceptor.consume_unsolicited_download_error() is None
+    assert len(list(tmp_path.glob("*.pdf"))) == 1  # no duplicate copy written
+    assert saved.read_bytes() == payload  # original file untouched
+
+    # A genuinely different file colliding on the same name is a real miss and must still surface.
+    interceptor.publish_download_bytes(b"a different file, same name", "statement.pdf", "application/pdf")
+    genuine = interceptor.consume_unsolicited_download_error()
+    assert genuine is not None
+    assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+    assert saved.read_bytes() == payload  # genuine collision fails closed; no overwrite
+
+
+def test_requested_duplicate_is_satisfied_but_different_bytes_still_fails(tmp_path: Path) -> None:
+    """Inside a requested-download bracket a byte-identical duplicate resolves as satisfied, while same-name different bytes still returns BROWSER_DOWNLOAD_FAILED."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nrequested-statement\n"
+
+    first = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert first is not None and first.exists()
+
+    token = interceptor.begin_requested_download()
+    duplicate = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert duplicate is not None
+    assert interceptor.finish_requested_download(token) is None
+    assert len(list(tmp_path.glob("*.pdf"))) == 1
+
+    token_different = interceptor.begin_requested_download()
+    interceptor.publish_download_bytes(b"a different requested file, same name", "statement.pdf", "application/pdf")
+    outcome = interceptor.finish_requested_download(token_different)
+    assert outcome is not None
+    assert outcome["error_code"] == "BROWSER_DOWNLOAD_FAILED"
+    assert first.read_bytes() == payload
+
+
+def test_dedupe_does_not_follow_a_destination_symlink(tmp_path: Path) -> None:
+    """A destination symlink whose target holds identical bytes is not treated as a duplicate: the confined O_NOFOLLOW check falls through to the write, which fails closed."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nidentical-bytes-outside\n"
+    save_path, _ = interceptor._resolve_save_path("statement.pdf", "application/pdf")
+    outside = tmp_path.parent / f"{tmp_path.name}-dedupe-outside.pdf"
+    outside.write_bytes(payload)
+    save_path.symlink_to(outside)
+
+    result = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+
+    assert result is None
+    genuine = interceptor.consume_unsolicited_download_error()
+    assert genuine is not None
+    assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+    assert save_path.is_symlink()  # the outside link was never adopted as the artifact
+    assert outside.read_bytes() == payload
+
+
+def test_dedupe_rejects_a_hard_linked_destination(tmp_path: Path) -> None:
+    """A destination hard-linked to an outside file with identical bytes is not a duplicate: the st_nlink != 1 check falls through to the confined write, which fails closed."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nhard-linked-outside\n"
+    save_path, _ = interceptor._resolve_save_path("statement.pdf", "application/pdf")
+    outside = tmp_path.parent / f"{tmp_path.name}-dedupe-hardlink-outside.pdf"
+    outside.write_bytes(payload)
+    save_path.hardlink_to(outside)
+
+    result = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+
+    assert result is None
+    genuine = interceptor.consume_unsolicited_download_error()
+    assert genuine is not None
+    assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+    assert outside.read_bytes() == payload  # the outside inode was never adopted or overwritten
+
+
+def test_publish_dedupe_rejects_after_scope_invalidation(tmp_path: Path) -> None:
+    """After invalidate_download_scope revokes the scope, a byte-identical publish is not deduped as a success: it fails closed rather than returning a stale artifact from a revoked scope."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nrevoked-scope\n"
+
+    first = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert first is not None and first.exists()
+    assert interceptor.consume_unsolicited_download_error() is None
+
+    interceptor.invalidate_download_scope()  # e.g. a failed persistent-session rebind revokes run authority
+
+    result = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert result is None
+    assert interceptor.consume_unsolicited_download_error() is not None
+    assert first.read_bytes() == payload
+
+
+def test_identical_replays_stay_bounded_by_the_run_byte_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate releases only its file slot, not its run bytes, so repeated identical replays keep accumulating against MAX_RUN_DOWNLOAD_BYTES and are refused at the cap instead of refunded past it."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"%PDF-1.7\nrun-byte-brake\n"
+    monkeypatch.setattr(mod, "MAX_RUN_DOWNLOAD_BYTES", 2 * len(payload))
+
+    first = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert first is not None
+    assert interceptor._run_download_bytes == len(payload)
+
+    duplicate = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert duplicate is not None
+    assert interceptor._run_download_file_count == 1  # the duplicate freed its file slot
+    assert interceptor._run_download_bytes == 2 * len(payload)  # but its bytes stay charged to the run
+    assert interceptor.consume_unsolicited_download_error() is None
+
+    refused = interceptor.publish_download_bytes(payload, "statement.pdf", "application/pdf")
+    assert refused is None
+    err = interceptor.consume_unsolicited_download_error()
+    assert err is not None
+    assert err["details"]["reasons"] == {"run_size_limit": 1}
+
+
+def test_existing_file_comparison_is_size_gated_and_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A size-mismatched collision is rejected on fstat before any read (no unbounded read past MAX_FILE_SIZE_BYTES); a size-matched collision is compared with a read bounded to len(data), not an unbounded read()."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    save_path, _ = interceptor._resolve_save_path("statement.pdf")
+    save_path.write_bytes(b"X" * 4096)  # existing destination is a different (larger) size
+    candidate = b"Y" * 16
+    read_calls: list[tuple[Any, ...]] = []
+    real_fdopen = mod.os.fdopen
+
+    class _ReadRecordingFile:
+        def __init__(self, wrapped: Any) -> None:
+            self._wrapped = wrapped
+
+        def fileno(self) -> int:
+            return int(self._wrapped.fileno())
+
+        def read(self, *args: Any) -> bytes:
+            read_calls.append(args)
+            return bytes(self._wrapped.read(*args))
+
+        def __enter__(self) -> "_ReadRecordingFile":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            self._wrapped.close()
+            return False
+
+    monkeypatch.setattr(mod.os, "fdopen", lambda fd, *a, **k: _ReadRecordingFile(real_fdopen(fd, *a, **k)))
+
+    assert interceptor._existing_file_is_identical(save_path, candidate) is False
+    assert read_calls == []  # rejected on size before any content read
+
+    read_calls.clear()
+    save_path.unlink()
+    save_path.write_bytes(b"Z" * 16)  # now a size match with the candidate
+    assert interceptor._existing_file_is_identical(save_path, b"Z" * 16) is True
+    assert read_calls == [(16,)]  # the read is bounded to len(data), not an unbounded read()
+
+
+def test_fdopen_failure_closes_raw_fd_without_double_closing_dir_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An os.fdopen failure after os.open closes the raw file descriptor exactly once and closes the directory fd exactly once — no leak, no double-close."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    save_path, _ = interceptor._resolve_save_path("statement.pdf")
+    save_path.write_bytes(b"payload")
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open = mod.os.open
+    real_close = mod.os.close
+
+    def spy_open(*a: Any, **k: Any) -> int:
+        fd = int(real_open(*a, **k))
+        opened.append(fd)
+        return fd
+
+    def spy_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def failing_fdopen(*a: Any, **k: Any) -> Any:
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(mod.os, "open", spy_open)
+    monkeypatch.setattr(mod.os, "close", spy_close)
+    monkeypatch.setattr(mod.os, "fdopen", failing_fdopen)
+
+    assert interceptor._existing_file_is_identical(save_path, b"payload") is False
+    assert len(opened) == 2  # the pinned directory fd and the file fd
+    assert sorted(opened) == sorted(closed)  # every opened fd was closed — no leak
+    assert len(closed) == len(set(closed))  # each fd closed exactly once — no double-close

@@ -21,6 +21,7 @@ from agents.exceptions import (
 )
 from agents.items import ToolCallItem
 from agents.run_context import RunContextWrapper
+from pydantic import BaseModel
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -39,6 +40,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ChallengeEffects,
+    Lever,
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     record_build_test_outcome,
@@ -61,6 +64,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisFailureType,
     DiagnosisInput,
     DiagnosisRepairContract,
     DiagnosisResult,
@@ -212,6 +216,30 @@ def _unverified_no_repair_contract() -> DiagnosisRepairContract:
     )
 
 
+def _challenge_effects_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(suspected_failure_type=DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER),
+        repair_decision=RepairDecision(next_action=RepairNextAction.STOP),
+        verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
+        challenge=ChallengeEffects(
+            kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
+        ),
+        levers=[Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")],
+    )
+
+
+def _challenge_failure_ctx() -> CopilotContext:
+    return _ctx(
+        last_workflow=object(),
+        last_workflow_yaml="workflow: yes",
+        last_update_block_count=2,
+        last_test_ok=False,
+        last_failure_category_top="ANTI_BOT_DETECTION",
+        last_test_failure_reason="Verify you are human",
+    )
+
+
 class TestFailedTestResponseNormalization:
     def test_paused_run_reply_is_not_rewritten_into_a_failed_test(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -224,6 +252,34 @@ class TestFailedTestResponseNormalization:
         pause_reply = "The run is paused at the approval step, waiting for someone to approve or reject it."
 
         assert _rewrite_failed_test_response(pause_reply, ctx) == pause_reply
+
+    def test_challenge_effects_keep_the_recorded_run_and_let_the_model_name_the_lever(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.latest_diagnosis_repair_contract = _challenge_effects_contract()
+        model_reply = (
+            "The solver ran and could not clear it. I can add a human interaction pause so you clear it yourself."
+        )
+
+        rewritten = _rewrite_failed_test_response(model_reply, ctx)
+
+        assert rewritten == (
+            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
+            f"Failure: Verify you are human. {model_reply} Keep the draft to iterate on, or discard."
+        )
+        assert "proxy location?" not in rewritten
+
+    def test_without_challenge_effects_the_base_follow_up_template_is_unchanged(self) -> None:
+        no_contract_ctx = _challenge_failure_ctx()
+        empty_recourse_ctx = _challenge_failure_ctx()
+        empty_recourse_ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
+
+        expected = (
+            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
+            "Failure: Verify you are human. Want me to retry with a different proxy location?"
+            " Keep the draft to iterate on, or discard."
+        )
+        assert _rewrite_failed_test_response("The site blocked me.", no_contract_ctx) == expected
+        assert _rewrite_failed_test_response("The site blocked me.", empty_recourse_ctx) == expected
 
     def test_rewrite_failed_test_response_avoids_success_language(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -3575,8 +3631,11 @@ workflow_definition:
     def test_unbacked_workflow_claim_renders_diagnosis_missing_context_labels(self) -> None:
         ctx = _ctx(
             last_test_ok=None,
-            latest_diagnosis_repair_contract=SimpleNamespace(
-                diagnosis_result=SimpleNamespace(missing_context=["workflow_run_id", "block_results"])
+            latest_diagnosis_repair_contract=DiagnosisRepairContract(
+                diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+                diagnosis_result=DiagnosisResult(missing_context=["workflow_run_id", "block_results"]),
+                repair_decision=RepairDecision(),
+                verification_result=VerificationResult(),
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
@@ -4442,6 +4501,23 @@ workflow_definition:
         assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
 
 
+class _CredentialWorkflowDefinition(BaseModel):
+    parameters: list[dict[str, object]]
+    blocks: list[dict[str, object]]
+    finally_block_label: str | None = None
+
+
+class _CredentialWorkflow(BaseModel):
+    """Raw definition fixture for credential admission, with snapshot copy semantics."""
+
+    workflow_id: str = "wf-1"
+    workflow_definition: _CredentialWorkflowDefinition
+    output_labels: set[str]
+
+    def get_output_parameter(self, label: str) -> SimpleNamespace | None:
+        return SimpleNamespace(label=label) if label in self.output_labels else None
+
+
 class TestRunBlocksCredentialApproval:
     @staticmethod
     def _workflow(
@@ -4451,7 +4527,7 @@ class TestRunBlocksCredentialApproval:
         blocks: list[dict[str, object]] | None = None,
         output_labels: set[str] | None = None,
         finally_block_label: str | None = None,
-    ) -> SimpleNamespace:
+    ) -> _CredentialWorkflow:
         workflow_parameters = parameters
         if workflow_parameters is None and credential_id is not None:
             workflow_parameters = [
@@ -4469,10 +4545,10 @@ class TestRunBlocksCredentialApproval:
         }
         if finally_block_label is not None:
             workflow_definition["finally_block_label"] = finally_block_label
-        return SimpleNamespace(
+        return _CredentialWorkflow(
             workflow_id="wf-1",
             workflow_definition=workflow_definition,
-            get_output_parameter=lambda label: SimpleNamespace(label=label) if label in known_labels else None,
+            output_labels=known_labels,
         )
 
     @staticmethod
@@ -6737,7 +6813,7 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
 
     assert rewritten == (
         "I created a draft workflow with 1 block and tested it, but the test failed. "
-        "Failure: Secure CodeBlock runner is unavailable. Please retry.."
+        "Failure: Secure CodeBlock runner is unavailable. Please retry."
     )
 
 

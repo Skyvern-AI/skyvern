@@ -77,6 +77,7 @@ _OBSERVATION_TOOLS = {
     "click",
     "type_text",
     "run_blocks_and_collect_debug",
+    "test_workflow_from_blank_browser",
     "scroll",
     "console_messages",
     "select_option",
@@ -553,7 +554,9 @@ async def _emit_code_repair_progress(
     )
 
 
-_BLOCK_RUNNING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug"})
+_BLOCK_RUNNING_TOOL_NAMES = frozenset(
+    {"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug", "test_workflow_from_blank_browser"}
+)
 
 
 def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str | None:
@@ -722,7 +725,12 @@ def _update_enforcement_from_tool(
     ):
         ctx.update_workflow_called = True
         ctx.test_after_update_done = False
-    if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"):
+    if tool_name in (
+        "run_blocks_and_collect_debug",
+        "update_and_run_blocks",
+        "edit_block_and_run",
+        "test_workflow_from_blank_browser",
+    ):
         ctx.test_after_update_done = True
 
     if tool_name == "navigate_browser" and output.get("ok"):

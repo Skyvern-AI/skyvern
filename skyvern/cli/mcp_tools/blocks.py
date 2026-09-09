@@ -372,6 +372,8 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "file_parser_block": "** FILE PARSER BLOCK (file_url_parser) **",
     "send_email_block": "** SEND EMAIL BLOCK (send_email) **",
     "human_interaction_block": "** HUMAN INTERACTION BLOCK (human_interaction) **",
+    "captcha_solver": "** CAPTCHA SOLVER (captcha_solver) **",
+    "proxy_location": "** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **",
     "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
     "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
     "parameter_templating": "** PARAMETER TEMPLATING **",
@@ -525,7 +527,7 @@ async def skyvern_workflow_knowledge(
             description=(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
-                "common_patterns, and best_practices."
+                "common_patterns, best_practices, captcha_solver, and proxy_location."
             )
         ),
     ] = None,

@@ -158,6 +158,7 @@ export interface WorkflowCopilotChatHistoryResponse {
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
   auto_accept?: boolean | null;
+  work_plan?: string[];
 }
 
 export interface WorkflowCopilotChatSummary {
@@ -228,6 +229,9 @@ export interface WorkflowCopilotStreamResponseUpdate {
   turn_id?: string | null;
   narrative_summary?: string | null;
   narrative_payload?: Record<string, unknown> | null;
+  // An empty list means the model cleared its plan; null/absent means this frame
+  // carries no snapshot and the rendered plan stands.
+  work_plan?: string[] | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {

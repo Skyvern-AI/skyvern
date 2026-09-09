@@ -15,7 +15,13 @@ from playwright._impl._errors import TargetClosedError
 
 from skyvern.cli.core.session_manager import active_copilot_session_ids
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionNotExtendable,
+    BrowserSessionNotFound,
+    BrowserSessionNotRenewable,
+    MissingBrowserAddressError,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
@@ -31,6 +37,14 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_timeouts import (
+    DEFAULT_TIMEOUT,
+    EXTENSION_MIN_REMAINING_SECONDS,
+    MAX_EXTENDED_TIMEOUT,
+    MAX_LIFETIME_REACHED_MESSAGE,
+    MAX_TIMEOUT,
+    creation_timeout_minutes,
+)
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
@@ -41,6 +55,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperationRejected,
     BrowserRetirement,
     BrowserRetirementReason,
+    BrowserSessionExtension,
     PersistentSessionsManager,
 )
 from skyvern.webeye.real_browser_manager import RealBrowserManager
@@ -174,6 +189,52 @@ def _renewal_extension_minutes(new_timeout_datetime: datetime, current_timeout_d
     return max(0, floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60))
 
 
+async def extend_session(
+    database: AgentDB, session_id: str, organization_id: str, additional_minutes: int
+) -> BrowserSessionExtension:
+    """Grant a live session more lifetime by moving its timeout, clamped to the maximum extended lifetime."""
+    browser_session = await database.browser_sessions.get_persistent_browser_session(
+        session_id=session_id,
+        organization_id=organization_id,
+    )
+    if browser_session is None:
+        raise BrowserSessionNotFound(session_id)
+    if browser_session.completed_at is not None or is_final_status(browser_session.status):
+        raise BrowserSessionNotExtendable("browser session has already ended", session_id)
+
+    current_timeout_minutes = browser_session.timeout_minutes or DEFAULT_TIMEOUT
+    headroom_minutes = MAX_EXTENDED_TIMEOUT - current_timeout_minutes
+    if headroom_minutes <= 0:
+        raise BrowserSessionNotExtendable(MAX_LIFETIME_REACHED_MESSAGE, session_id)
+    if browser_session.started_at is not None:
+        started_at_utc = (
+            browser_session.started_at.replace(tzinfo=timezone.utc)
+            if browser_session.started_at.tzinfo is None
+            else browser_session.started_at
+        )
+        remaining_seconds = current_timeout_minutes * 60 - (datetime.now(timezone.utc) - started_at_utc).total_seconds()
+        if remaining_seconds < EXTENSION_MIN_REMAINING_SECONDS:
+            raise BrowserSessionNotExtendable("browser session has expired", session_id)
+
+    granted_minutes = min(additional_minutes, headroom_minutes)
+    updated = await database.browser_sessions.update_persistent_browser_session(
+        session_id,
+        organization_id=organization_id,
+        timeout_minutes=current_timeout_minutes + granted_minutes,
+    )
+    LOG.info(
+        "Extended browser session",
+        requested_minutes=additional_minutes,
+        granted_minutes=granted_minutes,
+        timeout_minutes=current_timeout_minutes + granted_minutes,
+        session_id=session_id,
+        organization_id=organization_id,
+        lifecycle_event="browser_session_timeout_extended",
+        browser_session_id=session_id,
+    )
+    return BrowserSessionExtension(session=updated, granted_minutes=granted_minutes)
+
+
 async def renew_session(
     database: AgentDB, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
 ) -> PersistentBrowserSession:
@@ -194,9 +255,11 @@ async def renew_session(
     if minutes_left >= settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES:
         new_timeout_datetime = right_now + timedelta(minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES)
         minutes_diff = _renewal_extension_minutes(new_timeout_datetime, current_timeout_datetime)
+        # Automatic renewal stays within the creation cap; only the extend endpoint goes past it.
+        new_timeout_minutes = min(current_timeout_minutes + minutes_diff, max(MAX_TIMEOUT, current_timeout_minutes))
+        minutes_diff = new_timeout_minutes - current_timeout_minutes
         if minutes_diff == 0:
             return browser_session
-        new_timeout_minutes = current_timeout_minutes + minutes_diff
 
         browser_session = await database.browser_sessions.update_persistent_browser_session(
             session_id,
@@ -563,7 +626,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
-            timeout_minutes=timeout_minutes,
+            timeout_minutes=creation_timeout_minutes(timeout_minutes),
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             extensions=extensions,
@@ -744,6 +807,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             if session is None or session.completed_at is None:
                 await self.close_session(organization_id, session_id, reason=BrowserSessionCloseReason.expired)
             raise
+
+    async def extend_session(
+        self, session_id: str, organization_id: str, additional_minutes: int
+    ) -> BrowserSessionExtension:
+        return await extend_session(self.database, session_id, organization_id, additional_minutes)
 
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
         """These sessions run on browsers this process owns, which can always be given longer."""

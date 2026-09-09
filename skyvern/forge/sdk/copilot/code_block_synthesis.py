@@ -352,6 +352,8 @@ _RESERVED_PARAM_NAMES = frozenset(
         "max",
         "min",
         "sum",
+        "round",
+        "abs",
         "sorted",
         "sleep",
         "asyncio",

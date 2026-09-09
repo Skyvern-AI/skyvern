@@ -124,8 +124,8 @@ class CustomSMTPAuthenticationFailed(BaseWorkflowException):
 
 
 class NoValidEmailRecipient(BaseWorkflowException):
-    def __init__(self, recipients: list[str]) -> None:
-        super().__init__(f"No valid email recipient found. Recipients: {recipients}")
+    def __init__(self) -> None:
+        super().__init__("No email recipient found: the Recipients field resolved to no addresses.")
 
 
 class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):

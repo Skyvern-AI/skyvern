@@ -94,7 +94,8 @@ class BrowserSessionResponse(BaseModel):
     warning: str | None = Field(
         None,
         description="Advisory message about how the request was adjusted, if it was. Set when a requested timeout "
-        "above the maximum was capped; null otherwise.",
+        "above the maximum was capped at creation, when an extension was granted less than it asked for, or when "
+        "an extension was accepted but not yet confirmed; null otherwise.",
     )
 
     @classmethod

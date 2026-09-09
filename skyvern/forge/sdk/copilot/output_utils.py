@@ -7,8 +7,9 @@ import binascii
 import json
 import re
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 
@@ -17,12 +18,24 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, a
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _TEXT_MAX,
+    ACTION_OBSERVATIONS_EMPTY,
+    BLOCK_FACT_MAX_LABELS,
+    BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
+    BLOCK_FACT_URL_MAX_CHARS,
+    OBSERVED_BLOCK_END_URLS_EMPTY,
+    OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
+    OBSERVED_BLOCK_END_URLS_WITHHELD,
+    SOLVER_ATTEMPT_KEY,
+    URL_SECRET_MASK,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
     BuildTestPacketLocatorObservation,
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
+    append_omission_notice,
+    coerce_block_action_observations,
+    coerce_block_end_urls,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.context import (
@@ -33,7 +46,7 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionSelectorCandidate,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_in_object
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_raw_secrets_in_object
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.schemas.workflows import BlockType
 
@@ -52,7 +65,6 @@ _BUILD_TEST_PACKET_MAX_CHARS = 47_000
 _BUILD_TEST_WORKFLOW_MAX_CHARS = 30_000
 _BUILD_TEST_IDENTIFIER_MAX_CHARS = 160
 _BUILD_TEST_FAILURE_REASON_MAX_CHARS = 1_200
-_BUILD_TEST_URL_MAX_CHARS = 1_600
 _BUILD_TEST_LABEL_MAX_ITEMS = 24
 _BUILD_TEST_OUTPUT_MAX_ITEMS = 12
 _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS = 800
@@ -60,6 +72,9 @@ _BUILD_TEST_DOWNLOAD_MAX_ITEMS = 12
 _BUILD_TEST_UNFINISHED_MAX_ITEMS = 24
 _BUILD_TEST_ACTION_TRACE_MAX_ITEMS = 6
 _BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS = 8
+# Result summaries are interleaved rank by rank across regions, so six still reaches two rows each for
+# two result regions plus a third region's excerpt.
+_AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS = 6
 _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS = 300
 _BUILD_TEST_OBSTRUCTION_MAX_ITEMS = 5
 _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS = 6
@@ -292,9 +307,114 @@ def _summarize_extracted_data(extracted: Any) -> str:
     return "Extracted data present."
 
 
-def _append_omission(notices: list[str], notice: str) -> None:
-    if notice not in notices:
-        notices.append(notice)
+_ItemT = TypeVar("_ItemT")
+
+
+def _packet_notice_list(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+_PacketListEnd = Literal["first", "last"]
+
+
+def _compacted(
+    values: list[_ItemT],
+    limit: int,
+    *,
+    field_name: str,
+    notices: list[str],
+    keep: _PacketListEnd,
+    limit_reason: str = "the aggregate packet limit",
+) -> list[_ItemT]:
+    """``keep`` names the end the field's producer front-loads: ``first`` for a ranked list whose
+    leading entries are the load-bearing ones, ``last`` for a chronological one."""
+    if len(values) <= limit:
+        return values
+    dropped = len(values) - limit
+    end = "oldest" if keep == "last" else "newest"
+    append_omission_notice(
+        notices,
+        f"{field_name} shortened at {limit_reason}: {dropped} {end} item(s) omitted.",
+    )
+    if not limit:
+        return []
+    return values[-limit:] if keep == "last" else values[:limit]
+
+
+def _compacted_newest_labelled(
+    entries: list[tuple[str, _ItemT]], limit: int, *, field_name: str, notices: list[str]
+) -> list[tuple[str, _ItemT]]:
+    """Keeping the newest entries relies on producers inserting labels in execution order. Name the
+    blocks withheld, so a block this bound dropped is not read as one that recorded nothing."""
+    if len(entries) <= limit:
+        return entries
+    named = _bounded_labelled_names([(label, None) for label, _ in entries[:-limit]])
+    append_omission_notice(
+        notices,
+        f"{field_name} shortened at the aggregate packet limit: dropped the oldest block(s) {named}.",
+    )
+    return entries[-limit:]
+
+
+def screened_recorded_url(url: str) -> tuple[str | None, str | None]:
+    """The form of a recorded URL the model may be shown, and why it is not the whole URL. Query and
+    fragment are dropped unread rather than inspected for credential-shaped keys, and a masked,
+    over-long, non-http or userinfo-bearing URL is withheld whole."""
+    if len(url) > BLOCK_FACT_URL_MAX_CHARS:
+        return None, f"the recorded URL exceeded {BLOCK_FACT_URL_MAX_CHARS} characters"
+    if URL_SECRET_MASK in url or redact_raw_secrets_for_prompt(url) != url:
+        return None, "the recorded URL carried masked or secret material"
+    if safe_page_origin(url) is None:
+        return None, "the recorded URL named no reportable http origin"
+    parts = urlsplit(url)
+    if parts.username is not None:
+        return None, "the recorded URL carried credentials in its host"
+    if not parts.query and not parts.fragment:
+        return url, None
+    return (
+        urlunsplit((parts.scheme.lower(), parts.netloc, parts.path, "", "")),
+        "the recorded URL carried a query or fragment",
+    )
+
+
+def _bounded_labelled_names(entries: Sequence[tuple[str, str | None]]) -> str:
+    """Render the newest entries first so the ones the notice budget drops are the oldest, matching
+    what the unnamed tail says was left out."""
+    named: list[str] = []
+    remaining = BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS
+    for label, reason in reversed(entries[-BLOCK_FACT_MAX_LABELS:]):
+        rendered = f"{label}: {reason}" if reason else label
+        if len(rendered) > remaining:
+            break
+        remaining -= len(rendered)
+        named.append(rendered)
+    unnamed = len(entries) - len(named)
+    if unnamed:
+        named.append(f"and {unnamed} older block(s) left unnamed at the notice budget")
+    return "; ".join(named)
+
+
+def labelled_url_screen_reasons(entries: Sequence[tuple[str, str | None]]) -> str:
+    """Name the blocks the recorded-URL screen changed and why, so a reduced URL in the map is not read
+    as the page a block actually ended on. Bounded like the map it describes, newest blocks named first."""
+    return _bounded_labelled_names(entries)
+
+
+def labelled_block_names(labels: Sequence[str]) -> str:
+    """Name the blocks a bound left out of a per-label map, under the same notice budget."""
+    return _bounded_labelled_names([(label, None) for label in labels])
+
+
+def _screened_packet_url(value: str | None, *, field_name: str, notices: list[str]) -> str | None:
+    """A recorded URL is reported whole, reduced to its path, or not at all."""
+    if value is None:
+        return value
+    screened, reason = screened_recorded_url(value)
+    if reason is None:
+        return screened
+    verb = "omitted" if screened is None else "reduced to its path"
+    append_omission_notice(notices, f"{field_name} {verb}: {reason}.")
+    return screened
 
 
 def _bounded_packet_string(
@@ -306,7 +426,7 @@ def _bounded_packet_string(
 ) -> str | None:
     if value is None or len(value) <= max_chars:
         return value
-    _append_omission(notices, f"{field_name} shortened at {max_chars} characters.")
+    append_omission_notice(notices, f"{field_name} shortened at {max_chars} characters.")
     return value[: max_chars - 3] + "..."
 
 
@@ -317,10 +437,16 @@ def _bounded_packet_strings(
     max_items: int,
     max_chars: int | None,
     notices: list[str],
+    keep: _PacketListEnd,
 ) -> list[str]:
-    bounded = values[:max_items]
+    """``keep`` names the end the field's producer front-loads; see ``_compacted``."""
+    if not max_items:
+        bounded: list[str] = []
+    else:
+        bounded = values[-max_items:] if keep == "last" else values[:max_items]
     if len(values) > max_items:
-        _append_omission(notices, f"{field_name} shortened: {len(values) - max_items} item(s) omitted.")
+        end = "oldest" if keep == "last" else "newest"
+        append_omission_notice(notices, f"{field_name} shortened: the {len(values) - max_items} {end} item(s) omitted.")
     if max_chars is None:
         return bounded
     rendered: list[str] = []
@@ -332,7 +458,7 @@ def _bounded_packet_strings(
         rendered.append(value[: max_chars - 3] + "...")
         shortened += 1
     if shortened:
-        _append_omission(notices, f"{field_name} shortened: {shortened} text value(s) clipped.")
+        append_omission_notice(notices, f"{field_name} shortened: {shortened} text value(s) clipped.")
     return rendered
 
 
@@ -419,7 +545,7 @@ def _bounded_obstruction_control(
     field_prefix = f"{page_prefix}.obstructions[{obstruction_index}].visible_controls[{control_index}]"
     candidates = control.selector_candidates[:_BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS]
     if len(control.selector_candidates) > _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS:
-        _append_omission(
+        append_omission_notice(
             notices,
             f"{field_prefix}.selector_candidates shortened: "
             f"{len(control.selector_candidates) - _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS} item(s) omitted.",
@@ -489,7 +615,7 @@ def _bounded_page_obstructions(
 ) -> list[PageObstruction]:
     bounded_obstructions = obstructions[:_BUILD_TEST_OBSTRUCTION_MAX_ITEMS]
     if len(obstructions) > _BUILD_TEST_OBSTRUCTION_MAX_ITEMS:
-        _append_omission(
+        append_omission_notice(
             notices,
             f"{page_prefix}.obstructions shortened: "
             f"{len(obstructions) - _BUILD_TEST_OBSTRUCTION_MAX_ITEMS} item(s) omitted.",
@@ -499,7 +625,7 @@ def _bounded_page_obstructions(
         field_prefix = f"{page_prefix}.obstructions[{obstruction_index}]"
         controls = obstruction.visible_controls[:_BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS]
         if len(obstruction.visible_controls) > _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS:
-            _append_omission(
+            append_omission_notice(
                 notices,
                 f"{field_prefix}.visible_controls shortened: "
                 f"{len(obstruction.visible_controls) - _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS} item(s) omitted.",
@@ -536,7 +662,7 @@ def _bounded_locator_observations(
 ) -> list[BuildTestPacketLocatorObservation]:
     kept = observations[:_BUILD_TEST_LOCATOR_OBSERVATION_MAX_ITEMS]
     if len(observations) > len(kept):
-        _append_omission(
+        append_omission_notice(
             notices,
             f"failure.locator_observations shortened: {len(observations) - len(kept)} item(s) omitted.",
         )
@@ -545,7 +671,7 @@ def _bounded_locator_observations(
         observed_candidates = observation.observed_candidates or []
         candidates = observed_candidates[:_BUILD_TEST_LOCATOR_CANDIDATE_MAX_ITEMS]
         if len(observed_candidates) > len(candidates):
-            _append_omission(
+            append_omission_notice(
                 notices,
                 "failure.locator_observations[].observed_candidates shortened: "
                 f"{len(observed_candidates) - len(candidates)} item(s) omitted.",
@@ -586,17 +712,11 @@ def _bounded_packet_page_state(
     if page_state is None:
         return None
     updates = {
-        "current_origin": _bounded_packet_string(
-            page_state.current_origin,
-            field_name=f"{field_prefix}.current_origin",
-            max_chars=_BUILD_TEST_URL_MAX_CHARS,
-            notices=notices,
+        "current_origin": _screened_packet_url(
+            page_state.current_origin, field_name=f"{field_prefix}.current_origin", notices=notices
         ),
-        "current_url": _bounded_packet_string(
-            page_state.current_url,
-            field_name=f"{field_prefix}.current_url",
-            max_chars=_BUILD_TEST_URL_MAX_CHARS,
-            notices=notices,
+        "current_url": _screened_packet_url(
+            page_state.current_url, field_name=f"{field_prefix}.current_url", notices=notices
         ),
         "title": _bounded_packet_string(
             page_state.title,
@@ -622,6 +742,7 @@ def _bounded_packet_page_state(
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="first",
         ),
         "result_summaries": _bounded_packet_strings(
             page_state.result_summaries,
@@ -629,6 +750,7 @@ def _bounded_packet_page_state(
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="first",
         ),
         "action_summaries": _bounded_packet_strings(
             page_state.action_summaries,
@@ -636,6 +758,7 @@ def _bounded_packet_page_state(
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="first",
         ),
         "challenge_summaries": _bounded_packet_strings(
             page_state.challenge_summaries,
@@ -643,6 +766,7 @@ def _bounded_packet_page_state(
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="first",
         ),
         "obstruction_summaries": _bounded_packet_strings(
             page_state.obstruction_summaries,
@@ -650,22 +774,49 @@ def _bounded_packet_page_state(
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="first",
         ),
         "obstructions": _bounded_page_obstructions(page_state.obstructions, notices, page_prefix=field_prefix),
     }
     return page_state.model_copy(update=updates)
 
 
+def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]) -> BuildTestEvidencePacket:
+    return packet.model_copy(
+        update={
+            "observed_block_end_urls": dict(
+                _compacted_newest_labelled(
+                    list(packet.observed_block_end_urls.items()),
+                    2,
+                    field_name="observed_block_end_urls",
+                    notices=notices,
+                )
+            ),
+            "per_block_action_observations": dict(
+                _compacted_newest_labelled(
+                    list(packet.per_block_action_observations.items()),
+                    2,
+                    field_name="per_block_action_observations",
+                    notices=notices,
+                )
+            ),
+            "omission_notices": notices,
+        }
+    )
+
+
 def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
 ) -> BuildTestEvidencePacket:
-    _append_omission(
+    append_omission_notice(
         notices,
         f"repeated packet facts shortened further to keep the packet under {_BUILD_TEST_PACKET_MAX_CHARS} characters.",
     )
     outputs: list[BuildTestPacketRegisteredOutput] = []
-    for output in packet.registered_outputs[:6]:
+    for output in _compacted(
+        packet.registered_outputs, 6, field_name="registered_outputs", notices=notices, keep="first"
+    ):
         rendered = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
         outputs.append(
             output.model_copy(
@@ -683,21 +834,32 @@ def _compact_packet_for_aggregate_limit(
             return None
         had_obstructions = bool(page_state.obstructions)
 
-        def compact_summaries(values: list[str]) -> list[str]:
-            return [value[:117] + "..." if len(value) > 120 else value for value in values[:2]]
+        def compact_summaries(values: list[str], *, field_name: str, max_items: int = 2) -> list[str]:
+            kept = _compacted(
+                values, max_items, field_name=f"{field_prefix}.{field_name}", notices=notices, keep="first"
+            )
+            return [value[:117] + "..." if len(value) > 120 else value for value in kept]
 
         compacted = page_state.model_copy(
             update={
-                "form_summaries": compact_summaries(page_state.form_summaries),
-                "result_summaries": compact_summaries(page_state.result_summaries),
-                "action_summaries": compact_summaries(page_state.action_summaries),
-                "challenge_summaries": compact_summaries(page_state.challenge_summaries),
-                "obstruction_summaries": compact_summaries(page_state.obstruction_summaries),
+                "form_summaries": compact_summaries(page_state.form_summaries, field_name="form_summaries"),
+                "result_summaries": compact_summaries(
+                    page_state.result_summaries,
+                    field_name="result_summaries",
+                    max_items=_AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS,
+                ),
+                "action_summaries": compact_summaries(page_state.action_summaries, field_name="action_summaries"),
+                "challenge_summaries": compact_summaries(
+                    page_state.challenge_summaries, field_name="challenge_summaries"
+                ),
+                "obstruction_summaries": compact_summaries(
+                    page_state.obstruction_summaries, field_name="obstruction_summaries"
+                ),
                 "obstructions": [],
             }
         )
         if had_obstructions:
-            _append_omission(notices, f"{field_prefix}.obstructions omitted at the aggregate packet limit.")
+            append_omission_notice(notices, f"{field_prefix}.obstructions omitted at the aggregate packet limit.")
         return compacted
 
     failure = packet.failure
@@ -707,14 +869,17 @@ def _compact_packet_for_aggregate_limit(
         failure = failure.model_copy(
             update={
                 "action_trace": [
-                    value[:117] + "..." if len(value) > 120 else value for value in failure.action_trace[:2]
+                    value[:117] + "..." if len(value) > 120 else value
+                    for value in _compacted(
+                        failure.action_trace, 2, field_name="failure.action_trace", notices=notices, keep="last"
+                    )
                 ],
                 "page_state": page_state,
                 "locator_observations": failure.locator_observations[:2],
             }
         )
         if dropped_observations:
-            _append_omission(
+            append_omission_notice(
                 notices,
                 f"failure.locator_observations shortened at the aggregate packet limit: "
                 f"{dropped_observations} item(s) omitted.",
@@ -723,17 +888,45 @@ def _compact_packet_for_aggregate_limit(
         update={
             "canonical_workflow_yaml": None,
             "canonical_workflow_yaml_complete": False,
-            "attempted_block_labels": packet.attempted_block_labels[:12],
-            "executed_block_labels": packet.executed_block_labels[:12],
+            "attempted_block_labels": _compacted(
+                packet.attempted_block_labels, 12, field_name="attempted_block_labels", notices=notices, keep="last"
+            ),
+            "executed_block_labels": _compacted(
+                packet.executed_block_labels, 12, field_name="executed_block_labels", notices=notices, keep="last"
+            ),
             "action_observations": [
-                value[:117] + "..." if len(value) > 120 else value for value in packet.action_observations[:2]
+                value[:117] + "..." if len(value) > 120 else value
+                for value in _compacted(
+                    packet.action_observations, 2, field_name="action_observations", notices=notices, keep="last"
+                )
             ],
+            "observed_block_end_urls": dict(
+                _compacted_newest_labelled(
+                    list(packet.observed_block_end_urls.items()),
+                    2,
+                    field_name="observed_block_end_urls",
+                    notices=notices,
+                )
+            ),
+            "per_block_action_observations": {
+                label: _compacted(
+                    values, 1, field_name=f"per_block_action_observations[{label}]", notices=notices, keep="last"
+                )
+                for label, values in _compacted_newest_labelled(
+                    list(packet.per_block_action_observations.items()),
+                    2,
+                    field_name="per_block_action_observations",
+                    notices=notices,
+                )
+            },
             "failure": failure,
             "page_state": compact_page_state(packet.page_state, field_prefix="page_state"),
             "requested_outputs": packet.requested_outputs,
             "registered_outputs": outputs,
-            "downloads": packet.downloads[:6],
-            "unfinished_items": packet.unfinished_items[:12],
+            "downloads": _compacted(packet.downloads, 6, field_name="downloads", notices=notices, keep="first"),
+            "unfinished_items": _compacted(
+                packet.unfinished_items, 12, field_name="unfinished_items", notices=notices, keep="first"
+            ),
             "omission_notices": notices,
         }
     )
@@ -747,7 +940,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if workflow_yaml is not None and len(workflow_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
         workflow_yaml = workflow_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
         workflow_complete = False
-        _append_omission(
+        append_omission_notice(
             notices,
             "canonical_workflow_yaml shortened at 30000 characters; "
             "use the persisted workflow readback for full bytes.",
@@ -759,6 +952,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         max_items=_BUILD_TEST_LABEL_MAX_ITEMS,
         max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
         notices=notices,
+        keep="last",
     )
     executed = _bounded_packet_strings(
         packet.executed_block_labels,
@@ -766,6 +960,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         max_items=_BUILD_TEST_LABEL_MAX_ITEMS,
         max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
         notices=notices,
+        keep="last",
     )
     action_observations = _bounded_packet_strings(
         packet.action_observations,
@@ -773,7 +968,27 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         max_items=_BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
         max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
         notices=notices,
+        keep="last",
     )
+    observed_block_end_urls = coerce_block_end_urls(dict(packet.observed_block_end_urls), notices)
+    per_block_action_observations = coerce_block_action_observations(
+        dict(packet.per_block_action_observations), notices
+    )
+    explained_absences = (OBSERVED_BLOCK_END_URLS_WITHHELD, OBSERVED_BLOCK_END_URLS_UNREPORTABLE)
+    # The mint names the blocks whose URL it refused. When it refused them all the map is empty and
+    # already accounted for, so claiming nothing was recorded would contradict the notice above it.
+    already_explained = any(notice in notices for notice in explained_absences) or any(
+        notice.startswith("observed_block_end_urls omitted") for notice in notices
+    )
+    if not observed_block_end_urls and not packet.observed_block_end_urls and not already_explained:
+        append_omission_notice(notices, OBSERVED_BLOCK_END_URLS_EMPTY)
+    if not per_block_action_observations:
+        append_omission_notice(
+            notices,
+            "per_block_action_observations empty: no per-block typed action observation was recorded.",
+        )
+    if not action_observations:
+        append_omission_notice(notices, ACTION_OBSERVATIONS_EMPTY)
 
     requested_outputs: list[BuildTestPacketRequestedOutput] = []
     for output in packet.requested_outputs[:_BUILD_TEST_OUTPUT_MAX_ITEMS]:
@@ -820,7 +1035,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             )
         )
     if len(packet.requested_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
-        _append_omission(
+        append_omission_notice(
             notices,
             "requested_outputs shortened: "
             f"{len(packet.requested_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
@@ -834,7 +1049,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         if len(rendered_output) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS:
             block_output = rendered_output[: _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS - 3] + "..."
             value_complete = False
-            _append_omission(
+            append_omission_notice(
                 notices,
                 f"registered output {output.label or '(unlabeled)'} shortened.",
             )
@@ -859,7 +1074,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             )
         )
     if len(packet.registered_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
-        _append_omission(
+        append_omission_notice(
             notices,
             "registered_outputs shortened: "
             f"{len(packet.registered_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
@@ -873,6 +1088,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             max_items=_BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
+            keep="last",
         )
         failure = failure.model_copy(
             update={
@@ -919,6 +1135,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_FAILURE_REASON_MAX_CHARS,
                     notices=notices,
                 ),
+                "final_url": _screened_packet_url(
+                    failure.final_url,
+                    field_name="failure.final_url",
+                    notices=notices,
+                ),
                 "failed_operation": _bounded_failed_operation(failure.failed_operation, notices),
                 "connect_failure": _bounded_connect_failure(failure.connect_failure, notices),
                 "action_trace": action_trace,
@@ -948,7 +1169,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         for download in packet.downloads[:_BUILD_TEST_DOWNLOAD_MAX_ITEMS]
     ]
     if len(packet.downloads) > _BUILD_TEST_DOWNLOAD_MAX_ITEMS:
-        _append_omission(
+        append_omission_notice(
             notices,
             f"downloads shortened: {len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
         )
@@ -977,14 +1198,15 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                 ),
             }
         )
-        for item in packet.unfinished_items[:_BUILD_TEST_UNFINISHED_MAX_ITEMS]
-    ]
-    if len(packet.unfinished_items) > _BUILD_TEST_UNFINISHED_MAX_ITEMS:
-        _append_omission(
-            notices,
-            "unfinished_items shortened: "
-            f"{len(packet.unfinished_items) - _BUILD_TEST_UNFINISHED_MAX_ITEMS} item(s) omitted.",
+        for item in _compacted(
+            packet.unfinished_items,
+            _BUILD_TEST_UNFINISHED_MAX_ITEMS,
+            field_name="unfinished_items",
+            notices=notices,
+            keep="first",
+            limit_reason=f"the {_BUILD_TEST_UNFINISHED_MAX_ITEMS}-item unfinished_items limit",
         )
+    ]
 
     projected = packet.model_copy(
         update={
@@ -999,6 +1221,8 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             "attempted_block_labels": attempted,
             "executed_block_labels": executed,
             "action_observations": action_observations,
+            "observed_block_end_urls": observed_block_end_urls,
+            "per_block_action_observations": per_block_action_observations,
             "failure": failure,
             "page_state": _bounded_packet_page_state(packet.page_state, notices, field_prefix="page_state"),
             "requested_outputs": requested_outputs,
@@ -1043,13 +1267,17 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     projected = projected.model_copy(update={"run": run, "screenshot": screenshot, "omission_notices": notices})
 
     serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
+        # Repeated per-block facts give way before the workflow readback the repair turn needs more.
+        projected = _compact_block_fact_maps(projected, notices)
+        serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS and projected.canonical_workflow_yaml is not None:
         excess = len(serialized) - _BUILD_TEST_PACKET_MAX_CHARS
         retained_chars = max(0, len(projected.canonical_workflow_yaml) - excess - 200)
         shortened_workflow = projected.canonical_workflow_yaml[:retained_chars]
         if retained_chars >= 3:
             shortened_workflow = shortened_workflow[:-3] + "..."
-        _append_omission(
+        append_omission_notice(
             notices,
             f"canonical_workflow_yaml shortened further to keep the packet under {_BUILD_TEST_PACKET_MAX_CHARS} characters.",
         )
@@ -1072,7 +1300,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
 
 
 def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
+    # This handoff rebuilds its own notices, so it carries forward only the mint-time fact it cannot
+    # reconstruct; adopting the recorded list wholesale would relay run-supplied prose to the model.
     notices: list[str] = []
+    if OBSERVED_BLOCK_END_URLS_WITHHELD in packet.omission_notices:
+        notices.append(OBSERVED_BLOCK_END_URLS_WITHHELD)
     if packet.canonical_workflow_yaml is None:
         notices.append("canonical_workflow_yaml omitted: no persisted workflow readback was recorded.")
     if packet.run.workflow_run_id is None:
@@ -1083,8 +1315,6 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
         notices.append("attempted_block_labels omitted: no block run attempt was recorded.")
     if not packet.executed_block_labels:
         notices.append("executed_block_labels omitted: no block execution was recorded.")
-    if not packet.action_observations:
-        notices.append("action_observations empty: no same-run typed action observation was recorded.")
     if not packet.registered_outputs:
         notices.append(
             "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
@@ -1144,10 +1374,34 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
             }
         )
 
+    handoff_block_end_urls: dict[str, str] = {}
+    refused: list[tuple[str, str | None]] = []
+    reduced: list[tuple[str, str | None]] = []
+    for label, url in packet.observed_block_end_urls.items():
+        reportable, reason = screened_recorded_url(url)
+        if reportable is None:
+            refused.append((label, reason))
+            continue
+        if reason is not None:
+            reduced.append((label, reason))
+        handoff_block_end_urls[label] = reportable
+    if refused:
+        notices.append(
+            "observed_block_end_urls omitted block(s) for the direct test handoff: "
+            f"{labelled_url_screen_reasons(refused)}."
+        )
+    if reduced:
+        notices.append(
+            "observed_block_end_urls reduced block(s) to their path for the direct test handoff: "
+            f"{labelled_url_screen_reasons(reduced)}."
+        )
+    if not handoff_block_end_urls and packet.observed_block_end_urls:
+        notices.append(OBSERVED_BLOCK_END_URLS_UNREPORTABLE)
     return project_build_test_packet_for_llm(
         packet.model_copy(
             update={
                 "failure": failure,
+                "observed_block_end_urls": handoff_block_end_urls,
                 "omission_notices": notices,
             }
         )
@@ -1214,7 +1468,10 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
             _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
         ),
-        drop_data_keys=("sdk_equivalent", "authored_locator_observations"),
+        # The solver rows carry the contract builder a tri-state it projects into the packet; the raw
+        # dict spells the unresolved case as a categorical `attempted: false`, so it must not also
+        # reach the model.
+        drop_data_keys=("sdk_equivalent", "authored_locator_observations", SOLVER_ATTEMPT_KEY),
         replacement_fields={"screenshot_base64": _BASE64_IMAGE_OMITTED_MESSAGE},
     )
 
@@ -1240,7 +1497,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     ),
                 }
         data.pop("sdk_equivalent", None)
-        if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
+        if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run", "test_workflow_from_blank_browser"}:
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
@@ -1249,7 +1506,12 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name in {"get_run_results", "run_blocks_and_collect_debug", "edit_block_and_run"}:
+        if tool_name in {
+            "get_run_results",
+            "run_blocks_and_collect_debug",
+            "edit_block_and_run",
+            "test_workflow_from_blank_browser",
+        }:
             # _attach_failed_block_screenshots puts base64 bytes on each failed block. They would
             # otherwise flow straight into the LLM context as raw image data — strip them while
             # preserving the existence signal. The image itself reaches the model through
@@ -1313,6 +1575,9 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             # and values registered for secret scrubbing during finalization.
             data.pop("action_observations", None)
             data.pop("action_trace_summary", None)
+            data.pop("observed_block_end_urls", None)
+            data.pop("per_block_action_observations", None)
+            data.pop("block_fact_omission_notices", None)
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
@@ -1337,7 +1602,21 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     max_items=_BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
                     max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
                     notices=[],
+                    keep="last",
                 )
+            block_fact_notices = _packet_notice_list(data.get("block_fact_omission_notices"))
+            if "observed_block_end_urls" in data:
+                data["observed_block_end_urls"] = coerce_block_end_urls(
+                    data["observed_block_end_urls"], block_fact_notices
+                )
+            if "per_block_action_observations" in data:
+                data["per_block_action_observations"] = coerce_block_action_observations(
+                    data["per_block_action_observations"], block_fact_notices
+                )
+            if block_fact_notices:
+                data["block_fact_omission_notices"] = block_fact_notices
+            else:
+                data.pop("block_fact_omission_notices", None)
             sanitized["data"] = data
     return sanitized
 
@@ -1345,7 +1624,10 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
 def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
     """Yield non-empty failure_reason strings from a copilot tool result:
     run-level ``data.failure_reason`` first, then each block's ``failure_reason``
-    in order. Callers that only need the first match should wrap with ``next``."""
+    newest first. Callers that only need the first match should wrap with ``next``.
+
+    A canceled or timed-out run records no run-level reason, so the first block reason yielded is
+    what the user reads: it has to be the failure the run stopped on, not its first stumble."""
     data = result.get("data") if isinstance(result, dict) else None
     if not isinstance(data, dict):
         return
@@ -1354,7 +1636,7 @@ def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
         yield run_level
     blocks = data.get("blocks")
     if isinstance(blocks, list):
-        for block in blocks:
+        for block in reversed(blocks):
             if not isinstance(block, dict):
                 continue
             reason = block.get("failure_reason")
@@ -1616,7 +1898,7 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if data.get("valid"):
             return f"Block '{block_label(data.get('label', '?'))}' is valid"
         return "Block validation failed"
-    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run", "test_workflow_from_blank_browser"}:
         if not isinstance(raw_data, dict):
             return "Run debug completed"
         raw_executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]

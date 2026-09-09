@@ -52,6 +52,7 @@ import {
   buildFilmstrip,
   ELAPSED_NEVER_STARTED,
   formatElapsed,
+  resolveLandingSelectionId,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
@@ -100,6 +101,18 @@ function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
     return value.filter(isRunOutputError);
   }
   return [];
+}
+
+// The URL already says what to show. Every automatic landing decision defers to
+// it, so the pane and the URL cannot end up naming different things. A pin in
+// the store is not part of this: the auto-pin effect below writes one itself, so
+// only that effect checks for a pre-existing pin it must not stomp.
+function hasExplicitSelection(params: URLSearchParams): boolean {
+  return (
+    params.has(SYSTEM_RUN_FOCUS_PARAM) ||
+    Boolean(params.get("active")) ||
+    params.has("bl")
+  );
 }
 
 // Elapsed is derived from Date.now() during render, and nothing re-renders this
@@ -229,6 +242,7 @@ export function RunView({
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
   const view = useRunPaneViewStore((s) => s.view);
+  const setPaneView = useRunPaneViewStore((s) => s.setView);
   const resetPaneView = useRunPaneViewStore((s) => s.reset);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
@@ -324,7 +338,6 @@ export function RunView({
         : [],
     [timeline],
   );
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
@@ -341,6 +354,10 @@ export function RunView({
   useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
+  const landingSelectionId = useMemo(
+    () => resolveLandingSelectionId(frames, timeline, finalized),
+    [frames, timeline, finalized],
+  );
   const codeFailure = useMemo(
     () =>
       findRunCodeBlockFailure(
@@ -393,7 +410,7 @@ export function RunView({
     const params = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
-    if (params.has(SYSTEM_RUN_FOCUS_PARAM)) {
+    if (hasExplicitSelection(params)) {
       return;
     }
     // The short /runs/{wr} URL names the run in the path rather than ?wr=, so a
@@ -403,13 +420,7 @@ export function RunView({
     // The normal Studio route resolves the latest run without naming it in the
     // URL. For failures, give its strip the same zero-click failed-block target.
     const isLatestRunRoute = !params.get("wr") && !pathRunId;
-    if (
-      (!isFocusedDeepLink && !(failed && isLatestRunRoute)) ||
-      params.get("active")
-    ) {
-      return;
-    }
-    if (params.has("bl")) {
+    if (!isFocusedDeepLink && !(failed && isLatestRunRoute)) {
       return;
     }
     if (useRunViewStore.getState().pinnedFrameId) {
@@ -423,11 +434,10 @@ export function RunView({
       return;
     }
     // A failed run lands on the block that killed it, so its Failure section
-    // is on screen with zero clicks; anything else lands on the last item so
-    // the Browser pane shows the final screenshot.
-    const last = frames.length > 0 ? frames[frames.length - 1] : null;
+    // is on screen with zero clicks; anything else lands on the run's final
+    // state so the Browser pane shows the final screenshot.
     const target =
-      failed && failureBlockId ? failureBlockId : (last?.id ?? null);
+      failed && failureBlockId ? failureBlockId : landingSelectionId;
     if (target) {
       pinFrame(target);
     }
@@ -435,7 +445,7 @@ export function RunView({
     workflowRunId,
     workflowRun,
     timeline,
-    frames,
+    landingSelectionId,
     failed,
     failureBlockId,
     pinFrame,
@@ -444,12 +454,56 @@ export function RunView({
     timelineIsPlaceholder,
   ]);
 
+  // A run that had already succeeded when it was opened lands on its Outputs;
+  // a failed one keeps the timeline, where its failure section and Fix/Retry live.
+  // Explicit choices win here for the same reason they do for the pin above:
+  // a deep link names what to show, and switching the pane hides it.
+  const outputsLandingDecidedForRunRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !workflowRunId ||
+      outputsLandingDecidedForRunRef.current === workflowRunId ||
+      !workflowRun ||
+      runIsPlaceholder ||
+      timelineIsPlaceholder
+    ) {
+      return;
+    }
+    outputsLandingDecidedForRunRef.current = workflowRunId;
+    if (!finalized || outcome !== "success") {
+      return;
+    }
+    if (
+      hasExplicitSelection(
+        new URLSearchParams(
+          window.location.search || searchParamsRef.current.toString(),
+        ),
+      )
+    ) {
+      return;
+    }
+    if (
+      runHasOutputs(workflowRun) &&
+      useRunPaneViewStore.getState().view === "timeline"
+    ) {
+      setPaneView("outputs");
+    }
+  }, [
+    workflowRunId,
+    workflowRun,
+    finalized,
+    outcome,
+    runIsPlaceholder,
+    timelineIsPlaceholder,
+    setPaneView,
+  ]);
+
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
   // the live edge — the same resolution the Browser pane applies in useRunVisuals.
   const selectedId =
     pinnedFrameId && pinnedFrameId !== "stream"
       ? pinnedFrameId
-      : (lastFrame?.id ?? null);
+      : landingSelectionId;
   const activeItem = useMemo(
     () =>
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
@@ -602,10 +656,10 @@ export function RunView({
   if (!workflowRun) {
     return (
       <RunPlaceholder
+        unavailable={statusUnavailable}
         loading={
           isLoading ||
           runIdPending ||
-          statusUnavailable ||
           (Boolean(workflowRunId) && runIsPlaceholder)
         }
       />
@@ -799,7 +853,7 @@ export function RunView({
                   finished fact while it is still working reads as "this run
                   produced nothing". */}
               {finalized
-                ? "No outputs for this run"
+                ? "No output captured for this run"
                 : "Outputs appear when the run finishes"}
             </div>
           )}

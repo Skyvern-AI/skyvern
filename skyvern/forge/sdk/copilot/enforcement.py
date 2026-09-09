@@ -620,6 +620,9 @@ def is_synthetic_user_message(item: Any) -> bool:
 _PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
 _PACKET_LIST_CAP = 6
 _PACKET_REASON_CAP = 200
+# The challenge notices are whole sentences whose trailing clauses carry the qualification
+# ("availability ... is not a recommendation"), so the failure-reason cap would cut the meaning out.
+_PACKET_NOTICE_CAP = 400
 
 
 def _bounded_error_codes(codes: Any) -> list[str]:
@@ -641,6 +644,15 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
         bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
         if bounded_run:
             kept["run"] = bounded_run
+    challenge = packet.get("challenge")
+    if isinstance(challenge, dict) and challenge:
+        kept["challenge"] = challenge
+    levers = packet.get("levers")
+    if isinstance(levers, list) and levers:
+        kept["levers"] = [lever for lever in levers[:_PACKET_LIST_CAP] if isinstance(lever, dict)]
+    notices = packet.get("challenge_notices")
+    if isinstance(notices, list) and notices:
+        kept["challenge_notices"] = [str(notice)[:_PACKET_NOTICE_CAP] for notice in notices[:_PACKET_LIST_CAP]]
     failure = packet.get("failure")
     if isinstance(failure, dict):
         bounded: dict[str, Any] = {}
@@ -733,6 +745,11 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
         kept["challenge_state"] = {
             key: challenge_state.get(key) for key in ("detected", "kind", "source") if challenge_state.get(key)
         }
+        # The lever inventory is the author-time half of this change; summarizing it away leaves
+        # the model with a detected wall and nothing the product can do about it.
+        levers = challenge_state.get("levers")
+        if isinstance(levers, list) and levers:
+            kept["challenge_state"]["levers"] = [lever for lever in levers if isinstance(lever, dict)]
     indicators = data.get("anti_bot_indicators")
     if isinstance(indicators, list) and indicators:
         kept["anti_bot_indicators"] = indicators[:8]

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -46,6 +47,22 @@ class OrganizationAuthTokenBase(BaseModel):
 
 class OrganizationAuthToken(OrganizationAuthTokenBase):
     token: str
+
+
+OnePasswordTokenSource = Literal["organization", "instance_default"]
+
+
+class OrganizationAuthTokenMetadata(OrganizationAuthTokenBase):
+    @classmethod
+    def from_token(cls, token: OrganizationAuthToken) -> "OrganizationAuthTokenMetadata":
+        return cls(
+            id=token.id,
+            organization_id=token.organization_id,
+            token_type=token.token_type,
+            valid=token.valid,
+            created_at=token.created_at,
+            modified_at=token.modified_at,
+        )
 
 
 class AzureClientSecretCredential(BaseModel):
@@ -106,7 +123,7 @@ class CreateOnePasswordTokenRequest(BaseModel):
     """Request model for creating or updating a 1Password service account token."""
 
     token: str = Field(
-        ...,
+        min_length=1,
         description="The 1Password service account token",
         examples=["op_1234567890abcdef"],
     )
@@ -115,10 +132,17 @@ class CreateOnePasswordTokenRequest(BaseModel):
 class CreateOnePasswordTokenResponse(BaseModel):
     """Response model for 1Password token operations."""
 
-    token: OrganizationAuthToken = Field(
+    token: OrganizationAuthTokenMetadata = Field(
         ...,
-        description="The created or updated 1Password service account token",
+        description="Metadata for the created or updated 1Password service account token",
     )
+
+
+class OnePasswordTokenStatusResponse(BaseModel):
+    configured: bool
+    source: OnePasswordTokenSource | None
+    instance_default_available: bool
+    modified_at: datetime | None
 
 
 class ClearOrganizationAuthTokenResponse(BaseModel):

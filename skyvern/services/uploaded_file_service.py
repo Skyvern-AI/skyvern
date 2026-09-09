@@ -8,9 +8,11 @@ caller's organization prefix by the storage layer before the object is removed.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
 import structlog
+from fastapi import HTTPException, UploadFile
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -33,6 +35,10 @@ class FileNotAttachable(ValueError):
             "These file ids are not available to attach — each must name a file uploaded by this "
             f"organization that is not deleted and not already attached to another run: {', '.join(file_ids)}"
         )
+
+
+class UploadStorageError(RuntimeError):
+    """Raised when storage cannot persist an uploaded file."""
 
 
 def generate_upload_id() -> str:
@@ -86,6 +92,57 @@ async def record_upload(
         retention_days=retention_days,
     )
     return uploaded_file
+
+
+async def validate_file_size(file: UploadFile, *, max_size_bytes: int | None = None) -> UploadFile:
+    """Validate the ordinary upload byte limit before writing to storage."""
+    try:
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Could not determine file size.") from exc
+
+    max_size = settings.MAX_UPLOAD_FILE_SIZE if max_size_bytes is None else max_size_bytes
+    if size > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=(f"File size exceeds the maximum allowed size ({max_size / 1024 / 1024} MB)"),
+        )
+    return file
+
+
+async def save_uploaded_file(
+    *,
+    file: UploadFile,
+    organization_id: str,
+    retention_days: int | None = None,
+) -> tuple[UploadedFile, str]:
+    """Persist bytes and the ordinary uploaded-file record.
+
+    The returned URL is only for the ordinary upload response. Callers that launch a run must
+    use the returned record's durable ``storage_uri`` instead.
+    """
+    resolve_expires_at(retention_days)
+    file_id = generate_upload_id()
+    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
+    uris = await app.STORAGE.save_legacy_file(
+        organization_id=organization_id,
+        filename=storage_filename,
+        fileObj=file.file,
+    )
+    if not uris:
+        raise UploadStorageError("Failed to upload file to S3.")
+    presigned_url, uploaded_s3_uri = uris
+    uploaded_file = await record_upload(
+        file_id=file_id,
+        organization_id=organization_id,
+        storage_uri=uploaded_s3_uri,
+        filename=file.filename or "",
+        size_bytes=file.size,
+        retention_days=retention_days,
+    )
+    return uploaded_file, presigned_url
 
 
 async def delete_uploaded_file(*, file_id: str, organization_id: str) -> bool:

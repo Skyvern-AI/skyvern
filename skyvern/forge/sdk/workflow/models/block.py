@@ -25,7 +25,7 @@ import uuid
 import zipfile
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from enum import StrEnum
@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 from time import monotonic
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, TypeVar, Union, cast
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import aiofiles
 import aiohttp
@@ -43,7 +43,6 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined, TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
@@ -5184,6 +5183,8 @@ class CodeBlock(Block):
             "max": max,
             "min": min,
             "sum": sum,
+            "round": round,
+            "abs": abs,
             "sorted": sorted,
             "sleep": asyncio.sleep,
             "asyncio": SimpleNamespace(sleep=asyncio.sleep),
@@ -5278,18 +5279,25 @@ class CodeBlock(Block):
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():
-                if key not in safe_vars:
+                is_safe_var = key in safe_vars
+                is_numeric_builtin_shadow = key in {"round", "abs"}
+                if (not is_safe_var or is_numeric_builtin_shadow) and isinstance(value, Credential):
                     # Rebind against the page this block actually runs on. The bind above happens
                     # before the page exists, and only object identity is unforgeable: authored code
                     # can define a class carrying any capability a structural check looks for, and
                     # would then receive the sign-in link through its own goto().
-                    if isinstance(value, Credential):
-                        value.magic_link = _bind_code_block_magic_link(
-                            key, organization_id, workflow_run_id, expected_page=page
-                        )
+                    value.magic_link = _bind_code_block_magic_link(
+                        key, organization_id, workflow_run_id, expected_page=page
+                    )
+                if not is_safe_var:
                     safe_vars[key] = value
-                    if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
-                        parameter_defaults[key] = value
+                # `round` and `abs` were valid parameter names before they became safe globals.
+                # Keep persisted/manual blocks working by letting their wrapper arguments shadow
+                # the globals, while blocks without those parameters still receive the builtins.
+                if (not is_safe_var or is_numeric_builtin_shadow) and (
+                    key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__")
+                ):
+                    parameter_defaults[key] = value
         default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
         full_code = f"""
 async def wrapper({default_args}):
@@ -8353,6 +8361,182 @@ def _is_schema_configuration_failure(failure_reason: str) -> bool:
     return "JSON schema is invalid" in failure_reason or "JSON schema validation failed" in failure_reason
 
 
+def _schema_validation_facts(failure_reason: str, response: Any, json_schema: dict[str, Any]) -> dict[str, Any]:
+    """`failure_class` + `undeclared_required_count` from one validator pass (D7-fields).
+
+    `failure_class` is a logged contract: `schema_invalid` does NOT mean "the schema failed
+    metaschema validation" — `_extract_with_ai` rejects those before any LLM call — it means the
+    validator itself threw on a schema that passed the metaschema. `required_not_in_properties`
+    requires EVERY missing required key to be undeclared, because eng-schema-fix's customer-visible
+    message keys on that strict rule (D4-text-amend). `undeclared_required_count` is the
+    unconditional observational count of the same family, at every nesting level, so it stays
+    countable when the response also violates something else.
+    """
+    unclassifiable = {"failure_class": "schema_invalid", "undeclared_required_count": None}
+    if _is_schema_configuration_failure(failure_reason):
+        return unclassifiable
+    try:
+        errors = list(Draft202012Validator(json_schema).iter_errors(response))
+    except Exception:
+        return unclassifiable
+    required_errors = [error for error in errors if error.validator == "required"]
+    # jsonschema raises one `required` error per missing key but each carries the whole `required`
+    # list, so count distinct (node, key) pairs rather than summing per error.
+    # Path components stay a tuple: joining with "/" makes a property literally named "a/b"
+    # collide with the nested path a -> b, and two distinct violations would dedupe to one.
+    undeclared_required = {
+        (tuple(error.absolute_path), key)
+        for error in required_errors
+        for key in _undeclared_missing_required_keys(error)
+    }
+    return {
+        "failure_class": _classify_schema_errors(errors, required_errors),
+        "undeclared_required_count": len(undeclared_required),
+    }
+
+
+def _classify_schema_errors(errors: list[ValidationError], required_errors: list[ValidationError]) -> str:
+    if required_errors:
+        if all(_missing_required_keys_undefined(error) for error in required_errors):
+            return "required_not_in_properties"
+        return "missing_required_defined"
+    if errors and all(error.validator == "type" and error.instance is None for error in errors):
+        return "null_for_non_nullable"
+    return "type_mismatch_other"
+
+
+def _classify_schema_validation_failure(failure_reason: str, response: Any, json_schema: dict[str, Any]) -> str:
+    return str(_schema_validation_facts(failure_reason, response, json_schema)["failure_class"])
+
+
+def _missing_required_keys_undefined(error: ValidationError) -> bool:
+    missing = _missing_required_keys(error)
+    return bool(missing) and len(_undeclared_missing_required_keys(error)) == len(missing)
+
+
+def _missing_required_keys(error: ValidationError) -> list[str]:
+    if not isinstance(error.schema, dict) or not isinstance(error.instance, dict):
+        return []
+    required = error.validator_value if isinstance(error.validator_value, list) else []
+    return [key for key in required if key not in error.instance]
+
+
+def _undeclared_missing_required_keys(error: ValidationError) -> list[str]:
+    if not isinstance(error.schema, dict):
+        return []
+    defined = error.schema.get("properties") or {}
+    return [key for key in _missing_required_keys(error) if key not in defined]
+
+
+def _schema_sha256(json_schema: dict[str, Any]) -> str:
+    canonical = json.dumps(json_schema, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_SCHEMA_REF_MAX_DEPTH = 5
+
+
+def _resolve_schema_ref(node: dict[str, Any], root: dict[str, Any]) -> dict[str, Any] | None:
+    """Follow local `$ref` pointers to the object they name. None when it cannot be followed.
+
+    Generated schemas commonly root the object under `$ref` with the body in `$defs`. Reading the
+    wrapper instead reports zero required and zero properties, which is indistinguishable from a
+    genuinely empty schema, so an unresolvable ref must report None rather than a false zero.
+    """
+    seen: set[str] = set()
+    # One extra pass so a chain of exactly _SCHEMA_REF_MAX_DEPTH refs still returns its target.
+    for _ in range(_SCHEMA_REF_MAX_DEPTH + 1):
+        if "$ref" not in node:
+            return node
+        ref = node["$ref"]
+        # A node that HAS a $ref we cannot follow is unknown, never empty: returning the wrapper
+        # would report zero required and zero properties, the false zero this function exists to
+        # prevent. Non-string refs are rejected upstream by validate_schema; do not rely on that.
+        if not isinstance(ref, str) or ref in seen or not ref.startswith("#/"):
+            return None
+        seen.add(ref)
+        target: Any = root
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or part not in target:
+                return None
+            target = target[part]
+        if not isinstance(target, dict):
+            return None
+        node = target
+    return None
+
+
+def _schema_object_node(json_schema: dict[str, Any]) -> dict[str, Any] | None:
+    node = _resolve_schema_ref(json_schema, json_schema)
+    if node is None:
+        return None
+    items = node.get("items")
+    if node.get("type") == "array" and isinstance(items, dict):
+        return _resolve_schema_ref(items, json_schema)
+    return node
+
+
+_RESPONSE_KEYS_LOGGED = 20
+
+
+def _response_key_facts(response: Any, json_schema: dict[str, Any]) -> dict[str, Any]:
+    """Describe a response's top-level keys without copying any of them out of the file.
+
+    Only keys the customer declared in their own schema are named; anything else is
+    counted. This line fires when the model ignored the schema, so the undeclared keys
+    are model-invented or lifted straight out of the customer's document.
+    """
+    if not isinstance(response, dict):
+        return {"response_top_level_keys": None, "unexpected_key_count": None}
+    schema_node = _schema_object_node(json_schema)
+    if schema_node is None:
+        # The schema could not be read, so "undeclared" has no meaning here. Reporting an empty
+        # list and a definite count would say every key was undeclared, over-counting on every
+        # unresolvable-reference schema and disagreeing with the null shape fields on the same line.
+        return {"response_top_level_keys": None, "unexpected_key_count": None}
+    declared = schema_node.get("properties")
+    declared_names = set(declared) if isinstance(declared, dict) else set()
+    response_names = {str(key) for key in response}
+    return {
+        "response_top_level_keys": sorted(response_names & declared_names)[:_RESPONSE_KEYS_LOGGED],
+        "unexpected_key_count": len(response_names - declared_names),
+    }
+
+
+def _handler_llm_key(handler: LLMAPIHandler) -> str | None:
+    # Handlers are plain callables: the factory attaches .llm_key dynamically, and bound LLMCaller
+    # methods carry it on __self__ (mirrors LLMAPIHandlerFactory._maybe_get_flex_handler).
+    key = getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
+    return key if isinstance(key, str) else None
+
+
+_LOG_URL_PATTERN = re.compile(r"\w+://\S+")
+_LOG_QUOTED_PATTERN = re.compile(r'"[^"]*"')
+_FAILURE_FAMILY_CHARS = 60
+
+
+def _failure_family(failure_reason: str) -> str:
+    """Reduce a failure reason to something countable: no URLs, no quoted per-run references.
+
+    Quoted spans carry the customer's own parameter keys and block labels, which sit inside
+    the 60-char window and would otherwise split one family across every customer.
+    """
+    family = _LOG_URL_PATTERN.sub("<url>", failure_reason)
+    family = _LOG_QUOTED_PATTERN.sub("<ref>", family)
+    return family[:_FAILURE_FAMILY_CHARS]
+
+
+def _log_safe_url(value: str | None) -> str | None:
+    """Drop query and fragment: artifact URLs are signed and carry `sig` / `expiry` credentials."""
+    if not value:
+        return value
+    split = urlsplit(value)
+    if not split.query and not split.fragment:
+        return value
+    return urlunsplit((split.scheme, split.netloc, split.path, "", ""))
+
+
 def _llm_response_format_failure_reason(error: Exception) -> str:
     return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
 
@@ -10427,29 +10611,19 @@ class SendEmailBlock(Block):
         return file_paths
 
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
-        recipients = []
+        resolved: list[str] = []
         for recipient in self.recipients:
-            # Check if the recipient is a parameter and get its value
             if workflow_run_context.has_parameter(recipient):
-                maybe_recipient = workflow_run_context.get_value(recipient)
+                resolved.append(str(workflow_run_context.get_value(recipient)))
             else:
-                maybe_recipient = recipient
+                resolved.append(recipient)
 
-            recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
-            # check if maybe_recipient is a valid email address
-            try:
-                validate_email(maybe_recipient)
-                recipients.append(maybe_recipient)
-            except EmailNotValidError as e:
-                LOG.warning(
-                    "SendEmailBlock Invalid email address",
-                    recipient=maybe_recipient,
-                    reason=str(e),
-                )
-
+        recipients = email.normalize_recipients(resolved)
         if not recipients:
-            raise NoValidEmailRecipient(recipients=recipients)
-
+            raise NoValidEmailRecipient()
+        # An invalid entry fails the block: dropping it would deliver to a subset of the intended
+        # recipients while the block reports success.
+        email.validate_recipients(recipients)
         return recipients
 
     async def _build_email_message(
@@ -10682,6 +10856,59 @@ _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
 csv.field_size_limit(_MAX_CSV_FIELD_SIZE_BYTES)
 
 
+DetectionSource = Literal["explicit", "extension", "magic", "fallback"]
+# D3-amend item 5. "max_pages" is reserved for the user-set knob arriving with SKY-15830.
+TruncationLimit = Literal["token_limit", "ocr_page_limit", "ocr_page_failure", "max_pages"]
+
+
+@dataclass
+class FileParserTelemetry:
+    """Facts for the parse-completed / failed log lines; execute() starts each run from a fresh instance."""
+
+    configured_file_type: FileType | None = None
+    file_type_detected: FileType | None = None
+    detection_source: DetectionSource | None = None
+    content_tokens: int | None = None
+    content_tokens_sent: int | None = None
+    limit: TruncationLimit | None = None
+    pages_included: int | None = None
+    total_pages: int | None = None
+    tokens_included: int | None = None
+    token_limit: int | None = None
+    extraction_attempts: int = 0
+    llm_key: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.limit is not None
+
+    @property
+    def truncation_source(self) -> Literal["platform_cap", "max_pages"] | None:
+        # Derived, never stored: D3-fields dropped `source` from the truncation record because it
+        # only restated `limit`, and the two must not be able to drift.
+        if self.limit is None:
+            return None
+        return "max_pages" if self.limit == "max_pages" else "platform_cap"
+
+    def mark_platform_cap(
+        self,
+        limit: TruncationLimit,
+        tokens_included: int,
+        token_limit: int,
+        pages_included: int | None = None,
+        total_pages: int | None = None,
+    ) -> None:
+        # First cut wins: a page-bounded parse followed by the extraction bound is one truncation,
+        # and the first bound to fire is the smallest applicable one (D3-amend item 3).
+        if self.limit is not None:
+            return
+        self.limit = limit
+        self.tokens_included = tokens_included
+        self.token_limit = token_limit
+        self.pages_included = pages_included
+        self.total_pages = total_pages
+
+
 class FileParserBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -10691,6 +10918,19 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    # Shape checks on the head of a file that reached the CSV fallback (log only; detection is unchanged).
+    _FALLBACK_SNIFF_BYTES: ClassVar[int] = 8192
+    _FALLBACK_SNIFF_ROWS: ClassVar[int] = 20
+    _HTML_HEAD_MARKERS: ClassVar[tuple[str, ...]] = (
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<meta",
+        "<script",
+        "<title",
+        "<div",
+    )
     # ZIP extraction guards (zip-bomb protection; sizes from central-directory metadata).
     # ClassVar keeps these plain class attributes — without it pydantic wraps underscore
     # names in ModelPrivateAttr and class-level access breaks.
@@ -10707,6 +10947,7 @@ class FileParserBlock(Block):
     json_schema: dict[str, Any] | None = None
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
 
@@ -10761,18 +11002,24 @@ class FileParserBlock(Block):
 
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
+        detected, source = self._detect_file_type_and_source(file_url, file_path)
+        self._telemetry.detection_source = source
+        self._telemetry.file_type_detected = detected
+        return detected
+
+    def _detect_file_type_and_source(self, file_url: str, file_path: str | None) -> tuple[FileType, DetectionSource]:
         url_parsed = urlparse(file_url)
         suffix = Path(url_parsed.path).suffix.lower()
         if suffix in (".xlsx", ".xls", ".xlsm"):
-            return FileType.EXCEL
+            return FileType.EXCEL, "extension"
         elif suffix == ".pdf":
-            return FileType.PDF
+            return FileType.PDF, "extension"
         elif suffix == ".tsv":
-            return FileType.CSV  # TSV files are handled by the CSV parser
+            return FileType.CSV, "extension"  # TSV files are handled by the CSV parser
         elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
-            return FileType.IMAGE
+            return FileType.IMAGE, "extension"
         elif suffix == ".docx":
-            return FileType.DOCX
+            return FileType.DOCX, "extension"
         elif suffix == ".doc":
             raise InvalidFileType(
                 file_url=file_url,
@@ -10780,9 +11027,9 @@ class FileParserBlock(Block):
                 error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
             )
         elif suffix == ".zip":
-            return FileType.ZIP
+            return FileType.ZIP, "extension"
         elif suffix == ".csv":
-            return FileType.CSV
+            return FileType.CSV, "extension"
 
         # URL extension is missing or unrecognized — try magic-byte detection on the downloaded file
         if file_path:
@@ -10793,9 +11040,72 @@ class FileParserBlock(Block):
                     file_url=file_url,
                     detected_file_type=detected,
                 )
-                return detected
+                return detected, "magic"
 
-        return FileType.CSV  # Final fallback for truly unknown files
+        # Shadow log for D5: once labelled CSV nothing downstream can tell a real extension-less
+        # CSV from an HTML or error page, so record the head's shape here (never its content).
+        LOG.warning(
+            "FileParserBlock fell back to CSV for unrecognized content",
+            url_host=url_parsed.hostname,
+            url_suffix=suffix,
+            configured_file_type=self.file_type,
+            **self._sniff_fallback_content(file_path),
+        )
+        return FileType.CSV, "fallback"
+
+    def _sniff_fallback_content(self, file_path: str | None) -> dict[str, Any]:
+        facts: dict[str, Any] = {
+            "looks_binary": None,
+            "looks_like_html": None,
+            "delimiter": None,
+            "delimiter_sniffed": None,
+            "column_count": None,
+            "consistent_columns": None,
+            "sampled_rows": None,
+            "sniff_error": None,
+        }
+        if not file_path:
+            return facts
+        try:
+            self._fill_fallback_sniff_facts(file_path, facts)
+        except Exception as e:
+            # This runs inside execute()'s try, whose except turns any escape into a
+            # customer-visible "Failed to download or validate file" — a shadow log must never
+            # do that. The type name is kept so a broken sniffer is visible in the same query.
+            facts["sniff_error"] = type(e).__name__
+        return facts
+
+    def _fill_fallback_sniff_facts(self, file_path: str, facts: dict[str, Any]) -> None:
+        with open(file_path, "rb") as file:
+            head = file.read(self._FALLBACK_SNIFF_BYTES)
+        facts["looks_binary"] = b"\x00" in head and not head.startswith(self._CSV_UTF_BOMS)
+        # Decode the way the CSV parser will (_sniff_csv_delimiter), or a UTF-16 file reports a
+        # false consistent_columns=False and biases the D5 enforcement decision.
+        text = head.decode(self._detect_file_encoding(file_path), errors="replace").lstrip("\ufeff").lstrip()
+        lowered = text[:1024].lower()
+        facts["looks_like_html"] = lowered.startswith(self._HTML_HEAD_MARKERS) or "<html" in lowered
+        if facts["looks_binary"]:
+            return
+        lines = text.splitlines(keepends=True)
+        if len(head) == self._FALLBACK_SNIFF_BYTES and lines and not lines[-1].endswith(("\n", "\r")):
+            lines.pop()  # the read boundary cut the last row mid-line
+        rows = [line for line in lines[: self._FALLBACK_SNIFF_ROWS + 1] if line.strip()]
+        if not rows:
+            return
+        facts["sampled_rows"] = len(rows) - 1
+        try:
+            delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            facts["delimiter_sniffed"] = True
+        except csv.Error:
+            # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
+            delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
+            facts["delimiter_sniffed"] = False
+        facts["delimiter"] = delimiter
+        field_counts = [len(fields) for fields in csv.reader(rows, delimiter=delimiter)]
+        if not field_counts:
+            return
+        facts["column_count"] = field_counts[0]
+        facts["consistent_columns"] = all(count == field_counts[0] for count in field_counts[1:])
 
     _OLE_CFB_MAGIC: ClassVar[bytes] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -11171,10 +11481,21 @@ class FileParserBlock(Block):
             if current_tokens + chunk_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
                 LOG.warning(
                     "PDF OCR text exceeds token limit, truncating at page boundary",
-                    file_url=self.file_url,
-                    pages_included=page_number - 1,
-                    total_pages=len(page_results),
+                    file_url=_log_safe_url(self.file_url),
+                    pages_included=len(page_chunks),
+                    pages_rendered=len(page_results),
                     max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                )
+                # total_pages is left unknown: the render step caps at MAX_PDF_OCR_PAGES and does not
+                # report the document's page count, so len(page_results) would be the rendered count.
+                # SKY-15830 supplies the real total and marks the render cap itself (D7-review, option B).
+                self._telemetry.mark_platform_cap(
+                    limit="token_limit",
+                    tokens_included=current_tokens,
+                    token_limit=MAX_FILE_PARSE_INPUT_TOKENS,
+                    # Pages whose content is in the produced text (D3-fields-amend). A page that
+                    # rendered but transcribed to nothing was not included.
+                    pages_included=len(page_chunks),
                 )
                 break
             current_tokens += chunk_tokens
@@ -11316,6 +11637,10 @@ class FileParserBlock(Block):
 
             extracted_text = "\n".join(text_parts)
             extracted_text = sanitize_postgres_text(extracted_text)
+            if truncated:
+                self._telemetry.mark_platform_cap(
+                    limit="token_limit", tokens_included=current_tokens, token_limit=max_tokens
+                )
             LOG.info(
                 "Successfully parsed DOCX file",
                 file_url=self.file_url,
@@ -11497,8 +11822,13 @@ class FileParserBlock(Block):
 
     def _bound_extraction_input_tokens(self, content_str: str) -> str:
         tokens = encode_tokens(content_str)
+        self._telemetry.content_tokens = len(tokens)
+        self._telemetry.content_tokens_sent = min(len(tokens), MAX_FILE_PARSE_INPUT_TOKENS)
         if len(tokens) <= MAX_FILE_PARSE_INPUT_TOKENS:
             return content_str
+        self._telemetry.mark_platform_cap(
+            limit="token_limit", tokens_included=MAX_FILE_PARSE_INPUT_TOKENS, token_limit=MAX_FILE_PARSE_INPUT_TOKENS
+        )
         LOG.warning(
             "File parser extraction input exceeds token limit, truncating",
             file_url=self.file_url,
@@ -11519,6 +11849,18 @@ class FileParserBlock(Block):
         schema_to_use = self.json_schema or _default_structured_output_schema("Information extracted from the file")
         if not validate_schema(schema_to_use):
             raise ValueError("File parser JSON schema is invalid.")
+        schema_node = _schema_object_node(schema_to_use)
+        # required_count / properties_count describe the ROOT object node only (or `items` for an
+        # array root); a defect nested deeper is classified but not sized here. schema_sha256
+        # identifies the whole schema, so nested shapes stay groupable.
+        schema_facts: dict[str, Any] = {
+            "schema_type": schema_to_use.get("type"),
+            "schema_sha256": _schema_sha256(schema_to_use),
+            # None, never 0, when the root node could not be read: a zero here is a legitimate
+            # value, so a false one is indistinguishable from a schema that really has none.
+            "required_count": len(schema_node.get("required") or []) if schema_node is not None else None,
+            "properties_count": len(schema_node.get("properties") or {}) if schema_node is not None else None,
+        }
 
         # Convert content to string for AI processing
         if isinstance(content, list):
@@ -11542,9 +11884,13 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", workflow_run_block_id, organization_id
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
+        telemetry = self._telemetry
+        telemetry.llm_key = _handler_llm_key(llm_api_handler)
+        last_failure_class: str | None = None
 
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
+            telemetry.extraction_attempts = attempt + 1
             try:
                 llm_response = await llm_api_handler(
                     prompt=prompt_for_attempt,
@@ -11558,14 +11904,16 @@ class FileParserBlock(Block):
             except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                 failure_reason = _llm_response_format_failure_reason(e)
                 will_retry = attempt + 1 < self.schema_validation_max_attempts
+                last_failure_class = "response_format"
                 LOG.warning(
                     "FileParserBlock extraction LLM response failed response-format validation",
-                    file_url=self.file_url,
+                    file_url=_log_safe_url(self.file_url),
                     attempt=attempt + 1,
                     max_attempts=self.schema_validation_max_attempts,
                     will_retry=will_retry,
                     error_type=type(e).__name__,
-                    schema_type=schema_to_use.get("type"),
+                    llm_key=telemetry.llm_key,
+                    **schema_facts,
                 )
                 if not will_retry:
                     raise ValueError(failure_reason) from e
@@ -11574,18 +11922,36 @@ class FileParserBlock(Block):
 
             schema_validation_failure = self._validate_ai_response_against_json_schema(llm_response, schema_to_use)
             if not schema_validation_failure:
+                LOG.info(
+                    "FileParserBlock schema validation succeeded",
+                    attempt=attempt + 1,
+                    recovered_from_failure_class=last_failure_class,
+                    response_root_type=_json_type_name(llm_response),
+                    llm_key=telemetry.llm_key,
+                    content_tokens=telemetry.content_tokens,
+                    content_truncated=telemetry.truncated,
+                    **schema_facts,
+                )
                 return llm_response
 
+            schema_failure_facts = _schema_validation_facts(schema_validation_failure, llm_response, schema_to_use)
+            last_failure_class = str(schema_failure_facts["failure_class"])
             is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
             will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
             LOG.warning(
                 "FileParserBlock extraction LLM response failed schema validation",
-                file_url=self.file_url,
+                file_url=_log_safe_url(self.file_url),
                 attempt=attempt + 1,
                 max_attempts=self.schema_validation_max_attempts,
                 will_retry=will_retry,
                 failure_reason=schema_validation_failure,
-                schema_type=schema_to_use.get("type"),
+                response_root_type=_json_type_name(llm_response),
+                llm_key=telemetry.llm_key,
+                content_tokens=telemetry.content_tokens,
+                content_truncated=telemetry.truncated,
+                **schema_failure_facts,
+                **_response_key_facts(llm_response, schema_to_use),
+                **schema_facts,
             )
             if not will_retry:
                 raise ValueError(schema_validation_failure)
@@ -11605,6 +11971,9 @@ class FileParserBlock(Block):
         failure_reason: str,
     ) -> BlockResult:
         error_codes = self.get_failure_error_codes()
+        self._log_failure(
+            failure_reason, error_codes, workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+        )
         failure_output = build_block_failure_output(failure_reason, error_codes)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
@@ -11615,6 +11984,30 @@ class FileParserBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             error_codes=error_codes or None,
+        )
+
+    def _log_failure(
+        self,
+        failure_reason: str,
+        error_codes: list[str],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str | None,
+        organization_id: str | None,
+    ) -> None:
+        LOG.info(
+            "FileParserBlock failed",
+            failure_family=_failure_family(self._redact_registered_secrets(failure_reason, workflow_run_context)),
+            error_codes=error_codes,
+            # Same two names, same two meanings, as on `parse completed`: what the user configured,
+            # and what detection resolved (None when the block failed before detection ran).
+            configured_file_type=self._telemetry.configured_file_type,
+            file_type_detected=self._telemetry.file_type_detected,
+            detection_source=self._telemetry.detection_source,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_permanent_id=workflow_run_context.workflow_permanent_id,
+            organization_id=organization_id,
         )
 
     @staticmethod
@@ -11642,6 +12035,7 @@ class FileParserBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        self._telemetry = FileParserTelemetry(configured_file_type=self.file_type)
 
         if (
             self.file_url
@@ -11673,9 +12067,18 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
+            failure_reason = f"Failed to format jinja template: {str(e)}"
+            self._log_failure(
+                failure_reason,
+                self.get_failure_error_codes(),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                failure_reason,
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11711,6 +12114,9 @@ class FileParserBlock(Block):
                     and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
                 )
                 self.file_type = detected_file_type
+            else:
+                self._telemetry.detection_source = "explicit"
+                self._telemetry.file_type_detected = self.file_type
 
             # Validation opens the document, so on a large file it is as slow as the parse itself.
             try:
@@ -11816,7 +12222,7 @@ class FileParserBlock(Block):
 
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, final_data)
-        return await self.build_block_result(
+        result = await self.build_block_result(
             success=True,
             failure_reason=None,
             output_parameter_value=final_data,
@@ -11824,6 +12230,29 @@ class FileParserBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+        telemetry = self._telemetry
+        LOG.info(
+            "FileParserBlock parse completed",
+            configured_file_type=telemetry.configured_file_type,
+            file_type_detected=telemetry.file_type_detected,
+            detection_source=telemetry.detection_source,
+            content_tokens=telemetry.content_tokens,
+            content_tokens_sent=telemetry.content_tokens_sent,
+            truncated=telemetry.truncated,
+            truncation_source=telemetry.truncation_source,
+            limit=telemetry.limit,
+            pages_included=telemetry.pages_included,
+            total_pages=telemetry.total_pages,
+            tokens_included=telemetry.tokens_included,
+            token_limit=telemetry.token_limit,
+            had_schema=bool(self.json_schema),
+            extraction_attempts=telemetry.extraction_attempts,
+            llm_key=telemetry.llm_key,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+        return result
 
 
 class PDFParserBlock(Block):
@@ -12134,7 +12563,7 @@ class HumanInteractionBlock(BaseTaskBlock):
         for recipient in self.recipients:
             formatted.append(self.render_templatable_field("recipients", recipient, workflow_run_context))
 
-        self.recipients = formatted
+        self.recipients = email.normalize_recipients(formatted)
 
         self.negative_descriptor = self.render_templatable_field(
             "negative_descriptor", self.negative_descriptor, workflow_run_context
@@ -12183,7 +12612,7 @@ class HumanInteractionBlock(BaseTaskBlock):
         LOG.info(
             "Pausing workflow for human interaction",
             workflow_run_id=workflow_run_id,
-            recipients=self.recipients,
+            recipient_count=len(self.recipients),
             timeout=self.timeout_seconds,
             browser_session_id=browser_session_id,
         )

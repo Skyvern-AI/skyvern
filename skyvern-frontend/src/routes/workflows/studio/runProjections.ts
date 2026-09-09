@@ -8,6 +8,7 @@ import {
 import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
 import {
   isBlockItem,
+  WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
@@ -123,6 +124,60 @@ export function outputFieldEntries(outputs: unknown): Array<[string, unknown]> {
   );
 }
 
+export type RunErrorRow = { code: string | null; message: string | null };
+
+function readStringField(
+  record: Record<string, unknown>,
+  keys: Array<string>,
+): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (trimmed !== "") {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+// One row per distinct (code, message); a code-only entry stays a row so a
+// failure with no prose still shows its code. Shared with the has-outputs gate
+// so a run whose errors carry neither can't enable an empty Outputs pane.
+export function runErrorRows(
+  errors: Array<Record<string, unknown>>,
+): RunErrorRow[] {
+  const seen = new Set<string>();
+  const rows: RunErrorRow[] = [];
+  for (const error of errors) {
+    const code = readStringField(error, ["error_code", "code"]);
+    const message = readStringField(error, [
+      "reasoning",
+      "message",
+      "detail",
+      "error",
+      "error_message",
+      "description",
+    ]);
+    if (!code && !message) {
+      continue;
+    }
+    const key = `${code ?? ""}\u0000${message ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    rows.push({ code, message });
+  }
+  return rows;
+}
+
+function nonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim() !== "";
+}
+
 // RunView's Outputs tab keys off this. The extracted_information cast below is
 // unsound on purpose — a string value must stay truthy via Object.values,
 // matching what RunOutputsSection renders.
@@ -133,7 +188,8 @@ export function runHasOutputs(
     return false;
   }
   const hasErrors =
-    Array.isArray(workflowRun.errors) && workflowRun.errors.some(isRecord);
+    Array.isArray(workflowRun.errors) &&
+    runErrorRows(workflowRun.errors.filter(isRecord)).length > 0;
   const outputs = workflowRun.outputs;
   const extractedInformation =
     isRecord(outputs) && "extracted_information" in outputs
@@ -153,8 +209,8 @@ export function runHasOutputs(
     (workflowRun.downloaded_file_urls?.length ?? 0) > 0;
   const hasObserverOutput = workflowRun.task_v2?.output != null;
   const hasWebhookFailure =
-    workflowRun.task_v2?.webhook_failure_reason != null ||
-    workflowRun.webhook_failure_reason != null;
+    nonEmptyString(workflowRun.task_v2?.webhook_failure_reason) ||
+    nonEmptyString(workflowRun.webhook_failure_reason);
   return (
     hasErrors ||
     hasExtracted ||
@@ -243,6 +299,58 @@ export function buildFilmstrip(
   });
 
   return frames;
+}
+
+// The trailing leaf the run actually reached, walked in the same chronological
+// order buildFilmstrip uses so the landing target and the strip cannot disagree.
+// Ordering by modified_at would let a late background write on an earlier block
+// claim the trailing position; a skipped block is not a state the run reached.
+function lastReachedLeafBlock(
+  timeline: WorkflowRunTimelineItem[],
+): WorkflowRunBlock | null {
+  let last: WorkflowRunBlock | null = null;
+  const walk = (items: WorkflowRunTimelineItem[]): void => {
+    for (const item of items) {
+      if (
+        isBlockItem(item) &&
+        item.children.length === 0 &&
+        item.block.status !== null &&
+        item.block.status !== Status.Skipped
+      ) {
+        last = item.block;
+      }
+      if (item.children.length > 0) {
+        walk(item.children);
+      }
+    }
+  };
+  walk(flattenTimelineChronologically(timeline));
+  return last;
+}
+
+/**
+ * What a finished run lands on with nothing pinned; shared by the Browser and
+ * Overview panes so both resolve the same final state. The filmstrip carries
+ * action frames only, so the trailing block wins exactly when it emitted no
+ * actions of its own — otherwise its own last frame stays the target.
+ */
+export function resolveLandingSelectionId(
+  frames: FilmstripFrame[],
+  timeline: WorkflowRunTimelineItem[] | undefined,
+  finalized: boolean,
+): string | null {
+  const lastFrameId = frames.length > 0 ? frames[frames.length - 1]!.id : null;
+  if (!finalized) {
+    return lastFrameId;
+  }
+  const lastBlock = lastReachedLeafBlock(timeline ?? []);
+  if (!lastBlock) {
+    return lastFrameId;
+  }
+  const blockHasFrames = frames.some(
+    (frame) => frame.blockId === lastBlock.workflow_run_block_id,
+  );
+  return blockHasFrames ? lastFrameId : lastBlock.workflow_run_block_id;
 }
 
 export type BlockRunState = {

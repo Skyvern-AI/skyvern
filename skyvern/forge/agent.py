@@ -1582,16 +1582,6 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
-        from skyvern.forge.taskv3.block_context import (
-            MAX_PERSISTED_FINISH_REASON_CHARS,
-            GoalDirectives,
-            PreviousBlockHandoff,
-            compose_goal,
-            mask_signed_urls_in_text,
-            render_block_context,
-            sanitize_handoff_url,
-            select_previous_block,
-        )
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
@@ -1601,9 +1591,20 @@ class ForgeAgent:
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
         )
+        from skyvern.forge.taskv3.goal_composition import (
+            GoalDirectives,
+            compose_goal,
+            render_block_context,
+        )
+        from skyvern.forge.taskv3.handoff_redaction import (
+            MAX_PERSISTED_FINISH_REASON_CHARS,
+            mask_signed_urls_in_text,
+            sanitize_handoff_url,
+        )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import pending_marker
+        from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, select_previous_block
         from skyvern.utils.token_counter import approx_count_tokens
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
@@ -3290,6 +3291,67 @@ class ForgeAgent:
             context.navigation_goal = None
             context.navigation_payload = None
 
+    @staticmethod
+    def _latest_download_failure_status(steps: list[Step]) -> int | None:
+        """The failure status carried by the run's latest download-intent action, folded across steps.
+
+        Walks every persisted step with output in execution order, and every action within a step in
+        order. A download-intent action is one whose result recorded a download outcome
+        (``download_triggered`` set) or a stamped failure status. Each later download-intent action
+        supersedes earlier evidence: a later action that actually saved a file (non-empty
+        ``downloaded_files``), or a later download that received no file and observed no status, clears
+        an earlier status. A triggered-but-empty or aborted action that carries a status keeps it —
+        ``download_triggered=True`` alone is only a credited signal, not proof a file was saved. Ordinary
+        non-download actions never clear it. Returns the surviving status, or None.
+        """
+        latest_status: int | None = None
+        for step in steps:
+            output = step.output
+            if output is None or not output.actions_and_results:
+                continue
+            for _action, results in output.actions_and_results:
+                is_download_intent = any(
+                    result.download_triggered is not None or result.download_failure_status is not None
+                    for result in results
+                )
+                if not is_download_intent:
+                    continue
+                if any(result.downloaded_files for result in results):
+                    latest_status = None
+                    continue
+                latest_status = next(
+                    (result.download_failure_status for result in reversed(results) if result.download_failure_status),
+                    None,
+                )
+        return latest_status
+
+    async def _enrich_failure_reason_with_download_status(self, task: Task, reason: str) -> str:
+        """Append one bounded sentence to a terminal failure reason when the run's latest download-intent
+        action received no file and passively observed a server 5xx status.
+
+        Folds over every persisted step's output in execution order; only the latest download-intent
+        action's own evidence counts. The original reason is preserved verbatim and the sentence is
+        appended once (deduplicated). Returns the (possibly unchanged) reason to store; never raises.
+        """
+        try:
+            steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+            status = self._latest_download_failure_status(steps)
+            if status is None:
+                return reason
+            sentence = (
+                f"An HTTP request made during the download action returned HTTP {status}, and no file was received."
+            )
+            if sentence in reason:
+                return reason
+            return f"{reason} {sentence}"
+        except Exception:
+            LOG.warning(
+                "Failed to enrich failure reason with download status",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return reason
+
     async def fail_task(
         self,
         task: Task,
@@ -3300,9 +3362,14 @@ class ForgeAgent:
     ) -> bool:
         try:
             if step is not None and step.status != StepStatus.completed:
+                # This is the single durable failed-step write. When the step is still non-terminal,
+                # it also owns persisting step.output -- any same-step download evidence stamped at the
+                # known-exception re-raise -- so the update_task fold below reads it back from the db.
+                owns_output = step.status in (StepStatus.created, StepStatus.running)
                 await self.update_step(
                     step=step,
                     status=StepStatus.failed,
+                    output=step.output if owns_output else None,
                 )
 
             # This exit is reachable on v3 as well as v1 -- a run that dies by exception rather than
@@ -3316,7 +3383,6 @@ class ForgeAgent:
             if reason and run_secrets:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
-            # Update task status first
             failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
             LOG.info(
                 "Task failure classified",
@@ -3470,6 +3536,10 @@ class ForgeAgent:
                         log_context={"task_id": task.task_id},
                     )
 
+            # execute_step still holds this pre-running reference and hands it to fail_task on a known
+            # exception; update_step returns a fresh running row, so stamp download evidence onto this
+            # object below to reach fail_task's single failed-step write.
+            handoff_step = step
             step = await self.update_step(step=step, status=StepStatus.running)
             injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state
@@ -3614,7 +3684,13 @@ class ForgeAgent:
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
             BrowserSessionDegraded,
-        ):
+        ) as e:
+            # Stamp the accumulated step output (e.g. a download action's observed HTTP failure status)
+            # onto the caller's step and re-raise unchanged. fail_task owns the single failed-step write
+            # and persists this output, so the terminal update_task fold sees same-step evidence. No
+            # await here: this branch adds no cancellation point and cannot double-write the step.
+            detailed_agent_step_output.step_exception = e.__class__.__name__
+            handoff_step.output = detailed_agent_step_output.to_agent_step_output()
             raise
 
         except Exception as e:
@@ -7560,6 +7636,12 @@ class ForgeAgent:
         task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if task_from_db:
             task = task_from_db
+
+        # Enrich only the stored reason with a server 5xx observed on an admitted xhr/fetch request during
+        # the run's latest download action that received no file. Runs at the shared terminal seam so every
+        # failed/terminated path inherits it; the caller's classification of the original reason is untouched.
+        if status in (TaskStatus.failed, TaskStatus.terminated) and failure_reason is not None:
+            failure_reason = await self._enrich_failure_reason_with_download_status(task, failure_reason)
 
         task.validate_update(status, extracted_information, failure_reason)
         updates: dict[str, Any] = {}

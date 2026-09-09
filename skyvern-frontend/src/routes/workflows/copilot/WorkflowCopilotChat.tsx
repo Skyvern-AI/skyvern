@@ -90,6 +90,7 @@ import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
 import { QuestionPartsCard } from "./cards/QuestionPartsCard";
+import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import { composerPlaceholder } from "./composerPlaceholder";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
@@ -827,6 +828,7 @@ export function WorkflowCopilotChat({
   const codeOptionAvailable = codeBlockModeEnabled;
   const codeStateActive = codeWorkflow && codeOptionAvailable;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
   // Owning turn of the current proposedWorkflow. Kept alongside it (never
@@ -1583,6 +1585,7 @@ export function WorkflowCopilotChat({
     setProposedWorkflow(null);
     setPendingProposalTurnId(null);
     setAutoAccept(false);
+    setWorkPlan([]);
     setRejectedTurnIds(new Set());
     setAcceptedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
@@ -1648,6 +1651,7 @@ export function WorkflowCopilotChat({
         data.proposed_workflow ? restoredPendingProposalTurnId : null,
       );
       setAutoAccept(data.auto_accept ?? false);
+      setWorkPlan(data.work_plan ?? []);
     },
     // Only stable state setters and refs are referenced, so the callback never needs to change.
     [rememberTurnOwnedRun],
@@ -2263,6 +2267,7 @@ export function WorkflowCopilotChat({
       setProposedWorkflow(null);
       setPendingProposalTurnId(null);
       setAutoAccept(false);
+      setWorkPlan([]);
       setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
       return;
@@ -2910,6 +2915,9 @@ export function WorkflowCopilotChat({
           setLivePauseFrame(null);
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
           setQuestionCancelToken(null);
+          if (response.work_plan) {
+            setWorkPlan(response.work_plan);
+          }
           const receipts = response.narrative_payload?.questionInteractions as
             | QuestionInteraction[]
             | undefined;
@@ -4499,6 +4507,7 @@ export function WorkflowCopilotChat({
                 ) : null}
               </div>
             )}
+            <WorkPlanCard items={workPlan} />
           </div>
         </div>
         {!isPinned ? (

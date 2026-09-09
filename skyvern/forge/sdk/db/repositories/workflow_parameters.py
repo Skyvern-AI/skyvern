@@ -698,6 +698,7 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_copilot_chat_id: str,
         proposed_workflow: dict | None | object = _UNSET,
         auto_accept: bool | None = None,
+        work_plan: list[str] | None | object = _UNSET,
     ) -> WorkflowCopilotChat | None:
         async with self.Session() as session:
             chat = (
@@ -714,6 +715,8 @@ class WorkflowParametersRepository(BaseRepository):
                 chat.proposed_workflow = proposed_workflow
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
+            if work_plan is not _UNSET:
+                chat.work_plan = work_plan
 
             await session.commit()
             await session.refresh(chat)

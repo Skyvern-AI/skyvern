@@ -82,7 +82,7 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours) — requests above 240 are rejected. Default: `60` |
+| `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours) — requests above 240 are capped at 240 with a warning. Default: `60`. A running session can be [extended](#extend-a-session) up to 360 minutes (6 hours). |
 | `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for available options |
 | `browser_type` | string | Browser type: `chrome` or `msedge`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
@@ -114,8 +114,33 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 | `closed` | Session was closed manually or by timeout. No further tasks can run. |
 
 <Warning>
-Sessions close automatically when the timeout expires, **even if a task is still running**. The timeout countdown begins when the browser launches. Set timeouts with enough margin for your longest expected task.
+Sessions close automatically when the timeout expires, **even if a task is still running**. The timeout countdown begins when the browser launches. Set timeouts with enough margin for your longest expected task, or [extend the session](#extend-a-session) once you know how much work is queued.
 </Warning>
+
+---
+
+## Extend a session
+
+A session is created with at most 240 minutes, but a running session can be extended, one call at a time, up to a total lifetime of 360 minutes (6 hours) counted from when it started. Extension is additive: each call adds `additional_minutes` to the session's current deadline. Ask for more than what remains and the session is extended by the remainder, with a `warning` on the response explaining the difference.
+
+<CodeGroup>
+```python Python
+session = await skyvern.extend_browser_session(
+    browser_session_id="pbs_490705123456789012",
+    additional_minutes=60,
+)
+print(session.timeout)  # the session's new total budget in minutes, counted from started_at
+```
+
+```bash cURL
+curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_490705123456789012/extend \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"additional_minutes": 60}'
+```
+</CodeGroup>
+
+The call returns `409` when the session has already ended, is under two minutes from its deadline, or is already at the 360-minute maximum. Read `timeout` from the response rather than tracking the total yourself; a retried request adds again. The TypeScript SDK gains `extendBrowserSession` in its next release; until then call the REST endpoint directly.
 
 ---
 

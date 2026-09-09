@@ -153,7 +153,11 @@ function WorkflowsFlat() {
   const studioEnabled = useWorkflowStudioEnabled();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [search, setSearch] = useState("");
+  const searchParam = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(searchParam);
+  useEffect(() => {
+    setSearch(searchParam);
+  }, [searchParam]);
   const [debouncedSearch] = useDebounce(search, 250);
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
@@ -471,7 +475,13 @@ function WorkflowsFlat() {
 
   function setParamPatch(patch: Record<string, string>) {
     const params = new URLSearchParams(searchParams);
-    Object.entries(patch).forEach(([k, v]) => params.set(k, v));
+    Object.entries(patch).forEach(([key, value]) => {
+      if (value === "") {
+        params.delete(key);
+      } else {
+        params.set(key, value);
+      }
+    });
     setSearchParams(params, { replace: true });
   }
 
@@ -752,7 +762,7 @@ function WorkflowsFlat() {
               value={search}
               onChange={(value) => {
                 setSearch(value);
-                setParamPatch({ page: "1" });
+                setParamPatch({ search: value, page: "1" });
               }}
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"
