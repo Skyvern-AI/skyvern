@@ -3157,9 +3157,9 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     blocker = loop_mock.await_args.kwargs["verification_blocker"]
     assert blocker is not None
     assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
-    assert await blocker() is None
+    assert await blocker("completed") is None
     seen_states[0].arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
-    assert await blocker() is not None
+    assert await blocker("completed") is not None
 
 
 @pytest.mark.asyncio

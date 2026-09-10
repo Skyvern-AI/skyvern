@@ -1059,7 +1059,7 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     async def blocker(_staged: frozenset[str]) -> str | None:
         return "no download yet"
 
-    async def verification_blocker() -> str | None:
+    async def verification_blocker(_status: str) -> str | None:
         return "no code arrived"
 
     await run_task_v3_agent_loop(
