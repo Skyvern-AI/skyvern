@@ -37,15 +37,16 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import author_time_levers
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _requested_output_labels_by_path
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
-from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_extraction_plan import _exact_path, _value_witness_bindings
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
+    bound_call_browser_session,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
     clear_sensitive_origin_page_taint,
+    effective_browser_session_id,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
 )
@@ -358,7 +359,7 @@ async def _composition_capture_visual_summary(
 ) -> VisualSummaryCapture:
     capture_started_at = time.monotonic()
     capture_url = evidence.get("current_url") or evidence.get("inspected_url")
-    capture_session_id = getattr(ctx, "browser_session_id", None)
+    capture_session_id = effective_browser_session_id(ctx)
     screenshot_result = await _composition_get_screenshot(ctx, dispatch_session_id=capture_session_id)
     if not screenshot_result.get("ok"):
         return VisualSummaryCapture(
@@ -886,9 +887,12 @@ async def _capture_composition_evidence(
     requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> CompositionEvidenceCapture:
     """Capture page evidence, using HTML only to enrich a valid but unsettled structured packet."""
-    capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
+    capture_session_id = effective_browser_session_id(copilot_ctx) if isinstance(copilot_ctx, AgentContext) else None
+    capture_tracks_debug_session = (
+        isinstance(copilot_ctx, AgentContext) and capture_session_id == copilot_ctx.browser_session_id
+    )
     capture_session_generation = (
-        copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
+        copilot_ctx.browser_session_continuity_generation if capture_tracks_debug_session else None
     )
     requested_targets = _seeded_capture_targets(copilot_ctx, requested_reads)
     owned_labels = _seeded_label_owners(copilot_ctx, requested_reads)
@@ -977,15 +981,18 @@ async def _capture_composition_evidence(
         isinstance(copilot_ctx, AgentContext)
         and evidence is not None
         and (
-            copilot_ctx.browser_session_id != capture_session_id
-            or copilot_ctx.browser_session_continuity_generation != capture_session_generation
+            effective_browser_session_id(copilot_ctx) != capture_session_id
+            or (
+                capture_session_generation is not None
+                and copilot_ctx.browser_session_continuity_generation != capture_session_generation
+            )
         )
     ):
         evidence = _composition_add_inspection_warning(evidence, "mixed_browser_session_provenance")
         evidence["browser_session_provenance"] = {
             "mixed": True,
             "start_browser_session_id": capture_session_id,
-            "end_browser_session_id": copilot_ctx.browser_session_id,
+            "end_browser_session_id": effective_browser_session_id(copilot_ctx),
             "start_generation": capture_session_generation,
             "end_generation": copilot_ctx.browser_session_continuity_generation,
         }
@@ -998,46 +1005,28 @@ async def _read_run_session_page_evidence(
     run_session_id: str,
     current_url: str,
 ) -> tuple[dict[str, Any] | None, str | None, str | None, CapturedFrame | None]:
-    """The discovery extractor reads ctx.browser_session_id per call, so the rebind targets the run
-    session and is restored in a finally. The browser layer can substitute a replacement session for a
-    closed one, so the id the capture actually observed is read back before the restore."""
-    prior_session_id = ctx.browser_session_id
-    ctx.browser_session_id = run_session_id
+    """Capture automatic post-run evidence under the run's call-local browser binding."""
     observed_session_id: str | None = run_session_id
     observation_error: str | None = None
     evidence: dict[str, Any] | None = None
     frame: CapturedFrame | None = None
-    try:
-        capture = await asyncio.wait_for(
-            _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
-            timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
-        )
-        evidence, observation_error, frame = _capture_result_parts(capture)
-    except Exception:
-        LOG.debug("Post-run run-session page capture failed", exc_info=True)
-        observation_error = observation_error or "Post-run page capture against the run session failed."
-        evidence = None
-    finally:
-        # Read before the restore, which is the only point where the substituted id is still visible.
-        observed_session_id = ctx.browser_session_id
-        ctx.browser_session_id = prior_session_id
+    with bound_call_browser_session(run_session_id):
+        try:
+            capture = await asyncio.wait_for(
+                _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
+                timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
+            )
+            evidence, observation_error, frame = _capture_result_parts(capture)
+        except Exception:
+            LOG.debug("Post-run run-session page capture failed", exc_info=True)
+            observation_error = observation_error or "Post-run page capture against the run session failed."
+            evidence = None
 
     if not observed_session_id:
-        # A mid-capture session create that fails clears the id, and an unknown source id grants
-        # post-run identity, so an unprovable source has to drop the packet rather than launder it.
+        # An unknown source id grants post-run identity, so an unprovable source drops the packet
+        # rather than laundering it.
         return None, None, observation_error or "Post-run page capture lost its browser session.", None
     return (evidence if isinstance(evidence, dict) else None), observed_session_id, observation_error, frame
-
-
-def _post_run_page_source_session_id(ctx: CopilotContext, run_id: str | None) -> str | None:
-    """The run's own browser session, when a current-page look lands after a run that executed in a
-    different browser than the scout one."""
-    if not run_id:
-        return None
-    run_session_id = ctx.last_run_blocks_browser_session_id
-    if not run_session_id or run_session_id == ctx.browser_session_id:
-        return None
-    return run_session_id
 
 
 def _preserves_existing_post_run_page_evidence(
@@ -1208,19 +1197,17 @@ async def _inspect_page_for_composition_under_custody(
     from `discover_workflow_entrypoint`: discovery answers "which page?";
     inspection answers "what fields and controls are actually on this page?".
     """
-    arguments = {"target_url": target_url}
     authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
     if authority_error:
-        result = {"ok": False, "error": authority_error}
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
+        return {"ok": False, "error": authority_error}
     if sensitive_origin_page_has_active_run(copilot_ctx):
-        result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-    capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
+        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+    capture_session_id = effective_browser_session_id(copilot_ctx) if isinstance(copilot_ctx, AgentContext) else None
+    capture_tracks_debug_session = (
+        isinstance(copilot_ctx, AgentContext) and capture_session_id == copilot_ctx.browser_session_id
+    )
     capture_session_generation = (
-        copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
+        copilot_ctx.browser_session_continuity_generation if capture_tracks_debug_session else None
     )
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
@@ -1235,27 +1222,21 @@ async def _inspect_page_for_composition_under_custody(
 
     entry_url: str
     kind: str
-    run_page_source_session_id: str | None = None
-    observed_run_session_id: str | None = None
     if use_current_page:
-        run_page_source_session_id = _post_run_page_source_session_id(copilot_ctx, run_id)
-        current_url, _ = await _fallback_page_info(copilot_ctx, run_page_source_session_id)
+        current_url, _ = await _fallback_page_info(copilot_ctx)
         entry_url = current_url or "current_page"
         kind = "current_page"
     else:
         resolved_entry_url, kind = _resolve_discovery_entry_url(target_url)
         if resolved_entry_url is None:
-            result = {
+            return {
                 "ok": False,
                 "data": None,
                 "error": "inspect_page_for_composition requires a URL, domain with an explicit path, or target_url='current_page'.",
             }
-            record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-            return result
         entry_url = resolved_entry_url
         regression_error = _non_current_inspection_regression_error(copilot_ctx, entry_url=entry_url)
         if regression_error is not None:
-            record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, regression_error)
             return regression_error
 
     # Skip re-navigation when the inspect target is the page the browser is already on. A
@@ -1288,23 +1269,13 @@ async def _inspect_page_for_composition_under_custody(
         if on_target_page:
             # current_page, or a URL target the agent is already on — capture without navigating.
             current_url = inspect_target_url or entry_url
-            if run_page_source_session_id:
-                (
-                    evidence,
-                    observed_run_session_id,
-                    observation_error,
-                    visual_fallback_frame,
-                ) = await _read_run_session_page_evidence(
-                    copilot_ctx, run_session_id=run_page_source_session_id, current_url=current_url
-                )
-            else:
-                capture = await _capture_composition_evidence(
-                    copilot_ctx,
-                    inspected_url=entry_url,
-                    current_url=current_url,
-                    requested_reads=requested_reads,
-                )
-                evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
+            capture = await _capture_composition_evidence(
+                copilot_ctx,
+                inspected_url=entry_url,
+                current_url=current_url,
+                requested_reads=requested_reads,
+            )
+            evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
         else:
             nav_result = await _discovery_navigate(
                 copilot_ctx,
@@ -1317,13 +1288,11 @@ async def _inspect_page_for_composition_under_custody(
                 if sensitive_same_turn_run:
                     # Navigation failure may leave the browser on the sensitive origin page.
                     # Do not inspect that page through the ordinary failure fallback.
-                    result = {
+                    return {
                         "ok": False,
                         "data": None,
                         "error": f"inspect_page_for_composition could not navigate: {nav_error}",
                     }
-                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                    return result
                 failure_capture = await _composition_evidence_after_navigation_failure(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1331,13 +1300,11 @@ async def _inspect_page_for_composition_under_custody(
                     requested_reads=requested_reads,
                 )
                 if failure_capture is None:
-                    result = {
+                    return {
                         "ok": False,
                         "data": None,
                         "error": f"inspect_page_for_composition could not navigate: {nav_error}",
                     }
-                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                    return result
                 evidence, visual_fallback_frame = failure_capture
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
@@ -1352,44 +1319,41 @@ async def _inspect_page_for_composition_under_custody(
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
 
     if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
-        result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
+        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
 
     if (
         isinstance(copilot_ctx, AgentContext)
         and evidence is not None
         and (
-            copilot_ctx.browser_session_id != capture_session_id
-            or copilot_ctx.browser_session_continuity_generation != capture_session_generation
+            effective_browser_session_id(copilot_ctx) != capture_session_id
+            or (
+                capture_session_generation is not None
+                and copilot_ctx.browser_session_continuity_generation != capture_session_generation
+            )
         )
     ):
         evidence = _composition_add_inspection_warning(evidence, "mixed_browser_session_provenance")
         evidence["browser_session_provenance"] = {
             "mixed": True,
             "start_browser_session_id": capture_session_id,
-            "end_browser_session_id": copilot_ctx.browser_session_id,
+            "end_browser_session_id": effective_browser_session_id(copilot_ctx),
             "start_generation": capture_session_generation,
             "end_generation": copilot_ctx.browser_session_continuity_generation,
         }
 
     if observation_error is not None:
-        result = {
+        return {
             "ok": False,
             "data": None,
             "error": f"inspect_page_for_composition could not capture page evidence: {observation_error}",
         }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
 
     if evidence is None:
-        result = {
+        return {
             "ok": False,
             "data": None,
             "error": "inspect_page_for_composition could not capture page evidence.",
         }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
 
     if sensitive_same_turn_run:
         evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
@@ -1399,10 +1363,13 @@ async def _inspect_page_for_composition_under_custody(
     if isinstance(run_id, str) and run_id:
         session_provenance = evidence.get("browser_session_provenance")
         mixed_session_provenance = isinstance(session_provenance, dict) and session_provenance.get("mixed") is True
+        mixed_end_session_id = (
+            session_provenance.get("end_browser_session_id")
+            if isinstance(session_provenance, dict) and mixed_session_provenance
+            else None
+        )
         source_browser_session_id = (
-            None
-            if mixed_session_provenance
-            else (observed_run_session_id if run_page_source_session_id else copilot_ctx.browser_session_id)
+            mixed_end_session_id if isinstance(mixed_end_session_id, str) else effective_browser_session_id(copilot_ctx)
         )
         evidence, preserved_stored_evidence = store_post_run_page_evidence(
             copilot_ctx,
@@ -1425,6 +1392,23 @@ async def _inspect_page_for_composition_under_custody(
                 source_browser_session_id=source_browser_session_id,
             )
     else:
+        session_provenance = evidence.get("browser_session_provenance")
+        mixed_session_provenance = isinstance(session_provenance, dict) and session_provenance.get("mixed") is True
+        mixed_end_session_id = (
+            session_provenance.get("end_browser_session_id")
+            if isinstance(session_provenance, dict) and mixed_session_provenance
+            else None
+        )
+        evidence = stamp_page_evidence_provenance(
+            evidence,
+            source_browser_session_id=(
+                mixed_end_session_id
+                if isinstance(mixed_end_session_id, str)
+                else effective_browser_session_id(copilot_ctx)
+            ),
+            run_id=None,
+            run_browser_session_id=None,
+        )
         copilot_ctx.composition_page_evidence = evidence
     _attach_author_time_levers(copilot_ctx, evidence)
 
@@ -1453,7 +1437,11 @@ async def _inspect_page_for_composition_under_custody(
         evidence,
         url=str(evidence.get("current_url") or current_url or ""),
         capture_session_id=capture_session_id,
-        run_page_source_session_id=run_page_source_session_id,
+        run_page_source_session_id=(
+            capture_session_id
+            if isinstance(copilot_ctx, AgentContext) and capture_session_id != copilot_ctx.browser_session_id
+            else None
+        ),
     )
     # Surface the reached page at the top level so the model registers that the
     # inspection already navigated there and does not re-issue navigate_browser.
@@ -1468,7 +1456,6 @@ async def _inspect_page_for_composition_under_custody(
     if observation_step is not None:
         result["observation_step"] = observation_step
     result = _model_facing_inspect_result(result)
-    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
     if visual_fallback_frame is not None:
         workflow_run_id = evidence.get("workflow_run_id")
         enqueue_screenshot(
