@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, Credential
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _HIGH_LEVEL_ACTION_MAP,
@@ -55,7 +56,14 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ClickAction,
+    GotoUrlAction,
+    InputTextAction,
+    SolveCaptchaAction,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.playwright_input import (
     PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
@@ -417,6 +425,56 @@ def test_recording_page_keeps_raw_page_behind_private_seam() -> None:
     recording_page = RecordingPage(raw_page)
     assert not hasattr(recording_page, "underlying_page")
     assert recording_page._underlying_page is raw_page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [True, False])
+async def test_trusted_captcha_operation_records_boolean_result_around_nested_actions(result: bool) -> None:
+    emitted: list[Action] = []
+
+    async def emit(action: Action) -> None:
+        emitted.append(action)
+
+    page = RecordingPage(FakePage(), on_action=emit)
+
+    async def solve() -> bool:
+        await page.locator("#challenge").click()
+        return result
+
+    assert await page._record_solve_captcha(solve, workflow_run_id="wr_test") is result
+
+    recorded = page.recorded_actions()
+    assert [action.action_type for action in recorded] == [ActionType.SOLVE_CAPTCHA, ActionType.CLICK]
+    assert [action.action_order for action in recorded] == [0, 1]
+    assert [action.status for action in recorded] == [ActionStatus.completed, ActionStatus.completed]
+    assert isinstance(recorded[0], SolveCaptchaAction)
+    assert recorded[0].response == str(result).lower()
+    assert recorded[0].workflow_run_id == "wr_test"
+    assert {action.action_id for action in emitted} == {action.action_id for action in recorded}
+    assert len(emitted) == 2
+
+
+@pytest.mark.asyncio
+async def test_trusted_captcha_operation_records_cancellation_and_reraises() -> None:
+    emitted: list[Action] = []
+
+    async def emit(action: Action) -> None:
+        emitted.append(action)
+
+    page = RecordingPage(FakePage(), on_action=emit)
+
+    async def cancel() -> bool:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await page._record_solve_captcha(cancel, workflow_run_id="wr_test")
+
+    [action] = page.recorded_actions()
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CancelledError"
+    assert action.workflow_run_id == "wr_test"
+    assert [emitted_action.action_id for emitted_action in emitted] == [action.action_id]
 
 
 @pytest.mark.asyncio
@@ -1696,6 +1754,85 @@ async def test_recorded_calls_persist_as_actions_on_the_step(monkeypatch: pytest
         for action in actions
     ]
     assert [type(action) for action in hydrated] == [GotoUrlAction, InputTextAction, ClickAction]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["solved", "no_widget", "caught_unsolved"])
+async def test_code_block_solver_lifecycle_streams_one_persisted_action(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    page = FakePage()
+    context = FakeWorkflowRunContext(secrets={"customer_path": "/account?token=solver-secret#challenge"})
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> bool:
+        await recording_page.locator("#challenge").click()
+        if outcome == "caught_unsolved":
+            raise block_module.CaptchaChallengeUnsolvedError(
+                "https://example.com/account?token=solver-secret#challenge"
+            )
+        return outcome == "solved"
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    code = (
+        "try:\n    solver_result = await solve_captcha(page)\nexcept Exception:\n    code_continued = True"
+        if outcome == "caught_unsolved"
+        else "solver_result = await solve_captcha(page)"
+    )
+
+    result = await _make_code_block(code, goal="handle challenge").execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+
+    assert result.success is True
+    actions = sorted(_created_actions(mocks), key=lambda action: action.action_order)
+    assert [action.action_type for action in actions] == [ActionType.SOLVE_CAPTCHA, ActionType.CLICK]
+    assert [action.action_order for action in actions] == [0, 1]
+    solve_action = actions[0]
+    assert solve_action.task_id == "tsk_code"
+    assert solve_action.step_id == "stp_code"
+    assert solve_action.step_order == 0
+    assert solve_action.workflow_run_id == "wr_test"
+    if outcome == "caught_unsolved":
+        assert solve_action.status == ActionStatus.failed
+        assert solve_action.response == "CodeBlockCaptchaError"
+    else:
+        assert solve_action.status == ActionStatus.completed
+        assert solve_action.response == ("true" if outcome == "solved" else "false")
+    assert "solver-secret" not in solve_action.model_dump_json()
+    solver_writes = [action for action in _upsert_calls(mocks) if action.action_type == ActionType.SOLVE_CAPTCHA]
+    assert len(solver_writes) == 2
+    assert solver_writes[0].action_id == solver_writes[1].action_id
+
+
+@pytest.mark.asyncio
+async def test_code_block_solver_cancellation_streams_failed_action_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def cancel(_recording_page: RecordingPage, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await _make_code_block("await solve_captcha(page)", goal="handle challenge").execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    [action] = _created_actions(mocks)
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CancelledError"
+    assert action.task_id == "tsk_code"
+    assert action.step_id == "stp_code"
 
 
 @pytest.mark.asyncio
