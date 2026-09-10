@@ -70,6 +70,13 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.display_recorder import (
+    DisplayRecorderAcquisition,
+    carry_display_recording,
+    prepare_local_display_recording,
+    release_display_recorder,
+    release_started_display_recording,
+)
 from skyvern.webeye.playwright_input import register_playwright_input_context
 from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
@@ -753,6 +760,7 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
+        started_display_recorder = None
         browser_internal_headers, scoped_headers = _partition_browser_headers(kwargs.get("extra_http_headers"))
         creator_kwargs = {**kwargs, "extra_http_headers": browser_internal_headers}
         try:
@@ -760,6 +768,14 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
+            # The creator acquired the whole-display recorder before creating the context
+            # (prepare_local_display_recording) and stashed the acquisition. Register a NEWLY-started recorder
+            # for the outer cleanup below so a later context-setup failure releases it; a reused/adopted recorder
+            # (started=False) belongs to a live owner and is deliberately left running.
+            acquisition = browser_artifacts._display_recorder_acquisition
+            if isinstance(acquisition, DisplayRecorderAcquisition) and acquisition.started:
+                started_display_recorder = acquisition.recorder
+            browser_artifacts._display_recorder_acquisition = None
             requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
             if requested_profile_id and browser_artifacts.applied_browser_profile_id != requested_profile_id:
                 LOG.warning(
@@ -780,16 +796,11 @@ class BrowserContextFactory:
                 await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
-            # Gated on the process MODE, not the browser type. The earlier version keyed on
-            # is_attach_only_browser_type(settings.BROWSER_TYPE) and justified it with "an attached
-            # browser was configured by whoever launched it, so recording could only no-op" -- which
-            # is false: Playwright records video on a context IT created over connect_over_cdp
-            # regardless of who launched the browser. That gate therefore dropped video for every
-            # process using an attach-capable BROWSER_TYPE, and since this listener is the only
-            # producer of video_artifacts it took the main page's recording with it, not just popups.
-            # The thing that genuinely cannot record is the attach-only worker, which is what
-            # is_enforcing() names.
-            if not attach_only_enforcing():
+            # Playwright popup/page video is the ONLY producer of video_artifacts here, so register it whenever no
+            # whole-display recorder was acquired (an eligible-but-refused acquisition must still fall back). Gate
+            # on the attach-only WORKER mode, not BROWSER_TYPE (Playwright records a connect_over_cdp context it
+            # created regardless of who launched the browser).
+            if not attach_only_enforcing() and browser_artifacts._display_recorder is None:
                 set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
@@ -820,17 +831,35 @@ class BrowserContextFactory:
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
+            # The whole-display recorder was already acquired by the creator before context creation and
+            # consumed into ``started_display_recorder`` above; nothing to acquire here.
             return browser_context, browser_artifacts, cleanup_func
         except BaseException as e:
+            # Close the context FIRST (unmap the window) so the display fence is never freed while the window is
+            # still mapped; a close cancel is latched so the recorder still releases and cancellation wins after.
+            close_cancelled = False
             if browser_context is not None:
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
-                with suppress(Exception):
+                try:
                     await browser_context.close()
+                except asyncio.CancelledError:
+                    close_cancelled = True
+                except Exception:
+                    LOG.warning("Failed to close browser context after creation failure", exc_info=True)
+            if started_display_recorder is not None:
+                try:
+                    await release_display_recorder(started_display_recorder)
+                except asyncio.CancelledError:
+                    close_cancelled = True  # release finishes-then-re-raises; still run cleanup_func, cancel wins
+                except Exception:
+                    LOG.warning("Failed to release display recorder after creation failure", exc_info=True)
             if cleanup_func:
                 with suppress(Exception):
                     await cleanup_func()
 
+            if close_cancelled:
+                raise asyncio.CancelledError()
             if not isinstance(e, Exception) or isinstance(e, (UnknownBrowserType, BrowserEngineBootstrapError)):
                 raise e
 
@@ -1000,7 +1029,6 @@ async def _create_headless_chromium(
             "downloads_path": download_dir,
         }
     )
-
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
@@ -1104,30 +1132,51 @@ async def _create_headful_chromium(
     )
     if loaded_from_saved_profile:
         browser_artifacts.applied_browser_profile_id = browser_profile_id
+    # Acquire the whole-display recorder BEFORE the context is created; the Playwright record_video_* args are
+    # popped ONLY if a live recorder is obtained, so a refusal/startup failure keeps Playwright per-page
+    # recording (exactly one recording either way).
+    await prepare_local_display_recording(
+        browser_args,
+        browser_artifacts,
+        owner_id_override=cast(str | None, kwargs.get("display_recording_owner_id")),
+        workflow_run_id=cast(str | None, kwargs.get("workflow_run_id")),
+        task_id=cast(str | None, kwargs.get("task_id")),
+        script_id=cast(str | None, kwargs.get("script_id")),
+    )
+    # Outer BaseException holder: release the already-started whole-display recorder for ANY escape (including a
+    # Temporal CancelledError) from launch through return, so the bridge/flock/registry never leak (SKY-15466).
     try:
-        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    except Exception as launch_error:
-        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
-            LOG.warning(
-                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
-                browser_profile_id=browser_profile_id,
-                organization_id=organization_id_for_profile,
-                error=str(launch_error),
-            )
-            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
-            BrowserContextFactory.update_chromium_browser_preferences(
-                user_data_dir=fallback_dir,
-                download_dir=download_dir,
-            )
-            browser_args["user_data_dir"] = fallback_dir
-            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
-                har_path=browser_args["record_har_path"],
-                browser_session_dir=fallback_dir,
-            )
-            browser_artifacts.mark_seed_load_failed()
+        try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-        else:
-            raise
+        except Exception as launch_error:
+            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+                LOG.warning(
+                    "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                    browser_profile_id=browser_profile_id,
+                    organization_id=organization_id_for_profile,
+                    error=str(launch_error),
+                )
+                fallback_dir = make_temp_directory(prefix="skyvern_browser_")
+                BrowserContextFactory.update_chromium_browser_preferences(
+                    user_data_dir=fallback_dir,
+                    download_dir=download_dir,
+                )
+                browser_args["user_data_dir"] = fallback_dir
+                fallback_artifacts = BrowserContextFactory.build_browser_artifacts(
+                    har_path=browser_args["record_har_path"],
+                    browser_session_dir=fallback_dir,
+                )
+                fallback_artifacts.mark_seed_load_failed()
+                # Recorder already started before the first launch; carry it onto the rebuilt artifacts so it is not
+                # orphaned. record_video_* was already popped from the shared browser_args, so no double recording.
+                carry_display_recording(browser_artifacts, fallback_artifacts)
+                browser_artifacts = fallback_artifacts
+                browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+            else:
+                raise
+    except BaseException:
+        await release_started_display_recording(browser_artifacts)
+        raise
     return browser_context, browser_artifacts, None
 
 

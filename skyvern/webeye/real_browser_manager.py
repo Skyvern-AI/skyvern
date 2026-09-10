@@ -46,6 +46,10 @@ from skyvern.webeye.cdp_frame_publisher import (
     stream_key_for_task,
     stream_key_for_workflow_run,
 )
+from skyvern.webeye.display_recorder import (
+    DisplayRecorder,
+    stop_display_recorders_for_owner,
+)
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -1177,12 +1181,10 @@ class RealBrowserManager(BrowserManager):
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
-        if task.workflow_run_id and task.workflow_run_id in self.pages:
-            self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
-            return
-        if task.task_id in self.pages:
-            self.pages[task.task_id].browser_artifacts.video_artifacts = artifacts
-            return
+        for run_key in (task.workflow_run_id, task.task_id):
+            if run_key and run_key in self.pages:
+                self.pages[run_key].browser_artifacts.video_artifacts = artifacts
+                return
 
         raise MissingBrowserState(
             task_id=task.task_id,
@@ -1212,24 +1214,31 @@ class RealBrowserManager(BrowserManager):
             )
             return []
 
-        for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
+        display_recorder = browser_state.browser_artifacts._display_recorder
+        display_video_artifact = (
+            display_recorder.video_artifact if isinstance(display_recorder, DisplayRecorder) else None
+        )
+        # The whole-display recording is the legacy index-0 recording: per-step syncs read its current
+        # (growing) bytes and terminal finalize remuxes the SAME artifact/id, exactly like a Playwright
+        # per-page recording. It additionally finalizes once its recorder has stopped even when a deferred
+        # stream left finalize=False, so the deferred-close upload is finalized rather than a partial prefix.
+        display_recorder_stopped = isinstance(display_recorder, DisplayRecorder) and display_recorder.is_stopped
+
+        for video_artifact in browser_state.browser_artifacts.video_artifacts:
+            finalize_this = finalize or (video_artifact is display_video_artifact and display_recorder_stopped)
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
                 is_webm = path.lower().endswith(".webm")
-                if finalize and is_webm:
+                if finalize_this and is_webm:
                     async with prepare_recording_for_upload(path) as prepared:
                         with open(prepared.path, "rb") as f:
-                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                        browser_state.browser_artifacts.video_artifacts[
-                            i
-                        ].video_file_extension = prepared.file_extension
+                            video_artifact.video_data = f.read()
+                        video_artifact.video_file_extension = prepared.file_extension
                 else:
                     # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
-                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
-                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
-                    )
+                        video_artifact.video_data = f.read()
+                    video_artifact.video_file_extension = os.path.splitext(path)[1].lstrip(".").lower() or "webm"
             else:
                 LOG.debug(
                     "Video path not found",
@@ -1253,17 +1262,32 @@ class RealBrowserManager(BrowserManager):
         size snapshot of each ordinary growing WebM recording) for the fast streaming path, or ``None`` to
         fall back to the byte-based path whenever an artifact is non-WebM, not yet registered, or missing on
         disk.
+
+        The single admitted non-WebM source is the whole-display recorder's own fragmented-MP4 artifact
+        (SKY-15466): a fragmented MP4 grows append-only, so streaming ``[0, len)`` is a valid decodable
+        prefix exactly like a growing WebM. Eligibility is gated on the explicit producer signal — the
+        artifact is the live ``DisplayRecorder``'s owned ``video_artifact`` — never on the ``.mp4`` extension
+        alone, so unrelated ``.mp4`` sources and the stopped-recorder finalization case keep the byte path.
         """
         video_artifacts = browser_state.browser_artifacts.video_artifacts
         if len(video_artifacts) == 0:
             return []
+
+        display_recorder = browser_state.browser_artifacts._display_recorder
+        owned_mp4_artifact = (
+            display_recorder.video_artifact
+            if isinstance(display_recorder, DisplayRecorder) and not display_recorder.is_stopped
+            else None
+        )
 
         snapshots: list[RecordingPrefixSnapshot] = []
         for video_artifact in video_artifacts:
             path = video_artifact.video_path
             if not video_artifact.video_artifact_id or not path or not os.path.exists(path=path):
                 return None
-            if not path.lower().endswith(".webm"):
+            is_webm = path.lower().endswith(".webm")
+            is_owned_growing_mp4 = video_artifact is owned_mp4_artifact and path.lower().endswith(".mp4")
+            if not is_webm and not is_owned_growing_mp4:
                 return None
             snapshots.append(
                 RecordingPrefixSnapshot(
@@ -1387,6 +1411,15 @@ class RealBrowserManager(BrowserManager):
             else:
                 LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
 
+        # Whole-display recorder orphan sweep: reap a recorder whose per-browser release was bypassed by a
+        # mid-run cancel/crash. Gated on the terminal-CLOSE path only — on keep-open
+        # (close_browser_on_completion=False) the recorder is intentionally still live and must not be
+        # stopped. The local MP4 is intentionally left under VIDEO_PATH (matching Playwright's file
+        # lifetime): the terminal upload reads it AFTER this cleanup returns, so unlinking here would
+        # truncate the recording.
+        if close_browser_on_completion:
+            await stop_display_recorders_for_owner(task_id)
+
         return browser_state_to_close
 
     def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
@@ -1451,6 +1484,9 @@ class RealBrowserManager(BrowserManager):
         # registered in ``_start_frame_publisher`` may fire for the same
         # stream key. ``dict.pop(key, None)`` makes the second pop a no-op.
         streams_active = stream_ref_active(workflow_run_id)
+
+        # Owners whose close was EFFECTIVE (not suppressed by cross-run sharing); only these are swept below.
+        sweep_owner_ids: set[str] = set()
 
         if browser_state_to_close:
             # If another workflow run still references this browser state (e.g. a
@@ -1524,6 +1560,9 @@ class RealBrowserManager(BrowserManager):
                 # eventual ``close(True)`` fires the on-close callback that
                 # stops it; ``close(False)`` is covered by the publisher's
                 # own disconnect-driven self-termination.
+                # Whole-display recording is per-run and decoupled from the deferred close, so finalize it now:
+                # the run is terminal and the activity finally unlinks the file, so a later finalize=False loses it.
+                await self._finalize_deferred_display_recording(browser_state_to_close, workflow_run_id, task_ids)
             else:
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
@@ -1534,6 +1573,8 @@ class RealBrowserManager(BrowserManager):
                 )
                 finalization_attempted = effective_close
                 recording_finalized = effective_close and bool(close_succeeded)
+                if effective_close:
+                    sweep_owner_ids.add(workflow_run_id)
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
@@ -1541,13 +1582,14 @@ class RealBrowserManager(BrowserManager):
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None or streams_active:
                 continue
-            if task_browser_state is browser_state_to_close and finalization_attempted:
-                continue
-            # Same liveness-qualified ownership predicate as the run-level close: a distinct
-            # task-level state must not be held open by a ghost alias, and it must still yield to a
-            # genuinely live cross-run sharer.
+            # Compute before the already-finalized continue so a task whose browser IS the run's browser still
+            # contributes its (task-id-owned) recorder to the effective-close sweep set.
             shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
+            if effective_close:
+                sweep_owner_ids.add(task_id)
+            if task_browser_state is browser_state_to_close and finalization_attempted:
+                continue
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
@@ -1573,6 +1615,21 @@ class RealBrowserManager(BrowserManager):
                 )
         LOG.info("Workflow run is cleaned up", sampling=True)
 
+        # Orphan sweep: reap recorders whose per-browser release was bypassed by a mid-run cancel/crash so a dead
+        # bridge/ffmpeg + display lock never leaks into the next activity. Only ``sweep_owner_ids`` (effective-close
+        # owners, accumulated above; empty on keep-open) are swept — a shared/deferred owner's browser is still
+        # live, so freeing its display flock would let the next run capture it. The MP4 stays under VIDEO_PATH; the
+        # terminal upload reads it after cleanup returns, so unlinking here would truncate it.
+        sweep_cancelled = False
+        if not streams_active:
+            for sweep_owner_id in sweep_owner_ids:
+                try:
+                    await stop_display_recorders_for_owner(sweep_owner_id)
+                except asyncio.CancelledError:
+                    # Latch a mid-sweep cancel but finish sweeping every sibling owner (else its bridge/flock leaks);
+                    # session release + stream teardown below still run once, then re-raise before return.
+                    sweep_cancelled = True
+
         release_complete = True
         if browser_session_id and not streams_active:
             if organization_id:
@@ -1592,10 +1649,39 @@ class RealBrowserManager(BrowserManager):
         if not streams_active and release_complete:
             complete_stream_teardown(workflow_run_id)
 
+        if sweep_cancelled:
+            raise asyncio.CancelledError()
         return BrowserCleanupResult(
             browser_state=browser_state_to_close,
             recording_finalized=recording_finalized,
         )
+
+    async def _finalize_deferred_display_recording(
+        self, browser_state: BrowserState, workflow_run_id: str, task_ids: list[str]
+    ) -> None:
+        """Finalize this run's whole-display recorder when its browser close is deferred for an active stream.
+
+        Stops the recorder so the MP4 is complete/uploadable, but KEEPS the display reserved to this owner:
+        the browser is still mapped on the shared display, so freeing it now would let a later different-owner
+        run acquire the display and capture this tenant's window. The reservation is released only when the
+        deferred browser is actually torn down (real_browser_state.close -> release_display_recorder) or at
+        process death. Gated on the workflow-tree-owned task set (workflow_run_id or one of its task_ids — a
+        task-created browser owns its recorder under the task id) so an inherited/shared browser never has a
+        sibling run's recording stopped out from under it. Best-effort and never raising (cancellation still
+        propagates, preserving cancellation ownership)."""
+        recorder = browser_state.browser_artifacts._display_recorder
+        if not isinstance(recorder, DisplayRecorder) or recorder.owner_id not in {workflow_run_id, *task_ids}:
+            return
+        try:
+            await recorder.finalize_keeping_reservation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning(
+                "Failed to finalize whole-display recording on deferred close",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
 
     async def get_or_create_for_script(
         self,
@@ -1713,6 +1799,9 @@ class RealBrowserManager(BrowserManager):
             LOG.warning("Failed to drop engine owner during script cleanup", script_id=script_id, exc_info=True)
 
         async def _reclaim() -> BrowserState | None:
+            # A session-backed script is released, not closed, so its browser stays mapped for reuse. Both the
+            # close and the recorder sweep gate on this, or the sweep would free the display flock under it.
+            effective_close = close_browser_on_completion and not browser_session_id
             browser_state_to_close = self.pages.pop(script_id, None)
             if browser_state_to_close:
                 if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
@@ -1723,8 +1812,6 @@ class RealBrowserManager(BrowserManager):
                     except Exception:
                         LOG.warning("Failed to stop tracing during script cleanup", script_id=script_id, exc_info=True)
                 try:
-                    # Persistent session survives cleanup for reuse: don't close its context/driver, only release.
-                    effective_close = close_browser_on_completion and not browser_session_id
                     await browser_state_to_close.close(
                         close_browser_on_completion=effective_close,
                         release_driver=False if browser_session_id else None,
@@ -1755,6 +1842,11 @@ class RealBrowserManager(BrowserManager):
                     self._discard_session_lease(script_id, session_lease)
             elif browser_session_id:
                 LOG.warning("Organization ID not specified, cannot release browser session", script_id=script_id)
+            # Whole-display recorder orphan sweep (shielded so a cancel cannot skip it and leak). Gated on
+            # EFFECTIVE close — a keep-open or session-backed script keeps its live recorder. The local MP4 is
+            # left under VIDEO_PATH; the terminal upload reads it after this returns, so unlinking here truncates.
+            if effective_close:
+                await stop_display_recorders_for_owner(script_id)
             return browser_state_to_close
 
         # Shield the page/trace/close/release reclamation as one unit: a caller cancellation (shutdown or

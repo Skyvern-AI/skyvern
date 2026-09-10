@@ -15,6 +15,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.utils.url_validators import is_allowed_local_browser_host, resolve_fetch_host_ips, validate_browser_host
 from skyvern.webeye.browser_errors import (
+    BrowserCdpAcquisitionError,
     BrowserCdpConnectionError,
     BrowserTargetClosedError,
     BrowserTimeoutError,
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
+
+_CDP_ACQUISITION_DIAGNOSTIC = "Browser driver failed during CDP connect to [remote browser endpoint]."
 
 _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
     "econnrefused",
@@ -94,6 +97,12 @@ def is_cdp_connection_error(exc: Exception, selection: BrowserEngineSelection | 
     return False
 
 
+def _is_selected_engine_error(exc: BaseException, selection: BrowserEngineSelection | None) -> bool:
+    if selection is not None:
+        return selection.is_engine_error(exc)
+    return isinstance(exc, PWError)
+
+
 # Patch this module alias in tests so shard-wide asyncio.sleep mocks do not leak call counts.
 _sleep = asyncio.sleep
 
@@ -143,10 +152,12 @@ async def connect_over_cdp_with_retry(
         max_attempts = 1
     address_validated = not validate_browser_address
     for attempt in range(1, max_attempts + 1):
+        connect_started = False
         try:
             if not address_validated:
                 await _validate_browser_address_host(browser_address)
                 address_validated = True
+            connect_started = True
             browser = await playwright.chromium.connect_over_cdp(browser_address, headers=headers)
             if attempt > 1:
                 LOG.info(
@@ -162,6 +173,8 @@ async def connect_over_cdp_with_retry(
             is_cdp_error = is_cdp_connection_error(e, selection)
             is_retryable_error = is_resolution_error or is_cdp_error
             if not is_retryable_error or attempt == max_attempts:
+                if not is_retryable_error and connect_started and _is_selected_engine_error(e, selection):
+                    raise BrowserCdpAcquisitionError(_CDP_ACQUISITION_DIAGNOSTIC) from None
                 if log_browser_address is not None:
                     error_type = BrowserCdpConnectionError if is_retryable_error else RuntimeError
                     raise error_type(f"CDP connection to {log_browser_address} failed ({type(e).__name__})") from None

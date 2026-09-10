@@ -169,6 +169,7 @@ from skyvern.forge.sdk.workflow.context_manager import (
     WorkflowRunContext,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
+    CodeBlockTemplateSyntaxError,
     CustomizedCodeException,
     CustomSMTPAuthenticationFailed,
     CustomSMTPConnectionFailed,
@@ -1011,6 +1012,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         workflow_run_block_id: str | None,
         organization_id: str | None,
+        can_continue_after_failure: bool = True,
     ) -> BlockResult:
         failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
         error_codes = self.get_failure_error_codes()
@@ -1032,6 +1034,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             error_codes=error_codes or None,
+            can_continue_after_failure=can_continue_after_failure,
         )
 
     async def build_block_result(
@@ -1048,6 +1051,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_next_block: str | None = None,
         error_codes: list[str] | None = None,
         is_synthetic_loop_failure: bool = False,
+        can_continue_after_failure: bool = True,
     ) -> BlockResult:
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
@@ -1095,6 +1099,7 @@ class Block(BaseModel, abc.ABC):
             status=status,
             workflow_run_block_id=workflow_run_block_id,
             is_synthetic_loop_failure=is_synthetic_loop_failure,
+            can_continue_after_failure=can_continue_after_failure,
         )
 
     async def get_or_create_browser_state(
@@ -2513,6 +2518,9 @@ class LoopBlockExecutedResult(BaseModel):
         """Last appended result is a loop-structural / safety-limit failure, not a child."""
         return bool(self.block_outputs) and self.block_outputs[-1].is_synthetic_loop_failure
 
+    def can_continue_after_failure(self) -> bool:
+        return not self.block_outputs or self.block_outputs[-1].can_continue_after_failure
+
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
             return False
@@ -2528,8 +2536,8 @@ class LoopBlockExecutedResult(BaseModel):
             return True
 
         # Swallow flags apply only on natural-completion paths whose last result
-        # is a real child failure; structural/safety synthetics must propagate.
-        if not self.natural_completion or self.is_synthetic_loop_failure():
+        # is a recoverable child failure; structural and deterministic failures propagate.
+        if not self.natural_completion or self.is_synthetic_loop_failure() or not last_ouput.can_continue_after_failure:
             return False
 
         if self.last_block.continue_on_failure:
@@ -2564,6 +2572,7 @@ class LoopBlockExecutedResult(BaseModel):
             and self.natural_completion
             and not self.is_canceled()
             and not self.is_synthetic_loop_failure()
+            and self.can_continue_after_failure()
         )
 
         if self.is_canceled():
@@ -3498,11 +3507,13 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if (
-                    not block_output.success
-                    and not loop_block.continue_on_failure
-                    and not loop_block.next_loop_on_failure
-                    and not self.next_loop_on_failure
+                if not block_output.success and (
+                    not block_output.can_continue_after_failure
+                    or (
+                        not loop_block.continue_on_failure
+                        and not loop_block.next_loop_on_failure
+                        and not self.next_loop_on_failure
+                    )
                 ):
                     LOG.info(
                         f"ForLoopBlock Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
@@ -3520,7 +3531,7 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if block_output.success or loop_block.continue_on_failure:
+                if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
                     if loop_block.block_type == BlockType.CONDITIONAL:
                         branch_metadata = (
@@ -3557,7 +3568,9 @@ class ForLoopBlock(Block):
                     block_idx += 1
                     continue
 
-                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                if block_output.can_continue_after_failure and (
+                    loop_block.next_loop_on_failure or self.next_loop_on_failure
+                ):
                     LOG.info(
                         f"ForLoopBlock Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
                         block_output_count=len(block_outputs),
@@ -3721,6 +3734,7 @@ class ForLoopBlock(Block):
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
 
 
@@ -4213,11 +4227,13 @@ class WhileLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if (
-                    not block_output.success
-                    and not loop_block.continue_on_failure
-                    and not loop_block.next_loop_on_failure
-                    and not self.next_loop_on_failure
+                if not block_output.success and (
+                    not block_output.can_continue_after_failure
+                    or (
+                        not loop_block.continue_on_failure
+                        and not loop_block.next_loop_on_failure
+                        and not self.next_loop_on_failure
+                    )
                 ):
                     LOG.info(
                         "WhileLoopBlock encountered a failure processing block, terminating early",
@@ -4235,7 +4251,7 @@ class WhileLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if block_output.success or loop_block.continue_on_failure:
+                if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
                     if loop_block.block_type == BlockType.CONDITIONAL:
                         branch_metadata = (
@@ -4272,7 +4288,9 @@ class WhileLoopBlock(Block):
                     block_idx += 1
                     continue
 
-                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                if block_output.can_continue_after_failure and (
+                    loop_block.next_loop_on_failure or self.next_loop_on_failure
+                ):
                     LOG.info(
                         "WhileLoopBlock child block failed but will continue to next iteration",
                         block_output_count=len(block_outputs),
@@ -4398,6 +4416,7 @@ class WhileLoopBlock(Block):
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
 
 
@@ -5112,6 +5131,13 @@ class CodeBlock(Block):
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt"})
 
+    def validate_code_template(self) -> None:
+        masked_code, _ = mask_jinja_in_python_comments(self.code)
+        try:
+            jinja_sandbox_env.from_string(masked_code)
+        except TemplateSyntaxError as exc:
+            raise CodeBlockTemplateSyntaxError(self.label, exc) from exc
+
     def _effective_error_code_mapping(self, workflow_run_context: WorkflowRunContext) -> dict[str, str]:
         return dict(self.error_code_mapping or {})
 
@@ -5406,6 +5432,7 @@ async def wrapper({default_args}):
                     workflow_run_block=workflow_run_block,
                     artifact_type=ArtifactType.RECORDING,
                     data=video_artifacts[idx].video_data,
+                    file_extension=video_artifacts[idx].video_file_extension,
                 )
         except Exception:
             LOG.warning(
@@ -7413,6 +7440,7 @@ async def wrapper({default_args}):
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
+                can_continue_after_failure=False,
             )
 
         # get all parameters into a dictionary
@@ -8904,6 +8932,29 @@ class TextPromptBlock(Block):
         )
 
 
+def _resolve_uploads_organization_id(organization_id: str | None) -> str:
+    if organization_id:
+        return organization_id
+    context = skyvern_context.current()
+    if context and context.organization_id:
+        return context.organization_id
+    raise ValueError("An organization is required to store a file in the managed uploads bucket")
+
+
+def _build_managed_uploads_uri(organization_id: str, workflow_run_id: str, file_name: str) -> str:
+    """Key the file under the organization prefix so per-org retention rules can match it.
+
+    Managed uploads are addressed by prefix: reads are authorized against
+    `{env}/{organization_id}/`, and a retention policy configured for an organization matches
+    that same prefix. A key written outside it matches no policy and is unreadable through
+    managed storage, with nothing failing either way. The date segment carries no meaning of
+    its own; it keeps this layout the same as the other managed-uploads writer's.
+    """
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    key = f"{settings.ENV}/{organization_id}/{today}/{workflow_run_id}/{file_name}"
+    return f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{key}"
+
+
 class DownloadToS3Block(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -8926,6 +8977,10 @@ class DownloadToS3Block(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.url = self.render_templatable_field("url", self.url, workflow_run_context)
+
+    @staticmethod
+    def _get_s3_uri(organization_id: str, workflow_run_id: str) -> str:
+        return _build_managed_uploads_uri(organization_id, workflow_run_id, str(uuid.uuid4()))
 
     async def _upload_file_to_s3(self, uri: str, file_path: str, cleanup_file: bool = True) -> None:
         try:
@@ -8973,6 +9028,10 @@ class DownloadToS3Block(Block):
                 organization_id,
             )
 
+        # Resolved before the download: a raise after it would strand the delete=False temp file,
+        # whose only cleanup is in the upload's finally.
+        uploads_organization_id = _resolve_uploads_organization_id(organization_id)
+
         try:
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
@@ -8985,7 +9044,7 @@ class DownloadToS3Block(Block):
 
         uri = None
         try:
-            uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}"
+            uri = self._get_s3_uri(uploads_organization_id, workflow_run_id)
             await self._upload_file_to_s3(uri, file_path, cleanup_file=not self.url.startswith("/"))
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
@@ -9029,10 +9088,8 @@ class UploadToS3Block(Block):
             self.path = self.render_templatable_field("path", self.path, workflow_run_context)
 
     @staticmethod
-    def _get_s3_uri(workflow_run_id: str, path: str) -> str:
-        s3_bucket = settings.AWS_S3_BUCKET_UPLOADS
-        s3_key = f"{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
-        return f"s3://{s3_bucket}/{s3_key}"
+    def _get_s3_uri(organization_id: str, workflow_run_id: str, path: str) -> str:
+        return _build_managed_uploads_uri(organization_id, workflow_run_id, f"{uuid.uuid4()}_{Path(path).name}")
 
     async def execute(
         self,
@@ -9089,6 +9146,7 @@ class UploadToS3Block(Block):
         if not os.path.exists(resolved_path):
             raise FileNotFoundError(f"UploadToS3Block File not found at path: {resolved_path}")
 
+        uploads_organization_id = _resolve_uploads_organization_id(organization_id)
         s3_uris = []
         try:
             client = self.get_async_aws_client()
@@ -9103,11 +9161,11 @@ class UploadToS3Block(Block):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
                     file_path = os.path.join(resolved_path, file)
-                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+                    s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
             else:
-                s3_uri = self._get_s3_uri(workflow_run_id, resolved_path)
+                s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, resolved_path)
                 s3_uris.append(s3_uri)
                 await client.upload_file_from_path(uri=s3_uri, file_path=resolved_path)
         except Exception as e:

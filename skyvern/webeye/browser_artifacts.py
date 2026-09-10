@@ -85,6 +85,15 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    local_display_recording_eligible: bool = False
+    # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
+    # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
+    _display_capture_sizes: tuple[tuple[int, int], tuple[int, int]] | None = PrivateAttr(default=None)
+    _display_recorder: object | None = PrivateAttr(default=None)
+    # The pre-context acquire seam stashes its DisplayRecorderAcquisition here so the shared consumer can set
+    # up ``started_display_recorder`` for the outer cleanup (release a newly-started recorder on a later
+    # context-creation failure; leave a reused/adopted one live). Object-typed to avoid a display_recorder import.
+    _display_recorder_acquisition: object | None = PrivateAttr(default=None)
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Protocol, get_args, runtime_checkable
 from opentelemetry import trace as otel_trace
 
 if TYPE_CHECKING:
+    from agents.memory import Session
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
@@ -4047,6 +4048,7 @@ async def _run_agent_loop_with_surface(
     output_guardrails: list[Any],
     allow_untested_retry: bool = False,
     is_fallback: bool = False,
+    session: Session | None = None,
 ) -> Any:
     # No model owns the attempt until setup completes and enforcement is ready to
     # enter the model loop. This also clears a prior model before fallback setup.
@@ -4079,7 +4081,9 @@ async def _run_agent_loop_with_surface(
         model=model_name,
         output_guardrails=output_guardrails,
     )
-    session = create_copilot_session(chat_id)
+    owns_session = session is None
+    if session is None:
+        session = create_copilot_session(chat_id)
     model_token = _copilot_model_name.set(model_name)
     tool_call_count_start = ctx.tool_calls_this_turn
     try:
@@ -4191,7 +4195,8 @@ async def _run_agent_loop_with_surface(
             return result
     finally:
         _copilot_model_name.reset(model_token)
-        session.close()
+        if owns_session:
+            session.close()
 
 
 def _build_request_policy_clarification_result(
@@ -5277,6 +5282,7 @@ async def _run_copilot_turn_impl(
         )
 
     chat_id = chat_request.workflow_copilot_chat_id or chat_request.workflow_permanent_id
+    model_session: Session | None = None
 
     async def _run_attempt(
         attempt_model_name: str,
@@ -5289,7 +5295,7 @@ async def _run_copilot_turn_impl(
             ctx=ctx,
             stream=stream,
             chat_id=chat_id,
-            initial_input=initial_input,
+            initial_input=[] if is_fallback else initial_input,
             system_prompt=system_prompt,
             model_name=attempt_model_name,
             run_config=attempt_run_config,
@@ -5301,10 +5307,14 @@ async def _run_copilot_turn_impl(
             output_guardrails=output_guardrails,
             allow_untested_retry=ctx.allow_untested_workflow_draft,
             is_fallback=is_fallback,
+            session=model_session,
         )
         return attempt
 
     try:
+        from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
+
+        model_session = create_copilot_session(chat_id)
         with trace_context:
             try:
                 try:
@@ -5426,3 +5436,6 @@ async def _run_copilot_turn_impl(
             error=e,
             workflow_permanent_id=chat_request.workflow_permanent_id,
         )
+    finally:
+        if model_session is not None:
+            model_session.close()

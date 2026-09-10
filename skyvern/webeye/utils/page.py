@@ -628,18 +628,19 @@ async def _wait_for_screenshot_load_state(
     timeout_ms: float,
     engine_selection: BrowserEngineSelection | None = None,
 ) -> None:
-    # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
-    # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
-    # persistent spinner may never fire 'load', so a timeout here must be
-    # non-fatal — the capture has its own (separate) timeout budget.
+    # Best-effort readiness guard before capturing. Waiting for 'load' (rather than the
+    # earlier 'domcontentloaded') lets late subresources settle before capture; but pages
+    # with streaming/long-polling/SSE/websockets or a persistent spinner may never fire
+    # 'load', so a timeout here must stay non-fatal — the capture has its own (separate)
+    # timeout budget.
     if timeout_ms <= 0:
         return
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_load_state("load", timeout=timeout_ms)
     except Exception as exc:
         if not _is_engine_error(exc, engine_selection):
             raise
-        LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
+        LOG.warning("Page did not reach load before screenshot; capturing current state anyway")
 
 
 def _is_screenshot_target_closed(

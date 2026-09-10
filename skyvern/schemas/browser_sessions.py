@@ -130,6 +130,14 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
         default=False,
         description="When true, synthesize deterministic code blocks from the recording instead of agent blocks.",
     )
+    supports_credential_tokens: bool = Field(
+        default=False,
+        description=(
+            "Whether the caller substitutes credential tokens in a code block's code. A frontend that "
+            "does not would save the renamed parameters beside code still reading the token, which fails "
+            "at run time; recorded credentials stay unbound for those callers."
+        ),
+    )
 
 
 class ProcessBrowserSessionRecordingResponse(BaseModel):

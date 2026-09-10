@@ -1912,6 +1912,9 @@ def synthesize_code_block(
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
     emit_read_return: bool = True,
+    # Recordings can bind a `secret` credential, whose single value field is not a login field;
+    # copilot's own gating sets stay untouched by passing the wider set only from that caller.
+    allowed_credential_fields: AbstractSet[str] = _CREDENTIAL_FIELDS,
     _segment_pass: bool = False,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
@@ -2612,7 +2615,7 @@ def synthesize_code_block(
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
             credential_field = str(interaction.get("credential_field") or "").strip()
-            if not credential_id or credential_field not in _CREDENTIAL_FIELDS:
+            if not credential_id or credential_field not in allowed_credential_fields:
                 notes.append("dropped a credential fill with no usable credential reference")
                 diagnostics.dropped_interactions.append(
                     {
@@ -2825,6 +2828,7 @@ def synthesize_code_block(
                 parameter_binding_snapshot=parameter_binding_snapshot,
                 file_match_transform=file_match_transform if segment_download_target is not None else None,
                 emit_read_return=emit_read_return,
+                allowed_credential_fields=allowed_credential_fields,
                 _segment_pass=True,
             )
             if segment is None or not segment.diagnostics.emitted_interaction_count:

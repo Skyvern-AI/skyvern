@@ -51,7 +51,11 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/workflow/copilot/credential-response",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
 }
-_SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
+_SENSITIVE_ENDPOINT_PATTERNS = (
+    re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
+    re.compile(r"^[^ ]+ /mcp(?:/.*)?$", re.DOTALL),
+)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;

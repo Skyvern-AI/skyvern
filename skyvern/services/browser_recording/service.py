@@ -875,6 +875,7 @@ class Processor:
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
         code_first: bool = False,
+        supports_credential_tokens: bool = False,
     ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem]]:
         """
         Process the compressed browser session recording into workflow definition blocks.
@@ -884,7 +885,9 @@ class Processor:
             # draft steps carry no locators and act only as an edit overlay.
             events = self.compressed_chunks_to_events(compressed_chunks)
             actions = self.events_to_actions(events)
-            code_first_result = actions_to_code_first_blocks(actions, draft_steps)
+            code_first_result = actions_to_code_first_blocks(
+                actions, draft_steps, bind_credentials=supports_credential_tokens
+            )
             if code_first_result is not None:
                 code_blocks, code_parameters = code_first_result
                 LOG.info(
@@ -936,6 +939,7 @@ class BrowserSessionRecordingService:
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
         code_first: bool = False,
+        supports_credential_tokens: bool = False,
     ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
@@ -946,7 +950,12 @@ class BrowserSessionRecordingService:
             workflow_permanent_id,
         )
 
-        return await processor.process(compressed_chunks, draft_steps=draft_steps, code_first=code_first)
+        return await processor.process(
+            compressed_chunks,
+            draft_steps=draft_steps,
+            code_first=code_first,
+            supports_credential_tokens=supports_credential_tokens,
+        )
 
 
 async def smoke() -> None:

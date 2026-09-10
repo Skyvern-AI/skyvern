@@ -573,6 +573,14 @@ def _normalized_select_shadow_field(text: str | None) -> str | None:
     return _truncate_select_shadow_field(_normalize_select_shadow_text(text))
 
 
+def _collapse_select_shadow_field(text: str | None) -> str | None:
+    # Collapse whitespace runs before the length cap so a padded option row's identity (name + digits)
+    # survives truncation instead of the padding consuming it; case and punctuation are preserved verbatim.
+    if text is None:
+        return None
+    return _truncate_select_shadow_field(" ".join(text.split()))
+
+
 class SelectShadowAgreement(BaseModel):
     agrees: bool | None
     llm_index: int | None = None
@@ -737,8 +745,8 @@ def _autocomplete_commit_evidence(
         return None
     if not _is_boundary_fragment(normalized_post, normalized_label):
         return None
-    committed_option = _truncate_select_shadow_field(option_label)
-    committed_value = _truncate_select_shadow_field(post_value)
+    committed_option = _collapse_select_shadow_field(option_label)
+    committed_value = _collapse_select_shadow_field(post_value)
     if not committed_option or not committed_value:
         return None
     return committed_option, committed_value
@@ -7068,8 +7076,8 @@ def _ui_select_commit_result(
 
         def _accept(observed: object) -> ActionResult:
             result = ActionSuccess(
-                committed_option=_truncate_select_shadow_field(candidate),
-                committed_value=_truncate_select_shadow_field(str(observed)),
+                committed_option=_collapse_select_shadow_field(candidate),
+                committed_value=_collapse_select_shadow_field(str(observed)),
             )
             action.set_has_mini_agent()
             if action.stop_batch_after_dropdown_select:

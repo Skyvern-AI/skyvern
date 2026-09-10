@@ -543,6 +543,9 @@ class BlockResult:
     # missing block label) so callers can distinguish them from real child-block
     # results. Set explicitly at the synthetic construction sites in loop helpers.
     is_synthetic_loop_failure: bool = False
+    # False when retry/continuation cannot change the outcome, such as invalid
+    # CodeBlock source that fails before execution.
+    can_continue_after_failure: bool = True
 
 
 class FileType(StrEnum):

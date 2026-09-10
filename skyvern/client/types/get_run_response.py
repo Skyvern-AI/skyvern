@@ -84,6 +84,40 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class GetRunResponse_TaskV3(UniversalBaseModel):
+    run_type: typing.Literal["task_v3"] = "task_v3"
+    run_id: str
+    status: RunStatus
+    output: typing.Optional[TaskRunResponseOutput] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
+    screenshot_urls: typing.Optional[typing.List[str]] = None
+    failure_reason: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    queued_at: typing.Optional[dt.datetime] = None
+    started_at: typing.Optional[dt.datetime] = None
+    finished_at: typing.Optional[dt.datetime] = None
+    app_url: typing.Optional[str] = None
+    browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
+    max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class GetRunResponse_OpenaiCua(UniversalBaseModel):
     run_type: typing.Literal["openai_cua"] = "openai_cua"
     run_id: str
@@ -260,6 +294,7 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
 GetRunResponse = typing.Union[
     GetRunResponse_TaskV1,
     GetRunResponse_TaskV2,
+    GetRunResponse_TaskV3,
     GetRunResponse_OpenaiCua,
     GetRunResponse_AnthropicCua,
     GetRunResponse_UiTars,

@@ -55,7 +55,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.webeye.browser_errors import (
+    BrowserCdpAcquisitionError,
+    BrowserCdpConnectionError,
+    BrowserTargetClosedError,
+)
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 
@@ -1635,6 +1639,14 @@ async def verify_build_test_browser_session_by_attaching(
         retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
             BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
+        )
+    except BrowserCdpAcquisitionError as exc:
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id=examined_session_id,
+                diagnostic=str(exc),
+            )
         )
     except BrowserCdpConnectionError:
         # A failed attach does not prove the remote session is dead; keep its id as

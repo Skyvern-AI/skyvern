@@ -64,7 +64,6 @@ class ExfiltrationChannel(CdpChannel):
     """
 
     BINDING_NAME: t.ClassVar[str] = "__skyvern_exfiltrate_event"
-    CONSOLE_DEDUP_TTL_SECONDS: t.ClassVar[float] = 5.0
     REFRESH_INTERVAL_SECONDS: t.ClassVar[float] = 1.0
     # Tighter than the re-injection refresh so a navigation destroys few queued events.
     QUEUE_DRAIN_INTERVAL_SECONDS: t.ClassVar[float] = 0.25
@@ -101,7 +100,6 @@ class ExfiltrationChannel(CdpChannel):
         self.cdp_session: CDPSession | None = None
         self.on_event = on_event
         self._page_console_captures: weakref.WeakKeyDictionary[Page, PageConsoleCapture] = weakref.WeakKeyDictionary()
-        self._recent_console_event_fingerprints: dict[str, float] = {}
         self._seen_event_dedup_keys: dict[tuple[str, int], None] = {}
         self._pending_event_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task | None = None
@@ -202,39 +200,6 @@ class ExfiltrationChannel(CdpChannel):
 
         return arg
 
-    def _prune_console_dedup_cache(self, now: float) -> None:
-        expired = [
-            fingerprint
-            for fingerprint, emitted_at in self._recent_console_event_fingerprints.items()
-            if now - emitted_at > self.CONSOLE_DEDUP_TTL_SECONDS
-        ]
-        for fingerprint in expired:
-            self._recent_console_event_fingerprints.pop(fingerprint, None)
-
-    # Excluded from the fingerprint: advances by ms when one interaction is re-captured across a reconnect.
-    _CONSOLE_FINGERPRINT_VOLATILE_KEYS: t.ClassVar[frozenset[str]] = frozenset({"timestamp"})
-
-    def _console_fingerprint(self, event_data: dict[str, t.Any]) -> str:
-        # Drop None values (recursively) as well as volatile keys: the binding,
-        # Playwright-console, and raw-CDP transports materialize the same event
-        # with None-vs-absent differences (JSON.stringify drops undefined keys;
-        # the binding serializes them to null), which otherwise defeats dedup.
-        stable = self._strip_none(
-            {k: v for k, v in event_data.items() if k not in self._CONSOLE_FINGERPRINT_VOLATILE_KEYS}
-        )
-        try:
-            return json.dumps(stable, sort_keys=True, separators=(",", ":"))
-        except TypeError:
-            return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
-
-    @classmethod
-    def _strip_none(cls, value: t.Any) -> t.Any:
-        if isinstance(value, dict):
-            return {k: cls._strip_none(v) for k, v in value.items() if v is not None}
-        if isinstance(value, list):
-            return [cls._strip_none(item) for item in value]
-        return value
-
     def _event_dedup_key(self, event_data: dict[str, t.Any]) -> tuple[str, int] | None:
         doc_id = event_data.get("exfilDocId")
         seq = event_data.get("exfilSeq")
@@ -244,25 +209,15 @@ class ExfiltrationChannel(CdpChannel):
         return None
 
     def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
-        # Stamped events dedup exactly across transports; the fingerprint heuristic below is only for unstamped (older in-flight) events.
         dedup_key = self._event_dedup_key(event_data)
-        if dedup_key is not None:
-            if dedup_key in self._seen_event_dedup_keys:
-                return False
-            self._seen_event_dedup_keys[dedup_key] = None
-            while len(self._seen_event_dedup_keys) > self.SEEN_EVENT_DEDUP_KEY_LIMIT:
-                self._seen_event_dedup_keys.pop(next(iter(self._seen_event_dedup_keys)))
+        if dedup_key is None:
             return True
 
-        fingerprint = self._console_fingerprint(event_data)
-
-        now = time.monotonic()
-        self._prune_console_dedup_cache(now)
-        previous = self._recent_console_event_fingerprints.get(fingerprint)
-        if previous is not None and now - previous <= self.CONSOLE_DEDUP_TTL_SECONDS:
+        if dedup_key in self._seen_event_dedup_keys:
             return False
-
-        self._recent_console_event_fingerprints[fingerprint] = now
+        self._seen_event_dedup_keys[dedup_key] = None
+        while len(self._seen_event_dedup_keys) > self.SEEN_EVENT_DEDUP_KEY_LIMIT:
+            self._seen_event_dedup_keys.pop(next(iter(self._seen_event_dedup_keys)))
         return True
 
     def _emit_console_event(self, event_data: dict[str, t.Any], capture_seq: int) -> None:
@@ -887,7 +842,6 @@ class ExfiltrationChannel(CdpChannel):
 
                 await self.undecorate(page)
 
-            self._recent_console_event_fingerprints.clear()
         finally:
             # Release the dedicated Playwright driver + browser graph even if page-level
             # cleanup above raised on an already-dead page. _closing keeps this close()

@@ -1352,6 +1352,7 @@ async def _commit_staged_workflow(
         sequential_key=staged_workflow.sequential_key,
         edited_by="copilot",
         preserve_completion_contract=not clear_persisted_completion_contract,
+        validate_code_block_templates=False,
     )
 
 
@@ -1410,6 +1411,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         created_by=original_workflow.created_by,
         edited_by=original_workflow.edited_by,
         preserve_completion_contract=False,
+        validate_code_block_templates=False,
     )
 
 
@@ -2848,6 +2850,7 @@ async def workflow_copilot_apply_proposed_workflow(
         request=yaml_request,
         workflow_permanent_id=chat.workflow_permanent_id,
         edited_by="copilot",
+        validate_code_block_templates=False,
     )
 
     try:

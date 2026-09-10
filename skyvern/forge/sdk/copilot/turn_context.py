@@ -295,10 +295,8 @@ class TurnContextAssembler:
             return None
         labels_csv = ", ".join(labels)
         summary = (
-            "A prior turn proposed a workflow draft that was never committed to the canvas, so the"
-            " CURRENT WORKFLOW YAML above is empty. The user is asking to run/re-test that draft. To"
-            " run it, call run_blocks_and_collect_debug with these block labels: "
-            f"{labels_csv}. Do not call update_and_run_blocks and do not ask the user to rebuild it."
+            "A prior turn produced an uncommitted workflow draft. It is not the current canvas workflow. "
+            f"The draft remains runnable by its top-level block labels: {labels_csv}."
         )
         return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
 
