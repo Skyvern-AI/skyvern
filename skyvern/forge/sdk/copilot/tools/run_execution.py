@@ -5141,11 +5141,16 @@ def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, An
         _carry_prior_attempt_change_identity_into_result(copilot_ctx, data, tool_name)
         return
     this_run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    # Clearance compares block signatures, so it needs the authored bytes the signature was taken
+    # from: only the snapshot's own yaml, never _RunExecution's re-serialized fallback, whose
+    # model dump drops authoring-only fields and reads as a changed signature.
+    execution = result.execution if isinstance(result, _ExecutionResult) else None
+    executed_workflow_yaml = execution.snapshot.workflow_yaml if execution is not None else None
     unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
         copilot_ctx,
-        reported_workflow_yaml=copilot_ctx.persisted_workflow_yaml,
+        reported_workflow_yaml=executed_workflow_yaml or copilot_ctx.persisted_workflow_yaml,
         pending_later_run_id=this_run_id if isinstance(this_run_id, str) else None,
-        reported_workflow_is_persisted=True,
+        reported_workflow_is_persisted=executed_workflow_yaml is None,
     )
     # This seam is load-bearing for repair: a failure it fails to carry is one the model decides
     # without. One bounded event per successful hand-back, so a miss is attributable rather than

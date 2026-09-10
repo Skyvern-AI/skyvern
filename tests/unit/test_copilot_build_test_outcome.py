@@ -92,7 +92,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
@@ -5594,6 +5594,145 @@ def test_the_tool_result_and_the_terminal_agree_once_the_executed_snapshot_clear
     assert terminal.turn_outcome.unresolved_runtime_failure is None
     assert terminal.narrative_payload is not None
     assert terminal.narrative_payload["terminalMessage"] == "Built it and tested it."
+
+
+# Hand-backs whose logs carry the reported ordering: the run being reported has not reached the
+# history yet, and no workflow is saved.
+_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS = (
+    "wr_570538698832229610",
+    "wr_570540378164441128",
+    "wr_570559591083343744",
+    "wr_570559917500856932",
+    "wr_570560299752946268",
+)
+
+
+def _executed_run_result(
+    workflow_run_id: str, executed_workflow_yaml: str, snapshot_workflow_yaml: str | None = ""
+) -> dict[str, Any]:
+    """A hand-back shaped like the run path's: it carries the snapshot the run dispatched.
+
+    ``snapshot_workflow_yaml`` defaults to the executed text; pass None for the snapshots that
+    carry no authored bytes, where _RunExecution falls back to a re-serialized definition."""
+    now = datetime.now(UTC)
+    workflow = Workflow(
+        workflow_id="wf_test",
+        organization_id="org_test",
+        title="Test",
+        workflow_permanent_id="wpid_test",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        created_at=now,
+        modified_at=now,
+    )
+    execution = run_execution_module._RunExecution(
+        snapshot=run_execution_module.CopilotExecutionSnapshot(
+            provenance="staged",
+            workflow=workflow,
+            workflow_parameters=(),
+            output_parameters=(),
+            workflow_yaml=executed_workflow_yaml if snapshot_workflow_yaml == "" else snapshot_workflow_yaml,
+        ),
+        workflow_yaml=executed_workflow_yaml,
+        metadata={},
+        associations={},
+        source_at_start=None,
+        unbound_keys=[],
+        explicit_blank=False,
+    )
+    return run_execution_module._ExecutionResult(
+        {"ok": True, "data": {"workflow_run_id": workflow_run_id, "overall_status": "completed"}},
+        execution,
+    )
+
+
+def _never_saved_draft_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx(workflow_yaml=two_page_login_yaml())
+    ctx.persisted_workflow_yaml = None
+    ctx.staged_workflow_yaml = two_page_login_yaml()
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    return ctx
+
+
+def test_a_run_reports_the_snapshot_it_executed_when_nothing_is_saved() -> None:
+    """Nothing is saved, so the snapshot the run executed is the only candidate the failure can be
+    read against; reading persistence here reports a repaired run as having no candidate at all."""
+    ctx = _never_saved_draft_ctx()
+    result = _executed_run_result(
+        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[0], two_page_login_yaml(submit_selector="Continue")
+    )
+
+    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
+
+    assert "unresolved_earlier_failure" not in result["data"]
+    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == ["wr_1"]
+
+
+def test_a_run_that_executed_the_unrepaired_snapshot_carries_the_older_run_id() -> None:
+    ctx = _never_saved_draft_ctx()
+    result = _executed_run_result(_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[1], two_page_login_yaml())
+
+    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
+
+    carried = result["data"]["unresolved_earlier_failure"]
+    assert carried["workflow_run_id"] == "wr_1"
+    assert carried["workflow_run_id"] != result["data"]["workflow_run_id"]
+    assert carried["block_label"] == "sign_in_and_read"
+
+
+def test_a_repair_staged_after_the_run_cannot_clear_the_snapshot_that_ran() -> None:
+    """A proposal staged between the run and the hand-back was never executed, so crediting it
+    would clear a failure on the strength of code no run has tried."""
+    ctx = _never_saved_draft_ctx()
+    result = _executed_run_result(_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[2], two_page_login_yaml())
+    ctx.staged_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
+
+    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
+
+    assert result["data"]["unresolved_earlier_failure"]["workflow_run_id"] == "wr_1"
+
+
+def test_a_snapshot_without_authored_bytes_is_not_compared_against_a_re_serialization() -> None:
+    """Signatures are taken from authored yaml. A re-serialized definition drops authoring-only
+    fields, so comparing it would read every block as changed and clear the failure."""
+    ctx = _never_saved_draft_ctx()
+    result = _executed_run_result(
+        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[0],
+        two_page_login_yaml(submit_selector="Continue"),
+        snapshot_workflow_yaml=None,
+    )
+
+    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "run_blocks_and_collect_debug")
+
+    assert result["data"]["unresolved_earlier_failure"]["workflow_run_id"] == "wr_1"
+
+
+def test_the_terminal_judges_the_saved_workflow_while_the_run_reports_the_snapshot_that_ran() -> None:
+    ctx = make_copilot_ctx(workflow_yaml=two_page_login_yaml())
+    ctx.persisted_workflow_yaml = two_page_login_yaml()
+    ctx.staged_workflow_yaml = two_page_login_yaml()
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, _executing_run("wr_2", ["sign_in_and_read"]))
+    result = _executed_run_result(
+        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[3], two_page_login_yaml(submit_selector="Continue")
+    )
+
+    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
+    terminal = _make_agent_result(
+        ctx,
+        user_response="Built it and tested it.",
+        updated_workflow=object(),
+        global_llm_context=None,
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
+        narrative_payload={"terminalMessage": "Built it and tested it.", "narrativeSummary": "Built it and tested it."},
+    )
+
+    assert "unresolved_earlier_failure" not in result["data"]
+    assert terminal.turn_outcome is not None
+    assert terminal.turn_outcome.unresolved_runtime_failure == UnresolvedRuntimeFailure(
+        workflow_run_id="wr_1", block_label="sign_in_and_read"
+    )
 
 
 def _many_literal_selectors_yaml(selector_count: int) -> str:

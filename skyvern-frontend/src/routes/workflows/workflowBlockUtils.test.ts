@@ -5,6 +5,7 @@ import {
   describeRecordedAction,
   findCodeStepForLine,
   getCodeStepPlainText,
+  taskV3CallText,
   visitWorkflowBlocks,
 } from "./workflowBlockUtils";
 import type { ActionsApiResponse } from "@/api/types";
@@ -330,5 +331,27 @@ describe("describeRecordedAction", () => {
         null,
       ),
     ).toBe("Download invoice.pdf");
+  });
+});
+
+describe("taskV3CallText", () => {
+  it("returns the tool call a Task V3 action row was stamped with", () => {
+    expect(taskV3CallText("task_v3 click #sign-in")).toBe("click #sign-in");
+  });
+
+  it("keeps a selector that contains spaces whole", () => {
+    expect(taskV3CallText('task_v3 click [data-tv3="7"] button')).toBe(
+      'click [data-tv3="7"] button',
+    );
+  });
+
+  it("returns the bare tool name when the call carried no argument", () => {
+    expect(taskV3CallText("task_v3 scroll")).toBe("scroll");
+  });
+
+  it("ignores descriptions that are not Task V3 tool calls", () => {
+    expect(taskV3CallText("locator.click #sign-in")).toBeNull();
+    expect(taskV3CallText("Click the sign-in button")).toBeNull();
+    expect(taskV3CallText(null)).toBeNull();
   });
 });
