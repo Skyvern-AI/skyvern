@@ -1389,6 +1389,31 @@ describe("RunView failure presentation", () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
+  test("an input reassembly memory limit offers a retry instead of a copilot fix", () => {
+    seedFailedCodeRun(
+      "CodeBlock inputs exhausted the sandbox memory limit before the block started.",
+      "parameter_reassembly_memory_limit_exceeded",
+    );
+    const { getByTestId } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
+    const line = within(getByTestId("run-failure-line"));
+
+    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
+    expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
+  });
+
+  test("a code memory limit still offers a copilot fix", () => {
+    seedFailedCodeRun(
+      "CodeBlock exceeded the configured memory limit.",
+      "memory_limit_exceeded",
+    );
+    const { getByTestId } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
+    const line = within(getByTestId("run-failure-line"));
+
+    expect(
+      line.getByRole("button", { name: "Fix with Copilot" }),
+    ).not.toBeNull();
+  });
+
   test("a code block that continued on failure does not retitle the line", () => {
     seedCompletedRun({
       status: Status.Failed,

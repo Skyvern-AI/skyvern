@@ -100,6 +100,32 @@ describe("describeCodeBlockFailure", () => {
     ).toMatchObject({ kind: "infrastructure", recovery: "retry" });
   });
 
+  test("treats an input reassembly memory limit as a retry, not a code fix", () => {
+    expect(
+      describeCodeBlockFailure(
+        block({ error_codes: ["parameter_reassembly_memory_limit_exceeded"] }),
+      ),
+    ).toMatchObject({
+      kind: "infrastructure",
+      code: "parameter_reassembly_memory_limit_exceeded",
+      recovery: "retry",
+      guidance: expect.stringContaining("earlier block pass in less data"),
+    });
+  });
+
+  test("keeps a code memory limit repairable", () => {
+    expect(
+      describeCodeBlockFailure(
+        block({ error_codes: ["memory_limit_exceeded"] }),
+      ),
+    ).toMatchObject({
+      kind: "limit",
+      code: "memory_limit_exceeded",
+      recovery: "fix",
+      guidance: expect.stringContaining("Process data in smaller batches"),
+    });
+  });
+
   test("names the exception and line for a user code error", () => {
     const failure = describeCodeBlockFailure(
       block({
