@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from playwright._impl._errors import Error as PlaywrightError
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import (
+    _DOM_UTILS_MISSING_RESULT_KEY,
     JS_FUNCTION_DEFS,
     SkyvernFrame,
     _is_navigation_context_lost,
     _wait_for_navigation_settle,
+    with_dom_utils,
 )
 
 
@@ -25,7 +27,7 @@ class TestIsNavigationContextLost:
         )
 
     def test_reference_error_not_defined(self) -> None:
-        assert _is_navigation_context_lost("Page.evaluate: ReferenceError: scrollToXY is not defined") is True
+        assert _is_navigation_context_lost("Page.evaluate: ReferenceError: scrollToXY is not defined") is False
 
     def test_missing_protocol_context(self) -> None:
         assert (
@@ -71,10 +73,6 @@ class TestWaitForNavigationSettle:
 
 def _context_destroyed_error() -> PlaywrightError:
     return PlaywrightError("Page.evaluate: Execution context was destroyed, most likely because of a navigation.")
-
-
-def _reference_error() -> PlaywrightError:
-    return PlaywrightError("Page.evaluate: ReferenceError: scrollToXY is not defined")
 
 
 class TestEvaluateWithNavigationRecovery:
@@ -138,19 +136,19 @@ class TestEvaluateWithNavigationRecovery:
         assert result == 42
 
     @pytest.mark.asyncio
-    async def test_recovers_after_reference_error(self) -> None:
+    @pytest.mark.parametrize("error_type", [PlaywrightError, RuntimeError])
+    async def test_reference_error_propagates_without_recovery(self, error_type: type[Exception]) -> None:
         frame = AsyncMock()
-        frame.evaluate = AsyncMock(
-            side_effect=[
-                _reference_error(),
-                None,
-                "ok",
-            ]
-        )
+        source_error = error_type("Page.evaluate: ReferenceError: pageOwnedMissingValue is not defined")
+        frame.evaluate = AsyncMock(side_effect=source_error)
         frame.wait_for_load_state = AsyncMock()
 
-        result = await SkyvernFrame.evaluate(frame=frame, expression="() => getScrollXY()", timeout_ms=30000)
-        assert result == "ok"
+        with pytest.raises(error_type) as exc_info:
+            await SkyvernFrame.evaluate(frame=frame, expression="() => getScrollXY()", timeout_ms=30000)
+
+        assert exc_info.value is source_error
+        frame.evaluate.assert_awaited_once_with(expression="() => getScrollXY()", arg=None)
+        frame.wait_for_load_state.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_fails_after_max_attempts_exhausted(self) -> None:
@@ -239,24 +237,26 @@ class TestGetElementVisible:
         frame.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_missing_helpers_reinjects_and_reresolves(self) -> None:
+    async def test_missing_helpers_propagates_without_recovery(self) -> None:
         frame = AsyncMock()
         frame.evaluate = AsyncMock(return_value=None)
         frame.wait_for_load_state = AsyncMock()
         locator = AsyncMock()
         locator.count = AsyncMock(return_value=1)
-        locator.evaluate = AsyncMock(
-            side_effect=[
-                PlaywrightError("Locator.evaluate: ReferenceError: isElementVisible is not defined"),
-                True,
-            ]
+        source_error = PlaywrightError("Locator.evaluate: ReferenceError: isElementVisible is not defined")
+        locator.evaluate = AsyncMock(side_effect=source_error)
+
+        with pytest.raises(PlaywrightError) as exc_info:
+            await SkyvernFrame(frame).get_element_visible(locator)
+
+        assert exc_info.value is source_error
+        locator.evaluate.assert_awaited_once_with(
+            with_dom_utils(
+                "(element) => isElementVisible(element) && !isHidden(element)", ("isElementVisible", "isHidden")
+            )
         )
-
-        result = await SkyvernFrame(frame).get_element_visible(locator)
-
-        assert result is True
-        assert locator.evaluate.await_count == 2
-        frame.evaluate.assert_awaited_once()
+        frame.evaluate.assert_not_awaited()
+        frame.wait_for_load_state.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_uses_locator_evaluation_instead_of_stale_handle_marshalling(self) -> None:
@@ -273,7 +273,11 @@ class TestGetElementVisible:
         result = await SkyvernFrame(frame).get_element_visible(locator)
 
         assert result is True
-        locator.evaluate.assert_awaited_once_with("(element) => isElementVisible(element) && !isHidden(element)")
+        locator.evaluate.assert_awaited_once_with(
+            with_dom_utils(
+                "(element) => isElementVisible(element) && !isHidden(element)", ("isElementVisible", "isHidden")
+            )
+        )
         frame.evaluate.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -287,3 +291,76 @@ class TestGetElementVisible:
         assert result is False
         locator.evaluate.assert_not_awaited()
         frame.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failures",
+    [
+        [asyncio.TimeoutError()],
+        [_context_destroyed_error(), asyncio.TimeoutError()],
+        [_context_destroyed_error(), None, asyncio.TimeoutError()],
+    ],
+)
+async def test_large_helper_expression_is_bounded_in_timeout_logs(failures, monkeypatch):
+    from skyvern.webeye.utils import page as page_utils
+
+    warning = MagicMock()
+    monkeypatch.setattr(page_utils.LOG, "warning", warning)
+    frame = AsyncMock()
+    frame.evaluate.side_effect = failures
+    expression = "x" * 135000
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await SkyvernFrame.evaluate(frame=frame, expression=expression)
+    logged = [call.kwargs["expression"] for call in warning.call_args_list if "expression" in call.kwargs]
+    assert logged
+    assert all(value == expression[:200] for value in logged)
+
+
+@pytest.mark.asyncio
+async def test_builtin_operation_ships_bundle_only_after_guard_reports_missing_helpers() -> None:
+    frame = AsyncMock()
+    frame.evaluate.side_effect = [
+        {_DOM_UTILS_MISSING_RESULT_KEY: True},
+        None,
+        [11, 22],
+    ]
+
+    assert await SkyvernFrame(frame).get_scroll_x_y() == [11, 22]
+
+    calls = frame.evaluate.await_args_list
+    guarded_expression = calls[0].kwargs["expression"]
+    assert JS_FUNCTION_DEFS not in guarded_expression
+    assert calls[1].kwargs == {"expression": JS_FUNCTION_DEFS, "arg": None}
+    assert calls[2].kwargs["expression"] == guarded_expression
+
+
+@pytest.mark.asyncio
+async def test_builtin_operation_warm_path_uses_one_small_dispatch() -> None:
+    frame = AsyncMock()
+    frame.evaluate.return_value = [11, 22]
+
+    assert await SkyvernFrame(frame).get_scroll_x_y() == [11, 22]
+
+    frame.evaluate.assert_awaited_once()
+    assert JS_FUNCTION_DEFS not in frame.evaluate.await_args.kwargs["expression"]
+
+
+@pytest.mark.asyncio
+async def test_cold_locator_bootstraps_through_locator_evaluation() -> None:
+    frame = AsyncMock()
+    locator = AsyncMock()
+    locator.count.return_value = 1
+    locator.evaluate.side_effect = [
+        {_DOM_UTILS_MISSING_RESULT_KEY: True},
+        None,
+        True,
+    ]
+
+    assert await SkyvernFrame(frame).get_element_visible(locator) is True
+
+    assert locator.evaluate.await_count == 3
+    assert JS_FUNCTION_DEFS not in locator.evaluate.await_args_list[0].args[0]
+    assert JS_FUNCTION_DEFS in locator.evaluate.await_args_list[1].args[0]
+    assert locator.evaluate.await_args_list[2].args[0] == locator.evaluate.await_args_list[0].args[0]
+    frame.evaluate.assert_not_awaited()
