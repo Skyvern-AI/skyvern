@@ -62,6 +62,10 @@ class BrowserTargetClosedError(BrowserAutomationError):
     """The target page, frame, context, or browser was closed underneath an operation."""
 
 
+class BrowserCdpAcquisitionError(BrowserAutomationError):
+    """A selected browser driver failed during the CDP connect invocation."""
+
+
 class BrowserCdpConnectionError(BrowserAutomationError):
     """A CDP/transport-level failure talking to the browser."""
 

@@ -20,6 +20,7 @@ class BuildTestConnectFailure(BaseModel):
     task_id: str | None = None
     browser_session_id: str | None = None
     occupier_run_id: str | None = None
+    diagnostic: str | None = None
     retry_action: Literal["test_end_to_end"] = "test_end_to_end"
 
 

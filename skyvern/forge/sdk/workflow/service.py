@@ -140,6 +140,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BaseTaskBlock,
     Block,
     BlockTypeVar,
+    CodeBlock,
     ConditionalBlock,
     ExtractionBlock,
     FileParserBlock,
@@ -8019,7 +8020,7 @@ class WorkflowService:
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
-            if block.continue_on_failure:
+            if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
                 LOG.warning(
                     f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
                     block_type=block.block_type,
@@ -8043,7 +8044,7 @@ class WorkflowService:
                 block_label=block.label,
             )
 
-            if block.continue_on_failure:
+            if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
                 LOG.warning(
                     f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
                     block_type=block.block_type,
@@ -8067,7 +8068,7 @@ class WorkflowService:
                 block_label=block.label,
             )
 
-            if block.continue_on_failure:
+            if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
                 LOG.warning(
                     f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
                     block_type=block.block_type,
@@ -8123,7 +8124,7 @@ class WorkflowService:
         if block_result.status == BlockStatus.canceled:
             # Cancellation is never recoverable via continue_on_failure, matching normal block execution.
             return WorkflowRunStatus.canceled, None, failure_category
-        if block.continue_on_failure:
+        if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
             return None, None, None
         if block_result.status == BlockStatus.failed:
             failure_reason = f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
@@ -8417,6 +8418,12 @@ class WorkflowService:
             if isinstance(block, WorkflowTriggerBlock):
                 block.validate_payload_templates()
 
+    @staticmethod
+    def _validate_code_block_templates(workflow_definition: WorkflowDefinition) -> None:
+        for block in get_all_blocks(workflow_definition.blocks):
+            if isinstance(block, CodeBlock):
+                block.validate_code_template()
+
     async def create_workflow(
         self,
         organization_id: str,
@@ -8458,6 +8465,7 @@ class WorkflowService:
         encrypt_secrets: bool = True,
     ) -> Workflow:
         try:
+            self._validate_code_block_templates(workflow_definition)
             if encrypt_secrets:
                 await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             return await app.DATABASE.workflows.create_workflow(
@@ -8978,8 +8986,11 @@ class WorkflowService:
         notify_workflow_saved: bool = True,
         preserve_completion_contract: bool = True,
         created_via: str | None = None,
+        validate_code_block_templates: bool = True,
     ) -> Workflow:
         if workflow_definition is not None:
+            if validate_code_block_templates:
+                self._validate_code_block_templates(workflow_definition)
             if organization_id is not None:
                 organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
                 if organization is not None:
@@ -12190,6 +12201,7 @@ class WorkflowService:
                 workflow_id=placeholder.workflow_id,
                 organization_id=organization_id,
                 workflow_definition=dispatch_definition,
+                validate_code_block_templates=False,
             )
         except Exception:
             # The placeholder row already exists as the latest version; if definition
@@ -12378,6 +12390,7 @@ class WorkflowService:
         new_workflow_permanent_id: str | None = None,
         resolved_title: str | None = None,
         created_via: str | None = None,
+        validate_code_block_templates: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
         title = resolved_title
@@ -12537,6 +12550,7 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 edited_by=edited_by,
                 created_via=created_via,
+                validate_code_block_templates=validate_code_block_templates,
             )
 
             await self.maybe_delete_cached_code(

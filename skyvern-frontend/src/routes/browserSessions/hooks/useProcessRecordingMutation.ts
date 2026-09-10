@@ -103,6 +103,7 @@ const useProcessRecordingMutation = ({
             compressed_chunks: string[];
             draft_steps?: Array<RecordingDraftStep>;
             code_first: boolean;
+            supports_credential_tokens: boolean;
           },
           {
             data: {
@@ -114,6 +115,9 @@ const useProcessRecordingMutation = ({
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
           code_first: codeFirst,
+          // This build substitutes credential tokens in a code block's code; a build that
+          // does not must not be handed blocks whose code reads a token it cannot rename.
+          supports_credential_tokens: true,
           ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({

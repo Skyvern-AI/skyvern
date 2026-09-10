@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import litellm
 import pytest
 import yaml
 from agents import GuardrailFunctionOutput, InputGuardrail
@@ -5462,6 +5464,95 @@ class TestCopilotConfig:
 
         assert agent_module._is_retriable_llm_error(FakeRateLimitError("rate limit"))
 
+    def test_retriable_llm_error_uses_litellm_midstream_original_exception(self) -> None:
+        transient = litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+        wrapped_transient = litellm.exceptions.MidStreamFallbackError(
+            message=str(transient),
+            llm_provider="azure",
+            model="test",
+            original_exception=transient,
+        )
+        wrapped_transient.__cause__ = httpx.ReadError("")
+        wrapped_with_original_as_cause = litellm.exceptions.MidStreamFallbackError(
+            message=str(transient),
+            llm_provider="azure",
+            model="test",
+            original_exception=transient,
+        )
+        wrapped_with_original_as_cause.__cause__ = transient
+        permanent = litellm.BadRequestError(
+            message="connection error while validating a malformed request",
+            llm_provider="azure",
+            model="test",
+        )
+        wrapped_permanent = litellm.exceptions.MidStreamFallbackError(
+            message=str(permanent),
+            llm_provider="azure",
+            model="test",
+            original_exception=permanent,
+        )
+
+        assert agent_module._is_retriable_llm_error(transient)
+        assert agent_module._is_retriable_llm_error(wrapped_transient)
+        assert agent_module._is_retriable_llm_error(wrapped_with_original_as_cause)
+        assert not agent_module._is_retriable_llm_error(permanent)
+        assert not agent_module._is_retriable_llm_error(wrapped_permanent)
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_retriable_llm_error_after_handled_context_overflow(self, wrapped: bool) -> None:
+        try:
+            raise litellm.ContextWindowExceededError(
+                message="context window exceeded", llm_provider="azure", model="test"
+            )
+        except litellm.ContextWindowExceededError as overflow:
+            try:
+                raise litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+            except litellm.APIConnectionError as transient:
+                assert transient.__context__ is overflow
+                failure = (
+                    litellm.exceptions.MidStreamFallbackError(
+                        message=str(transient), llm_provider="azure", model="test", original_exception=transient
+                    )
+                    if wrapped
+                    else transient
+                )
+                assert agent_module._is_retriable_llm_error(failure)
+
+    def test_retriable_llm_error_handles_a_cyclic_midstream_original_exception(self) -> None:
+        wrapped = litellm.exceptions.MidStreamFallbackError(
+            message="stream failed",
+            llm_provider="azure",
+            model="test",
+        )
+        wrapped.original_exception = wrapped
+
+        assert not agent_module._is_retriable_llm_error(wrapped)
+
+    @pytest.mark.parametrize(
+        "permanent",
+        [
+            pytest.param(
+                litellm.AuthenticationError(message="invalid credentials", llm_provider="azure", model="test"),
+                id="authentication",
+            ),
+            pytest.param(
+                litellm.ContentPolicyViolationError(
+                    message="refused by content policy", llm_provider="azure", model="test"
+                ),
+                id="content-policy",
+            ),
+        ],
+    )
+    def test_midstream_wrapper_does_not_promote_permanent_original(self, permanent: BaseException) -> None:
+        wrapped = litellm.exceptions.MidStreamFallbackError(
+            message=str(permanent),
+            llm_provider="azure",
+            model="test",
+            original_exception=permanent,
+        )
+
+        assert not agent_module._is_retriable_llm_error(wrapped)
+
     def test_empty_completion_is_typed_retriable_and_tool_calls_are_attempt_local(self) -> None:
         ctx = _ctx()
         error = agent_module._empty_completion_error(
@@ -5762,14 +5853,9 @@ class TestCopilotConfig:
         assert stopped[0]["log_level"] == "info"
 
     @pytest.mark.asyncio
-    async def test_run_copilot_agent_retries_retriable_failure_with_fallback(
+    async def test_run_copilot_agent_continues_wrapped_transient_on_shared_session(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        class FakeRateLimitError(Exception):
-            pass
-
-        FakeRateLimitError.__module__ = "openai"
-
         class FakeMCPServerManager:
             def __init__(self, servers):
                 self.active_servers = servers
@@ -5788,12 +5874,46 @@ class TestCopilotConfig:
             resolved_keys.append(key)
             return f"model-{key}", object(), key, True
 
-        run_with_enforcement = AsyncMock(
-            side_effect=[
-                FakeRateLimitError("rate limit"),
-                _fake_run_result({"type": "REPLY", "user_response": "ok"}),
-            ]
-        )
+        seen_sessions: list[Any] = []
+        seen_inputs: list[str | list[Any]] = []
+
+        async def run_with_retained_session(**kwargs: Any) -> Any:
+            session = kwargs["session"]
+            seen_sessions.append(session)
+            seen_inputs.append(kwargs["initial_input"])
+            if len(seen_sessions) == 1:
+                await session.add_items(
+                    [
+                        {"role": "user", "content": "build it"},
+                        {
+                            "type": "function_call",
+                            "call_id": "call_browser_action",
+                            "name": "browser_action",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_browser_action",
+                            "output": "completed once",
+                        },
+                    ]
+                )
+                transient = litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+                wrapped = litellm.exceptions.MidStreamFallbackError(
+                    message=str(transient),
+                    llm_provider="azure",
+                    model="test",
+                    original_exception=transient,
+                )
+                wrapped.__cause__ = httpx.ReadError("")
+                raise wrapped
+
+            retained = await session.get_items()
+            assert [item.get("type") for item in retained].count("function_call_output") == 1
+            assert retained[-1]["output"] == "completed once"
+            return _fake_run_result({"type": "REPLY", "user_response": "ok"})
+
+        run_with_enforcement = AsyncMock(side_effect=run_with_retained_session)
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
@@ -5836,8 +5956,135 @@ class TestCopilotConfig:
         assert result.user_response == "ok"
         assert resolved_keys == ["PRIMARY", "SECONDARY"]
         assert run_with_enforcement.await_count == 2
+        assert seen_sessions[0] is seen_sessions[1]
+        assert isinstance(seen_inputs[0], str) and seen_inputs[0]
+        assert seen_inputs[1] == []
         for call in run_with_enforcement.await_args_list:
             assert not getattr(call.kwargs["agent"], "input_guardrails", None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("primary_original", "fallback_fails", "expected_attempts"),
+        [
+            pytest.param(
+                litellm.BadRequestError(
+                    message="connection error while validating a malformed request",
+                    llm_provider="azure",
+                    model="test",
+                ),
+                False,
+                1,
+                id="wrapped-permanent",
+            ),
+            pytest.param(
+                litellm.APIConnectionError(message="primary stream failed", llm_provider="azure", model="test"),
+                True,
+                2,
+                id="fallback-failure",
+            ),
+        ],
+    )
+    async def test_wrapped_failure_is_bounded_and_preserves_staged_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        primary_original: BaseException,
+        fallback_fails: bool,
+        expected_attempts: int,
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        staged_workflow = MagicMock()
+        staged_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
+
+        async def restore_proposal(ctx: Any) -> None:
+            ctx.has_staged_proposal = True
+            ctx.staged_workflow = staged_workflow
+            ctx.staged_workflow_yaml = staged_yaml
+            ctx.last_workflow = staged_workflow
+            ctx.last_workflow_yaml = staged_yaml
+
+        def fake_resolve_model_config(
+            _handler: Any, *, copilot_config: Any = None, llm_key_override: str | None = None
+        ):
+            del copilot_config
+            key = llm_key_override or "PRIMARY"
+            return f"model-{key}", object(), key, True
+
+        primary = litellm.exceptions.MidStreamFallbackError(
+            message=str(primary_original),
+            llm_provider="azure",
+            model="test",
+            original_exception=primary_original,
+        )
+        failures: list[BaseException] = [primary]
+        if fallback_fails:
+            fallback_original = litellm.APIConnectionError(
+                message="fallback stream failed", llm_provider="azure", model="test"
+            )
+            failures.append(
+                litellm.exceptions.MidStreamFallbackError(
+                    message=str(fallback_original),
+                    llm_provider="azure",
+                    model="test",
+                    original_exception=fallback_original,
+                )
+            )
+        run_with_enforcement = AsyncMock(side_effect=failures)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal",
+            restore_proposal,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                message="build it",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_run_id=None,
+                workflow_yaml="",
+                browser_session_id=None,
+                product_action=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        )
+
+        assert run_with_enforcement.await_count == expected_attempts
+        assert result.updated_workflow is staged_workflow
+        assert result.staged_workflow is staged_workflow
+        assert result.has_staged_proposal is True
+        assert result.proposal_disposition == "review_untested"
+        assert "unexpected issue" in result.user_response
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("fallback_enabled", [True, False])

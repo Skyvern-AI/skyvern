@@ -884,6 +884,21 @@ async def _convert_css_shape_to_string(
     return None
 
 
+@dataclass(frozen=True)
+class RecordingVideoSizeResolution:
+    """Outcome of resolving the recording resolution for a run.
+
+    ``record_video_size`` is the Playwright/Patchright ``record_video_size`` (a feature-selected
+    profile is capped to the effective viewport; an operator override passes through untouched).
+    ``raw_output_bound`` is the UNCAPPED selection — the raw profile or the operator override — used
+    as the whole-display recorder's FFmpeg output bound so it never inherits the viewport-capped
+    Playwright size (which would fit the window twice). ``None`` on either field means "unchanged":
+    keep the existing ``record_video_size`` / fall back to the static display-recording default."""
+
+    record_video_size: dict[str, int] | None
+    raw_output_bound: dict[str, int] | None
+
+
 class AgentFunction:
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
@@ -1087,13 +1102,14 @@ class AgentFunction:
         organization_id: str | None,
         workflow_permanent_id: str | None = None,
         viewport: dict[str, int] | None = None,
-    ) -> dict[str, int] | None:
+    ) -> RecordingVideoSizeResolution:
         """Resolve the browser recording resolution for this run.
 
-        Returns ``current_size`` unchanged. Cloud overrides this to opt runs into
-        an elevated resolution behind a feature flag.
+        Returns ``current_size`` unchanged as both the Playwright size and the raw output bound (an
+        operator-set ``BROWSER_RECORDING_WIDTH/HEIGHT`` is the only selection OSS knows). Cloud
+        overrides this to opt runs into an elevated resolution behind a feature flag.
         """
-        return current_size
+        return RecordingVideoSizeResolution(current_size, current_size)
 
     async def should_keep_code_mode_for_workflow_run(
         self,

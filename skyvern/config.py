@@ -91,6 +91,22 @@ class Settings(BaseSettings):
 
     ADDITIONAL_MODULES: list[str] = []
 
+    # Whole-display recording is opt-in and intended for packaged Linux workers only. Default OFF keeps
+    # ordinary local/OSS users on the existing Playwright per-page recording path. Enabling replaces
+    # per-page recording with one change-driven whole-display MP4 for an explicitly selected cohort.
+    EXCLUSIVE_DISPLAY_RECORDING: bool = False
+    # Narrow, validated whole-display recording profile (safe defaults; invalid values fall back explicitly).
+    DISPLAY_RECORDING_OUTPUT_WIDTH: int = 1280
+    DISPLAY_RECORDING_OUTPUT_HEIGHT: int = 720
+    DISPLAY_RECORDING_MAX_FPS: int = 15
+    DISPLAY_RECORDING_CRF: int = 28
+    DISPLAY_RECORDING_KEYFRAME_SECONDS: int = 5
+    # How many browser runs one worker drives at once (mirrors the worker env of the same name; default 1 =
+    # historical pod-per-run). Whole-display recording captures the ENTIRE display, and the per-display flock
+    # only blocks a second recorder, not a second browser sharing the display — so it is display-ownership-safe
+    # only at concurrency == 1. The recorder reads this to fail closed above 1.
+    BROWSER_WORKER_MAX_CONCURRENT_ACTIVITIES: int = 1
+
     BROWSER_TYPE: str = "chromium-headful"
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None

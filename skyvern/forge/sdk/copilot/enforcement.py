@@ -782,6 +782,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
 
     data = parsed.get("data")
+    # Session continuation can compact the same output again. Re-bound the
+    # structured synopsis instead of discarding its already-retained facts.
+    if not isinstance(data, dict) and isinstance(parsed.get("page_evidence"), dict):
+        data = parsed["page_evidence"]
     if isinstance(data, dict) and _is_page_evidence(data):
         synopsis["page_evidence"] = _summarize_page_evidence(parsed, data)
         synopsis["_summarized"] = "older page evidence — bounded facts retained, raw excerpts dropped"

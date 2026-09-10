@@ -34,6 +34,16 @@ add_type("application/json", ".har")
 add_type("text/plain", ".log")
 add_type("application/zstd", ".zst")
 
+
+_RECORDING_CONTENT_TYPES = {".mp4": "video/mp4", ".webm": "video/webm"}
+
+
+def _recording_content_type(uri_or_path: str) -> str | None:
+    """Allowlist MIME for RECORDING artifacts ONLY (.mp4/.webm -> video/*, for <video> playback); never infers
+    html/svg/other from a (possibly user-named) key — unknown extensions return None (never minting a renderable MIME)."""
+    return _RECORDING_CONTENT_TYPES.get(os.path.splitext(uri_or_path)[1].lower())
+
+
 _S3_OPERATION_RETRIES = 2
 # get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
 S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
@@ -583,15 +593,20 @@ class AsyncAWSClient:
         tags: dict[str, str] | None = None,
         serialize_key: str | None = None,
         supersede_queued: bool = False,
+        content_type: str | None = None,
     ) -> str | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/put_object.html
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
 
+        effective_content_type = content_type
+
         async def _op() -> str:
             async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
-                extra_args = {"Tagging": self._create_tag_string(tags)} if tags else {}
+                extra_args: dict[str, Any] = {"Tagging": self._create_tag_string(tags)} if tags else {}
+                if effective_content_type:
+                    extra_args["ContentType"] = effective_content_type
                 await client.put_object(
                     Body=data,
                     Bucket=parsed_uri.bucket,
@@ -660,15 +675,20 @@ class AsyncAWSClient:
         tags: dict[str, str] | None = None,
         close_file_obj: bool = False,
         serialize_key: str | None = None,
+        content_type: str | None = None,
     ) -> str | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_fileobj.html#upload-fileobj
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
 
+        effective_content_type = content_type
+
         async def _op() -> str:
             async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
                 extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
+                if effective_content_type:
+                    extra_args["ContentType"] = effective_content_type
                 if tags:
                     extra_args["Tagging"] = self._create_tag_string(tags)
                 await client.upload_fileobj(
@@ -789,11 +809,15 @@ class AsyncAWSClient:
                         async def _fallback_upload() -> Any:
                             async def _op() -> None:
                                 async with self._s3_client() as client:
+                                    fb_extra: dict[str, Any] = {"StorageClass": str(storage_class)}
+                                    fb_ct = _recording_content_type(uri)
+                                    if fb_ct:
+                                        fb_extra["ContentType"] = fb_ct
                                     await client.upload_fileobj(
                                         reader,
                                         parsed_uri.bucket,
                                         parsed_uri.key,
-                                        ExtraArgs={"StorageClass": str(storage_class)},
+                                        ExtraArgs=fb_extra,
                                         Config=_STREAM_UPLOAD_TRANSFER_CONFIG,
                                     )
 
@@ -899,11 +923,15 @@ class AsyncAWSClient:
         full-replaces again."""
         token = uuid.uuid4().hex
         reader = _RangedFileReader(fh, 0, length)  # non-owning: the outer store_recording_prefix owns fh
+        reseed_extra: dict[str, Any] = {"StorageClass": str(sc), "Metadata": {_COMPOSE_GEN_META_KEY: token}}
+        reseed_ct = _recording_content_type(uri)
+        if reseed_ct:
+            reseed_extra["ContentType"] = reseed_ct
         await client.upload_fileobj(
             reader,
             parsed_uri.bucket,
             parsed_uri.key,
-            ExtraArgs={"StorageClass": str(sc), "Metadata": {_COMPOSE_GEN_META_KEY: token}},
+            ExtraArgs=reseed_extra,
             Config=_STREAM_UPLOAD_TRANSFER_CONFIG,
         )
         head = await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
@@ -960,12 +988,14 @@ class AsyncAWSClient:
             # A single copy part / tail part cannot exceed 5 GiB; fall back rather than split.
             raise ComposeUnsupportedError()
         token = uuid.uuid4().hex
+        create_ct = _recording_content_type(uri)  # set on create so S3 carries it onto the completed object
         try:
             create = await client.create_multipart_upload(
                 Bucket=parsed_uri.bucket,
                 Key=parsed_uri.key,
                 StorageClass=str(sc),
                 Metadata={_COMPOSE_GEN_META_KEY: token},
+                **({"ContentType": create_ct} if create_ct else {}),
             )
         except Exception as e:
             if self._is_expired_token_error(e):

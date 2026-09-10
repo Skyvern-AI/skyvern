@@ -777,6 +777,7 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
+        file_extension: str | None = None,
     ) -> tuple[str, str]:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_workflow_run_block_uri(
@@ -785,6 +786,9 @@ class ArtifactManager:
             workflow_run_block=workflow_run_block,
             artifact_type=artifact_type,
         )
+        # Match create_artifact: an MP4 RECORDING must key under .mp4 so mid-run bytes serve video/mp4 (SKY-15466).
+        if file_extension and artifact_type == ArtifactType.RECORDING:
+            uri = replace_file_extension(uri, file_extension)
         await self._create_artifact(
             aio_task_primary_key=workflow_run_block.workflow_run_block_id,
             artifact_id=artifact_id,
@@ -804,12 +808,14 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
+        file_extension: str | None = None,
     ) -> str:
         artifact_id, _ = await self._create_workflow_run_block_artifact_internal(
             workflow_run_block=workflow_run_block,
             artifact_type=artifact_type,
             data=data,
             path=path,
+            file_extension=file_extension,
         )
         return artifact_id
 

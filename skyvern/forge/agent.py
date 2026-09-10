@@ -5674,11 +5674,23 @@ class ForgeAgent:
                 for idx, video_artifact in enumerate(video_artifacts):
                     if video_artifact.video_artifact_id:
                         continue
-                    video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.RECORDING,
-                        data=video_artifact.video_data,
-                    )
+                    if video_artifact.video_file_extension:
+                        # Seed the first-step RECORDING artifact with the real container (mp4 for the
+                        # whole-display recorder) so its uri matches the bytes from step 0 and per-step
+                        # prefixes/terminal finalize address the same .mp4 key (SKY-15466). Playwright
+                        # per-page recordings leave it None and keep their .webm default.
+                        video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                        )
                     video_artifacts[idx].video_artifact_id = video_artifact_id
                 app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
 

@@ -22,6 +22,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
+    CodeBlock,
     ConditionalBlock,
     JinjaBranchCriteria,
     LoginBlock,
@@ -69,6 +70,15 @@ def _login_block(label: str, url: str) -> LoginBlock:
         label=label,
         title=label,
         navigation_goal="log in",
+        output_parameter=_output_parameter(f"{label}_output"),
+    )
+
+
+def _code_block(label: str, *, continue_on_failure: bool = False) -> CodeBlock:
+    return CodeBlock(
+        label=label,
+        code="pass",
+        continue_on_failure=continue_on_failure,
         output_parameter=_output_parameter(f"{label}_output"),
     )
 
@@ -463,6 +473,63 @@ async def test_block_terminal_outcome_cannot_overwrite_concurrent_cancellation(
     assert workflow_run is canceled_run
     assert should_stop is True
     conditional_terminal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_code_render_failure_stops_despite_continue_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = WorkflowService()
+    block = _code_block("code", continue_on_failure=True)
+    block_result = BlockResult(
+        success=False,
+        failure_reason="Failed to format CodeBlock parameters.",
+        output_parameter=block.output_parameter,
+        status=BlockStatus.failed,
+        can_continue_after_failure=False,
+    )
+    failed_run = MagicMock()
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(service, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    workflow_run, should_stop = await service._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=1,
+        block_result=block_result,
+        workflow_run=_workflow_run(),
+        workflow_run_id="wr_test",
+    )
+
+    assert workflow_run is failed_run
+    assert should_stop is True
+    mark_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_code_failure_still_honors_continue_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = WorkflowService()
+    block = _code_block("code", continue_on_failure=True)
+    block_result = BlockResult(
+        success=False,
+        failure_reason="Code failed after execution.",
+        output_parameter=block.output_parameter,
+        status=BlockStatus.failed,
+    )
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(service, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    running = _workflow_run()
+
+    workflow_run, should_stop = await service._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=1,
+        block_result=block_result,
+        workflow_run=running,
+        workflow_run_id="wr_test",
+    )
+
+    assert workflow_run is running
+    assert should_stop is False
+    mark_failed.assert_not_awaited()
 
 
 @pytest.mark.asyncio

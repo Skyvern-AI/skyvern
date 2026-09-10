@@ -679,6 +679,7 @@ async def process_recording(
         workflow_permanent_id=recording_request.workflow_permanent_id,
         draft_steps=recording_request.draft_steps,
         code_first=recording_request.code_first,
+        supports_credential_tokens=recording_request.supports_credential_tokens,
     )
 
     return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)

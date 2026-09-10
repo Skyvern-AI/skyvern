@@ -6,7 +6,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _prior_run_debug_text, _store_turn_context_packet_on_context
+from skyvern.forge.sdk.copilot.agent import (
+    _build_user_context,
+    _prior_run_debug_text,
+    _store_turn_context_packet_on_context,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs
@@ -164,6 +168,81 @@ _WORKFLOW_V1 = (
 _WORKFLOW_V2 = _WORKFLOW_V1 + (
     "    - block_type: text_prompt\n      label: summarize_result\n      llm_key: x\n      prompt: ok\n"
 )
+
+_EMPTY_WORKFLOW = "workflow_definition:\n  parameters: []\n  blocks: []\n"
+
+
+def _render_runnable_draft_context(
+    *,
+    user_message: str,
+    workflow_yaml: str = _EMPTY_WORKFLOW,
+    prior_workflow_yaml: str = _WORKFLOW_V2,
+    allow_run_blocks: bool = True,
+) -> tuple[str, str | None]:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(allow_run_blocks=allow_run_blocks),
+            user_message=user_message,
+            workflow_yaml=workflow_yaml,
+            prior_workflow_yaml=prior_workflow_yaml,
+        )
+    )
+    summary = packet.runnable_draft_context.rendered_summary if packet.runnable_draft_context else None
+    rendered = _build_user_context(
+        workflow_yaml=workflow_yaml,
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message=user_message,
+        runnable_draft_summary=summary or "",
+    )
+    return rendered, summary
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        pytest.param("Run the draft again unchanged.", id="rerun"),
+        pytest.param("Replace the saved binding with credential B, then continue.", id="replacement"),
+    ],
+)
+def test_runnable_draft_context_is_the_same_factual_packet_for_follow_up_requests(user_message: str) -> None:
+    rendered, summary = _render_runnable_draft_context(user_message=user_message)
+
+    assert summary is not None
+    assert "uncommitted workflow draft" in summary
+    assert "not the current canvas workflow" in summary
+    assert "remains runnable by its top-level block labels" in summary
+    assert "open_site, summarize_result" in summary
+    assert "The user is asking" not in summary
+    assert "run_blocks_and_collect_debug" not in summary
+    assert "update_and_run_blocks" not in summary
+    assert "RUNNABLE UNCOMMITTED DRAFT (not on the canvas):" in rendered
+    assert summary in rendered
+
+
+@pytest.mark.parametrize(
+    ("workflow_yaml", "prior_workflow_yaml", "allow_run_blocks"),
+    [
+        pytest.param(_WORKFLOW_V1, _WORKFLOW_V2, True, id="current-canvas"),
+        pytest.param(_EMPTY_WORKFLOW, _EMPTY_WORKFLOW, True, id="no-draft"),
+        pytest.param(_EMPTY_WORKFLOW, _WORKFLOW_V2, False, id="no-run-authority"),
+    ],
+)
+def test_runnable_draft_context_controls_do_not_project_a_draft_section(
+    workflow_yaml: str,
+    prior_workflow_yaml: str,
+    allow_run_blocks: bool,
+) -> None:
+    rendered, summary = _render_runnable_draft_context(
+        user_message="Continue.",
+        workflow_yaml=workflow_yaml,
+        prior_workflow_yaml=prior_workflow_yaml,
+        allow_run_blocks=allow_run_blocks,
+    )
+
+    assert summary is None
+    assert "RUNNABLE UNCOMMITTED DRAFT (not on the canvas):" not in rendered
 
 
 def test_workflow_change_context_reports_user_edit() -> None:

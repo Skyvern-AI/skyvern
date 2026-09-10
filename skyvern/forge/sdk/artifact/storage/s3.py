@@ -15,7 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri, _recording_content_type
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -221,7 +221,12 @@ class S3Storage(BaseStorage):
             # compose base cached for this key is now stale and must not seed a later copy.
             self.async_client.forget_compose_state(serialize_key)
         await self.async_client.upload_file(
-            uri, data, storage_class=sc, serialize_key=serialize_key, supersede_queued=supersede_queued_prefixes
+            uri,
+            data,
+            storage_class=sc,
+            serialize_key=serialize_key,
+            supersede_queued=supersede_queued_prefixes,
+            content_type=_recording_content_type(uri) if artifact.artifact_type == ArtifactType.RECORDING else None,
         )
 
     async def _get_storage_class_for_org(
@@ -329,12 +334,14 @@ class S3Storage(BaseStorage):
         # close the reader only after the real transfer finishes.
         reader = BoundedFileReader(path, length)
         # serialize_key fences this prefix ahead of the terminal write to the same uri (see store_artifact).
+        rec_ct = _recording_content_type(artifact.uri) if artifact.artifact_type == ArtifactType.RECORDING else None
         await self.async_client.upload_file_stream(
             artifact.uri,
             cast(BinaryIO, reader),
             storage_class=sc,
             close_file_obj=True,
             serialize_key=artifact.uri,
+            content_type=rec_ct,
         )
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:

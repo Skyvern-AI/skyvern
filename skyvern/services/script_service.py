@@ -827,6 +827,7 @@ async def _create_video_artifact(
                 step=step,
                 artifact_type=ArtifactType.RECORDING,
                 data=video_artifact.video_data,
+                file_extension=video_artifact.video_file_extension,
             )
             video_artifacts[idx].video_artifact_id = video_artifact_id
         app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)

@@ -192,6 +192,18 @@ class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
         )
 
 
+class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, original: BaseException) -> None:
+        self.block_label = block_label
+        self.original = original
+        self.line = getattr(original, "lineno", None)
+        line_suffix = f" on line {self.line}" if self.line is not None else ""
+        super().__init__(
+            f"Invalid Jinja2 in code block '{block_label}'{line_suffix}: {original}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
     def __init__(self, block_label: str, wait_sec: int, max_sec: int) -> None:
         super().__init__(

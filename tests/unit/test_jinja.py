@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.exceptions import CodeBlockTemplateSyntaxError, FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models._jinja import (
     mask_jinja_in_python_comments,
     restore_jinja_masked_comments,
 )
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.workflows import BlockResult, BlockStatus
 
 
 def _round_trip(source: str) -> str:
@@ -143,3 +144,45 @@ def test_code_block_still_raises_when_the_executable_source_is_unrenderable() ->
 
     with pytest.raises(FailedToFormatJinjaStyleParameter):
         block.format_potential_template_parameters(_mock_context({}))
+
+
+def test_code_block_template_validation_reports_the_executable_source_line() -> None:
+    block = _code_block("# {{ }} is inert\nvalue = 1\nraw = r'''{{ }}'''\n")
+
+    with pytest.raises(CodeBlockTemplateSyntaxError) as excinfo:
+        block.validate_code_template()
+
+    assert excinfo.value.block_label == "prefill"
+    assert excinfo.value.line == 3
+
+
+def test_code_block_template_validation_ignores_jinja_delimiters_in_comments() -> None:
+    block = _code_block("# code blocks use {{ }} templating\nvalue = '{{ email }}'\n")
+
+    block.validate_code_template()
+
+
+@pytest.mark.asyncio
+async def test_code_block_marks_runtime_template_failure_as_nonrecoverable() -> None:
+    block = _code_block("value = {{ }}")
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    async def failure_result(*args: object, **kwargs: object) -> BlockResult:
+        return BlockResult(
+            success=False,
+            output_parameter=block.output_parameter,
+            status=BlockStatus.failed,
+            can_continue_after_failure=bool(kwargs["can_continue_after_failure"]),
+        )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", new_callable=AsyncMock),
+        patch.object(CodeBlock, "get_workflow_run_context", return_value=_mock_context({})),
+        patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock, return_value=browser_state),
+        patch.object(CodeBlock, "_ensure_run_recording_artifact", new_callable=AsyncMock),
+        patch.object(CodeBlock, "_template_format_failure_result", side_effect=failure_result),
+    ):
+        result = await block._execute("wr_test", "wrb_test", organization_id="org_test")
+
+    assert result.can_continue_after_failure is False

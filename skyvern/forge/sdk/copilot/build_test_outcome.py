@@ -126,9 +126,9 @@ _BROWSER_OPERATION_FAILED: BuildTestFailedOperationKind = "browser_operation_fai
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
 _FAILED_BLOCK_STATUSES = frozenset({"failed", "terminated", "canceled", "timed_out"})
 _COMPLETED_BLOCK_STATUSES = frozenset({BlockStatus.completed.value})
-# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
-# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
-# a saturated runner gate says nothing about the code, so rewriting it cannot help.
+# Sandbox-process faults, not authored-code faults. ``timeout``, ``user_code_error``, and input
+# reassembly OOM stay out: workflow edits can make each repairable. ``busy`` is in — a saturated
+# runner gate says nothing about the code, so rewriting it cannot help.
 INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
     {
         "runner_unavailable",

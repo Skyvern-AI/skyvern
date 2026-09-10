@@ -121,8 +121,14 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block ran out of memory",
     guidance:
-      "Process the data in smaller batches rather than holding it all at once.",
+      "Process data in smaller batches, or return only the fields the next block needs.",
     recovery: "fix",
+  },
+  parameter_reassembly_memory_limit_exceeded: {
+    ...INFRASTRUCTURE,
+    title: "The code sandbox ran out of memory while receiving inputs",
+    guidance:
+      "Retry the run. If it keeps happening, have an earlier block pass in less data to this block.",
   },
   busy: {
     kind: "infrastructure",

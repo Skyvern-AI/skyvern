@@ -13,6 +13,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.block import (
     Block,
+    CodeBlock,
     FileParserBlock,
     ForLoopBlock,
     JinjaBranchCriteria,
@@ -657,6 +658,50 @@ class TestLoopBlockExecutedResultIsCompletedRespectsNaturalCompletion:
 
 
 class TestLoopBlockExecutedResultIsCompletedWithNaturalCompletion:
+    def test_empty_loop_result_does_not_crash_with_parent_swallow_flag(self) -> None:
+        result = LoopBlockExecutedResult(
+            outputs_with_loop_values=[],
+            block_outputs=[],
+            last_block=None,
+            natural_completion=True,
+        )
+
+        assert result.resolve_status(parent_next_loop_on_failure=True) == (
+            BlockStatus.completed,
+            True,
+            None,
+        )
+
+    def test_nonrecoverable_failure_is_not_swallowed_by_any_loop_flag(self) -> None:
+        inner = NavigationBlock(
+            label="inner",
+            output_parameter=_make_output_param("inner"),
+            url="https://example.com",
+            navigation_goal="g",
+            continue_on_failure=True,
+            next_loop_on_failure=True,
+        )
+        failure = BlockResult(
+            success=False,
+            output_parameter=inner.output_parameter,
+            status=BlockStatus.failed,
+            failure_reason="template render failed",
+            can_continue_after_failure=False,
+        )
+        result = LoopBlockExecutedResult(
+            outputs_with_loop_values=[],
+            block_outputs=[failure],
+            last_block=inner,
+            natural_completion=True,
+        )
+
+        assert result.is_completed() is False
+        assert result.resolve_status(parent_next_loop_on_failure=True) == (
+            BlockStatus.failed,
+            False,
+            "template render failed",
+        )
+
     def test_is_completed_true_when_natural_completion_and_inner_next_loop_on_failure(self) -> None:
         inner = NavigationBlock(
             label="inner",
@@ -773,6 +818,61 @@ class TestForLoopSkipsUnparseableFile:
         assert status == BlockStatus.completed
         assert success is True
         assert failure_reason is None
+
+    @pytest.mark.asyncio
+    async def test_nonrecoverable_code_failure_stops_all_loop_continuation(self) -> None:
+        code = CodeBlock(
+            label="render_code",
+            code="pass",
+            output_parameter=_make_output_param("render_code"),
+            continue_on_failure=True,
+            next_loop_on_failure=True,
+        )
+        after = TaskBlock(label="after", output_parameter=_make_output_param("after"))
+        loop_block = ForLoopBlock(
+            label="each_item",
+            output_parameter=_make_output_param("each_item"),
+            loop_blocks=[code, after],
+            next_loop_on_failure=True,
+        )
+        executed: list[tuple[str, str]] = []
+
+        async def fake_execute_safe(block: Block, **kwargs: Any) -> BlockResult:
+            loop_value = kwargs["current_value"]
+            executed.append((block.label, loop_value))
+            return BlockResult(
+                success=False,
+                output_parameter=block.output_parameter,
+                status=BlockStatus.failed,
+                failure_reason="template render failed",
+                can_continue_after_failure=False,
+            )
+
+        workflow_run_context = MagicMock()
+        workflow_run_context.has_value.return_value = False
+
+        with (
+            patch.object(Block, "execute_safe", autospec=True, side_effect=fake_execute_safe),
+            patch.object(CodeBlock, "execute_safe", autospec=True, side_effect=fake_execute_safe),
+            patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+            result = await loop_block.execute_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=workflow_run_context,
+                loop_over_values=["first", "second"],
+                organization_id="org_test",
+            )
+
+        assert executed == [("render_code", "first")]
+        assert result.natural_completion is False
+        assert result.can_continue_after_failure() is False
 
     @pytest.mark.asyncio
     async def test_without_the_flag_the_first_unparseable_file_stops_the_loop(self) -> None:

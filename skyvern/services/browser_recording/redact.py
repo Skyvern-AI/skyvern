@@ -9,7 +9,14 @@ from __future__ import annotations
 import re
 import typing as t
 
-from skyvern.services.browser_recording.types import CredentialKind, ExfiltratedConsoleEvent, ExfiltratedEvent
+from skyvern.services.browser_recording.types import (
+    Action,
+    ActionClick,
+    ActionInputText,
+    CredentialKind,
+    ExfiltratedConsoleEvent,
+    ExfiltratedEvent,
+)
 
 SECRET_INPUT_TYPES = frozenset({"password"})
 SECRET_AUTOCOMPLETE_TOKENS = frozenset(
@@ -64,6 +71,13 @@ SECRET_HINT_PHRASES = (
     "bearer token",
     "secret value",
 )
+# A login identifier, recognized only from the one attribute that says a field holds an
+# account identifier rather than describing its value: `autocomplete="username"`. An email
+# input, or `autocomplete="email"`, is also how an account-settings form collects a new
+# contact address - claiming those writes the account's username over the intended value.
+# Ids and labels are deliberately not read: deciding credential semantics from page prose is
+# a classifier in the harness. A field without the attribute stays unbound.
+IDENTIFIER_AUTOCOMPLETE_TOKENS = frozenset({"username"})
 MAGIC_LINK_HINT_PHRASES = (
     "magic link",
     "email me a link",
@@ -138,6 +152,33 @@ def is_secret_field(
         tag_name=tag_name,
     )
     return kind in {"password", "totp", "credit_card", "secret"}
+
+
+def is_identifier_field(action: Action) -> bool:
+    """Whether this recorded field is a login identifier, so a username may be typed into it.
+
+    Positive rather than residual: "not a secret" also describes a tenant domain or a search
+    box, and filling a username into one of those types the wrong value into the page while
+    leaving the real identifier empty. Typed markup only - see the constants above.
+    """
+    if not isinstance(action, ActionInputText):
+        return False
+    target = action.target
+    tokens = _autocomplete_tokens(target.autocomplete)
+    return any(token in IDENTIFIER_AUTOCOMPLETE_TOKENS for token in tokens)
+
+
+def credential_kind_for_action(action: Action) -> CredentialKind | None:
+    if not isinstance(action, (ActionClick, ActionInputText)):
+        return None
+    return credential_kind_for_target(
+        action.target.input_type,
+        action.target.autocomplete,
+        field_id=action.target.id,
+        accessible_name=action.target.accessible_name,
+        texts=action.target.texts,
+        tag_name=action.target.tag_name,
+    )
 
 
 def credential_kind_for_target(

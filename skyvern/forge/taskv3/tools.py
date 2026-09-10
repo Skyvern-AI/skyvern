@@ -609,6 +609,46 @@ _STOPWORDS_JS = (
     "'inc','llc','ltd','corp'])"
 )
 
+# The page's own statement, ON THE ELEMENT ITSELF, that it is out of BOTH the accessibility tree and
+# the tab order. Both together, because either alone is ordinary: a decorative icon carries only the
+# first, a control driven by a roving tabindex only the second. The tab order is read off el.tabIndex
+# -- the value the UA already parsed -- rather than a regex over the attribute, which called
+# tabindex="-0" negative and tabindex="-1x" positive and was wrong both times. tabIndex is declared
+# per interface, so SVGElement's getter is tried when HTMLElement's does not answer: an icon control
+# authored as <svg role="button"> is not an HTMLElement. Accessors come off the prototype, never off
+# the node -- a form exposes its named controls as own properties that override built-ins, so
+# `<input name="hasAttribute">` would otherwise make this throw for every control in that form, and
+# the caller answers a throw by dropping the control.
+#
+# Deliberately the element's own attributes and nothing else. aria-hidden inherits and `inert` covers
+# a whole region, so reading the ancestor chain is strictly more faithful -- and five review rounds
+# running found a demonstrated defect in that walk: clobbered traversal getters that deleted a live
+# field, the inert-vs-aria-hidden priority, a namespace-blind inert read, an unguarded post-drain
+# read that failed the entire digest. Each fix was right and the next round found the next one. The
+# case this exists for carries both attributes on the element itself, so the ancestor forms buy no
+# coverage here; they are SKY-15894, to be built once with their own tests rather than as the Nth
+# amendment to this one.
+_A11Y_REMOVED_JS = r"""(el) => {
+  // No guard of its own: both callers already answer a throw from this by saying nothing, which is
+  // the only sensible answer to a page that has deleted a descriptor or replaced an intrinsic. A
+  // second guard here would only be a branch no test can reach.
+  const _getter = (proto, name) => {
+    const d = Object.getOwnPropertyDescriptor(proto, name);
+    return (d && d.get) || null;
+  };
+  // Per-read, because a getter that does not apply is not an error: SVGElement's tabIndex throws on
+  // an HTMLElement and vice versa, and that throw is what selects the other one.
+  const _read = (fn) => { try { return fn ? fn.call(el) : null; } catch (e) { return null; } };
+  if (!Element.prototype.hasAttribute.call(el, 'tabindex')) return '';
+  let ti = _read(_getter(HTMLElement.prototype, 'tabIndex'));
+  if (typeof ti !== 'number') {
+    ti = _read(typeof SVGElement === 'function' ? _getter(SVGElement.prototype, 'tabIndex') : null);
+  }
+  if (!(typeof ti === 'number' && ti < 0)) return '';
+  const hidden = Element.prototype.getAttribute.call(el, 'aria-hidden');
+  return String(hidden || '').toLowerCase() === 'true' ? 'aria-hidden' : '';
+}"""
+
 # The roles this engine treats as controls. observe enumerates exactly these (its `q` selector is
 # this list expanded) and reports them on each record, so it is the single answer to "is this a
 # control?" rather than each probe keeping its own.
@@ -4896,6 +4936,9 @@ async () => {
   let truncatedInComponents = 0;
   let lastGroup = '';
   let groupTotal = 0;
+  const _a11yRemoved = """
+    + _A11Y_REMOVED_JS
+    + r""";
   const _PHANTOM_TEXT_TYPES = /^(?:text|search|email|tel|url|number|password|date|datetime-local|month|week|time)$/;
   // Our own witness for the walk: every marker write can run page code, synchronously or through
   // the page's own MutationObservers after we yield. Anything it changed is re-validated below;
@@ -5053,8 +5096,15 @@ async () => {
     let slottedName = false;
     if (!strongLabel) strongLabel = (el.innerText || '').trim();
     if (!strongLabel && host) { strongLabel = slottedText(el, host); slottedName = !!strongLabel; }
+    // A skinned native is exempt: the zero-rect carve-out above already established that the page
+    // draws a visible proxy for it and that the tools drive it directly, which is the opposite
+    // finding to this one.
+    let removedBy = '';
+    try { if (!hidden) removedBy = _a11yRemoved(el); } catch (e) { removedBy = ''; }
     // A text control the page itself hides from assistive tech, takes out of the tab order and
-    // leaves unnamed is one no person can reach; a non-zero box does not make it a field.
+    // leaves unnamed is one no person can reach; a non-zero box does not make it a field. Left
+    // exactly as it was: a DROP is not widened on a statement that leaves the control working, and
+    // an aria-hidden field with a negative tabindex still fills.
     const isTextLike = el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && _PHANTOM_TEXT_TYPES.test(String(el.type || '').toLowerCase()));
     const unnamed = !strongLabel && !['placeholder', 'aria-labelledby', 'title'].some((a) => (el.getAttribute(a) || '').trim());
     if (isTextLike && el.getAttribute('aria-hidden') === 'true' && el.getAttribute('tabindex') === '-1' && unnamed) {
@@ -5118,6 +5168,7 @@ async () => {
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
+    if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
     // and the model cannot tell it from decoration. The role travels with its state below, or it is
     // not worth surfacing: an on switch and an off one that read identically invite toggling the
@@ -5301,6 +5352,15 @@ async () => {
       } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
     if (!ok) { labelOfControl.delete(el); out.splice(k, 1); dropped++; }
+    // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
+    // can change either attribute in response to a marker write, and the line has to describe the
+    // page as it stands when the line is printed. Only the MARK is re-decided -- the omission is the
+    // pre-existing rule on its pre-existing predicate, so it has nothing new to re-decide.
+    else if (el && !rec.hidden) {
+      let now = '';
+      try { now = _a11yRemoved(el); } catch (e) { now = ''; }
+      if (now) rec.a11yRemoved = now; else delete rec.a11yRemoved;
+    }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
   // summaries) live in non-interactive nodes the element list can never carry. Three sources in
@@ -6432,6 +6492,13 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
             if e.get("group"):
                 extra += f" group={_field(e['group'], OBSERVE_DISPLAY_WIDTHS['group'])!r}"
+            if e.get("a11yRemoved"):
+                # What the page declared, not a prediction: aria-hidden with a negative tabindex does
+                # not stop a click landing or a field filling (measured), and a control the page
+                # disowned can still be the only one there is. What it does do is tell a design
+                # system's own clickable surface apart from the native control it stands in for, when
+                # the two render the same caption and the digest lines would otherwise be identical.
+                extra += " [aria-hidden: the page keeps this out of its accessibility tree and tab order]"
             # INVARIANT for this line and every line above it: no page-controlled byte reaches the
             # digest un-escaped, and the header's count and the number of element lines come from the
             # same list. Everything else here is either repr'd or a literal. `type` is the trap --
@@ -6461,6 +6528,7 @@ def build_browser_tools(
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
+            "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
         # text or a field value the model previously typed (a token resolved back to its URL), and
