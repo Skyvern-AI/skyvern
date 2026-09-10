@@ -4188,6 +4188,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             authorize_request_hop=authorizer,
             download_scope=None,
             approved_initial_url="https://site.example/report.pdf?sig=secret",
+            normalize_query_backslashes=True,
         )
         assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1.4 private report"
 
@@ -5652,3 +5653,22 @@ def test_fdopen_failure_closes_raw_fd_without_double_closing_dir_fd(
     assert len(opened) == 2  # the pinned directory fd and the file fd
     assert sorted(opened) == sorted(closed)  # every opened fd was closed — no leak
     assert len(closed) == len(set(closed))  # each fd closed exactly once — no double-close
+
+
+@pytest.mark.asyncio
+async def test_download_url_directly_opts_into_query_backslash_normalization(tmp_path: Path) -> None:
+    """The CDP download re-fetch opts the guarded seam into query/fragment backslash tolerance, so a
+    Windows-path download URL is authorized here while every other canonicalize_origin caller stays strict."""
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    interceptor._browser_context = MagicMock()
+    interceptor._cookie_header_for_url = AsyncMock(return_value="")
+
+    guarded_fetch = AsyncMock(side_effect=RuntimeError("stop after capturing the guarded-fetch call"))
+    with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+        await interceptor._download_url_directly(
+            "https://host.example/ELABSTelFileDownload.aspx?TelFile=\\V\\segment\\0\\sample.zip.gpg",
+            "sample.zip.gpg",
+        )
+
+    assert guarded_fetch.await_count == 1
+    assert guarded_fetch.await_args.kwargs.get("normalize_query_backslashes") is True

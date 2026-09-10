@@ -4760,6 +4760,7 @@ async def test_handle_action_adopted_session_refetches_when_save_as_target_close
         authorize_request_hop=authorize_request_hop,
         download_scope=None,
         approved_initial_url=download.url,
+        normalize_query_backslashes=True,
     )
     page.context._skyvern_cdp_download_interceptor._cookie_header_for_url.assert_awaited_once_with(download.url)
     page.context.request.get.assert_not_called()
@@ -4886,6 +4887,7 @@ async def test_handle_action_adopted_session_falls_through_to_session_folder_whe
         authorize_request_hop=authorize_request_hop,
         download_scope=None,
         approved_initial_url=download.url,
+        normalize_query_backslashes=True,
     )
     # storage was polled at least twice: once before the action, again on a later loop iteration
     assert mock_app.STORAGE.list_downloaded_files_in_browser_session.await_count >= 2
@@ -5140,6 +5142,7 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
             authorize_request_hop=authorize_request_hop,
             download_scope=None,
             approved_initial_url=download.url,
+            normalize_query_backslashes=True,
         )
         page.context.request.get.assert_not_called()
         # file moved from staging to download dir

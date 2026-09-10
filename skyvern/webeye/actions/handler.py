@@ -1360,6 +1360,7 @@ async def _save_adopted_session_download(
             authorize_request_hop=authorize_request_hop,
             download_scope=download_scope,
             approved_initial_url=download.url,
+            normalize_query_backslashes=True,
         )
         body = response.body
         if not body:

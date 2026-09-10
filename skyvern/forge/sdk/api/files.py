@@ -248,6 +248,22 @@ class GuardedFileResponse:
 GuardedFileFetchHopResult: TypeAlias = GuardedFileRedirect | GuardedFileResponse
 
 
+def _origin_authorizable_url(url: str) -> str:
+    """Return *url* with query/fragment backslashes percent-encoded so the origin guard does not
+    refuse a benign Windows-style path carried there. Scheme, authority, and path keep their
+    backslashes so this stays fail-closed on an authority-parse divergence; at the download seam that
+    is defense-in-depth, because validate_and_pin (AnyHttpUrl/WHATWG) already normalizes authority and
+    path backslashes before the origin check. Only for the origin check — never the fetched URL."""
+    cut = len(url)
+    for separator in ("?", "#"):
+        index = url.find(separator)
+        if index != -1 and index < cut:
+            cut = index
+    if cut == len(url):
+        return url
+    return url[:cut] + url[cut:].replace("\\", "%5C")
+
+
 async def fetch_file_bytes(
     url: str,
     *,
@@ -258,6 +274,7 @@ async def fetch_file_bytes(
     authorize_request_hop: RedirectHopAuthorizer[GuardedFileFetchHopResult],
     download_scope: str | None = None,
     approved_initial_url: str | None = None,
+    normalize_query_backslashes: bool = False,
 ) -> GuardedFileResponse:
     """Fetch a bounded HTTP file through the validated, pinned, per-hop authorization seam.
 
@@ -272,10 +289,20 @@ async def fetch_file_bytes(
 
     resolver = SSRFGuardedResolver()
     current_url = await validate_and_pin_fetch_url(url, resolver)
-    if canonicalize_origin(current_url) is None:
+    origin_source = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
+    if canonicalize_origin(origin_source) is None:
         raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
     if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
         raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+
+    # The run-scoped authorizer canonicalizes target_url/initial_url via canonicalize_effect_target,
+    # which refuses a backslash exactly like the precheck above. Present it the same query-normalized
+    # form; current_url below stays raw so the encoded wire request and SSRF pinning are unchanged.
+    authz_initial_url = (
+        _origin_authorizable_url(approved_initial_url)
+        if normalize_query_backslashes and approved_initial_url is not None
+        else approved_initial_url
+    )
 
     request_headers = dict(headers or {})
     source_url: str | None = None
@@ -283,6 +310,7 @@ async def fetch_file_bytes(
     async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
         for _ in range(MAX_SAFE_REDIRECTS + 1):
             encoded_url = encode_url(current_url)
+            authz_target_url = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
 
             async def dispatch(_resolved_values: tuple[str, ...]) -> GuardedFileFetchHopResult:
                 async with session.get(
@@ -312,10 +340,10 @@ async def fetch_file_bytes(
                 authorize_request_hop,
                 RedirectHopAuthorization(
                     source_url=source_url,
-                    target_url=current_url,
+                    target_url=authz_target_url,
                     method="GET",
                     download_scope=download_scope,
-                    initial_url=approved_initial_url,
+                    initial_url=authz_initial_url,
                 ),
                 dispatch,
             )
@@ -323,7 +351,8 @@ async def fetch_file_bytes(
                 return result
 
             next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
-            if canonicalize_origin(next_url) is None:
+            next_origin_source = _origin_authorizable_url(next_url) if normalize_query_backslashes else next_url
+            if canonicalize_origin(next_origin_source) is None:
                 raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
             if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(allowed_redirect_origin):
                 raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
