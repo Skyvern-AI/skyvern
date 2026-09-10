@@ -95,6 +95,9 @@ class BrowserArtifacts(BaseModel):
     # context-creation failure; leave a reused/adopted one live). Object-typed to avoid a display_recorder import.
     _display_recorder_acquisition: object | None = PrivateAttr(default=None)
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    # Latches so an unwritable console log is reported once per browser rather than once per console
+    # message — a chatty page emits hundreds per second and would otherwise set the error volume itself.
+    _browser_console_log_write_failed: bool = PrivateAttr(default=False)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
     _discarded_pages: set[Page] = PrivateAttr(default_factory=set)
@@ -142,8 +145,21 @@ class BrowserArtifacts(BaseModel):
             return 0
 
         async with self._browser_console_log_lock:
-            async with aiofiles.open(self.browser_console_log_path, "a") as f:
-                return await f.write(msg)
+            try:
+                async with aiofiles.open(self.browser_console_log_path, "a") as f:
+                    return await f.write(msg)
+            except OSError:
+                # Activity teardown wipes the shared log root, so a browser context that outlives its
+                # activity keeps a path that no longer exists. The artifact is unrecoverable at that
+                # point and raising would only reach a pyee listener as an unhandled exception.
+                if not self._browser_console_log_write_failed:
+                    self._browser_console_log_write_failed = True
+                    LOG.warning(
+                        "Browser console log is no longer writable, dropping this browser's console output",
+                        log_path=self.browser_console_log_path,
+                        exc_info=True,
+                    )
+                return 0
 
     async def _read_console_log_file(self) -> bytes:
         if self.browser_console_log_path is None:
