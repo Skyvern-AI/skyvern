@@ -202,7 +202,7 @@ async def test_late_structured_error_retains_valid_hollow_packet(monkeypatch: py
     monkeypatch.setattr(tools.composition_capture, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
 
     evidence, error = await tools._capture_composition_evidence(
-        SimpleNamespace(),
+        SimpleNamespace(browser_session_id=None),
         inspected_url="https://example.com/loading",
         current_url="https://example.com/loading",
     )
@@ -268,7 +268,9 @@ async def test_unrendered_challenge_keeps_structured_packet_when_relooks_run_out
     monkeypatch.setattr(tools.composition_capture, "asyncio", _AsyncioSleepProxy(settle_sleep))
 
     evidence, html_error = await tools._capture_composition_evidence(
-        SimpleNamespace(), inspected_url="https://example.com/login", current_url="https://example.com/login"
+        SimpleNamespace(browser_session_id=None),
+        inspected_url="https://example.com/login",
+        current_url="https://example.com/login",
     )
 
     assert html_error is None
@@ -355,7 +357,9 @@ async def test_signalled_packet_survives_extractor_blinking_mid_loop(monkeypatch
     monkeypatch.setattr(tools.composition_capture, "asyncio", _AsyncioSleepProxy(AsyncMock()))
 
     evidence, html_error = await tools._capture_composition_evidence(
-        SimpleNamespace(), inspected_url="https://example.com/login", current_url="https://example.com/login"
+        SimpleNamespace(browser_session_id=None),
+        inspected_url="https://example.com/login",
+        current_url="https://example.com/login",
     )
 
     assert html_error is None
@@ -1077,6 +1081,30 @@ def test_witness_the_capture_cannot_record_leaves_no_witness_in_the_packet(
         url="https://example.com/metrics",
         capture_session_id=capture_session_id,
         run_page_source_session_id=None,
+    )
+
+    assert recorded == []
+    assert "value_witnesses" not in packet
+    assert "requested_values" not in packet
+    assert tools._witnessed_output_paths(packet) == frozenset()
+
+
+def test_last_run_browser_witness_never_becomes_a_scouted_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        tools.composition_capture,
+        "_record_scouted_read",
+        lambda ctx, *, expression, data, url, declared_output_path=None: recorded.append(expression),
+    )
+    ctx = _requested_tile_ctx()
+    packet = _witness_packet()
+
+    tools.composition_capture._record_value_witnesses(
+        ctx,
+        packet,
+        url="https://example.com/metrics",
+        capture_session_id="pbs_run",
+        run_page_source_session_id="pbs_run",
     )
 
     assert recorded == []

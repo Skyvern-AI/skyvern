@@ -7314,7 +7314,7 @@ class TestToolFactOwnership:
             ("select_option", "For free-text inputs"),
             ("press_key", "Escape"),
             ("console_messages", "read-only"),
-            ("inspect_page_for_composition", "navigates the live browser there"),
+            ("inspect_page_for_composition", "navigates the targeted browser there"),
             ("get_block_schema", "task_v2"),
             ("evaluate", "record a scouted interaction"),
             ("inspect_page_for_composition", "bounded read of known or current page state"),

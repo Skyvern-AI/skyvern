@@ -54,7 +54,11 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
-from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.runtime import (
+    OriginRunRedactionRegistry,
+    bound_call_browser_session,
+    effective_browser_session_id,
+)
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -2917,19 +2921,11 @@ async def _drive_inspect_page(
     *,
     captured: dict[str, object] | None,
     target_url: str = "current_page",
-    capture_lands_on_session: str | None = None,
-    capture_clears_session: bool = False,
-    capture_raises: bool = False,
+    browser_session_id: str | None = None,
 ) -> dict[str, object]:
     async def fake_capture(
         inner_ctx: CopilotContext, *, inspected_url: str, current_url: str, **_kwargs: object
     ) -> tuple[dict[str, object] | None, None]:
-        if capture_clears_session:
-            inner_ctx.browser_session_id = None
-        elif capture_lands_on_session is not None:
-            inner_ctx.browser_session_id = capture_lands_on_session
-        if capture_raises:
-            raise TimeoutError("capture timed out after the session was substituted")
         return (dict(captured) if captured is not None else None), None
 
     async def fake_page_info(inner_ctx: CopilotContext, session_id_override: str | None = None) -> tuple[str, str]:
@@ -2937,7 +2933,29 @@ async def _drive_inspect_page(
 
     monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
     monkeypatch.setattr(composition_capture_module, "_fallback_page_info", fake_page_info)
-    return await composition_capture_module._inspect_page_for_composition_impl(ctx, target_url)
+    with bound_call_browser_session(browser_session_id):
+        return await composition_capture_module._inspect_page_for_composition_impl(ctx, target_url)
+
+
+@pytest.mark.asyncio
+async def test_post_run_current_page_inspect_without_a_target_stays_on_the_scout_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current-page look after a run reads the browser this chat drives, not the run's.
+
+    Nothing binds this call, so only the tool's own default decides. Reading the run's browser
+    here is the SKY-15909 defect: the user is shown another browser's page as their own.
+    """
+    ctx = _post_run_inspect_ctx()
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+
+    assert result["ok"] is True
+    stored = ctx.composition_page_evidence
+    assert isinstance(stored, dict)
+    assert stored["source_browser_session_id"] == "scout_session"
+    assert stored["observed_after_workflow_run"] is False
+    assert "workflow_run_id" not in stored
 
 
 @pytest.mark.asyncio
@@ -2947,7 +2965,12 @@ async def test_post_run_current_page_inspect_is_sourced_from_the_run_session(
     ctx = _post_run_inspect_ctx()
 
     with capture_logs() as logs:
-        result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+        result = await _drive_inspect_page(
+            monkeypatch,
+            ctx,
+            captured=_bounded_failure_page_evidence(),
+            browser_session_id="run_session",
+        )
 
     assert result["ok"] is True
     stored = ctx.composition_page_evidence
@@ -2981,7 +3004,7 @@ async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_
     evidence = _bounded_failure_page_evidence()
     evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
 
-    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence)
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence, browser_session_id="run_session")
 
     assert result["ok"] is True
     assert result["data"]["forms"][0]["fields"][0]["label"] == "Verification code"
@@ -3007,63 +3030,74 @@ async def test_sensitive_current_page_inspect_stays_withheld_while_origin_run_is
     ctx.sensitive_origin_browser_session_ids = {"run_session"}
     ctx.active_sensitive_origin_browser_session_ids = {"run_session"}
 
-    result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+    result = await _drive_inspect_page(
+        monkeypatch,
+        ctx,
+        captured=_bounded_failure_page_evidence(),
+        browser_session_id="run_session",
+    )
 
     assert result["ok"] is False
     assert "specific named URL" in result["error"]
 
 
 @pytest.mark.asyncio
-async def test_post_run_inspect_drops_a_packet_whose_source_session_is_unprovable(
+async def test_automatic_post_run_capture_uses_a_call_local_run_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed mid-capture session create clears the id, and an unknown source id grants post-run
-    identity, so the packet has to be dropped rather than laundered into the run's own evidence."""
     ctx = _post_run_inspect_ctx()
+    observed: list[str | None] = []
 
-    result = await _drive_inspect_page(
-        monkeypatch,
+    async def fake_capture(
+        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str
+    ) -> tuple[dict[str, object], None]:
+        observed.append(effective_browser_session_id(inner_ctx))
+        return _bounded_failure_page_evidence(), None
+
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
+    evidence, source_session_id, error, _ = await composition_capture_module._read_run_session_page_evidence(
         ctx,
-        captured=_bounded_failure_page_evidence(),
-        capture_clears_session=True,
+        run_session_id="run_session",
+        current_url="https://example.test/app/results",
     )
 
-    assert result["ok"] is False
-    assert ctx.composition_page_evidence is None
-    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert evidence is not None
+    assert source_session_id == "run_session"
+    assert error is None
+    assert observed == ["run_session"]
     assert ctx.browser_session_id == "scout_session"
 
 
 @pytest.mark.asyncio
-async def test_failed_post_run_capture_on_a_substituted_session_is_inert(
+async def test_failed_automatic_post_run_capture_is_inert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Substitution racing a capture failure is the trickiest path here: it must neither grant post-run
-    identity nor disturb the packet already stored for the run."""
     ctx = _post_run_inspect_ctx()
     clean = _clean_same_run_page_evidence()
     ctx.composition_page_evidence = clean
 
-    result = await _drive_inspect_page(
-        monkeypatch,
+    async def failed_capture(inner_ctx: CopilotContext, *, inspected_url: str, current_url: str) -> tuple[None, None]:
+        assert effective_browser_session_id(inner_ctx) == "run_session"
+        raise TimeoutError("capture timed out")
+
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", failed_capture)
+    evidence, source_session_id, error, _ = await composition_capture_module._read_run_session_page_evidence(
         ctx,
-        captured=_bounded_failure_page_evidence(),
-        capture_lands_on_session="replacement_session",
-        capture_raises=True,
+        run_session_id="run_session",
+        current_url="https://example.test/app/results",
     )
 
-    assert result["ok"] is False
+    assert evidence is None
+    assert source_session_id == "run_session"
+    assert error is not None
     assert ctx.composition_page_evidence is clean
-    assert ctx.post_run_page_observation_workflow_run_id is None
     assert ctx.browser_session_id == "scout_session"
 
 
 @pytest.mark.asyncio
-async def test_post_run_inspect_does_not_close_the_session_it_landed_on(
+async def test_automatic_post_run_capture_does_not_close_its_target_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tool calls in one batch run concurrently, so a session read back off the shared context may be
-    a sibling's rather than this capture's substitute; closing it would kill a live browser."""
     ctx = _post_run_inspect_ctx()
     closed: list[str] = []
 
@@ -3073,11 +3107,17 @@ async def test_post_run_inspect_does_not_close_the_session_it_landed_on(
 
     monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", _Sessions(), raising=False)
 
-    await _drive_inspect_page(
-        monkeypatch,
+    async def fake_capture(
+        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str
+    ) -> tuple[dict[str, object], None]:
+        assert effective_browser_session_id(inner_ctx) == "run_session"
+        return _bounded_failure_page_evidence(), None
+
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
+    await composition_capture_module._read_run_session_page_evidence(
         ctx,
-        captured=_bounded_failure_page_evidence(),
-        capture_lands_on_session="replacement_session",
+        run_session_id="run_session",
+        current_url="https://example.test/app/results",
     )
 
     assert closed == []
@@ -3085,23 +3125,29 @@ async def test_post_run_inspect_does_not_close_the_session_it_landed_on(
 
 
 @pytest.mark.asyncio
-async def test_post_run_inspect_stamps_the_session_the_capture_landed_on(
+async def test_mixed_target_capture_does_not_claim_a_browser_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _post_run_inspect_ctx()
+    evidence = _bounded_failure_page_evidence()
+    evidence["browser_session_provenance"] = {
+        "mixed": True,
+        "start_browser_session_id": "run_session",
+        "end_browser_session_id": "replacement_session",
+    }
 
     result = await _drive_inspect_page(
         monkeypatch,
         ctx,
-        captured=_bounded_failure_page_evidence(),
-        capture_lands_on_session="replacement_session",
+        captured=evidence,
+        browser_session_id="run_session",
     )
 
-    evidence = result["data"]
-    assert isinstance(evidence, dict)
-    assert evidence["source_browser_session_id"] == "replacement_session"
-    assert evidence["observed_after_workflow_run"] is False
-    assert "workflow_run_id" not in evidence
+    result_evidence = result["data"]
+    assert isinstance(result_evidence, dict)
+    assert result_evidence["source_browser_session_id"] == "replacement_session"
+    assert result_evidence["observed_after_workflow_run"] is False
+    assert "workflow_run_id" not in result_evidence
     assert ctx.post_run_page_observation_workflow_run_id is None
     assert result["reached_via"] == "current_page"
 
@@ -3133,7 +3179,7 @@ async def test_preserved_post_run_capture_does_not_move_the_observation_marker(
         "challenge_controls": [],
     }
 
-    await _drive_inspect_page(monkeypatch, ctx, captured=hollow)
+    await _drive_inspect_page(monkeypatch, ctx, captured=hollow, browser_session_id="run_session")
 
     assert ctx.post_run_page_observation_generation == 3
     stored = ctx.composition_page_evidence
@@ -3150,9 +3196,17 @@ async def test_refused_post_run_capture_preserves_stored_evidence_but_returns_th
     ctx.composition_page_evidence = clean
     replacement_page = _bounded_failure_page_evidence()
     replacement_page["page_title"] = "Replacement session page"
+    replacement_page["browser_session_provenance"] = {
+        "mixed": True,
+        "start_browser_session_id": "run_session",
+        "end_browser_session_id": "replacement_session",
+    }
 
     result = await _drive_inspect_page(
-        monkeypatch, ctx, captured=replacement_page, capture_lands_on_session="replacement_session"
+        monkeypatch,
+        ctx,
+        captured=replacement_page,
+        browser_session_id="run_session",
     )
 
     assert ctx.composition_page_evidence is clean
@@ -3160,6 +3214,7 @@ async def test_refused_post_run_capture_preserves_stored_evidence_but_returns_th
     assert isinstance(evidence, dict)
     assert evidence["page_title"] == "Replacement session page"
     assert evidence["observed_after_workflow_run"] is False
+    assert evidence["source_browser_session_id"] == "replacement_session"
 
 
 @pytest.mark.asyncio
@@ -3179,7 +3234,7 @@ async def test_hollow_post_run_capture_preserves_stored_evidence_but_returns_the
         "challenge_controls": [],
     }
 
-    result = await _drive_inspect_page(monkeypatch, ctx, captured=hollow)
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=hollow, browser_session_id="run_session")
 
     assert ctx.composition_page_evidence is clean
     evidence = result["data"]

@@ -21,7 +21,11 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
-from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
+from skyvern.forge.sdk.copilot.runtime import (
+    PendingBrowserInteractionObservation,
+    bound_call_browser_session,
+    current_call_browser_session_override,
+)
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,
@@ -872,7 +876,8 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
 
     async def fake_page_info(_ctx: object, session_id: str | None = None) -> tuple[str, str]:
-        assert session_id == "pbs_run"
+        assert session_id is None
+        assert current_call_browser_session_override() == "pbs_run"
         return "https://www.example.com/search", "Search"
 
     async def fake_visual_summary(
@@ -903,7 +908,8 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_page_info)
     monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
 
-    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+    with bound_call_browser_session("pbs_run"):
+        result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["data"]["source_browser_session_id"] == "pbs_run"
     assert result["data"]["workflow_run_id"] == "wr_123"
