@@ -1868,6 +1868,7 @@ class CDPDownloadInterceptor:
                 authorize_request_hop=self._redirect_hop_authorizer,
                 download_scope=self._download_scope,
                 approved_initial_url=url,
+                normalize_query_backslashes=True,
             )
         except Exception as exc:
             # The download URL is credential-bearing and can reappear inside an exception message
