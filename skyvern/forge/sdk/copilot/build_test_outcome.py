@@ -759,7 +759,31 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     prior = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if not isinstance(prior, RecordedBuildTestOutcome):
         prior = None
-    if outcome.failed_operation is not None:
+    # Keyed on the failure itself, not on ``failed_operation``: that projection exists only for
+    # browser-operation failures, so a block that died on an ordinary Python exception would
+    # otherwise keep none of its diagnosis.
+    # An acquisition failure that never reached a run names none, so it cannot contradict the prior
+    # failure and merges into it; the merged record keeps that run's identity, since the rebase below
+    # starts from it. Only a record naming a *different* run is a separate outcome.
+    prior_same_run_block_failure = (
+        prior is not None
+        and prior.reason_code == "runtime_block_failure"
+        and bool(prior.workflow_run_id)
+        and outcome.workflow_run_id in (None, "", prior.workflow_run_id)
+    )
+    merged_into_prior_failure = False
+    if outcome.connect_failure is not None and prior is not None and prior_same_run_block_failure:
+        # An acquisition failure concluded nothing about the blocks, so the run's own failure record
+        # stands and the acquisition fact rides along with it. Rebased on that record rather than
+        # copied field by field: the repair prompt reads a dozen diagnostic fields -- evidence refs,
+        # page capture, observed summary -- and a copy list would silently drop each one it grows.
+        # The acquisition fact stays typed in ``connect_failure``; the repair prompt renders it from
+        # there. Folding it into the summary would put two failures through one 160-character clip.
+        # The page-path continuation is dropped: it binds the model to act on the page the prior run
+        # left behind, and the browser holding that page is the one this record says was not acquired.
+        outcome = prior.model_copy(update={"connect_failure": outcome.connect_failure, "page_path_failure": None})
+        merged_into_prior_failure = True
+    elif outcome.failed_operation is not None:
         source_yaml = _executed_workflow_yaml(ctx)
         association = outcome.failed_operation.block_association
         failed_code = _code_for_runner_association(ctx, source_yaml, association)
@@ -789,7 +813,11 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     ctx.latest_recorded_build_test_outcome = outcome
     raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
-    history.append(_history_entry(ctx, outcome))
+    # A merged record adds no block outcome -- the prior entry already holds this failure, snapshotted
+    # against the code the run executed. Appending would re-snapshot it against the current draft,
+    # so a later clearance check would compare the failure to code it never ran.
+    if not merged_into_prior_failure:
+        history.append(_history_entry(ctx, outcome))
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
     if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
