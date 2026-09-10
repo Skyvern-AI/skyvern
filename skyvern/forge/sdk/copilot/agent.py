@@ -55,7 +55,10 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState, serialize_prior_budget_expiry
-from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _TEXT_MAX,
     _VALUE_EXCERPT_MAX,
@@ -1165,6 +1168,15 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
             "Repair the persisted code at this evidenced block/line, then test the changed attempt with "
             "edit_block_and_run before reporting it."
         )
+    # Rendered from the typed fact rather than folded into observed_evidence, which clips at 160
+    # characters and would drop whichever of the two failures came second.
+    connect_failure = outcome.connect_failure
+    if connect_failure is not None:
+        # The typed sentence, not the bare state: it says whether to wait or take a fresh session.
+        # The occupying run id is cleared first -- prompt atoms carry no raw run ids, and leaving it
+        # in makes the leak guard drop the whole line rather than redact the id.
+        sentence = build_test_connect_failure_sentence(connect_failure.model_copy(update={"occupier_run_id": None}))
+        lines.append(f"browser_acquisition_failed: {_clean_authoring_repair_prompt_atom(sentence)}")
     # Facts render for every outcome; the two post-run page-path directives bind the model's next
     # action, so they keep the authority check that gated this whole section before.
     page_path_failure = outcome.page_path_failure
