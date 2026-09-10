@@ -5171,7 +5171,7 @@ async def test_capture_retains_rendered_disclosure_facts_on_a_standalone_control
     </body></html>
     """
     server = _RecordingCompositionServer(structured_json=rendered, html=html, reject_html=True)
-    ctx = SimpleNamespace(discovery_mcp_server=server)
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None)
 
     evidence, error = await tools_module._capture_composition_evidence(
         ctx,
@@ -5253,7 +5253,7 @@ async def test_capture_prefers_html_parse_over_hollow_structured_on_fallback(mon
     )
     html = "<html><head><title>Notice</title></head><body><p>Welcome notice text</p></body></html>"
     server = _RecordingCompositionServer(structured_json=hollow, html=html)
-    ctx = SimpleNamespace(discovery_mcp_server=server)
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None)
 
     evidence, error = await tools_module._capture_composition_evidence(
         ctx, inspected_url="https://example.com/p", current_url="https://example.com/p"

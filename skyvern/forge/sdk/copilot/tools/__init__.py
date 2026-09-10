@@ -14,7 +14,7 @@ from agents.tool_context import ToolContext
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
-from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
+from skyvern.forge.sdk.copilot.browser_target import BrowserTarget, resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -1409,6 +1409,7 @@ async def inspect_page_for_composition_tool(
     ctx: RunContextWrapper,
     target_url: str,
     requested_output_reads: list[RequestedOutputRead] | None = None,
+    target: BrowserTarget = BrowserTarget.DEBUG,
 ) -> str:
     """Inspect a known page before composing form/search workflow blocks.
 
@@ -1417,10 +1418,15 @@ async def inspect_page_for_composition_tool(
     Use this after the entrypoint URL is known and before authoring blocks that
     fill fields, submit searches, filter results, or expand result rows. It
     can also inspect the current browser page after a run by passing
-    target_url="current_page"; use that after partial/budgeted runs so you do
+    target_url="current_page". `target="debug"` (the default) keeps the read on
+    the browser this chat drives; `target="last_run"` reads the browser used by
+    the most recent test run. Use the latter after partial/budgeted runs so you do
     not replay a search that already advanced the page. Passing any other
-    `target_url` navigates the live browser there and reports the reached
-    `current_url`, so a further `navigate_browser` to that same URL is redundant. The packet
+    `target_url` navigates the targeted browser there and reports the reached
+    `current_url`, so a further `navigate_browser` to that same URL is redundant. Navigating
+    `target="last_run"` leaves the page that run stopped on, losing the state you are diagnosing,
+    and anything it submits there is real; pass `target_url="current_page"` to observe that browser
+    without moving it. The packet
     describes the page only as it is at that moment: a control that appears solely after an
     interaction -- a Delete control after an Add click, a cart after add-to-cart, the secure area
     after login -- is absent from it until that interaction has happened.
@@ -1448,39 +1454,87 @@ async def inspect_page_for_composition_tool(
     and returns every observed selector candidate with its cardinality as facts; you
     remain responsible for choosing a selector and authoring the workflow read.
     """
-    authority_error = _authority_tool_error(ctx.context, "inspect_page_for_composition")
-    if authority_error:
-        return _diagnosis_repair_tool_error(ctx.context, "inspect_page_for_composition", authority_error)
-    admitted, _ = admitted_requested_output_reads(requested_output_reads or [])
-    result = await _inspect_page_for_composition_impl(ctx.context, target_url, admitted)
-    if requested_output_reads and result.get("ok"):
-        data = result.get("data")
-        witnessed_paths = _witnessed_output_paths(data)
-        verified, unverified = await _verify_requested_output_reads(
-            ctx.context, requested_output_reads, witnessed_paths
+    copilot_ctx = ctx.context
+    target_value = target.value
+    arguments: dict[str, Any] = {"target_url": target_url, "target": target_value}
+    if requested_output_reads is not None:
+        arguments["requested_output_reads"] = requested_output_reads
+    binding = resolve_browser_session_binding(copilot_ctx, {"target": target_value})
+
+    def finish(result: dict[str, Any], source_browser_session_id: str | None) -> str:
+        result_data = result.get("data")
+        session_provenance = result_data.get("browser_session_provenance") if isinstance(result_data, dict) else None
+        mixed_session_provenance = isinstance(session_provenance, dict) and session_provenance.get("mixed") is True
+        source_matches_target = (
+            binding.source_matches_target
+            and not mixed_session_provenance
+            and source_browser_session_id is not None
+            and source_browser_session_id == binding.session_id_for(copilot_ctx)
         )
-        if isinstance(data, dict):
-            data["requested_output_designations"] = verified
-            if unverified:
-                data["unverified_output_designations"] = unverified
-                retry_paths = [
-                    item["output_path"]
-                    for item in unverified
-                    if item.get("output_path") and item.get("reason") != SUPERSEDED_BY_VALUE_WITNESS
-                ]
-                if retry_paths:
-                    data["requested_output_designation_capability"] = requested_output_designation_capability(
-                        retry_paths
-                    )
-    elif result.get("ok"):
-        requested_paths = requested_output_paths_for_derivation(ctx.context)
-        data = result.get("data")
-        if requested_paths and isinstance(data, dict):
-            data["requested_output_designation_capability"] = requested_output_designation_capability(
-                list(requested_paths)
+        stamped = {
+            **result,
+            **binding.provenance(),
+            "source_matches_target": source_matches_target,
+            "source_browser_session_id": source_browser_session_id,
+        }
+        scrubbed = scrub_secrets_from_structure(copilot_ctx, stamped)
+        model_result = _model_facing_inspect_result(scrubbed)
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, model_result)
+        return json.dumps(model_result)
+
+    if binding.unavailable_reason:
+        return finish(
+            {"ok": False, "data": None, "error": binding.unavailable_reason},
+            None,
+        )
+
+    with bound_call_browser_session(binding.session_id_override):
+        authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
+        if authority_error:
+            authority_result = json.loads(
+                _diagnosis_repair_tool_error(copilot_ctx, "inspect_page_for_composition", authority_error)
             )
-    scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
-    return json.dumps(_model_facing_inspect_result(scrubbed_result))
+            return finish(
+                authority_result,
+                None,
+            )
+        admitted, _ = admitted_requested_output_reads(requested_output_reads or [])
+        result = await _inspect_page_for_composition_impl(copilot_ctx, target_url, admitted)
+        if requested_output_reads and result.get("ok"):
+            data = result.get("data")
+            witnessed_paths = _witnessed_output_paths(data)
+            verified, unverified = await _verify_requested_output_reads(
+                copilot_ctx, requested_output_reads, witnessed_paths
+            )
+            if isinstance(data, dict):
+                data["requested_output_designations"] = verified
+                if unverified:
+                    data["unverified_output_designations"] = unverified
+                    retry_paths = [
+                        item["output_path"]
+                        for item in unverified
+                        if item.get("output_path") and item.get("reason") != SUPERSEDED_BY_VALUE_WITNESS
+                    ]
+                    if retry_paths:
+                        data["requested_output_designation_capability"] = requested_output_designation_capability(
+                            retry_paths
+                        )
+        elif result.get("ok"):
+            requested_paths = requested_output_paths_for_derivation(copilot_ctx)
+            data = result.get("data")
+            if requested_paths and isinstance(data, dict):
+                data["requested_output_designation_capability"] = requested_output_designation_capability(
+                    list(requested_paths)
+                )
+        data = result.get("data")
+        source_browser_session_id = (
+            data.get("source_browser_session_id")
+            if isinstance(data, dict) and "source_browser_session_id" in data
+            else None
+        )
+        if not isinstance(source_browser_session_id, str):
+            source_browser_session_id = None
+        return finish(result, source_browser_session_id)
 
 
 @function_tool(name_override="fill_credential_field", strict_mode=False)

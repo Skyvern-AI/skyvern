@@ -88,6 +88,7 @@ class ExfiltrationChannel(CdpChannel):
     _DISCARD_QUEUE_JS: t.ClassVar[str] = (
         "() => { const q = window.__skyvern_exfil_queue; if (Array.isArray(q)) q.length = 0; }"
     )
+    _DECORATION_PRESENT_JS: t.ClassVar[str] = '() => document.getElementById("__skyvern_mouse_follower") !== null'
     _active_binding_channels: t.ClassVar[weakref.WeakKeyDictionary[Page, "ExfiltrationChannel"]] = (
         weakref.WeakKeyDictionary()
     )
@@ -104,6 +105,8 @@ class ExfiltrationChannel(CdpChannel):
         self._pending_event_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
+        self._decoration_init_script_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._decoration_page_locks: weakref.WeakKeyDictionary[Page, asyncio.Lock] = weakref.WeakKeyDictionary()
         self._pending_nav_tasks: weakref.WeakKeyDictionary[Page, asyncio.Task] = weakref.WeakKeyDictionary()
         self._network_activity_count = 0
         self._last_network_activity_emit = 0.0
@@ -333,6 +336,14 @@ class ExfiltrationChannel(CdpChannel):
                 except Exception:
                     LOG.debug(
                         f"{self.class_name} failed to refresh exfiltration on page",
+                        url=page.url,
+                        exc_info=True,
+                    )
+                try:
+                    await self.decorate(page)
+                except Exception:
+                    LOG.debug(
+                        f"{self.class_name} failed to refresh decoration on page",
                         url=page.url,
                         exc_info=True,
                     )
@@ -632,12 +643,21 @@ class ExfiltrationChannel(CdpChannel):
         if page.url.startswith("devtools:"):
             return self
 
-        LOG.info(f"{self.class_name} adding decoration to page.", url=page.url, **self.identity)
+        lock = self._decoration_page_locks.get(page)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._decoration_page_locks[page] = lock
 
-        await page.add_init_script(self.js("decorate"))
-        await page.evaluate(self.js("decorate"))
-
-        LOG.info(f"{self.class_name} decoration setup complete on page.", url=page.url, **self.identity)
+        async with lock:
+            decorate_script = self.js("decorate")
+            if page not in self._decoration_init_script_pages:
+                LOG.info(f"{self.class_name} adding decoration to page.", url=page.url, **self.identity)
+                await page.add_init_script(decorate_script)
+                self._decoration_init_script_pages.add(page)
+                await page.evaluate(decorate_script)
+                LOG.info(f"{self.class_name} decoration setup complete on page.", url=page.url, **self.identity)
+            elif not await page.evaluate(self._DECORATION_PRESENT_JS):
+                await page.evaluate(decorate_script)
 
         return self
 
