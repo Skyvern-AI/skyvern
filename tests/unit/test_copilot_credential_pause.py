@@ -1778,9 +1778,13 @@ async def test_the_card_outlives_the_model_stream_deadline_the_tool_call_ran_und
     card cancelled out from under them."""
     ctx = _tool_ctx(
         monkeypatch,
-        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 1.6),
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 4.5),
     )
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 1.0)
+    # Keep the timing order explicit: loaded-runner overhead < turn budget < human
+    # wait < credential-card timeout. The neighboring resume test uses the same
+    # margins because a one-second turn budget is too small on a cold CI shard.
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 4.0)
+    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=30)
 
     stream = _make_stream()
     fake_result = _fake_result()

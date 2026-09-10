@@ -268,6 +268,33 @@ def load_js_script() -> str:
 
 JS_FUNCTION_DEFS = load_js_script()
 
+
+class _DomUtilsExpression(str):
+    """A guarded built-in expression whose helpers may be bootstrapped before it runs."""
+
+
+_DOM_UTILS_MISSING_RESULT_KEY = "__skyvern_dom_utils_missing__"
+
+
+def _is_dom_utils_missing_result(result: Any) -> bool:
+    return result == {_DOM_UTILS_MISSING_RESULT_KEY: True}
+
+
+def with_dom_utils(expression: str, required_helpers: tuple[str, ...]) -> str:
+    """Guard a built-in call so missing helpers are reported before the operation runs."""
+    textual_enabled = SettingsManager.get_settings().ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE
+    context = skyvern_context.current()
+    enriched_enabled = bool(context and context.enriched_tree_enabled())
+    return _DomUtilsExpression(f"""(arg) => {{
+        if (!{json.dumps(required_helpers)}.every((name) => typeof globalThis[name] === "function")) {{
+            return {{{json.dumps(_DOM_UTILS_MISSING_RESULT_KEY)}: true}};
+        }}
+        window.GlobalEnableAllTextualElements = {json.dumps(textual_enabled)};
+        window.GlobalEnableEnrichedElementTree = {json.dumps(enriched_enabled)};
+        return ({expression})(arg);
+    }}""")
+
+
 _NAVIGATION_RECOVERY_MAX_ATTEMPTS = 4
 _NAVIGATION_SETTLE_TIMEOUT_MS = 3000
 
@@ -302,11 +329,7 @@ def _extract_playwright_screenshot_stage(exc: BaseException) -> str:
 
 
 def _is_navigation_context_lost(error_msg: str) -> bool:
-    if "Execution context was destroyed" in error_msg:
-        return True
-    if "Cannot find context with specified id" in error_msg:
-        return True
-    return "ReferenceError" in error_msg and "is not defined" in error_msg
+    return "Execution context was destroyed" in error_msg or "Cannot find context with specified id" in error_msg
 
 
 # Order-locked labels for the selectors in LOADING_INDICATOR_PROBE_JS. The JS ships back a fixed
@@ -606,6 +629,22 @@ async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | No
     if arg is not None and not _is_json_inlinable(arg):
         return await frame.evaluate(expression=expression, arg=arg)
     return await evaluate_in_main_world(frame, expression, arg)
+
+
+async def _dispatch_dom_utils_bootstrap(
+    frame: Page | Frame, operation_arg: Any | None, *, force_cdp: bool = False
+) -> Any:
+    """Install helpers through the same world-selection route as the guarded operation."""
+    if force_cdp:
+        return await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None, force_cdp=True)
+    if not is_page_like(frame):
+        return await frame.evaluate(expression=JS_FUNCTION_DEFS, arg=None)
+    context = frame.context
+    if context is None or get_main_world_prefix(context) is None:
+        return await frame.evaluate(expression=JS_FUNCTION_DEFS, arg=None)
+    if operation_arg is not None and not _is_json_inlinable(operation_arg):
+        return await frame.evaluate(expression=JS_FUNCTION_DEFS, arg=None)
+    return await evaluate_in_main_world(frame, JS_FUNCTION_DEFS)
 
 
 async def _wait_for_navigation_settle(
@@ -1501,12 +1540,16 @@ class SkyvernFrame:
         async def evaluate_expression() -> Any:
             return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
 
+        async def bootstrap_expression() -> Any:
+            return await _dispatch_dom_utils_bootstrap(frame, arg, force_cdp=force_cdp)
+
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
             expression=expression,
             evaluate_expression=evaluate_expression,
             timeout_ms=timeout_ms,
             engine_selection=engine_selection,
+            bootstrap_expression=bootstrap_expression,
             **({"deadline": deadline} if deadline is not None else {}),
         )
 
@@ -1518,7 +1561,23 @@ class SkyvernFrame:
         timeout_ms: float,
         engine_selection: BrowserEngineSelection | None = None,
         deadline: float | None = None,
+        bootstrap_expression: Callable[[], Awaitable[Any]] | None = None,
     ) -> Any:
+        if isinstance(expression, _DomUtilsExpression):
+            if bootstrap_expression is None:
+                raise RuntimeError("domUtils expression requires a matching-world bootstrap")
+            guarded_evaluate = evaluate_expression
+
+            async def evaluate_expression() -> Any:
+                for _ in range(_NAVIGATION_RECOVERY_MAX_ATTEMPTS):
+                    result = await guarded_evaluate()
+                    if not _is_dom_utils_missing_result(result):
+                        return result
+                    # The guarded expression returned before invoking the built-in operation, so
+                    # installing helpers and trying it again cannot repeat caller-visible effects.
+                    await bootstrap_expression()
+                raise RuntimeError("domUtils helpers remained unavailable after bootstrap")
+
         loop = asyncio.get_running_loop()
         deadline = deadline if deadline is not None else loop.time() + timeout_ms / 1000
         try:
@@ -1528,7 +1587,7 @@ class SkyvernFrame:
             skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
             # Re-raised and handled by the caller (scrape retries / failure classification),
             # so this is not the failure boundary; log without a traceback at warning.
-            LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
+            LOG.warning("Skyvern timed out trying to analyze the page", expression=expression[:200])
             raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
         except RuntimeError as e:
             # `evaluate_in_main_world` raises RuntimeError on Runtime.evaluate
@@ -1594,7 +1653,7 @@ class SkyvernFrame:
             if _remaining_seconds() <= 0:
                 LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
-                    expression=expression,
+                    expression=expression[:200],
                 )
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
 
@@ -1615,7 +1674,7 @@ class SkyvernFrame:
                 if inject_budget <= 0:
                     LOG.warning(
                         "Skyvern timed out trying to analyze the page after navigation recovery",
-                        expression=expression,
+                        expression=expression[:200],
                     )
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
                 try:
@@ -1626,7 +1685,7 @@ class SkyvernFrame:
                 except asyncio.TimeoutError as error:
                     LOG.warning(
                         "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
-                        expression=expression,
+                        expression=expression[:200],
                         exc_info=True,
                     )
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
@@ -1649,7 +1708,7 @@ class SkyvernFrame:
             if retry_budget <= 0:
                 LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
-                    expression=expression,
+                    expression=expression[:200],
                 )
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
@@ -1660,7 +1719,9 @@ class SkyvernFrame:
                 return result
             except asyncio.TimeoutError as error:
                 LOG.warning(
-                    "Skyvern timed out on retry after JS context re-injection", expression=expression, exc_info=True
+                    "Skyvern timed out on retry after JS context re-injection",
+                    expression=expression[:200],
+                    exc_info=True,
                 )
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except Exception as retry_err:
@@ -2032,7 +2093,7 @@ class SkyvernFrame:
             return await self.frame.content()
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
-        js_script = "() => getScrollXY()"
+        js_script = with_dom_utils("() => getScrollXY()", ("getScrollXY",))
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
     async def get_open_aria_popup_trigger(self) -> dict | None:
@@ -2043,7 +2104,10 @@ class SkyvernFrame:
         semantics live in getOpenAriaPopupTrigger in domUtils.js.
         """
         try:
-            result = await self.evaluate(frame=self.frame, expression="() => getOpenAriaPopupTrigger()")
+            result = await self.evaluate(
+                frame=self.frame,
+                expression=with_dom_utils("() => getOpenAriaPopupTrigger()", ("getOpenAriaPopupTrigger",)),
+            )
         except Exception:
             LOG.warning(
                 "Failed to detect open ARIA popup trigger; using default scrolling behavior",
@@ -2053,11 +2117,11 @@ class SkyvernFrame:
         return result if isinstance(result, dict) else None
 
     async def get_scroll_width_and_height(self) -> tuple[int, int]:
-        js_script = "() => getScrollWidthAndHeight()"
+        js_script = with_dom_utils("() => getScrollWidthAndHeight()", ("getScrollWidthAndHeight",))
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
     async def scroll_to_x_y(self, x: int, y: int) -> None:
-        js_script = "([x, y]) => scrollToXY(x, y)"
+        js_script = with_dom_utils("([x, y]) => scrollToXY(x, y)", ("scrollToXY",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[x, y]
         )
@@ -2077,19 +2141,24 @@ class SkyvernFrame:
         )
 
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
-        js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
+        js_script = with_dom_utils(
+            "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)", ("scrollToElementBottom",)
+        )
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[element, page_by_page]
         )
 
     async def scroll_to_element_top(self, element: ElementHandle) -> None:
-        js_script = "(element) => scrollToElementTop(element)"
+        js_script = with_dom_utils("(element) => scrollToElementTop(element)", ("scrollToElementTop",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
-        js_script = "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)"
+        js_script = with_dom_utils(
+            "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)",
+            ("buildElementObject",),
+        )
         parsed = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2100,35 +2169,41 @@ class SkyvernFrame:
         return parsed
 
     async def get_element_scrollable(self, element: ElementHandle) -> bool:
-        js_script = "(element) => isScrollable(element)"
+        js_script = with_dom_utils("(element) => isScrollable(element)", ("isScrollable",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
 
     async def get_element_visible(self, locator: Locator) -> bool:
-        js_script = "(element) => isElementVisible(element) && !isHidden(element)"
+        js_script = with_dom_utils(
+            "(element) => isElementVisible(element) && !isHidden(element)", ("isElementVisible", "isHidden")
+        )
 
         async def evaluate_expression() -> bool:
             if await locator.count() == 0:
                 return False
             return await locator.evaluate(js_script)
 
+        async def bootstrap_expression() -> Any:
+            return await locator.evaluate(f"(element) => {{ {JS_FUNCTION_DEFS} }}")
+
         return await self._evaluate_expression(
             frame=self.frame,
             engine_selection=self.engine_selection,
             expression=js_script,
             evaluate_expression=evaluate_expression,
+            bootstrap_expression=bootstrap_expression,
             timeout_ms=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
 
     async def get_disabled_from_style(self, element: ElementHandle) -> bool:
-        js_script = "(element) => checkDisabledFromStyle(element)"
+        js_script = with_dom_utils("(element) => checkDisabledFromStyle(element)", ("checkDisabledFromStyle",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
 
     async def get_blocking_element_id(self, element: ElementHandle) -> tuple[str, bool]:
-        js_script = "(element) => getBlockElementUniqueID(element)"
+        js_script = with_dom_utils("(element) => getBlockElementUniqueID(element)", ("getBlockElementUniqueID",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
@@ -2140,7 +2215,10 @@ class SkyvernFrame:
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = "async ([draw_boxes, frame, frame_index]) => await safeScrollToTop(draw_boxes, frame, frame_index)"
+        js_script = with_dom_utils(
+            "async ([draw_boxes, frame, frame_index]) => await safeScrollToTop(draw_boxes, frame, frame_index)",
+            ("safeScrollToTop",),
+        )
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2165,7 +2243,10 @@ class SkyvernFrame:
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = "async ([draw_boxes, frame, frame_index, need_overlap]) => await scrollToNextPage(draw_boxes, frame, frame_index, need_overlap)"
+        js_script = with_dom_utils(
+            "async ([draw_boxes, frame, frame_index, need_overlap]) => await scrollToNextPage(draw_boxes, frame, frame_index, need_overlap)",
+            ("scrollToNextPage",),
+        )
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2186,7 +2267,7 @@ class SkyvernFrame:
         Remove the bounding boxes from the page.
         :param page: Page instance to remove the bounding boxes from.
         """
-        js_script = "() => removeBoundingBoxes()"
+        js_script = with_dom_utils("() => removeBoundingBoxes()", ("removeBoundingBoxes",))
         await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2195,7 +2276,10 @@ class SkyvernFrame:
         )
 
     async def build_elements_and_draw_bounding_boxes(self, frame: str, frame_index: int) -> None:
-        js_script = "async ([frame, frame_index]) => await buildElementsAndDrawBoundingBoxes(frame, frame_index)"
+        js_script = with_dom_utils(
+            "async ([frame, frame_index]) => await buildElementsAndDrawBoundingBoxes(frame, frame_index)",
+            ("buildElementsAndDrawBoundingBoxes",),
+        )
         await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2205,23 +2289,23 @@ class SkyvernFrame:
         )
 
     async def is_window_scrollable(self) -> bool:
-        js_script = "() => isWindowScrollable()"
+        js_script = with_dom_utils("() => isWindowScrollable()", ("isWindowScrollable",))
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
     async def is_parent(self, parent: ElementHandle, child: ElementHandle) -> bool:
-        js_script = "([parent, child]) => isParent(parent, child)"
+        js_script = with_dom_utils("([parent, child]) => isParent(parent, child)", ("isParent",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[parent, child]
         )
 
     async def is_sibling(self, el1: ElementHandle, el2: ElementHandle) -> bool:
-        js_script = "([el1, el2]) => isSibling(el1, el2)"
+        js_script = with_dom_utils("([el1, el2]) => isSibling(el1, el2)", ("isSibling",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[el1, el2]
         )
 
     async def has_ASP_client_control(self) -> bool:
-        js_script = "() => hasASPClientControl()"
+        js_script = with_dom_utils("() => hasASPClientControl()", ("hasASPClientControl",))
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
     async def click_element_in_javascript(self, element: ElementHandle) -> None:
@@ -2267,19 +2351,19 @@ class SkyvernFrame:
         )
 
     async def get_select_options(self, element: ElementHandle) -> tuple[list, str]:
-        js_script = "([element]) => getSelectOptions(element)"
+        js_script = with_dom_utils("([element]) => getSelectOptions(element)", ("getSelectOptions",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[element]
         )
 
     async def get_element_dom_depth(self, element: ElementHandle) -> int:
-        js_script = "([element]) => getElementDomDepth(element)"
+        js_script = with_dom_utils("([element]) => getElementDomDepth(element)", ("getElementDomDepth",))
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=[element]
         )
 
     async def remove_all_unique_ids(self) -> None:
-        js_script = "() => removeAllUniqueIds()"
+        js_script = with_dom_utils("() => removeAllUniqueIds()", ("removeAllUniqueIds",))
         await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
     async def _set_enriched_element_tree_flag(
@@ -2314,7 +2398,10 @@ class SkyvernFrame:
         # unconditional: it is protection against a hostile wrapper injecting the key, not capture
         # cost.
         capture_destination_facts = policy_observation_enabled()
-        js_script = "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
+        js_script = with_dom_utils(
+            "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)",
+            ("buildTreeFromBody",),
+        )
 
         # One monotonic budget across the flag write, both build attempts and the re-injection
         # between them -- as _evaluate_with_navigation_recovery does -- so the retry cannot double
@@ -2339,9 +2426,7 @@ class SkyvernFrame:
 
         tree = _as_element_tree_pair(await build())
         if tree is None:
-            # Callers scraping an iframe swallow a raise here and drop the whole frame from the tree,
-            # so spend one re-injection before giving up: a silent non-pair is the same lost JS world
-            # the raised-ReferenceError path already recovers from, minus an error to key on.
+            # Re-bootstrap once for a malformed tree result; missing helpers are prepared before build().
             LOG.warning(
                 "Element tree builder returned no tree, re-injecting domUtils.js and retrying",
                 url=redact_url_secrets(self.frame.url),
@@ -2370,7 +2455,10 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
-        js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
+        js_script = with_dom_utils(
+            "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)",
+            ("getIncrementElements",),
+        )
         result = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2400,7 +2488,10 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
-        js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
+        js_script = with_dom_utils(
+            "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)",
+            ("buildElementTree",),
+        )
         result = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
@@ -2449,7 +2540,7 @@ class SkyvernFrame:
                 is_finished = await self.evaluate(
                     frame=self.frame,
                     engine_selection=self.engine_selection,
-                    expression="() => isAnimationFinished()",
+                    expression=with_dom_utils("() => isAnimationFinished()", ("isAnimationFinished",)),
                     timeout_ms=timeout_ms,
                 )
                 if is_finished:
