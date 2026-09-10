@@ -363,6 +363,7 @@ class _Recorder:
         self.failed_locator: Locator | None = None
         self.failed_locator_exception: BaseException | None = None
         self.failure_operation_generation = 0
+        self._next_action_order = 0
         self._on_action = on_action
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
@@ -426,6 +427,11 @@ class _Recorder:
         self.failed_locator = None
         return self.failure_operation_generation
 
+    def _reserve_action_order(self) -> int:
+        action_order = self._next_action_order
+        self._next_action_order += 1
+        return action_order
+
     async def record(
         self,
         action_type: ActionType,
@@ -436,12 +442,15 @@ class _Recorder:
         kwargs: dict[str, Any],
         description: str | None = None,
         failure_locator: Locator | None = None,
+        record_boolean_response: bool = False,
+        workflow_run_id: str | None = None,
+        record_failure_type_only: bool = False,
     ) -> Any:
         generation = self.begin_failure_operation()
         started = time.monotonic()
         started_wall = naive_utc_now()
         code_line = _frame_user_line()
-        action_order = len(self.actions)
+        action_order = self._reserve_action_order()
         # Input values may be credentials (incl. derived TOTP codes); never describe them.
         describe_args = () if action_type == ActionType.INPUT_TEXT else args
         common_fields = dict(
@@ -450,6 +459,7 @@ class _Recorder:
             action_type=action_type,
             status=ActionStatus.completed,
             action_order=action_order,
+            workflow_run_id=workflow_run_id,
             # A reader-facing prompt (page.extract/complete) is the action's own copy; prefer it over
             # the "page.method arg" form so the timeline reads as plain language even when the editor's
             # derived step is missing or stale and the UI falls back to this description.
@@ -472,6 +482,8 @@ class _Recorder:
         )
         try:
             result = await call()
+            if record_boolean_response and isinstance(result, bool):
+                action.response = str(result).lower()
         except BaseException as exc:
             action.status = ActionStatus.failed
             # Generous rather than tight: the persistence path masks secrets by exact match, so a
@@ -481,11 +493,14 @@ class _Recorder:
             # A user-defined __str__ can raise or return a non-str. Unguarded, that replaces the
             # browser's failure with its own and skips both last_exception and the re-raise below,
             # so the run would lose the fault this line exists to report.
-            try:
-                captured = str(exc)[:RECORDED_FAILURE_CAPTURE_MAX_CHARS]
-            except BaseException:
-                captured = ""
-            action.response = captured or type(exc).__name__
+            if record_failure_type_only:
+                action.response = type(exc).__name__
+            else:
+                try:
+                    captured = str(exc)[:RECORDED_FAILURE_CAPTURE_MAX_CHARS]
+                except BaseException:
+                    captured = ""
+                action.response = captured or type(exc).__name__
             self.last_exception = exc
             if generation == self.failure_operation_generation:
                 self.failed_locator_exception = exc
@@ -732,13 +747,34 @@ class RecordingPage:
         return self.__page
 
     def recorded_actions(self) -> list[Action]:
-        return list(self.__recorder.actions)
+        return sorted(self.__recorder.actions, key=lambda action: cast(int, action.action_order))
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.__recorder.last_exception
 
     def failure_locator(self, exception: BaseException) -> Locator | None:
         return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
+
+    async def _record_solve_captcha(
+        self,
+        call: Callable[[], Awaitable[bool]],
+        *,
+        workflow_run_id: str | None,
+    ) -> bool:
+        return cast(
+            bool,
+            await self.__recorder.record(
+                ActionType.SOLVE_CAPTCHA,
+                "solve_captcha",
+                None,
+                call,
+                (),
+                {},
+                record_boolean_response=True,
+                workflow_run_id=workflow_run_id,
+                record_failure_type_only=True,
+            ),
+        )
 
     def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
         """Return the trusted timeout that a secure-runner block must restore."""

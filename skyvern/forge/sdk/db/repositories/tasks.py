@@ -30,6 +30,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
 from skyvern.schemas.steps import AgentStepOutput
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -443,7 +444,13 @@ class TasksRepository(BaseRepository):
         return [hydrate_action(row) for row in rows]
 
     @db_operation("get_action_count_for_step")
-    async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:
+    async def get_action_count_for_step(
+        self,
+        step_id: str,
+        task_id: str,
+        organization_id: str,
+        exclude_action_types: Sequence[ActionType] | None = None,
+    ) -> int:
         """Get count of actions for a step. Uses composite index for efficiency."""
         async with self.Session() as session:
             query = (
@@ -453,6 +460,8 @@ class TasksRepository(BaseRepository):
                 .where(ActionModel.task_id == task_id)
                 .where(ActionModel.step_id == step_id)
             )
+            if exclude_action_types:
+                query = query.where(ActionModel.action_type.notin_([t.value for t in exclude_action_types]))
             result = await session.scalar(query)
             return result or 0
 
