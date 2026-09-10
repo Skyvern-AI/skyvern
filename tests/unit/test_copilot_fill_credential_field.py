@@ -24,7 +24,13 @@ from structlog.testing import capture_logs
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    _build_request_policy_bootstrap,
+    _ground_user_provided_sites,
+    _seed_prior_approved_credentials,
+    admit_credential_for_live_page,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     OriginRunRedactionRegistry,
@@ -42,6 +48,7 @@ from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
     remove_sensitive_disclosure_prerequisite,
@@ -70,6 +77,7 @@ def _policy(**overrides: Any) -> RequestPolicy:
 def _ctx(**overrides: Any) -> SimpleNamespace:
     ns = SimpleNamespace(
         organization_id="o_1",
+        persisted_workflow_yaml=None,
         turn_origin=TurnOrigin.interactive,
         request_policy=_policy(),
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -1583,7 +1591,7 @@ class TestCredentialFillLivePageAdmission:
         result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
-        assert "cannot be filled" in result["error"]
+        assert "request_credential" in result["error"]
         assert page.fill_calls == []
 
     async def _unbound_grant(
@@ -1647,7 +1655,7 @@ class TestCredentialFillLivePageAdmission:
 
         assert grant is None
         assert error is not None
-        assert "has not named this site" in error
+        assert "request_credential" in error
 
     @pytest.mark.asyncio
     async def test_a_lookalike_domain_does_not_match_the_user_site(self) -> None:
@@ -1729,9 +1737,7 @@ class TestCredentialFillLivePageAdmission:
 
         assert grant is None
         assert error is not None
-        # Only an exact name or a cred_ id is read back off the next message, so an ask that would
-        # settle for "yes" re-asks forever — the loop this seam exists to end.
-        assert "exact name" in error and "cred_" in error
+        assert "request_credential" in error
 
     @pytest.mark.asyncio
     async def test_naming_this_turn_settles_among_several_resolved(self) -> None:
@@ -2483,3 +2489,113 @@ async def test_a_terminal_credential_run_does_not_authorize_a_credential_without
     assert result["ok"] is False
     assert result["error"] != SENSITIVE_ORIGIN_PAGE_ERROR
     assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin_arm",
+    [
+        "saved_login",
+        "vault",
+        "tested",
+        "wrong_origin",
+        "unavailable",
+        "canvas_only",
+        "ambiguous_authority",
+        "saved_other_user_site",
+        "saved_other_named",
+        "saved_other_approved",
+    ],
+)
+async def test_saved_workflow_login_fills_without_repeating_the_credential_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    origin_arm: str,
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    credential = _org_credential("cred_123", "authtest simple", _FIXTURE_LOGIN_URL if origin_arm == "tested" else None)
+    saved_yaml = f"""
+workflow_definition:
+  parameters:
+    - parameter_type: credential
+      key: login
+      credential_id: cred_123
+  blocks:
+    - block_type: login
+      label: login
+      url: {_FIXTURE_LOGIN_URL if origin_arm == "saved_login" else "https://public.example.org/book"}
+      parameter_keys: [login]
+"""
+    if origin_arm == "ambiguous_authority":
+        saved_yaml = saved_yaml.replace(
+            "https://public.example.org/book", r"https://trusted.example\@authenticationtest.com/simpleFormAuth/"
+        )
+    policy = await _build_request_policy_bootstrap(
+        user_message="Run the whole workflow again",
+        workflow_yaml=saved_yaml.replace("https://public.example.org/book", _FIXTURE_LOGIN_URL),
+        persisted_workflow_yaml=saved_yaml if origin_arm != "canvas_only" else None,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="o_1",
+    )
+    ctx = make_copilot_context()
+    ctx.organization_id = "o_1"
+    ctx.browser_session_id = "pbs_1"
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = policy
+    ctx.persisted_workflow_yaml = saved_yaml if origin_arm != "canvas_only" else None
+    ctx.vault_login_uris_by_credential_id = {"cred_123": [_FIXTURE_LOGIN_URL] if origin_arm == "vault" else []}
+    if origin_arm == "wrong_origin":
+        credential.tested_url = "https://wrong.example.net/login"
+    candidates = [credential]
+    if origin_arm in {"saved_other_user_site", "saved_other_named", "saved_other_approved"}:
+        policy.user_provided_site_urls = [_FIXTURE_LOGIN_URL]
+        candidates.append(_org_credential("cred_other", "other login", _FIXTURE_LOGIN_URL))
+        if origin_arm == "saved_other_named":
+            policy.current_turn_named_credential_ids = {"cred_123"}
+        if origin_arm == "saved_other_approved":
+            with patch(
+                "skyvern.forge.sdk.copilot.request_policy.app.DATABASE.credentials.get_credentials_by_ids",
+                AsyncMock(return_value=[credential]),
+            ):
+                await _seed_prior_approved_credentials(
+                    policy,
+                    organization_id="o_1",
+                    global_llm_context=json.dumps({"approved_credentials": [{"credential_id": "cred_123"}]}),
+                )
+    with patch.object(credential_fill_module, "load_credentials", AsyncMock(return_value=candidates)):
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    allowed = origin_arm in {"saved_login", "vault", "tested", "saved_other_named", "saved_other_approved"}
+    assert result["ok"] is allowed
+    assert bool(page.fill_calls) is allowed
+    assert _FAKE_PASSWORD not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_fill_names_the_in_chat_selection_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx(request_policy=RequestPolicy(), org_credentials_for_turn=[])
+    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    assert result["ok"] is False
+    assert "request_credential" in result["error"]
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_live_admission_exposes_the_existing_selection_path(ambiguous: bool) -> None:
+    candidates = [_org_credential("cred_site", "site login", _FIXTURE_LOGIN_URL)]
+    if ambiguous:
+        candidates.append(_org_credential("cred_other", "other login", _FIXTURE_LOGIN_URL))
+    admission = await admit_credential_for_live_page(
+        RequestPolicy(),
+        organization_id="o_1",
+        credential_id="cred_unselected",
+        page_url=_FIXTURE_LOGIN_URL,
+        load_org_credentials=AsyncMock(return_value=candidates),
+    )
+    assert admission.admitted is False
+    assert admission.steer is not None
+    assert "request_credential" in admission.steer if ambiguous else "cred_site" in admission.steer
+    assert "Ask the user which" not in admission.steer
