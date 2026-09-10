@@ -128,7 +128,7 @@ function siteFromLoginPageUrls(urls: string[] | undefined): string {
     return "the site";
   }
   try {
-    return new URL(first).hostname;
+    return new URL(first).origin;
   } catch {
     return first;
   }

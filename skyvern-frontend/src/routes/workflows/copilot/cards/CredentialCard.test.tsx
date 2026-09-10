@@ -111,9 +111,13 @@ afterEach(() => {
 });
 
 describe("CredentialCard content", () => {
-  it("renders the site parsed from login_page_urls in the headline", () => {
+  it.each([
+    "https://news.ycombinator.com",
+    "http://news.ycombinator.com",
+    "https://news.ycombinator.com:8443",
+  ])("renders the full origin %s in the headline", (origin) => {
     const frame = buildCredentialRequiredFrame({
-      login_page_urls: ["https://news.ycombinator.com/login?goto=news"],
+      login_page_urls: [`${origin}/login?goto=news`],
     });
     render(
       <CredentialCard
@@ -124,7 +128,7 @@ describe("CredentialCard content", () => {
       />,
     );
     expect(
-      screen.getByText("Copilot needs to sign in to news.ycombinator.com"),
+      screen.getByText(`Copilot needs to sign in to ${origin}`),
     ).toBeTruthy();
   });
 
@@ -186,7 +190,9 @@ describe("CredentialCard content", () => {
     );
     expect(container.querySelector("p.text-sm")).toBeNull();
     expect(
-      screen.getByText("Copilot needs to sign in to news.ycombinator.com"),
+      screen.getByText(
+        "Copilot needs to sign in to https://news.ycombinator.com",
+      ),
     ).toBeTruthy();
   });
 
