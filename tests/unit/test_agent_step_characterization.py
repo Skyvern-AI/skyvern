@@ -34,6 +34,7 @@ from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _click(element_id: str = "node-1") -> ClickAction:
@@ -129,7 +130,6 @@ def make_agent_step_rig(
         action_handler = AsyncMock(return_value=[ActionSuccess()])
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", action_handler)
     agent.record_artifacts_after_action = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
     agent.check_user_goal_complete = AsyncMock()
 
     llm_handler = AsyncMock(return_value=json_response)
@@ -142,7 +142,7 @@ def make_agent_step_rig(
         AsyncMock(return_value=injected_actions),
     )
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
     # Wait-time optimization is a cloud experiment (OSS/killswitch-off returns None).

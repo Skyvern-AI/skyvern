@@ -213,6 +213,31 @@ def test_web_input_text_action_repr_redacts_otp_text_marked_by_identifier() -> N
     assert REDACTED_OTP_VALUE in rendered_str
 
 
+def test_web_input_text_action_redacts_multi_field_reasoning_and_value() -> None:
+    action = InputTextAction(
+        action_type=ActionType.INPUT_TEXT,
+        element_id="box-0",
+        text="7",
+        reasoning="use the six digit value now",
+        intention="enter the code",
+        response="7",
+        totp_timing_info={
+            "is_totp_sequence": True,
+            "action_index": 0,
+            "box_element_ids": ["box-0", "box-1"],
+            "code_source": "external",
+        },
+    )
+
+    payload = redact_action_for_log(action)
+
+    assert payload["text"] == REDACTED_OTP_VALUE
+    assert payload["reasoning"] == "Entered a one-time code digit."
+    assert payload["intention"] == "*"
+    assert payload["response"] == "*"
+    assert "six digit" not in str(payload)
+
+
 def test_step_output_serialization_redacts_otp_input_action() -> None:
     secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
     action = InputTextAction(
@@ -280,7 +305,7 @@ def test_action_log_payload_redacts_otp_text_response_and_timing_secret() -> Non
     payload = redact_action_for_log(action)
 
     assert payload["text"] == REDACTED_OTP_VALUE
-    assert payload["response"] == REDACTED_OTP_VALUE
+    assert payload["response"] == "*"
     assert payload["totp_timing_info"]["totp_secret"] == REDACTED_OTP_SECRET
     assert secret_value not in str(payload)
     assert timing_secret not in str(payload)

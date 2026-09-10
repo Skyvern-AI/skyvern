@@ -30,7 +30,9 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
     InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
@@ -119,6 +121,7 @@ class HandlerOutcome:
     update_thought_calls: list[dict[str, Any]] = field(default_factory=list)
     block_cost_calls: list[dict[str, Any]] = field(default_factory=list)
     usage_events: list[dict[str, Any]] = field(default_factory=list)
+    metrics_events: list[dict[str, Any]] = field(default_factory=list)
     span: ReadableSpan | None = None
 
     @property
@@ -190,6 +193,8 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
     def capture_info(_event: str, **fields: Any) -> None:
         if fields.get("log_code") == "copilot_model_usage":
             outcome.usage_events.append(fields)
+        if _event == "LLM API handler duration metrics":
+            outcome.metrics_events.append(fields)
 
     mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
@@ -231,6 +236,8 @@ def _handler_call_kwargs(
     organization_id: str | None,
     screenshots: list[bytes] | None,
     parameters: dict[str, Any] | None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "prompt": prompt,
@@ -240,6 +247,8 @@ def _handler_call_kwargs(
         "workflow_run_block_id": workflow_run_block_id,
         "organization_id": organization_id,
         "screenshots": screenshots,
+        "recording_attempt_id": recording_attempt_id,
+        "interpretation_session_id": interpretation_session_id,
     }
     if parameters is not None:
         kwargs["parameters"] = dict(parameters)
@@ -261,7 +270,9 @@ async def _run_direct(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
-    force_parse_failure: bool = False,
+    parse_failure: BaseException | None = None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -281,11 +292,11 @@ async def _run_direct(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
-        if force_parse_failure:
+        if parse_failure is not None:
             mp.setattr(
                 api_handler_factory,
                 "parse_api_response",
-                MagicMock(side_effect=ValueError("invalid response")),
+                MagicMock(side_effect=parse_failure),
             )
 
         span_exporter.clear()
@@ -293,7 +304,16 @@ async def _run_direct(
         try:
             outcome.parsed = await handler(
                 **_handler_call_kwargs(
-                    prompt, prompt_name, step, thought, workflow_run_block_id, organization_id, screenshots, parameters
+                    prompt,
+                    prompt_name,
+                    step,
+                    thought,
+                    workflow_run_block_id,
+                    organization_id,
+                    screenshots,
+                    parameters,
+                    recording_attempt_id,
+                    interpretation_session_id,
                 )
             )
         except BaseException as exc:
@@ -319,7 +339,9 @@ async def _run_router(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
-    force_parse_failure: bool = False,
+    parse_failure: BaseException | None = None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -366,11 +388,11 @@ async def _run_router(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
-        if force_parse_failure:
+        if parse_failure is not None:
             mp.setattr(
                 api_handler_factory,
                 "parse_api_response",
-                MagicMock(side_effect=ValueError("invalid response")),
+                MagicMock(side_effect=parse_failure),
             )
 
         span_exporter.clear()
@@ -378,7 +400,16 @@ async def _run_router(
             handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(ROUTER_LLM_KEY)
             outcome.parsed = await handler(
                 **_handler_call_kwargs(
-                    prompt, prompt_name, step, thought, workflow_run_block_id, organization_id, screenshots, parameters
+                    prompt,
+                    prompt_name,
+                    step,
+                    thought,
+                    workflow_run_block_id,
+                    organization_id,
+                    screenshots,
+                    parameters,
+                    recording_attempt_id,
+                    interpretation_session_id,
                 )
             )
         except BaseException as exc:
@@ -450,6 +481,78 @@ async def test_happy_path_parses_and_records_identically(span_exporter: InMemory
 
 
 @pytest.mark.asyncio
+async def test_recording_correlation_is_present_on_cost_telemetry_for_both_handlers(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    correlation = {
+        "recording_attempt_id": "attempt-1",
+        "interpretation_session_id": "interpretation-1",
+    }
+    direct = await _run_direct(
+        span_exporter,
+        responses=[ParityResponse("gpt-4")],
+        parameters={},
+        **correlation,
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[ParityResponse("gpt-4")],
+        parameters={},
+        **correlation,
+    )
+
+    for outcome in (direct, router):
+        assert outcome.error is None
+        for key, value in correlation.items():
+            assert outcome.metrics_events[0][key] == value
+            assert outcome.span_attrs[key] == value
+            assert outcome.event_attrs[key] == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parse_failure",
+    [
+        InvalidLLMResponseFormat("invalid response"),
+        EmptyLLMResponseError("empty response"),
+        InvalidLLMResponseType("list"),
+    ],
+    ids=["invalid-format", "empty-response", "invalid-type"],
+)
+async def test_recording_correlation_survives_response_parse_failure(
+    span_exporter: InMemorySpanExporter,
+    parse_failure: BaseException,
+) -> None:
+    correlation = {
+        "recording_attempt_id": "attempt-1",
+        "interpretation_session_id": "interpretation-1",
+    }
+    direct = await _run_direct(
+        span_exporter,
+        responses=[ParityResponse("gpt-4", content="not json")],
+        parameters={},
+        parse_failure=parse_failure,
+        **correlation,
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[ParityResponse("gpt-4", content="not json")],
+        parameters={},
+        parse_failure=parse_failure,
+        **correlation,
+    )
+
+    for outcome in (direct, router):
+        assert outcome.error is not None
+        assert len(outcome.metrics_events) == 1
+        assert outcome.span_attrs["status"] == "error"
+        assert not any(event.name == LLM_REQUEST_COMPLETED_EVENT for event in outcome.span.events)
+        for key, value in correlation.items():
+            assert outcome.metrics_events[0][key] == value
+            assert outcome.span_attrs[key] == value
+
+
+@pytest.mark.asyncio
 async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -512,14 +615,14 @@ async def test_copilot_model_usage_survives_response_parse_failure(
         responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
         prompt_name="workflow-copilot-narration",
         parameters={},
-        force_parse_failure=True,
+        parse_failure=InvalidLLMResponseFormat("invalid response"),
     )
     router = await _run_router(
         span_exporter,
         responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
         prompt_name="workflow-copilot-narration",
         parameters={},
-        force_parse_failure=True,
+        parse_failure=InvalidLLMResponseFormat("invalid response"),
     )
 
     assert direct.error is not None and router.error is not None

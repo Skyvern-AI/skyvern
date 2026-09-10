@@ -23,11 +23,12 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "check": 2,
             "click": 24,
             "clear": 4,
-            "close": 5,
+            # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
+            "close": 6,
             "dblclick": 2,
             "evaluate": 15,
             "fill": 2,
-            "focus": 3,
+            "focus": 4,
             "go_back": 1,
             "go_forward": 1,
             "goto": 2,
@@ -41,6 +42,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "send": 3,
             "set_files": 2,
             "set_input_files": 1,
+            "type": 1,
             "uncheck": 2,
             "wheel": 5,
         }
@@ -55,7 +57,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "check": 2,
             "click": 3,
             "dblclick": 1,
-            "evaluate": 3,
+            "evaluate": 5,
             "fill": 1,
             "focus": 2,
             "goto": 2,
@@ -107,9 +109,9 @@ _EVALUATE_CALLERS = {
         }
     ),
     "skyvern/webeye/real_browser_state.py": Counter({"stop_page_loading": 1}),
-    # read-only hit-test geometry check gating the custom-select intercept JS fallback
+    # OTP box/scope/document marker writes, visual masks and read-only hit-test geometry.
     "skyvern/webeye/utils/dom.py": Counter(
-        {"apply_secret_visual_mask": 1, "blur": 1, "_pointer_interceptor_matches_label": 1}
+        {"apply_secret_visual_mask": 1, "mark_totp_box": 2, "blur": 1, "_pointer_interceptor_matches_label": 1}
     ),
 }
 
@@ -219,21 +221,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 165
+    assert sum(sum(methods.values()) for methods in observed.values()) == 170
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 160
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 165
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 28
+    assert sum(sum(callers.values()) for callers in observed.values()) == 30
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

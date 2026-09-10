@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     connected_account_choice_context,
     selected_connected_account_id,
 )
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ResponseKind,
@@ -49,10 +50,11 @@ def _google(
     state: str = "active",
     email_address: str | None = None,
     scopes_granted: list[str] | None = None,
+    organization_id: str = "org-1",
 ) -> GoogleOAuthCredentialBase:
     return GoogleOAuthCredentialBase(
         id=connection_id,
-        organization_id="org-1",
+        organization_id=organization_id,
         credential_name=name,
         email_address=email_address,
         state=state,
@@ -1184,3 +1186,281 @@ async def test_picker_selection_rejects_unusable_account_before_persisting_appro
         explicit_selected_connection_id=policy.selected_connected_account_id,
     )
     assert policy.run_approved_google_connection_ids == []
+
+
+PROPOSAL_BOUND_ACCOUNT_ID = "goac_proposal_bound"
+SECOND_PROPOSAL_ACCOUNT_ID = "goac_proposal_second"
+UNBOUND_ACCOUNT_ID = "goac_never_bound"
+NO_SHEETS_SCOPE = ["https://www.googleapis.com/auth/drive.file"]
+
+
+def _multi_bound_proposal_yaml(first_connection_id: str, second_connection_id: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  blocks:\n"
+        f"    - label: {SHEETS_BLOCK_LABEL}\n"
+        "      block_type: google_sheets_write\n"
+        f"      credential_id: {first_connection_id}\n"
+        "    - label: write_again\n"
+        "      block_type: google_sheets_write\n"
+        f"      credential_id: {second_connection_id}\n"
+    )
+
+
+async def _test_end_to_end_run_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pending_proposal_yaml: str,
+    connections: list[GoogleOAuthCredentialBase],
+    submitted_workflow_yaml: str = EMPTY_WORKFLOW_YAML,
+) -> tuple[WorkflowCopilotChatRequest, request_policy_module.RequestPolicy]:
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=connections),
+    )
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="user prose the action replaces",
+        workflow_yaml=submitted_workflow_yaml,
+        product_action="test_end_to_end",
+    )
+    workflow_copilot_route._apply_test_end_to_end_action(chat_request, pending_proposal_yaml)
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message=chat_request.message,
+        workflow_yaml=chat_request.workflow_yaml,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+        selected_connected_account_id=chat_request.selected_connected_account_id,
+    )
+    return chat_request, policy
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_supplies_the_proposal_bound_account_to_unchanged_run_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-saved copilot build contributes nothing to persisted run authority, so without the
+    account its own pending proposal binds the picker re-fires on the press and nothing dispatches."""
+    active = _google(PROPOSAL_BOUND_ACCOUNT_ID, "Google Sheets")
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[active]),
+    )
+    pending_proposal_yaml = _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID)
+
+    unsupplied = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run it",
+        workflow_yaml=pending_proposal_yaml,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+        selected_connected_account_id=None,
+    )
+    assert unsupplied.run_approved_google_connection_ids == []
+
+    chat_request, policy = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=pending_proposal_yaml,
+        connections=[active],
+    )
+
+    assert chat_request.selected_connected_account_id == PROPOSAL_BOUND_ACCOUNT_ID
+    assert chat_request.workflow_yaml == pending_proposal_yaml
+    assert policy.selected_connected_account_id == PROPOSAL_BOUND_ACCOUNT_ID
+    assert policy.run_approved_google_connection_ids == [PROPOSAL_BOUND_ACCOUNT_ID]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,scopes,organization_id",
+    [
+        ("revoked", ["https://www.googleapis.com/auth/spreadsheets"], "org-1"),
+        ("active", ["https://www.googleapis.com/auth/spreadsheets"], "org-2"),
+        ("active", NO_SHEETS_SCOPE, "org-1"),
+    ],
+    ids=["inactive", "foreign_org", "missing_sheets_scope"],
+)
+async def test_test_end_to_end_refuses_an_unusable_proposal_bound_account(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    scopes: list[str],
+    organization_id: str,
+) -> None:
+    unusable = _google(
+        PROPOSAL_BOUND_ACCOUNT_ID,
+        "Google Sheets",
+        state=state,
+        scopes_granted=scopes,
+        organization_id=organization_id,
+    )
+
+    chat_request, policy = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=_sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID),
+        connections=[unusable],
+    )
+
+    assert chat_request.selected_connected_account_id == PROPOSAL_BOUND_ACCOUNT_ID
+    assert policy.selected_connected_account_id is None
+    assert policy.run_approved_google_connection_ids == []
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_refuses_an_account_the_pending_proposal_does_not_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unbound_but_valid = _google(UNBOUND_ACCOUNT_ID, "Google Sheets")
+
+    chat_request, policy = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=EMPTY_WORKFLOW_YAML,
+        connections=[unbound_but_valid],
+    )
+
+    assert chat_request.selected_connected_account_id is None
+    assert policy.selected_connected_account_id is None
+    assert policy.run_approved_google_connection_ids == []
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_refuses_a_binding_that_exists_only_on_the_live_canvas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unaccepted canvas binding must never become durable run authority."""
+    canvas_only = _google(PROPOSAL_BOUND_ACCOUNT_ID, "Google Sheets")
+
+    chat_request, policy = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=EMPTY_WORKFLOW_YAML,
+        connections=[canvas_only],
+        submitted_workflow_yaml=_sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID),
+    )
+
+    assert chat_request.selected_connected_account_id is None
+    assert policy.selected_connected_account_id is None
+    assert policy.run_approved_google_connection_ids == []
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_leaves_a_multi_account_proposal_at_the_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _google(PROPOSAL_BOUND_ACCOUNT_ID, "Google Sheets")
+    second = _google(SECOND_PROPOSAL_ACCOUNT_ID, "Other Sheets")
+
+    chat_request, policy = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=_multi_bound_proposal_yaml(PROPOSAL_BOUND_ACCOUNT_ID, SECOND_PROPOSAL_ACCOUNT_ID),
+        connections=[first, second],
+    )
+
+    assert chat_request.selected_connected_account_id is None
+    assert policy.selected_connected_account_id is None
+    assert policy.run_approved_google_connection_ids == []
+
+
+def test_test_end_to_end_never_overwrites_an_explicit_picker_selection() -> None:
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="run it",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        product_action="test_end_to_end",
+        selected_connected_account_id=UNBOUND_ACCOUNT_ID,
+    )
+
+    workflow_copilot_route._apply_test_end_to_end_action(chat_request, _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID))
+
+    assert chat_request.selected_connected_account_id == UNBOUND_ACCOUNT_ID
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_approval_carries_to_the_next_turn_and_dies_when_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = _google(PROPOSAL_BOUND_ACCOUNT_ID, "Google Sheets")
+    _chat_request, granted = await _test_end_to_end_run_authority(
+        monkeypatch,
+        pending_proposal_yaml=_sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID),
+        connections=[active],
+    )
+    assert granted.run_approved_google_connection_ids == [PROPOSAL_BOUND_ACCOUNT_ID]
+
+    carried = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=granted, credential_pause_connected_credential_id=None),
+        "",
+    )
+    assert carried is not None
+    assert PROPOSAL_BOUND_ACCOUNT_ID in carried
+
+    next_turn = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run the workflow now",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context=carried,
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+    )
+    assert next_turn.run_approved_google_connection_ids == [PROPOSAL_BOUND_ACCOUNT_ID]
+
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[]),
+    )
+    after_disconnect = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run the workflow now",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context=carried,
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+    )
+    assert after_disconnect.run_approved_google_connection_ids == []
+
+
+def test_test_end_to_end_derived_account_is_labelled_as_a_pending_proposal_binding() -> None:
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="run it",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        product_action="test_end_to_end",
+    )
+    workflow_copilot_route._apply_test_end_to_end_action(chat_request, _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID))
+
+    context = connected_account_choice_context(
+        None,
+        explicit_selected_connection_id=chat_request.selected_connected_account_id,
+        from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
+    )
+
+    assert '"selection_source":"pending_proposal_binding"' in context
+    assert PROPOSAL_BOUND_ACCOUNT_ID in context
+
+
+def test_test_end_to_end_explicit_client_pick_is_still_labelled_as_a_user_picker_selection() -> None:
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="run it",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        product_action="test_end_to_end",
+        selected_connected_account_id=UNBOUND_ACCOUNT_ID,
+    )
+    workflow_copilot_route._apply_test_end_to_end_action(chat_request, _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID))
+
+    context = connected_account_choice_context(
+        None,
+        explicit_selected_connection_id=chat_request.selected_connected_account_id,
+        from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
+    )
+
+    assert chat_request.selected_connected_account_id == UNBOUND_ACCOUNT_ID
+    assert '"selection_source":"user_picker"' in context

@@ -225,7 +225,7 @@ def test_watchdog_cancel_with_stale_challenge_markup_is_not_promoted() -> None:
     assert ctx.blocker_signal is None
 
 
-def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence() -> None:
+def test_status_blocked_value_with_challenge_evidence_terminalizes() -> None:
     ctx = _fresh_context()
     ctx.composition_page_evidence = {
         "challenge_state": {
@@ -249,8 +249,8 @@ def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence(
                     "status": "completed",
                     "extracted_data": {
                         "status": "blocked",
-                        "records": [],
-                        "record_count": 0,
+                        "records": [{"name": "DOE, JANE"}],
+                        "record_count": 1,
                     },
                 }
             ],
@@ -259,9 +259,9 @@ def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence(
 
     _record_run_blocks_result(ctx, result)
 
-    assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_test_anti_bot is not None
     assert ctx.last_run_outcome is not None
     assert ctx.last_run_outcome.reason_code == "blocker_reported"
     assert ctx.turn_halt is None

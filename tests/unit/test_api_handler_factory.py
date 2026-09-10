@@ -22,7 +22,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMCaller,
     get_org_aware_secondary_llm_api_handler,
 )
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -2281,6 +2281,55 @@ async def test_llm_caller_logs_the_served_leg_and_where_the_tier_came_from(
     assert metrics["served_model_group"] == "openai-unittest-flex"
     assert metrics["service_tier_source"] == "inferred"
     assert metrics["service_tier"] == "flex"
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_logs_recording_correlation_without_forwarding_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+
+    await caller.call(
+        prompt="test",
+        prompt_name="recording-action-block-prompt",
+        recording_attempt_id="attempt-1",
+        interpretation_session_id="interpretation-1",
+    )
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["recording_attempt_id"] == "attempt-1"
+    assert metrics["interpretation_session_id"] == "interpretation-1"
+    dispatch_kwargs = caller._dispatch_llm_call.await_args.kwargs
+    assert "recording_attempt_id" not in dispatch_kwargs
+    assert "interpretation_session_id" not in dispatch_kwargs
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_does_not_mark_parse_failure_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    enrich_span = MagicMock()
+    monkeypatch.setattr(api_handler_factory, "_enrich_llm_span", enrich_span)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "parse_api_response",
+        MagicMock(side_effect=InvalidLLMResponseFormat("invalid response")),
+    )
+
+    with pytest.raises(InvalidLLMResponseFormat):
+        await caller.call(
+            prompt="test",
+            prompt_name="recording-action-block-prompt",
+            recording_attempt_id="attempt-1",
+            interpretation_session_id="interpretation-1",
+        )
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["recording_attempt_id"] == "attempt-1"
+    assert metrics["interpretation_session_id"] == "interpretation-1"
+    enrich_span.assert_called_once()
+    assert enrich_span.call_args.kwargs["mark_completed"] is False
 
 
 def test_recovered_tier_stays_out_of_the_persisted_response_artifact() -> None:

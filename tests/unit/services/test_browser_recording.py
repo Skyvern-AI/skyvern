@@ -1231,15 +1231,30 @@ async def test_create_action_block_prompt_omits_secret_keeps_email(
 ) -> None:
     import skyvern.services.browser_recording.service as svc
 
-    captured: dict[str, str] = {}
+    captured: dict[str, t.Any] = {}
 
-    async def fake_llm(*, prompt: str, prompt_name: str, organization_id: str) -> dict[str, t.Any]:
+    async def fake_llm(
+        *,
+        prompt: str,
+        prompt_name: str,
+        organization_id: str,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
+    ) -> dict[str, t.Any]:
         captured[prompt_name] = prompt
+        captured["recording_attempt_id"] = recording_attempt_id
+        captured["interpretation_session_id"] = interpretation_session_id
         return {"block_label": "fill", "title": "Fill", "prompt": "Fill the field."}
 
     monkeypatch.setattr(svc, "_recording_enrichment_llm_handler", lambda: fake_llm)
 
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    processor = Processor(
+        PBS_ID,
+        ORG_ID,
+        WP_ID,
+        recording_attempt_id="attempt-1",
+        interpretation_session_id="interpretation-1",
+    )
 
     await processor.create_action_block(
         ActionInputText(
@@ -1259,6 +1274,8 @@ async def test_create_action_block_prompt_omits_secret_keeps_email(
         )
     )
     assert "hunter2" not in captured["recording-action-block-prompt-input-text"]
+    assert captured["recording_attempt_id"] == "attempt-1"
+    assert captured["interpretation_session_id"] == "interpretation-1"
 
     captured.clear()
     await processor.create_action_block(

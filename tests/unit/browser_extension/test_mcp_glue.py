@@ -363,12 +363,21 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
     capability_token = "fake-secret-capability"
     capability_url = f"ws://127.0.0.1:43210/cdp/{capability_token}"
     connect_over_cdp = AsyncMock(
-        side_effect=RuntimeError(f"BrowserType.connect_over_cdp failed while connecting to {capability_url}")
+        side_effect=RuntimeError(
+            "BrowserType.connect_over_cdp: Protocol error: COMMAND_TIMEOUT: "
+            "The page changed while the extension operation was running. "
+            "Bearer fake-secret-token response body from https://Internal.example/private. Customer.Name. "
+            f"Call log: connecting to {capability_url}"
+        )
     )
     playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp))
     skyvern = object.__new__(Skyvern)
     skyvern._get_playwright = AsyncMock(return_value=playwright)
-    runtime = SimpleNamespace(cdp_ws_url=capability_url, wait_for_extension=AsyncMock(return_value=True))
+    runtime = SimpleNamespace(
+        cdp_ws_url=capability_url,
+        extension_connected=True,
+        wait_for_extension=AsyncMock(return_value=True),
+    )
     current_token = session_manager._current_session.set(None)
     monkeypatch.setattr(session_manager, "_global_session", None)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: skyvern)
@@ -381,7 +390,10 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
         session_manager._current_session.reset(current_token)
 
     assert result["ok"] is False
-    assert result["error"]["message"] == _PAIRING_FALLBACK_GUIDANCE
+    assert result["error"]["message"] == "BrowserSessionConnectionError: COMMAND_TIMEOUT"
+    assert "Target.setAutoAttach" not in result["error"]["message"]
+    assert "COMMAND_TIMEOUT" in result["error"]["message"]
+    assert "The extension is connected" in result["error"]["hint"]
     assert "/cdp/" not in repr(result)
     assert capability_token not in repr(result)
     connect_over_cdp.assert_awaited_once_with(capability_url)
