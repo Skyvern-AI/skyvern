@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
     BuildTestPacketUnfinishedItem,
+    PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
@@ -326,6 +327,405 @@ def test_connect_failure_clears_when_a_later_real_run_records_recovery() -> None
     assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_recovered"
     assert ctx.latest_recorded_build_test_outcome.connect_failure is None
     assert ctx.recorded_build_test_outcome_history[-1]["connect_failure"] is None
+
+
+def test_post_run_connect_failure_keeps_the_runs_repairable_block_failure() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_1",
+        workflow_run_block_id="wrb_1",
+        block_label="collect_credentials",
+        failing_line=12,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            failed_operation=failed_operation,
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id="wr_1",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.failed_operation == failed_operation
+    assert latest.verdict == "repairable_failure"
+    assert latest.reason_code == "runtime_block_failure"
+    assert latest.attempted_block_label == "collect_credentials"
+    assert latest.failed_block_labels == ["collect_credentials"]
+    assert latest.connect_failure is not None
+    assert latest.connect_failure.state == "cdp_connect_failed"
+
+
+def test_acquisition_failure_without_a_run_id_still_leaves_the_earlier_failure_findable() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_1",
+                block_label="collect_credentials",
+                failing_line=12,
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    # An acquisition failure that never reached a run names none, so it merges into the failure it
+    # follows and keeps that run's identity. The record must never carry runtime_block_failure under
+    # an empty run id: the scan reads that as an incomplete record and stops, reporting nothing.
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.workflow_run_id == "wr_1"
+    assert latest.attempted_block_label == "collect_credentials"
+    assert latest.connect_failure is not None
+    assert ctx.recorded_build_test_outcome_history[-1]["workflow_run_id"] == "wr_1"
+    assert unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_is_persisted=True)[1] != (
+        "incomplete_failure_record"
+    )
+
+
+def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            observed_evidence_summary="select_option timed out waiting for the state dropdown",
+            structural_failure_identity="locator-timeout-identity",
+            page_evidence_refs=["pe_1"],
+            evidence_refs=["ev_1"],
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_1",
+                block_label="collect_credentials",
+                failing_line=12,
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id="wr_1",
+            structural_failure_identity="build_test_connect:cdp_connect_failed",
+            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    # The diagnosis the model repairs from, not just the label naming what failed.
+    assert "select_option timed out" in latest.observed_evidence_summary
+    assert latest.page_evidence_refs == ["pe_1"]
+    assert latest.evidence_refs == ["ev_1"]
+    assert latest.structural_failure_identity == "locator-timeout-identity"
+    # The acquisition fact is additional, not a replacement. It stays typed rather than folded into
+    # the summary, which the repair prompt clips to 160 characters.
+    assert latest.connect_failure is not None
+    assert latest.connect_failure.state == "cdp_connect_failed"
+    assert "cdp_connect_failed" not in latest.observed_evidence_summary
+
+
+def test_a_block_that_died_on_a_plain_exception_is_preserved_like_a_browser_failure() -> None:
+    """``failed_operation`` is populated only for browser-operation failures, so keying the merge on
+    it would leave an ordinary Python exception with none of its diagnosis."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            observed_evidence_summary="KeyError: 'state' while building the payload",
+            page_evidence_refs=["pe_1"],
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id="wr_1",
+            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.failed_operation is None
+    assert latest.verdict == "repairable_failure"
+    assert latest.reason_code == "runtime_block_failure"
+    assert latest.attempted_block_label == "collect_credentials"
+    assert "KeyError" in latest.observed_evidence_summary
+    assert latest.page_evidence_refs == ["pe_1"]
+    assert latest.connect_failure is not None
+
+
+def test_merging_an_acquisition_failure_drops_the_stale_page_continuation() -> None:
+    """The continuation binds the model to act on the prior run's page, in the browser this same
+    record says could not be acquired."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            page_path_failure=PostRunPagePathFailure(
+                kind="login",
+                workflow_run_id="wr_1",
+                current_url="https://example.test/login",
+                continuation_targets=(),
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id="wr_1",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.page_path_failure is None
+    assert latest.reason_code == "runtime_block_failure"
+    assert latest.connect_failure is not None
+
+
+def test_a_terminal_challenge_keeps_its_own_reason_over_an_earlier_block_failure() -> None:
+    """A terminal challenge outranks a failed block to suppress code repair. Restating it as that
+    failure would send the model to edit code that was never the obstacle."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_1",
+                block_label="collect_credentials",
+                failing_line=12,
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="terminal_challenge_blocker",
+            workflow_run_id="wr_1",
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.reason_code == "terminal_challenge_blocker"
+    assert latest.verdict == "not_authoritative"
+    assert latest.attempted_block_label == ""
+    assert ctx.recorded_build_test_outcome_history[-1]["reason_code"] == "terminal_challenge_blocker"
+
+
+def test_a_block_failure_with_no_run_id_is_never_merged_into_an_acquisition_failure() -> None:
+    """The merged record must carry a real run id. Stamped runtime_block_failure under an empty one,
+    the unresolved-failure scan reads it as an incomplete record and stops, reporting nothing."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    newest = ctx.recorded_build_test_outcome_history[-1]
+    assert not (newest["reason_code"] == "runtime_block_failure" and not newest["workflow_run_id"])
+
+
+def test_a_different_runs_blocker_is_not_restated_as_the_earlier_runs_block_failure() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_1",
+                block_label="collect_credentials",
+                failing_line=12,
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="terminal_challenge_blocker",
+            workflow_run_id="wr_2",
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.workflow_run_id == "wr_2"
+    assert latest.verdict == "not_authoritative"
+    assert latest.reason_code == "terminal_challenge_blocker"
+    assert latest.attempted_block_label == ""
+    assert latest.failed_block_labels == []
+    # The earlier run's failure is still carried, and is still the one the unresolved-failure scan
+    # finds: wr_2's own entry must not be stamped as a runtime block failure under wr_2's id.
+    assert latest.failed_operation is not None
+    assert latest.failed_operation.workflow_run_id == "wr_1"
+    assert ctx.recorded_build_test_outcome_history[-1]["reason_code"] == "terminal_challenge_blocker"
+    unresolved = unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_is_persisted=True)[0]
+    assert unresolved is not None
+    assert unresolved.workflow_run_id == "wr_1"
+
+
+def test_later_run_with_its_own_failed_block_replaces_the_earlier_attribution() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_1",
+            attempted_block_label="collect_credentials",
+            failed_block_labels=["collect_credentials"],
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_1",
+                block_label="collect_credentials",
+                failing_line=12,
+            ),
+        ),
+    )
+    second_failure = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_2",
+        block_label="sign_in_and_read",
+        failing_line=3,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_2",
+            attempted_block_label="sign_in_and_read",
+            failed_block_labels=["sign_in_and_read"],
+            failed_operation=second_failure,
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.failed_operation == second_failure
+    assert latest.attempted_block_label == "sign_in_and_read"
+    assert latest.failed_block_labels == ["sign_in_and_read"]
 
 
 def _failed_run_result_with_categories(categories: list[dict]) -> dict:
@@ -2179,6 +2579,86 @@ def test_a_templated_selector_does_not_read_as_the_call_being_removed() -> None:
 
     open_failure = unresolved_runtime_block_failure(ctx)
 
+    assert open_failure is not None
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_merging_an_acquisition_failure_does_not_resnapshot_the_failure_against_edited_code() -> None:
+    """History snapshots are taken from the current draft, so re-appending the carried failure after
+    an edit would record it against code the run never executed."""
+    ctx = _run_history_ctx(_templated_selector_yaml())
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": ""}),
+    )
+    entries_before = len(ctx.recorded_build_test_outcome_history)
+    signature_at_failure = ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"]
+    assert signature_at_failure
+
+    # The model repairs the block, then the next dispatch dies before a run exists.
+    edited = _templated_selector_yaml(templated=False)
+    ctx.workflow_yaml = edited
+    ctx.persisted_workflow_yaml = edited
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+
+    assert len(ctx.recorded_build_test_outcome_history) == entries_before
+    assert ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"] == signature_at_failure
+    # The diagnosis still reaches the repair prompt, which reads only the newest outcome.
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.reason_code == "runtime_block_failure"
+    assert latest.connect_failure is not None
+
+
+def test_a_carried_failure_keeps_the_call_reference_so_an_edit_alone_cannot_retire_it() -> None:
+    """Carrying the block label without its call reference would downgrade clearance to a
+    whole-block signature comparison, which any unrelated edit trips."""
+    delivered = _templated_selector_yaml()
+    ctx = _run_history_ctx(delivered)
+    ctx.runner_code_block_associations_by_label = {}
+    record_build_test_outcome(
+        ctx,
+        failed_second_factor_run("wr_1").model_copy(
+            update={
+                "attempted_call_ref": "locator:#submit-btn",
+                "failed_operation": BuildTestFailedOperation(
+                    kind="browser_operation_failed",
+                    workflow_run_id="wr_1",
+                    block_label="sign_in_and_read",
+                    failing_line=2,
+                ),
+            }
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id="wr_1",
+            connect_failure=BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id="pbs_stale",
+            ),
+        ),
+    )
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    assert ctx.recorded_build_test_outcome_history[-2]["attempted_call_ref"] == "locator:#submit-btn"
+    open_failure = unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered)
     assert open_failure is not None
     assert open_failure.block_label == "sign_in_and_read"
 

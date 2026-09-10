@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestConnectFailure,
     ChallengeEffects,
     Lever,
     PostRunPagePathFailure,
@@ -751,6 +752,59 @@ workflow_definition:
         assert "rerun update_and_run_blocks" in prompt
         assert "Declare code_artifact_metadata goal_value_paths" in prompt
         assert "Coastal" not in prompt
+
+    def test_recorded_build_test_outcome_prompt_keeps_both_failures_past_the_summary_clip(self) -> None:
+        """A long block diagnosis must not push the browser loss out of the prompt: the summary
+        clips at 160 characters, so the acquisition fact renders from its own typed field."""
+        long_diagnosis = "select_option timed out waiting for the state dropdown; " + "detail " * 30
+        assert len(long_diagnosis) > 160
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_failed",
+                attempted_block_label="collect_credentials",
+                observed_evidence_summary=long_diagnosis,
+                connect_failure=BuildTestConnectFailure(
+                    state="cdp_connect_failed",
+                    browser_session_id="pbs_stale",
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "select_option timed out" in prompt
+        assert "browser_acquisition_failed:" in prompt
+        assert "cdp_connect_failed" in prompt
+
+    def test_recorded_build_test_outcome_prompt_says_what_to_do_about_an_occupied_browser(self) -> None:
+        """The bare state does not say what to do. The occupying run id stays out of prompt text, and
+        must not take the guidance with it: the leak guard blanks any atom that carries one."""
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_failed",
+                attempted_block_label="collect_credentials",
+                connect_failure=BuildTestConnectFailure(
+                    state="occupied",
+                    occupier_run_id="wr_holder",
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "fresh session" in prompt
+        assert "already running another test" in prompt
+        assert "wr_holder" not in prompt
 
     def test_recorded_build_test_outcome_prompt_does_not_offer_page_actions_for_non_page_outcome(self) -> None:
         ctx = _ctx(
