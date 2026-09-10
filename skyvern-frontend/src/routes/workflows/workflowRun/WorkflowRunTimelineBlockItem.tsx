@@ -15,6 +15,7 @@ import {
   Status,
 } from "@/api/types";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
+import { InlineMarkdown } from "@/components/AgentMarkdown";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -38,6 +39,7 @@ import {
   findCodeStepForLine,
   isRecorderCallText,
   normalizeInlineText,
+  taskV3CallText,
 } from "../workflowBlockUtils";
 import {
   ActionItem,
@@ -191,12 +193,27 @@ function StatusDot({
   );
 }
 
-function getActionSummary(action: ActionsApiResponse): string | null {
-  return (
-    normalizeInlineText(action.reasoning) ??
-    normalizeInlineText(action.text) ??
-    normalizeInlineText(action.response)
-  );
+type ActionSummary = {
+  text: string;
+  // Only the model's own prose is markdown. A typed value or a recorder trace is literal text and
+  // must render verbatim — a password containing "*" is not emphasis.
+  isProse: boolean;
+};
+
+function getActionSummary(action: ActionsApiResponse): ActionSummary | null {
+  const candidates: Array<[string | null | undefined, boolean]> = [
+    [action.reasoning, true],
+    [action.text, false],
+    [action.response, false],
+    [action.intention, true],
+  ];
+  for (const [value, isProse] of candidates) {
+    const text = normalizeInlineText(value);
+    if (text !== null) {
+      return { text, isProse };
+    }
+  }
+  return null;
 }
 
 function getRecordedActionMeta(action: ActionsApiResponse): {
@@ -226,8 +243,8 @@ function formatActionDurationMs(durationMs: number): string {
 type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
-  summary: string | null;
-  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  summary: ActionSummary | null;
+  // Machine syntax (a Playwright call or a Task V3 tool call); shown on hover, never as the primary line.
   detail: string | null;
   tone: "default" | "error";
 };
@@ -260,7 +277,7 @@ function getCodeActionRowPresentation(
     // This row hides its label from sighted users, so it falls back to the readable type
     // where the chat, which always shows the label, prints nothing.
     isCodeError
-      ? getActionSummary(action)
+      ? (getActionSummary(action)?.text ?? null)
       : (describeRecordedAction(action, matchedStep) ??
         getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
     codeLine !== null ? `line ${codeLine}` : null,
@@ -269,7 +286,10 @@ function getCodeActionRowPresentation(
   return {
     icon,
     label,
-    summary: parts.length > 0 ? parts.join(" · ") : null,
+    // Literal even when the leading part came from prose: the row's text is that part joined with
+    // machine suffixes (line N, duration), and half-markdown-half-not would render as neither.
+    summary:
+      parts.length > 0 ? { text: parts.join(" · "), isProse: false } : null,
     detail:
       !isCodeError && isRecorderCallText(action.description)
         ? normalizeInlineText(action.description)
@@ -567,7 +587,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
-              detail: null,
+              detail: taskV3CallText(action.description),
               tone: "default" as const,
             };
 
@@ -616,10 +636,33 @@ function TimelineActionRows({
                 ) : (
                   <span className="sr-only">{label}</span>
                 )}
-                {summary && (
+                {summary !== null ? (
                   <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
-                    · {summary}
+                    ·{" "}
+                    {summary.isProse ? (
+                      <InlineMarkdown
+                        text={summary.text}
+                        // Prose that renders to nothing must not blank the row; the sr-only
+                        // label above already names it, so this copy is decorative.
+                        fallback={<span aria-hidden="true">{label}</span>}
+                      />
+                    ) : (
+                      summary.text
+                    )}
                   </span>
+                ) : (
+                  // A Task V3 turn that emitted only tool calls leaves every action of that round
+                  // with no prose, which used to render as a bare icon and index. Show the type
+                  // label sighted readers were missing; it duplicates the sr-only label above, so
+                  // assistive tech must not read it twice. Error rows already show theirs.
+                  tone !== "error" && (
+                    <span
+                      aria-hidden="true"
+                      className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500"
+                    >
+                      · {label}
+                    </span>
+                  )
                 )}
               </button>
             </div>

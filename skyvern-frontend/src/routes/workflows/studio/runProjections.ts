@@ -11,6 +11,7 @@ import {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
+import { taskV3CallText } from "@/routes/workflows/workflowBlockUtils";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { isRecord } from "@/util/utils";
 import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
@@ -237,10 +238,14 @@ export type FilmstripFrame = {
 };
 
 export function actionLabel(action: ActionsApiResponse): string {
+  // A Task V3 description is a machine tool-call stamp ("task_v3 click #sign-in"), not a label, so
+  // the action's own prose outranks it and the readable type is the floor.
+  const description =
+    taskV3CallText(action.description) === null
+      ? action.description?.trim()
+      : undefined;
   const candidate =
-    action.intention?.trim() ||
-    action.description?.trim() ||
-    action.reasoning?.trim();
+    action.intention?.trim() || description || action.reasoning?.trim();
   if (candidate) {
     // Goto actions surface as "page.goto <url>"; show just the URL.
     return candidate.replace(/^page\.goto\s+/i, "");

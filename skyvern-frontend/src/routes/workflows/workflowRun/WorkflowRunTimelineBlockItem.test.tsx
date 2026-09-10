@@ -1402,4 +1402,142 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText("Extract Data")).toBeDefined();
     expect(screen.queryByText(/A step on another line/)).toBeNull();
   });
+
+  it("renders markdown in an action's reasoning instead of its source syntax", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_markdown_reasoning",
+      block_type: "task",
+      label: "extract_invoices",
+      actions: [
+        {
+          action_id: "act_markdown",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: "**Navigating account details** then reading the table",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    const { container } = render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Navigating account details").tagName).toBe(
+      "STRONG",
+    );
+    expect(container.textContent).not.toContain("**");
+  });
+
+  it("renders a typed value verbatim, since only the model's prose is markdown", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_literal_value",
+      block_type: "login",
+      label: "login",
+      actions: [
+        {
+          action_id: "act_typed",
+          action_type: ActionTypes.InputText,
+          status: Status.Completed,
+          reasoning: null,
+          text: "a*b*c_d_e",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/a\*b\*c_d_e/)).toBeDefined();
+  });
+
+  it("falls back to the action's intention when it carries no other prose", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_intention",
+      block_type: "task",
+      label: "answer",
+      actions: [
+        {
+          action_id: "act_intention",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: null,
+          text: null,
+          response: null,
+          intention: "Answer **which** plan is active",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("which").tagName).toBe("STRONG");
+    expect(screen.getByText(/plan is active/)).toBeDefined();
+  });
+
+  // A Task V3 turn that emits only tool calls persists every action of that round with no prose at
+  // all, which used to leave the row as a bare icon and index.
+  it("falls back to a visible action type when an action carries no prose", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_no_prose",
+      block_type: "login",
+      label: "login",
+      actions: [
+        {
+          action_id: "act_no_prose",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: null,
+          text: null,
+          response: null,
+          intention: null,
+          description: "task_v3 click #sign-in",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const summary = screen.getByText(`${TIMELINE_DESCRIPTOR_SEPARATOR} Click`);
+    expect(summary.className).not.toContain("sr-only");
+    expect(
+      screen.getByRole("button", { name: /Click/ }).getAttribute("title"),
+    ).toBe("click #sign-in");
+  });
 });

@@ -12,7 +12,11 @@ import {
   getReadableActionType,
   type ActionsApiResponse,
 } from "@/api/types";
-import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
+import {
+  isRecorderCallText,
+  taskV3CallText,
+} from "@/routes/workflows/workflowBlockUtils";
+import { BlockMarkdown } from "@/components/AgentMarkdown";
 import { CopyButton } from "@/components/CopyButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,7 +34,9 @@ type InspectorField = {
   label: string;
   value: unknown;
   // "mono": an identifier or enum token, set like every other id in the pane.
-  kind?: "json" | "text" | "mono";
+  // "prose": agent-authored text, which is markdown (a Task V3 turn's reasoning is emitted with
+  // **bold** headings) and reads as escaped punctuation unless it is rendered as markdown.
+  kind?: "json" | "text" | "mono" | "prose";
 };
 
 type JsonExplorerProps = {
@@ -124,6 +130,13 @@ function FieldValue({ field }: { field: InspectorField }) {
       <code className="break-all font-mono text-xs text-foreground">
         {String(field.value)}
       </code>
+    );
+  }
+  if (field.kind === "prose") {
+    return (
+      <div className="break-words text-sm text-foreground">
+        <BlockMarkdown text={String(field.value)} />
+      </div>
     );
   }
   return (
@@ -451,13 +464,13 @@ function getActionSummaryFields(
       ? `${Math.round(action.confidence_float * 100)}%`
       : null,
   );
-  pushField(fields, "Reasoning", action.reasoning);
-  pushField(fields, "Intention", action.intention);
-  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
-  // this panel is the reachable home for it.
+  pushField(fields, "Reasoning", action.reasoning, "prose");
+  pushField(fields, "Intention", action.intention, "prose");
+  // A hover title is unreachable by keyboard and easy to miss; this panel is its stable home.
   if (isRecorderCallText(action.description)) {
     pushField(fields, "Recorded call", action.description);
   }
+  pushField(fields, "Tool call", taskV3CallText(action.description), "mono");
   return fields;
 }
 

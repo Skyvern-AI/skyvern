@@ -13,6 +13,7 @@ import {
 } from "@/routes/workflows/types/workflowRunTypes";
 import capturedRun from "./__fixtures__/completed-code-block-run.json";
 import {
+  actionLabel,
   buildActionIndex,
   buildBlockStatusMap,
   buildFilmstrip,
@@ -685,5 +686,41 @@ describe("formatRunTimesTooltip", () => {
     expect(title).not.toContain("Started");
     // finished_at is present but the run is not finalized → still hidden.
     expect(title).not.toContain("Finished");
+  });
+});
+
+describe("actionLabel", () => {
+  // Task V3 stamps every action's description with its tool call, so a description-first fallback
+  // labelled every v3 frame with machine syntax instead of what the agent said it was doing.
+  test("prefers the action's own prose over a Task V3 tool-call stamp", () => {
+    expect(
+      actionLabel(
+        action({
+          description: "task_v3 click #sign-in",
+          reasoning: "Submitting the sign-in form",
+        }),
+      ),
+    ).toBe("Submitting the sign-in form");
+  });
+
+  test("falls back to the readable type when a v3 action carries no prose", () => {
+    expect(
+      actionLabel(
+        action({
+          action_type: "click",
+          description: "task_v3 click #sign-in",
+          reasoning: null,
+          intention: null,
+        }),
+      ),
+    ).toBe("Click");
+  });
+
+  test("still uses a non-v3 description", () => {
+    expect(
+      actionLabel(
+        action({ description: "Open the billing page", reasoning: null }),
+      ),
+    ).toBe("Open the billing page");
   });
 });
