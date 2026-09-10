@@ -803,6 +803,67 @@ class TestS3StorageContentType:
         assert obj_meta["ContentType"] == expected_content_type
 
 
+def _recording_artifact_with_ext(s3_storage: S3Storage, ext: str) -> Artifact:
+    """A RECORDING artifact whose URI ends in the given extension (the whole-display recorder registers .mp4)."""
+    artifact_id_val = generate_artifact_id()
+    step = create_fake_step(f"s_ct_{ext}")
+    base = s3_storage.build_uri(
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_id=artifact_id_val,
+        step=step,
+        artifact_type=ArtifactType.RECORDING,
+    )
+    uri = base.rsplit(".", 1)[0] + "." + ext
+    return Artifact(
+        artifact_id=artifact_id_val,
+        artifact_type=ArtifactType.RECORDING,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        step_id=step.step_id,
+        task_id=step.task_id,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestS3StorageRecordingContentType:
+    """SKY-15466: the whole-display recorder's S3 lifecycle must set ``ContentType=video/mp4`` for ``.mp4``
+    objects so a signed-S3 GET / Chrome <video> plays them. Real-S3 v7 proved every settled recording object
+    was served ``binary/octet-stream`` (FAIL_PRODUCT_CONTRACT); these end-to-end moto head_object checks would
+    fail on the current head."""
+
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
+    @pytest.mark.parametrize("supersede", [False, True], ids=["initial_store", "terminal_replacement"])
+    async def test_store_artifact_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, supersede: bool
+    ) -> None:
+        # Both write paths (initial store and the terminal supersede/replacement) must settle .mp4 as video/mp4.
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        await s3_storage.store_artifact(art, b"final-mp4-bytes", supersede_queued_prefixes=supersede)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_store_artifact_prefix_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        f = tmp_path / "rec.mp4"
+        f.write_bytes(b"m" * 4096)
+        await s3_storage.store_artifact_prefix_from_path(art, str(f), 4096)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_unknown_extension_no_invented_content_type(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "skyvernunknown15466")  # project-unique ext -> guess_type None
+        await s3_storage.store_artifact(art, b"opaque-bytes")
+        ct = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)["ContentType"]
+        assert ct != "video/mp4" and not ct.startswith("video/")  # unknown -> not invented (S3 default)
+
+
 @pytest.mark.asyncio
 class TestS3StorageHARCompression:
     """Test S3Storage HAR file compression with zstd."""
@@ -1494,6 +1555,7 @@ async def test_store_artifact_prefix_from_path_streams_bounded_reader(s3_storage
         storage_class: object = None,
         close_file_obj: bool = False,
         serialize_key: str | None = None,
+        content_type: str | None = None,
     ) -> str:
         captured["uri"] = uri
         captured["close_file_obj"] = close_file_obj
@@ -1656,8 +1718,9 @@ async def test_store_artifact_serializes_only_recording_writes(
         storage_class: object = None,
         serialize_key: str | None = None,
         supersede_queued: bool = False,
+        content_type: str | None = None,
     ) -> str:
-        seen[uri] = (serialize_key, supersede_queued)
+        seen[uri] = (serialize_key, supersede_queued, content_type)
         return uri
 
     s3_storage.async_client = MagicMock()
@@ -1668,10 +1731,9 @@ async def test_store_artifact_serializes_only_recording_writes(
     await s3_storage.store_artifact(rec, b"data", supersede_queued_prefixes=True)
     await s3_storage.store_artifact(other, b"data", supersede_queued_prefixes=True)
 
-    # recording terminal write is fenced by uri and (as a finalize) seals queued prefixes;
-    # a non-recording write is never fenced (serialize_key=None), so the seal flag is inert.
-    assert seen[rec.uri] == (rec.uri, True)
-    assert seen[other.uri][0] is None
+    # RECORDING terminal write is fenced+sealed and opts into video MIME; a non-recording (HTML) write is neither.
+    assert seen[rec.uri] == (rec.uri, True, "video/webm")
+    assert seen[other.uri] == (None, True, None)
 
 
 @pytest.mark.asyncio

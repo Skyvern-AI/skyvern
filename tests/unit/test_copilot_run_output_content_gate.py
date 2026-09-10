@@ -1349,7 +1349,10 @@ def test_infrastructure_runner_code_prepends_unrecoverable_tool_error(error_code
     assert ctx.last_infrastructure_tool_error == error_code
 
 
-@pytest.mark.parametrize("error_code", ["timeout", "user_code_error", "insecure_code_detected"])
+@pytest.mark.parametrize(
+    "error_code",
+    ["timeout", "user_code_error", "insecure_code_detected", "memory_limit_exceeded"],
+)
 def test_repairable_runner_code_injects_no_unrecoverable_category(error_code: str) -> None:
     result = _failed_code_block_run_result(error_code)
     ctx = _ctx(result["data"]["blocks"])
@@ -1360,6 +1363,35 @@ def test_repairable_runner_code_injects_no_unrecoverable_category(error_code: st
     assert all(entry.get("category") != "UNRECOVERABLE_TOOL_ERROR" for entry in categories)
     assert ctx.last_failure_category_top != "UNRECOVERABLE_TOOL_ERROR"
     assert ctx.last_infrastructure_tool_error is None
+
+
+def test_input_reassembly_memory_limit_stays_available_for_copilot_repair() -> None:
+    error_code = "parameter_reassembly_memory_limit_exceeded"
+    reason = "CodeBlock inputs exhausted the sandbox memory limit before the block started."
+    result = _failed_code_block_run_result(error_code)
+    result["data"]["blocks"][0]["failure_reason"] = reason
+    result["data"]["failure_categories"] = [
+        {
+            "category": "INFRASTRUCTURE_ERROR",
+            "confidence_float": 0.95,
+            "reason_code": "secure_codeblock_input_memory_limit",
+            "reasoning": "Secure CodeBlock sandbox ran out of memory before executing the block",
+        }
+    ]
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert result["data"]["failure_categories"] == [
+        {
+            "category": "INFRASTRUCTURE_ERROR",
+            "confidence_float": 0.95,
+            "reason_code": "secure_codeblock_input_memory_limit",
+            "reasoning": "Secure CodeBlock sandbox ran out of memory before executing the block",
+        }
+    ]
+    assert ctx.last_infrastructure_tool_error is None
+    assert ctx.last_test_failure_reason == reason
 
 
 def test_unstructured_failure_prose_leaves_category_consumers_clear() -> None:

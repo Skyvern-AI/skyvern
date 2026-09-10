@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import socket
+import traceback
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,7 +13,7 @@ from playwright._impl._errors import TimeoutError as PWTimeoutError
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
-from skyvern.webeye.browser_errors import BrowserCdpConnectionError
+from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError, BrowserCdpConnectionError
 from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry, is_cdp_connection_error
 
 
@@ -23,12 +25,16 @@ class _FakeEngineRetryable(_FakeEngineError):
     pass
 
 
+class _FakeEngineTimeout(_FakeEngineError):
+    pass
+
+
 def _fake_selection() -> BrowserEngineSelection:
     return BrowserEngineSelection(
         name="fake",
         start_driver=cast(Any, lambda: None),
         error_type=_FakeEngineError,
-        timeout_error_type=_FakeEngineError,
+        timeout_error_type=_FakeEngineTimeout,
         metadata=BrowserEngineMetadata(name="fake"),
         selection_reason="test-fake",
         retryable_error_types=(_FakeEngineRetryable,),
@@ -47,6 +53,20 @@ def _set_budget(monkeypatch: pytest.MonkeyPatch, attempts: int, backoff: list[fl
 
 
 class TestRetryBehavior:
+    @pytest.mark.asyncio
+    async def test_cancellation_is_not_wrapped_as_acquisition_failure(self) -> None:
+        pw = _make_playwright(asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await connect_over_cdp_with_retry(
+                pw,
+                "wss://cdp.example.test",
+                validate_browser_address=False,
+                retry=False,
+            )
+
+        pw.chromium.connect_over_cdp.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_validates_browser_address_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "ENV", "prod")
@@ -167,10 +187,59 @@ class TestRetryBehavior:
         assert pw.chromium.connect_over_cdp.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_non_retryable_error_raises_immediately(self):
-        pw = _make_playwright([PWError("net::ERR_NAME_NOT_RESOLVED")])
-        with pytest.raises(PWError):
+    async def test_native_non_retryable_connect_failure_is_an_acquisition_fact(self):
+        raw_address = "wss://secret@cdp.example.test/devtools/browser/session?token=hidden"
+        native_error = PWError(f"connect failed at {raw_address}; authorization: bare-secret")
+        pw = _make_playwright([native_error])
+
+        with pytest.raises(BrowserCdpAcquisitionError) as excinfo:
             await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
+
+        assert pw.chromium.connect_over_cdp.call_count == 1
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+        assert "secret" not in str(excinfo.value)
+        assert "token=hidden" not in str(excinfo.value)
+        assert "cdp.example.test" not in str(excinfo.value)
+        assert "bare-secret" not in str(excinfo.value)
+        assert str(excinfo.value) == "Browser driver failed during CDP connect to [remote browser endpoint]."
+        rendered = "".join(traceback.format_exception(excinfo.value))
+        assert "bare-secret" not in rendered
+        assert "token=hidden" not in rendered
+        assert "cdp.example.test" not in rendered
+        assert not is_cdp_connection_error(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_native_connect_failure_is_an_acquisition_fact(self):
+        native_error = _FakeEngineError("selected engine connect failed")
+        pw = _make_playwright([native_error])
+
+        with pytest.raises(BrowserCdpAcquisitionError) as excinfo:
+            await connect_over_cdp_with_retry(
+                pw,
+                "http://10.0.0.1:9224",
+                selection=_fake_selection(),
+                validate_browser_address=False,
+            )
+
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+        assert pw.chromium.connect_over_cdp.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_does_not_claim_a_foreign_native_connect_failure(self):
+        native_error = PWError("foreign driver connect failed")
+        pw = _make_playwright([native_error])
+
+        with pytest.raises(PWError) as excinfo:
+            await connect_over_cdp_with_retry(
+                pw,
+                "http://10.0.0.1:9224",
+                selection=_fake_selection(),
+                validate_browser_address=False,
+            )
+
+        assert excinfo.value is native_error
         assert pw.chromium.connect_over_cdp.call_count == 1
 
     @pytest.mark.asyncio

@@ -1764,6 +1764,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "markers_minted",
         "markers_reused",
         "group_texts_found",
+        "a11y_removed_listed",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -11289,6 +11290,218 @@ async def test_observe_still_lists_aria_hidden_tabindex_negative_text_input_when
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok", r.content
         assert _ref_line(r.content, "Promo code")
+
+
+_MARK = "[aria-hidden: the page keeps this out of its accessibility tree and tab order]"
+
+# One control, two nodes. A design system builds its own clickable surface and leaves the native
+# control underneath, marked out of the accessibility tree and out of the tab order. Both carry the
+# same caption, so observe printed two byte-identical lines and the model had nothing to tell them
+# apart -- and the one the page disowned is routinely the one that does not work.
+_TWO_RENDERINGS = """
+<!doctype html><html><body>
+  <div id="wrapper" role="button" tabindex="0" style="width:376px;height:40px">
+    <button id="native" type="submit" {removal} style="width:376px;height:40px">Sign In</button>
+  </div>
+</body></html>
+"""
+
+
+def _lines(content: str) -> list[str]:
+    return [line for line in content.splitlines() if line.startswith("ref=")]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "removal",
+    [
+        # The tab order is whatever the UA parsed, not what the attribute spells: "-1x" is -1 to the
+        # browser, and "-0" (in the negative-control test below) is not negative at all.
+        pytest.param('aria-hidden="true" tabindex="-1"', id="tabindex-1"),
+        pytest.param('aria-hidden="true" tabindex="-2"', id="tabindex-2"),
+        pytest.param('aria-hidden="true" tabindex="-99"', id="tabindex-99"),
+        pytest.param('aria-hidden="true" tabindex="-1x"', id="tabindex-trailing-junk"),
+        pytest.param('aria-hidden="TRUE" tabindex="-1"', id="aria-hidden-uppercase"),
+    ],
+)
+async def test_observe_tells_a_removed_rendering_apart_from_the_control_the_page_drives(removal: str) -> None:
+    async with _content_page(_TWO_RENDERINGS.format(removal=removal)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        named = [line for line in _lines(r.content) if "'Sign In'" in line]
+        # Both stay listed -- deciding which of two same-named controls to use is the model's job,
+        # and the removed one is sometimes the only one that works. What changes is that the two
+        # lines are no longer the same bytes.
+        assert len(named) == 2, r.content
+        [marked] = [line for line in named if _MARK in line]
+        assert marked.split(" ")[1] == "button/submit", r.content
+        assert r.data["summary"]["a11y_removed_listed"] == 1, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        'aria-hidden="true"',
+        'tabindex="-2"',
+        'tabindex="0"',
+        'tabindex="-0"',
+        'aria-hidden="false" tabindex="-2"',
+        'aria-hidden="true" tabindex="1"',
+    ],
+)
+async def test_observe_does_not_mark_a_control_the_page_removed_from_only_one(attrs: str) -> None:
+    # The positive control, one per conjunct: neither half is the cause on its own. Without this a
+    # green result above could be a blanket mark on anything carrying either attribute.
+    async with _content_page(_TWO_RENDERINGS.format(removal=attrs)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        assert len([line for line in _lines(r.content) if "'Sign In'" in line]) == 2, r.content
+        assert _MARK not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ancestor",
+    [
+        pytest.param('<div aria-hidden="true">', id="inherited-aria-hidden"),
+        pytest.param("<div inert>", id="inherited-inert"),
+    ],
+)
+async def test_observe_reads_only_the_controls_own_removal_attributes(ancestor: str) -> None:
+    # aria-hidden inherits and `inert` covers a region, so reading the ancestor chain would be
+    # strictly more faithful -- and five review rounds running found a demonstrated defect in that
+    # walk. This pins the narrower rule that shipped instead, so the day someone builds SKY-15894
+    # this test is the thing that has to change, deliberately, rather than a silent widening.
+    html = f"""<!doctype html><html><body>
+      {ancestor}<button id="native" type="submit" tabindex="-1"
+              style="width:200px;height:40px">Continue</button></div></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        assert _MARK not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_marks_a_removed_svg_control() -> None:
+    # tabIndex is declared per interface. Reading only HTMLElement's getter leaves an icon control
+    # authored as <svg role="button"> unable to carry the mark at all.
+    html = """<!doctype html><html><body>
+      <svg role="button" aria-hidden="true" tabindex="-1" width="40" height="40">
+        <rect width="40" height="40"/></svg></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        [line] = _lines(r.content)
+        assert _MARK in line, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_survives_a_page_that_removed_the_tabindex_descriptor() -> None:
+    # The getters are captured in the page's own realm on each call. A page that has deleted one
+    # leaves the capture undefined, and calling it would throw inside the per-element guard -- which
+    # answers by dropping the control, for every control on the page.
+    html = """<!doctype html><html><body>
+      <script>delete HTMLElement.prototype.tabIndex;</script>
+      <form>
+        <label for="e">Email</label><input id="e" type="text" style="width:200px;height:30px">
+        <button style="width:80px;height:30px">Continue</button>
+      </form></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        assert len(_lines(r.content)) == 2, r.content
+        assert _ref_line(r.content, "Email")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_rereads_the_removal_state_a_page_changed_during_the_walk() -> None:
+    # Marking a control for addressing runs the page's own observers, and one of them can restore
+    # the control it had removed. The line has to describe the page as it stands when the line is
+    # printed, not as it stood when the record was built.
+    html = """<!doctype html><html><body>
+      <button aria-hidden="true" tabindex="-1" style="width:200px;height:40px">Continue</button>
+      <script>
+        new MutationObserver(() => {
+          // Only the tabindex: the element's own aria-hidden is already fingerprinted, so changing
+          // it would drop the record instead of exercising the re-read.
+          for (const b of document.querySelectorAll('button[tabindex]')) b.removeAttribute('tabindex');
+        }).observe(document.body, {attributes: true, subtree: true});
+      </script></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        [line] = [ln for ln in _lines(r.content) if "'Continue'" in ln]
+        assert _MARK not in line, r.content
+        assert r.data["summary"]["a11y_removed_listed"] == 0, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_does_not_mark_a_skinned_native_the_tools_drive_directly() -> None:
+    # A design system skins a native at zero size behind a styled widget and marks it exactly this
+    # way. That case is already answered on the same line -- "the tool acts on it directly" -- and
+    # the two verdicts contradict each other, so the removal mark stops at the carve-out.
+    html = """<!doctype html><html><body>
+      <label for="country">Country</label>
+      <select id="country" aria-hidden="true" tabindex="-1" style="display:none">
+        <option>United States</option></select>
+      <div role="listbox" style="width:200px;height:30px">Pick</div></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        [line] = [ln for ln in _lines(r.content) if "'Country'" in ln]
+        assert "[hidden-native" in line, r.content
+        assert _MARK not in line, r.content
+        assert r.data["summary"]["a11y_removed_listed"] == 0, r.data
+
+
+# Being removed is not being useless: a styled proxy hides the native control a tool drives through
+# the element itself, and a removed control can be the only one on the page. Nothing here may be
+# dropped -- the pre-existing rule still drops only the unnamed text controls it always did.
+_REMOVED_BUT_NEEDED = {
+    "the_only_fillable_field": """
+  <div role="combobox" tabindex="0" aria-expanded="false" style="width:260px;height:36px">
+    <span>Country</span>
+    <input type="text" aria-label="Country" aria-hidden="true" tabindex="-1"></div>""",
+    "the_native_behind_a_file_proxy": """
+  <div style="position:relative;width:220px;height:40px">
+    <button type="button" style="width:220px;height:40px">Attach Resume</button>
+    <input type="file" aria-label="Attach Resume" aria-hidden="true" tabindex="-1"
+           style="position:absolute;inset:0;width:220px;height:40px;opacity:0"></div>""",
+    "the_only_control_on_the_page": """
+  <button aria-hidden="true" tabindex="-1" style="width:32px;height:32px">Close</button>""",
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_REMOVED_BUT_NEEDED))
+async def test_observe_still_lists_every_removed_control_it_marks(shape: str) -> None:
+    html = f"<!doctype html><html><body>{_REMOVED_BUT_NEEDED[shape]}</body></html>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        expected = await page.evaluate(
+            "() => document.querySelectorAll('input,select,button,[role=button],[role=combobox]').length"
+        )
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        assert len(_lines(r.content)) == expected, r.content
+        assert r.data["summary"]["phantom_dropped"] == 0, r.data
+        assert r.data["summary"]["a11y_removed_listed"] == 1, r.data
 
 
 # A consent wall is the common shape of a layer that covers a whole form: a fixed, view-sized

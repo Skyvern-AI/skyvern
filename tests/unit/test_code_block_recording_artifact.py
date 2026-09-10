@@ -15,10 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -597,3 +598,34 @@ async def test_at_failure_url_masks_registered_secrets() -> None:
     assert "123456" not in persisted_url
     # The rest of the URL is the diagnostic payload and must survive masking.
     assert persisted_url == "https://portal.example.com/mfa?token=*****&step=verify"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension, expected_suffix",
+    [("mp4", ".mp4"), ("webm", ".webm"), (None, ".webm")],
+    ids=["mp4_video_creates_mp4_uri", "webm_video_keeps_webm_uri", "default_video_keeps_webm_uri"],
+)
+async def test_run_recording_artifact_uri_matches_video_extension(
+    monkeypatch: pytest.MonkeyPatch, extension: str | None, expected_suffix: str
+) -> None:
+    # Entry-point (real ArtifactManager URI, not mock-arg): an mp4 VideoArtifact must key the RECORDING row .mp4.
+    va = [VideoArtifact(video_path="/tmp/recording.mp4", video_data=b"partial", video_file_extension=extension)]
+    block = SimpleNamespace(workflow_run_block_id="wrb", workflow_run_id="wr", organization_id="o")
+    captured: dict[str, str] = {}
+
+    async def capture(*, uri: str, **_: object) -> str:
+        captured["uri"] = uri
+        return "a_recording"
+
+    real = ArtifactManager()
+    monkeypatch.setattr(real, "_create_artifact", AsyncMock(side_effect=capture))
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", real)
+    monkeypatch.setattr(app.STORAGE, "build_workflow_run_block_uri", MagicMock(return_value="s3://b/recording.webm"))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_video_artifacts", AsyncMock(return_value=va))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_block", AsyncMock(return_value=block))
+    await _code_block()._ensure_run_recording_artifact(
+        browser_state=_browser_state(va), workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="o"
+    )
+    assert captured["uri"].endswith(expected_suffix)

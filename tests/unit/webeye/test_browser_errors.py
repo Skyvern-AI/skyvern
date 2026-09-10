@@ -10,6 +10,7 @@ from skyvern.webeye.browser_errors import (
     _CONTEXT_LOST_MESSAGE_MARKERS,
     _TARGET_CLOSED_MESSAGE_MARKERS,
     BrowserAutomationError,
+    BrowserCdpAcquisitionError,
     BrowserCdpConnectionError,
     BrowserEngineErrorFamilies,
     BrowserErrorFamiliesConfigError,
@@ -45,12 +46,14 @@ def test_taxonomy_subclasses_skyvern_exception() -> None:
     for cls in (
         BrowserTimeoutError,
         BrowserTargetClosedError,
+        BrowserCdpAcquisitionError,
         BrowserCdpConnectionError,
         BrowserRetryableCdpError,
     ):
         assert issubclass(cls, BrowserAutomationError)
     # Retryable CDP error is a specialization of the transport error.
     assert issubclass(BrowserRetryableCdpError, BrowserCdpConnectionError)
+    assert not issubclass(BrowserCdpAcquisitionError, BrowserCdpConnectionError)
 
 
 def test_timeout_type_classifies_to_timeout_with_cause() -> None:

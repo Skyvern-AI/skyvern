@@ -1359,3 +1359,29 @@ def test_a_compacted_output_without_a_packet_gains_no_empty_one() -> None:
 
     assert "build_test_packet" not in parsed
     assert "failing_code_line" not in parsed
+
+
+def test_repeated_compaction_preserves_page_evidence_for_fallback() -> None:
+    payload = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "source_tool": "inspect_page_for_composition",
+                "current_url": "http://localhost/copilot_stream_fallback/",
+                "inspected_url": "http://localhost/copilot_stream_fallback/",
+                "page_title": "Stream recovery QA",
+                "clickable_controls": [
+                    {
+                        "text": "Continue to statements",
+                        "tag": "button",
+                        "selector_candidates": [{"selector": "#continue", "source": "id"}],
+                        "identity": {"tag": "button", "role": "button", "label_context": "Continue to statements"},
+                    }
+                ],
+                "rendered_text": "discarded raw text " * 500,
+            },
+        }
+    )
+    once = _summarize_tool_output(payload)
+    assert "page_evidence" in json.loads(once)
+    assert _summarize_tool_output(once) == once

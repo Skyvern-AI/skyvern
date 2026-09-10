@@ -2724,3 +2724,240 @@ def test_snapshot_recording_prefixes_none_when_path_absent(tmp_path) -> None:
     browser_state = _browser_state_for_snapshot([artifact])
 
     assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") is None
+
+
+def _owned_display_recorder_state(mp4_artifact: VideoArtifact, stopped: bool = False) -> MagicMock:
+    """A browser_state whose _display_recorder is a REAL DisplayRecorder owning mp4_artifact (the strict
+    producer signal snapshot_recording_prefixes uses to admit an MP4 to the bounded prefix path)."""
+    from skyvern.webeye.display_recorder import DisplayRecorder
+
+    class _P:
+        returncode = None
+        pid = 2_147_483_646
+
+    rec = DisplayRecorder(display=":99", owner_id="wr_x", process=_P(), lock_fd=-1, video_artifact=mp4_artifact)
+    if stopped:
+        rec._stop_result = True  # is_stopped -> True (finalization case)
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = [mp4_artifact]
+    browser_state.browser_artifacts._display_recorder = rec
+    return browser_state
+
+
+def test_snapshot_recording_prefixes_plans_owned_display_mp4(tmp_path) -> None:
+    """SKY-15466: the owned, registered, growing whole-display fragmented-MP4 uses the bounded prefix path,
+    snapshotting the current on-disk length (not the live EOF)."""
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(b"m" * 500)
+    mp4 = VideoArtifact(video_path=str(src), video_artifact_id="vid-mp4", video_file_extension="mp4")
+    browser_state = _owned_display_recorder_state(mp4)
+
+    plan = manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t")
+
+    src.write_bytes(b"m" * 9_999)  # later growth must not enlarge the already-snapshotted bound
+    assert plan == [RecordingPrefixSnapshot(video_artifact_id="vid-mp4", path=str(src), prefix_len=500)]
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    [
+        lambda mp4: _browser_state_for_snapshot([mp4]),  # unowned: _display_recorder is not a DisplayRecorder
+        lambda mp4: _owned_display_recorder_state(mp4, stopped=True),  # stopped: terminal byte/supersede case
+    ],
+    ids=["unowned_mp4", "stopped_display_mp4"],
+)
+def test_snapshot_recording_prefixes_none_for_non_streaming_mp4(tmp_path, make_state) -> None:
+    # A bare .mp4 that is NOT an owned, live display-recorder artifact falls back to the byte path: the bounded
+    # MP4 prefix path is gated on the explicit live-producer signal (owned + not stopped), not the extension.
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(b"m" * 500)
+    mp4 = VideoArtifact(video_path=str(src), video_artifact_id="vid-mp4", video_file_extension="mp4")
+    assert manager.snapshot_recording_prefixes(browser_state=make_state(mp4), task_id="t") is None
+
+
+# --- SKY-15466 whole-display recorder: cleanup must not truncate the recording, and the orphan sweep
+# --- must not stop a still-live recorder on keep-open paths. ---
+@pytest.mark.asyncio
+async def test_cleanup_then_terminal_read_persists_finalized_mp4_bytes(tmp_path, monkeypatch) -> None:
+    """Outer-contract regression: real terminal cleanup must NOT delete the finalized MP4, and the real
+    terminal artifact-read consumer used by persistence (``get_video_artifacts``) must then read those
+    finalized bytes into ``video_data`` — not the stale last-step snapshot. The reverted bug unlinked in
+    cleanup, so the read missed the file and re-uploaded stale/empty bytes. Neither the cleanup nor the read
+    is mocked."""
+    from types import SimpleNamespace
+
+    from skyvern.config import settings
+    from skyvern.webeye import display_recorder
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+
+    monkeypatch.setattr(settings, "VIDEO_PATH", str(tmp_path))
+    day = tmp_path / "2026-09-03"
+    day.mkdir()
+    owner = "tsk_persist"
+    recording = day / f"{display_recorder._safe_owner_id(owner)}.mp4"
+    finalized = b"\x00\x00\x00\x18ftypisom" + b"FINALIZED-DISPLAY-MP4-BYTES" * 8
+    recording.write_bytes(finalized)
+
+    va = VideoArtifact(video_path=str(recording))
+    va.video_data = b"STALE-LAST-STEP-SNAPSHOT"  # what a per-step sync left behind before finalize
+    browser_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(video_artifacts=[va]))
+
+    manager = RealBrowserManager()
+    # (1) real terminal cleanup for this owner (no-unlink + gated sweep) — the finalized file must survive.
+    await manager.cleanup_for_task(owner, close_browser_on_completion=True)
+    assert recording.exists(), "terminal cleanup must not delete the finalized recording"
+
+    # (2) real terminal artifact read/finalize consumer used by persistence — NOT mocked.
+    result = await manager.get_video_artifacts(browser_state, task_id=owner, finalize=True)
+    assert len(result) == 1
+    assert result[0].video_data == finalized  # byte-for-byte the finalized on-disk MP4
+    assert result[0].video_data != b"STALE-LAST-STEP-SNAPSHOT"  # not the pre-finalize snapshot
+    assert result[0].video_file_extension == "mp4"
+
+
+def _patch_sweep(monkeypatch, swept: list[str]) -> None:
+    async def _fake_sweep(owner_id: str) -> int:
+        swept.append(owner_id)
+        return 0
+
+    monkeypatch.setattr(real_browser_manager, "stop_display_recorders_for_owner", _fake_sweep)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_task_sweeps_recorder_only_on_terminal_close(monkeypatch) -> None:
+    """Keep-open regression: the orphan sweep may run only on the actual-close path; on keep-open
+    (close_browser_on_completion=False) the recorder is intentionally still live and must not be stopped."""
+    swept: list[str] = []
+    _patch_sweep(monkeypatch, swept)
+    manager = RealBrowserManager()
+
+    await manager.cleanup_for_task("tsk_keepopen", close_browser_on_completion=False)
+    assert swept == [], "keep-open cleanup must NOT stop the live recorder"
+
+    await manager.cleanup_for_task("tsk_close", close_browser_on_completion=True)
+    assert swept == ["tsk_close"], "terminal-close cleanup should sweep exactly its own owner"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_sweeps_recorder_only_on_effective_close(monkeypatch) -> None:
+    """A session-backed script is released (not closed) so the session's browser is reused; its recorder must
+    stay live/locked. The sweep gates on EFFECTIVE close (close and not browser_session_id), not raw close."""
+    swept: list[str] = []
+    _patch_sweep(monkeypatch, swept)
+    manager = RealBrowserManager()
+    monkeypatch.setattr(manager, "_drop_engine_owner", AsyncMock())
+
+    await manager.cleanup_for_script("scr_shared", close_browser_on_completion=True, browser_session_id="pbs_x")
+    assert swept == [], "a session-backed script's live recorder must not be swept"
+
+    await manager.cleanup_for_script("scr_solo", close_browser_on_completion=True)
+    assert swept == ["scr_solo"], "standalone terminal close should sweep exactly its own owner"
+
+
+def _cleanup_state() -> MagicMock:
+    # A browser state whose close path needs no real Playwright objects: no context/traces so tracing is
+    # skipped, and close() succeeds.
+    st = MagicMock()
+    st.browser_context = None
+    st.browser_artifacts.traces_dir = None
+    st.close = AsyncMock(return_value=True)
+    return st
+
+
+def _install_cleanup_stubs(manager: RealBrowserManager, monkeypatch, swept: list[str], *, streams: bool) -> None:
+    _patch_sweep(monkeypatch, swept)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: streams)
+    monkeypatch.setattr(manager, "_stop_frame_publisher", AsyncMock())
+    monkeypatch.setattr(manager, "_drop_engine_owner", AsyncMock())
+
+
+# Owner-sweep contract: the orphan sweep reaps a recorder ONLY for an owner whose close was EFFECTIVE (present
+# in-process, not suppressed by cross-run sharing). A shared browser is still rendering, so its recorder stays
+# live/registered/locked (freeing the flock would let the next run capture it); a non-shared task/run owner IS
+# reaped. Both outcomes stay distinct named rows with the exact swept set.
+@pytest.mark.parametrize(
+    "pages,shared_pred,run_owner,task_ids,expected_swept",
+    [
+        (
+            ["wr_shared", "tsk_owned"],
+            lambda wrid, state: wrid == "wr_shared",
+            "wr_shared",
+            ["tsk_owned"],
+            ["tsk_owned"],
+        ),
+        (["wr_solo"], lambda wrid, state: False, "wr_solo", [], ["wr_solo"]),
+    ],
+    ids=["shared_owner_not_reaped_task_reaped", "solo_run_owner_reaped"],
+)
+@pytest.mark.asyncio
+async def test_orphan_sweep_reaps_only_effective_close_owners(
+    pages, shared_pred, run_owner, task_ids, expected_swept, monkeypatch
+) -> None:
+    swept: list[str] = []
+    manager = RealBrowserManager()
+    for p in pages:
+        manager.pages[p] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", shared_pred)
+    await manager.cleanup_for_workflow_run(run_owner, task_ids, close_browser_on_completion=True)
+    assert sorted(swept) == sorted(expected_swept)  # shared owner absent; effective-close owners reaped exactly
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_skips_keep_open_and_deferred_paths(monkeypatch) -> None:
+    """Keep-open (close=False) and deferred (active CDP stream) paths must sweep NEITHER — the recorder is
+    intentionally still live and the later real close handles release."""
+    swept: list[str] = []
+    manager = RealBrowserManager()
+    manager.pages["wr_keep"] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    await manager.cleanup_for_workflow_run("wr_keep", ["tsk_k"], close_browser_on_completion=False)
+    assert swept == []
+
+    swept.clear()
+    manager2 = RealBrowserManager()
+    manager2.pages["wr_defer"] = _cleanup_state()
+    _install_cleanup_stubs(manager2, monkeypatch, swept, streams=True)
+    monkeypatch.setattr(manager2, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    # Keep the deferred branch actually deferred: set_deferred_close_params must report streams still active.
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", lambda *a, **k: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr(manager2, "_finalize_deferred_display_recording", AsyncMock())
+    await manager2.cleanup_for_workflow_run("wr_defer", ["tsk_d"], close_browser_on_completion=True)
+    assert swept == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_sweep_cancel_still_sweeps_siblings_releases_session_and_completes_teardown(monkeypatch) -> None:
+    # A second cancel landing mid-sweep must not abandon sibling owners' recorders (leaking bridge/flock) nor skip
+    # the run's session release + stream teardown: latch it, finish every owner + terminal work once, then re-raise.
+    swept: list[str] = []
+
+    async def _sweep(owner_id: str) -> int:
+        swept.append(owner_id)
+        if len(swept) == 1:  # first owner finishes (appended) THEN the caller's cancel is delivered
+            raise asyncio.CancelledError()
+        return 0
+
+    manager = RealBrowserManager()
+    manager.pages["wr_run"] = _cleanup_state()
+    manager.pages["tsk_owned"] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stop_display_recorders_for_owner", _sweep)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    release = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_release_persistent_session", release)
+    teardown = MagicMock()
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.complete_stream_teardown", teardown)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.cleanup_for_workflow_run(
+            "wr_run", ["tsk_owned"], close_browser_on_completion=True, browser_session_id="pbs_x", organization_id="o"
+        )
+
+    assert sorted(swept) == ["tsk_owned", "wr_run"]  # sibling still swept despite the first owner's mid-sweep cancel
+    release.assert_awaited_once()  # session release ran once
+    teardown.assert_called_once_with("wr_run")  # stream teardown completed once
