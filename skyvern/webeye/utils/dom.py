@@ -1192,6 +1192,29 @@ class SkyvernElement:
             await self._classify_typing_timeout(exc)
             raise
 
+    async def mark_totp_box(self, page: Page, expected_digits: int) -> None:
+        """Keep the smallest filled group length and this box's privacy provenance."""
+        record_minimum = (
+            "const previous = Number(root.getAttribute('data-skyvern-otp-filled'));"
+            f"root.setAttribute('data-skyvern-otp-filled', String(Number.isInteger(previous) && previous >= 2 ? Math.min(previous, {expected_digits}) : {expected_digits}));"
+        )
+        await SkyvernFrame.evaluate(
+            frame=self.get_frame(),
+            expression="""(element) => {
+                const root = element.ownerDocument.documentElement;
+            """
+            + record_minimum
+            + """
+                element.setAttribute("data-skyvern-otp-box", "1");
+            }""",
+            arg=await self.get_element_handler(),
+        )
+        if self.get_frame() is not page:
+            await SkyvernFrame.evaluate(
+                frame=page,
+                expression="() => {const root = document.documentElement;" + record_minimum + "}",
+            )
+
     async def apply_secret_visual_mask(self) -> None:
         try:
             tag_name = self.get_tag_name().lower()
@@ -1692,7 +1715,7 @@ class DomUtil:
             return True
         return False
 
-    async def get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement:
+    async def get_skyvern_element_by_id(self, element_id: str, *, allow_xpath_fallback: bool = True) -> SkyvernElement:
         element = self.scraped_page.id_to_element_dict.get(element_id)
         if not element:
             raise MissingElementDict(element_id)
@@ -1711,6 +1734,8 @@ class DomUtil:
 
         num_elements = await locator.count()
         if num_elements < 1:
+            if not allow_xpath_fallback:
+                raise MissingElement(selector=css, element_id=element_id)
             xpath: str | None = element.get("xpath")
             if not xpath:
                 LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)

@@ -128,8 +128,11 @@ class TransientPageTextObserver:
         previous_active_observer = binding_state.active_observer
 
         def record_text_event(_source: dict[str, Any], payload: Any) -> None:
-            if binding_state.active_observer is not None:
-                _append_text_event(binding_state.active_observer.events, payload)
+            if binding_state.active_observer is None:
+                return
+            events = binding_state.active_observer.events
+            for item in payload if isinstance(payload, list) else [payload]:
+                _append_text_event(events, item)
 
         try:
             self._document_install_attempt_count += 1
@@ -140,7 +143,7 @@ class TransientPageTextObserver:
             await SkyvernFrame.evaluate(
                 frame=self.page,
                 expression="""
-                ({ bindingName, stateKey, minLength, maxLength, scanInitialVisibleState }) => {
+                ({ bindingName, stateKey, minLength, maxLength, eventLimit, scanInitialVisibleState }) => {
                   const key = stateKey;
                   const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
                   const previousState = window[key];
@@ -165,17 +168,29 @@ class TransientPageTextObserver:
                       ? element.innerText
                       : element.textContent || "";
 
+                  let batch = [];
+                  const flushBatch = () => {
+                    if (!batch.length) return;
+                    const payload = batch;
+                    batch = [];
+                    Promise.resolve(window[bindingName](payload)).catch(() => {});
+                  };
+
                   const capture = (element) => {
                     let text = normalize(innerTextOf(element));
                     if (text.length < minLength) return;
                     if (text.length > maxLength) text = text.slice(0, maxLength);
-                    Promise.resolve(window[bindingName]({
+                    // Only adjacent duplicates are safe: intervening texts may evict an older
+                    // occurrence from Python's history even within this batch.
+                    if (batch[batch.length - 1]?.text === text) return;
+                    batch.push({
                       text,
                       timestamp_ms: Date.now(),
-                      tag: element.tagName || null,
-                      role: element.getAttribute("role"),
-                      aria_live: element.getAttribute("aria-live"),
-                    })).catch(() => {});
+                      tag: element.tagName?.slice(0, maxLength) || null,
+                      role: element.getAttribute("role")?.slice(0, maxLength) ?? null,
+                      aria_live: element.getAttribute("aria-live")?.slice(0, maxLength) ?? null,
+                    });
+                    if (batch.length === eventLimit) flushBatch();
                   };
 
                   let state;
@@ -213,6 +228,7 @@ class TransientPageTextObserver:
                         pendingVisible.delete(element);
                       }
                     }
+                    flushBatch();
                     if (pendingVisible.size > 0) scheduleSweep();
                   };
                   const scheduleSweep = () => {
@@ -254,6 +270,7 @@ class TransientPageTextObserver:
                           emit(mutation.target);
                         }
                       }
+                      flushBatch();
                     });
                     observer.observe(document.documentElement || document.body, {
                       subtree: true,
@@ -271,6 +288,7 @@ class TransientPageTextObserver:
                         if (!staleVisibleTexts.has(normalize(innerTextOf(element)))) capture(element);
                       }
                     }
+                    flushBatch();
                     state = { observer, bindingName, visibleSemanticTexts, pendingVisible };
                     window[key] = state;
                     try { previousState?.observer?.disconnect?.(); } catch (e) {}
@@ -286,6 +304,7 @@ class TransientPageTextObserver:
                     "stateKey": TRANSIENT_TEXT_OBSERVER_STATE_KEY,
                     "minLength": TRANSIENT_TEXT_MIN_LENGTH,
                     "maxLength": TRANSIENT_TEXT_MAX_LENGTH,
+                    "eventLimit": TRANSIENT_TEXT_EVENT_LIMIT,
                     "scanInitialVisibleState": scan_initial_visible_state,
                 },
             )
