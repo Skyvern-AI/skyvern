@@ -130,7 +130,9 @@ class ClickContext(BaseModel):
 
 # Stamp on Task V3-persisted action rows. Their `reasoning` is the whole TURN's text, shared by
 # every action of the round — readers that assume per-action reasoning (cached-script prompt
-# inference) must key off this stamp and skip it.
+# inference) must key off this stamp and skip it. The literal prefix is also parsed by the frontend
+# (skyvern-frontend/src/routes/workflows/workflowBlockUtils.ts `taskV3CallText`), which cannot import
+# it across the OSS boundary, so changing the string is a cross-repo change.
 TASK_V3_ACTION_DESCRIPTION_PREFIX = "task_v3 "
 
 

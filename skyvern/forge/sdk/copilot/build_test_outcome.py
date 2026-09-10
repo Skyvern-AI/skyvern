@@ -1124,8 +1124,8 @@ def unresolved_runtime_block_failure_with_disposition(
             )
             if executed_snapshot_disposition is not None:
                 return None, executed_snapshot_disposition
-        # Clearance reads the workflow the user can actually run, or -- when nothing is saved yet --
-        # the snapshot a run proved above. A draft neither of those covers clears nothing.
+        # Absence answers a different question per caller: the run-level carrier reads the snapshot
+        # the run executed, the terminal reads what is saved. reported_workflow_is_persisted says which.
         delivered_yaml = reported_workflow_yaml
         code = _code_blocks_by_label(delivered_yaml).get(label) if delivered_yaml else None
         if not (label and run_id and later_runs and code):
