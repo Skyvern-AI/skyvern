@@ -290,6 +290,7 @@
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
                       "yutori_navigator": "#/components/schemas/TaskRunResponse",
+                      "task_v3": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -19855,6 +19856,7 @@
         "enum": [
           "task_v1",
           "task_v2",
+          "task_v3",
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
@@ -23075,6 +23077,7 @@
             "enum": [
               "task_v1",
               "task_v2",
+              "task_v3",
               "openai_cua",
               "anthropic_cua",
               "ui_tars",
