@@ -58,6 +58,7 @@ from skyvern.browser_extension.broker_state import (
     ensure_run_directory,
     process_identity_matches,
     publish_broker_state,
+    read_broker_state,
     read_extension_secret,
     remove_control_socket,
     reset_lease_journal,
@@ -100,6 +101,8 @@ _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"
 _APPROVAL_SOURCE_GRANT = "grant"
 _BUILD_HASH_SHORT_LENGTH = 12
+_OWNERSHIP_STATE_READ_ATTEMPTS = 3
+_OWNERSHIP_STATE_READ_RETRY_SECONDS = 0.05
 
 
 def _local_extension_build_hash() -> str:
@@ -303,7 +306,6 @@ class BrowserExtensionBrokerServer:
                     count=stale_leases,
                     archive=str(self.paths.leases_stale),
                 )
-            remove_control_socket(self.paths)
             relay = self._make_relay(extension_secret)
             self._relay = relay
             try:
@@ -389,11 +391,7 @@ class BrowserExtensionBrokerServer:
         if relay is not None:
             await relay.stop()
 
-        with suppress(BrowserExtensionBrokerError, OSError):
-            validate_run_directory(self.paths, expected_identity=self._run_identity)
-            publish_broker_state(self.paths, self._state(lifecycle="stopped", clean_shutdown=clean_shutdown))
-        with suppress(BrowserExtensionBrokerError, OSError):
-            remove_control_socket(self.paths)
+        self._cleanup_published_state(clean_shutdown=clean_shutdown)
         if self._daemon_lock is not None:
             self._daemon_lock.release()
             self._daemon_lock = None
@@ -428,11 +426,65 @@ class BrowserExtensionBrokerServer:
         if relay is not None:
             with suppress(Exception):
                 await relay.stop()
-        with suppress(BrowserExtensionBrokerError, OSError):
-            remove_control_socket(self.paths)
+        self._cleanup_published_state(clean_shutdown=False)
         if self._daemon_lock is not None:
             self._daemon_lock.release()
             self._daemon_lock = None
+
+    def _cleanup_published_state(self, *, clean_shutdown: bool) -> None:
+        if not self._owns_published_state():
+            return
+        try:
+            validate_run_directory(self.paths, expected_identity=self._run_identity)
+            publish_broker_state(self.paths, self._state(lifecycle="stopped", clean_shutdown=clean_shutdown))
+        except (BrowserExtensionBrokerError, OSError):
+            LOG.warning("browser_extension_broker_state_cleanup_failed", port=self.port, exc_info=True)
+        else:
+            with suppress(BrowserExtensionBrokerError, OSError):
+                remove_control_socket(self.paths)
+
+    def _owns_published_state(self) -> bool:
+        daemon_lock = self._daemon_lock
+        if daemon_lock is None or daemon_lock.fd is None:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="lifecycle_lock_not_held",
+            )
+            return False
+        state: BrokerState | None = None
+        for attempt in range(_OWNERSHIP_STATE_READ_ATTEMPTS):
+            try:
+                state = read_broker_state(self.paths)
+            except (BrowserExtensionBrokerError, OSError):
+                if attempt + 1 == _OWNERSHIP_STATE_READ_ATTEMPTS:
+                    LOG.warning(
+                        "browser_extension_broker_artifact_ownership_lost",
+                        port=self.port,
+                        reason="state_unreadable",
+                        exc_info=True,
+                    )
+                    return False
+                time.sleep(_OWNERSHIP_STATE_READ_RETRY_SECONDS)
+            else:
+                break
+        if state is None:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="state_missing",
+            )
+            return False
+        if state.pid != os.getpid() or state.bootId != self._boot_id:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="state_owner_mismatch",
+                state_pid=state.pid,
+                state_boot_id=state.bootId,
+            )
+            return False
+        return True
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if (

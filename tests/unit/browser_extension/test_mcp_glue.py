@@ -25,6 +25,7 @@ from skyvern.cli.commands.browser import browser_app
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import session as mcp_session
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 from .test_broker_client import _ignore_event, _mock_pre_upgrade_daemon
 
@@ -620,7 +621,7 @@ def test_extension_broker_status_never_kills_a_pre_upgrade_daemon(
     daemon out from under whoever depends on it. (extension-broker-stop is the one
     auto_spawn=False command that IS allowed to terminate one - see below.)"""
     monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
-    path_probe = BrokerClient(19778, _ignore_event)
+    path_probe = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
 
     result = CliRunner().invoke(browser_app, ["extension-broker-status"])
@@ -637,7 +638,7 @@ def test_extension_broker_stop_terminates_a_pre_upgrade_daemon(
     doesn't need to bring a replacement back up, so it must still be able to remove a
     mismatched-generation daemon that a normal wire-level stop can't reach."""
     monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
-    path_probe = BrokerClient(19778, _ignore_event)
+    path_probe = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
 
     result = CliRunner().invoke(browser_app, ["extension-broker-stop"])

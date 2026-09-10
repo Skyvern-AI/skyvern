@@ -14,6 +14,7 @@ import skyvern.browser_extension.runtime as runtime_module
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 
 class StubRelay:
@@ -185,7 +186,7 @@ async def test_busy_pairing_waits_then_opens_this_clients_offer(monkeypatch: pyt
     async def ignore_event(_event: str, _params: dict) -> None:
         return None
 
-    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    relay = BrokerClient(19777, ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     begin_pairing = AsyncMock(
         side_effect=[
             BrowserExtensionBrokerError("PAIRING_BUSY", "Another client is pairing"),
@@ -208,7 +209,7 @@ async def test_pairing_surfaces_extension_upgrade_requirement(monkeypatch: pytes
     async def ignore_event(_event: str, _params: dict) -> None:
         return None
 
-    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    relay = BrokerClient(19777, ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     monkeypatch.setattr(
         relay,
         "begin_pairing",
