@@ -11,6 +11,8 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from html import escape
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -45,6 +47,123 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+
+def mask_otp_values_in_html(source: str) -> str:
+    """Mask marked inputs and successor box groups before HTML is retained."""
+    if "data-skyvern-otp-" not in source.lower():
+        return source
+    offsets = [0, *[match.end() for match in re.finditer("\n", source)]]
+    void_tags = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
+    class InputValueRedactor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.minimum = 0
+            self.nodes: list[dict[str, Any]] = []
+            self.stack: list[int] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attributes = dict(attrs)
+            if tag == "html":
+                try:
+                    self.minimum = int(attributes.get("data-skyvern-otp-filled") or "0")
+                except ValueError:
+                    self.minimum = 0
+            eligible = False
+            if tag == "input":
+                raw_maxlength = attributes.get("maxlength")
+                try:
+                    maxlength = int(raw_maxlength) if raw_maxlength and raw_maxlength.strip() else None
+                except ValueError:
+                    maxlength = -1
+                pattern = attributes.get("pattern") or ""
+                digit_constraint = (
+                    (attributes.get("inputmode") or "").lower() in {"numeric", "decimal"}
+                    or "digit" in pattern.lower()
+                    or "\\d" in pattern
+                    or "[0-9]" in pattern
+                    or bool(re.fullmatch(r"[0-9]+", pattern))
+                )
+                eligible = (attributes.get("type") or "text").lower() in {"text", "number", "tel", "password"} and (
+                    maxlength == 1 or maxlength is None and digit_constraint
+                )
+            line, column = self.getpos()
+            self.nodes.append(
+                {
+                    "tag": tag,
+                    "attrs": attrs,
+                    "parent": self.stack[-1] if self.stack else None,
+                    "eligible": eligible,
+                    "count": int(eligible),
+                    "start": offsets[line - 1] + column,
+                    "raw": self.get_starttag_text() or "",
+                    "group": False,
+                }
+            )
+            if tag not in void_tags:
+                self.stack.append(len(self.nodes) - 1)
+
+        def handle_endtag(self, tag: str) -> None:
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.nodes[self.stack[index]]["tag"] == tag:
+                    del self.stack[index:]
+                    break
+
+        def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            self.handle_starttag(tag, attrs)
+            if tag not in void_tags:
+                self.handle_endtag(tag)
+
+    parser = InputValueRedactor()
+    parser.feed(source)
+    # Count once bottom-up, then propagate group membership once top-down.
+    for node in reversed(parser.nodes):
+        if node["parent"] is not None:
+            parser.nodes[node["parent"]]["count"] += node["count"]
+    parts: list[str] = []
+    previous_end = 0
+    for node in parser.nodes:
+        parent = parser.nodes[node["parent"]] if node["parent"] is not None else None
+        inherited = parent is not None and parent["group"]
+        own_group = parser.minimum >= 2 and node["count"] >= parser.minimum
+        node["group"] = False if node["tag"] in {"html", "body"} else own_group or (inherited and node["tag"] != "form")
+        attrs = dict(node["attrs"])
+        if node["tag"] != "input" or not ("data-skyvern-otp-box" in attrs or node["eligible"] and inherited):
+            continue
+        value = attrs.get("value")
+        reflecting = {"value", "aria-valuenow", "aria-valuetext", "data-value", "defaultvalue"}
+        if (value is not None and attrs.get("placeholder") == value) or re.fullmatch(
+            r"[0-9]+", attrs.get("placeholder") or ""
+        ):
+            reflecting.add("placeholder")
+        masked_attrs = [
+            name
+            if attr_value is None
+            else f'{name}="{escape("*" * len(attr_value) if name in reflecting else attr_value, quote=True)}"'
+            for name, attr_value in node["attrs"]
+        ]
+        ending = "/>" if node["raw"].endswith("/>") else ">"
+        parts.extend((source[previous_end : node["start"]], f"<input {' '.join(masked_attrs)}{ending}"))
+        previous_end = node["start"] + len(node["raw"])
+    parts.append(source[previous_end:])
+    return "".join(parts)
+
 
 SECRET_VISUAL_MASK_STYLE_ID = "skyvern-secret-mask-style"
 SECRET_VISUAL_MASK_ATTRIBUTE = "data-skyvern-secret-mask"
@@ -267,6 +386,10 @@ def load_js_script() -> str:
 
 
 JS_FUNCTION_DEFS = load_js_script()
+OTP_INPUT_PRIVACY_JS = JS_FUNCTION_DEFS.split("// BEGIN OTP INPUT PRIVACY\n", 1)[1].split(
+    "// END OTP INPUT PRIVACY", 1
+)[0]
+OTP_SAFE_FRAGMENT_HTML_JS = "(element) => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(element, true);}"
 
 
 class _DomUtilsExpression(str):
@@ -667,11 +790,8 @@ async def _wait_for_screenshot_load_state(
     timeout_ms: float,
     engine_selection: BrowserEngineSelection | None = None,
 ) -> None:
-    # Best-effort readiness guard before capturing. Waiting for 'load' (rather than the
-    # earlier 'domcontentloaded') lets late subresources settle before capture; but pages
-    # with streaming/long-polling/SSE/websockets or a persistent spinner may never fire
-    # 'load', so a timeout here must stay non-fatal — the capture has its own (separate)
-    # timeout budget.
+    # Unfinished load-blocking resources can delay 'load'; background fetches, WebSockets and
+    # spinners do not inherently block it. Keep this guard non-fatal with its own timeout budget.
     if timeout_ms <= 0:
         return
     try:
@@ -764,6 +884,24 @@ async def _page_screenshot_helper(
     except Exception as timeout_error:
         if not is_engine_timeout(timeout_error, engine_selection):
             raise
+        if page.is_closed():
+            raise
+        if (
+            not full_page
+            and (engine_selection is None or engine_selection.name != SKYCDP_ENGINE_NAME)
+            and (browser := page.context.browser) is not None
+            and browser.browser_type.name == "chromium"
+        ):
+            # A failed rescue ends this attempt; scaled viewports retain the animation retry.
+            rescued = await _cdp_rescue_screenshot(page=page, file_path=file_path)
+            if page.is_closed():
+                raise
+            if isinstance(rescued, bytes):
+                LOG.info("Recovered the screenshot over raw CDP after the page screenshot failed", file_path=file_path)
+                skyvern_context.record_browser_recovery(BrowserOperation.SCREENSHOT)
+                return rescued
+            if rescued is None:
+                raise
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
         )
@@ -840,6 +978,15 @@ async def _current_viewpoint_screenshot_helper(
     except Exception as e:
         if engine_selection is not None and not _is_engine_error(e, engine_selection):
             raise
+        if page.is_closed() or _is_screenshot_target_closed(e, engine_selection):
+            LOG.info(
+                "Skipping screenshot because target closed during capture",
+                url=url,
+                viewport=viewport_info,
+                full_page=full_page,
+                mode=mode.value if hasattr(mode, "value") else str(mode),
+            )
+            raise ScreenshotTargetClosed(error_message=str(e)) from e
         if is_engine_timeout(e, engine_selection):
             skyvern_context.record_browser_timeout(BrowserOperation.SCREENSHOT)
             LOG.warning(
@@ -853,15 +1000,6 @@ async def _current_viewpoint_screenshot_helper(
                 error=str(e),
             )
             raise FailedToTakeScreenshot(error_message=str(e)) from e
-        if _is_screenshot_target_closed(e, engine_selection):
-            LOG.info(
-                "Skipping screenshot because target closed during capture",
-                url=url,
-                viewport=viewport_info,
-                full_page=full_page,
-                mode=mode.value if hasattr(mode, "value") else str(mode),
-            )
-            raise ScreenshotTargetClosed(error_message=str(e)) from e
         LOG.error(
             "Screenshot failed",
             url=url,
@@ -879,17 +1017,32 @@ CDP_RESCUE_DETACH_TIMEOUT_SECONDS = 2
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | None:
-    """Capture over raw CDP after the page-level screenshot primitive failed; the page just proved it
-    will not answer a capture, so session open, send and detach each carry their own budget and the
-    detach bound stays lexically outside the capture one."""
+class _RescueDeclined:
+    """Scaled viewport requiring the existing Playwright animation retry."""
+
+
+_RESCUE_DECLINED = _RescueDeclined()
+
+
+async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | _RescueDeclined | None:
+    """Return PNG bytes, a scaled-viewport decline, or None after a failed rescue."""
     session = None
     try:
         session = await asyncio.wait_for(page.context.new_cdp_session(page), timeout=CDP_RESCUE_SESSION_TIMEOUT_SECONDS)
-        result = await asyncio.wait_for(
-            session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False}),
-            timeout=CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS,
-        )
+        async with asyncio.timeout(CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS):
+            # The renderer round-trip shares the capture budget and can still time out on a stuck renderer.
+            geometry = await session.send(
+                "Runtime.evaluate",
+                {
+                    "expression": "({deviceScaleFactor: window.devicePixelRatio, "
+                    "viewportScale: window.visualViewport.scale})",
+                    "returnByValue": True,
+                },
+            )
+            if geometry["result"]["value"] != {"deviceScaleFactor": 1, "viewportScale": 1}:
+                # A scaled CDP clip can reset Chromium's emulated DPR, so leave scaled captures to Playwright.
+                return _RESCUE_DECLINED
+            result = await session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
         data = base64.b64decode(result.get("data", ""), validate=False)
         if data[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE:
             LOG.warning("Raw CDP rescue screenshot returned a non-PNG payload", payload_bytes=len(data))
@@ -897,16 +1050,23 @@ async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | N
         if file_path is not None:
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
             Path(file_path).write_bytes(data)
-        LOG.info("Recovered the screenshot over raw CDP after the page screenshot failed", file_path=file_path)
-        skyvern_context.record_browser_recovery(BrowserOperation.SCREENSHOT)
         return data
     except Exception:
         LOG.warning("Raw CDP rescue screenshot failed", exc_info=True)
         return None
     finally:
         if session is not None:
+            detach_task = asyncio.create_task(
+                asyncio.wait_for(session.detach(), timeout=CDP_RESCUE_DETACH_TIMEOUT_SECONDS)
+            )
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(session.detach(), timeout=CDP_RESCUE_DETACH_TIMEOUT_SECONDS)
+                try:
+                    await asyncio.shield(detach_task)
+                except asyncio.CancelledError:
+                    # Drain the owned, already-bounded cleanup before propagating cancellation.
+                    with contextlib.suppress(Exception):
+                        await detach_task
+                    raise
 
 
 async def take_element_screenshot(
@@ -2009,7 +2169,7 @@ class SkyvernFrame:
             x = None
             y = None
             raise
-        except Exception as exc:
+        except Exception:
             LOG.warning(
                 "Failed to take full page screenshot, fallback to use playwright full page screenshot",
                 exc_info=True,
@@ -2017,12 +2177,6 @@ class SkyvernFrame:
             # reset x and y to None to avoid the scroll_to_x_y call in finally block
             x = None
             y = None
-            if isinstance(exc, FailedToTakeScreenshot) and not (
-                engine_selection is not None and engine_selection.name == SKYCDP_ENGINE_NAME
-            ):
-                rescued = await _cdp_rescue_screenshot(page=page, file_path=file_path)
-                if rescued is not None:
-                    return rescued
             return await _current_viewpoint_screenshot_helper(
                 page=page,
                 file_path=file_path,
@@ -2090,7 +2244,7 @@ class SkyvernFrame:
     @traced(name="skyvern.browser.get_content")
     async def get_content(self, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
         async with asyncio.timeout(timeout):
-            return await self.frame.content()
+            return mask_otp_values_in_html(await self.frame.content())
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
         js_script = with_dom_utils("() => getScrollXY()", ("getScrollXY",))

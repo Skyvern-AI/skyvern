@@ -1192,6 +1192,21 @@ class CDPDownloadInterceptor:
         saving over HTTP), so re-sending allow/downloadPath would disable it on remote CDP."""
         return self._browser_session is not None
 
+    def has_pending_download_activity(self) -> bool:
+        """True while a browser-download or CDP Fetch handler is scheduled or in flight. A file this
+        interceptor writes next cannot be tied to a later action's own click while any is outstanding."""
+        return bool(
+            self._browser_download_tasks or self._cdp_handler_tasks or self._pending_browser_download_event_bytes
+        )
+
+    async def prove_pre_action_download_quiescence(self) -> bool:
+        """Bounded pre-action quiescence gate for the v4 false-click lifecycle. Always admit one
+        ``BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS`` window -- admitting an older browser-download/CDP
+        event in flight when the sets read empty -- then return True only when nothing is scheduled or in
+        flight, never draining a capture to its deadline (caller fails open)."""
+        await asyncio.sleep(BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS)
+        return not self.has_pending_download_activity()
+
     def _resolve_save_path(self, filename: str = "", content_type: str = "") -> tuple[Path, str]:
         """Generate a unique save path under _output_dir.
 
@@ -3039,6 +3054,18 @@ async def settle_browser_downloads_for_context(browser_context: BrowserContext |
         return
     async with interceptor.settle_browser_downloads():
         yield
+
+
+async def false_click_download_attribution_is_quiescent(browser_context: BrowserContext | None) -> bool:
+    """Bounded pre-action quiescence gate for the v4 false-click download lifecycle. True when no
+    interceptor is bound (no queued handler can mint a misattributable file) or the bound interceptor
+    proves quiescence within one admission grace; False fails the caller open."""
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    if not isinstance(interceptor, CDPDownloadInterceptor):
+        return True
+    return await interceptor.prove_pre_action_download_quiescence()
 
 
 def has_download_interceptor_for_context(browser_context: BrowserContext | None) -> bool:

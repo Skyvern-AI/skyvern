@@ -3,24 +3,28 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from aiohttp import ClientSession, ClientWebSocketResponse
 
+import skyvern.browser_extension.cdp_adapter as cdp_adapter_module
 from skyvern.browser_extension.cdp_adapter import ExtensionCdpAdapter
 from skyvern.browser_extension.errors import (
     BrowserExtensionBrokerError,
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 
 
 class StubRelay:
     def __init__(self, scoped_tabs: list[dict] | None = None) -> None:
         self.scoped_tabs = scoped_tabs or []
+        self.connected = True
         self.calls: list[tuple[str, dict]] = []
         self.next_tab_id = 100
         self.fail_next: BrowserExtensionBrokerError | ExtensionRequestError | None = None
@@ -756,6 +760,1044 @@ async def test_session_command_routes_to_relay_and_preserves_session_id(
         "sessionId": "missing",
         "error": {"code": -32001, "message": "session not found"},
     }
+
+
+@pytest.mark.asyncio
+async def test_navigation_response_precedes_buffered_commit_events(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    navigation_events = [
+        {
+            "method": "Page.frameStartedNavigating",
+            "params": {"frameId": "frame-42", "url": "https://destination.example"},
+        },
+        {
+            "method": "Network.requestWillBeSent",
+            "params": {"requestId": "request-42", "type": "Document"},
+        },
+        {
+            "method": "Network.responseReceived",
+            "params": {"requestId": "request-42", "type": "Document"},
+        },
+        {
+            "method": "Page.lifecycleEvent",
+            "params": {"frameId": "frame-42", "name": "init"},
+        },
+        {
+            "method": "Page.frameNavigated",
+            "params": {"frame": {"id": "frame-42", "url": "https://destination.example", "title": "Destination"}},
+        },
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+
+        for event in navigation_events:
+            await adapter.handle_extension_event("debugger.event", {"tabId": 42, **event})
+
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        relay.release_send[navigation_key].set()
+        messages = [await ws.receive_json(timeout=2) for _ in range(len(navigation_events) + 1)]
+
+    assert messages[0] == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert [message["method"] for message in messages[1:]] == [event["method"] for event in navigation_events]
+    assert registry.target_info_for_tab(42)["url"] == "https://destination.example"
+
+
+@pytest.mark.asyncio
+async def test_stale_navigation_cleanup_does_not_clear_new_connection_navigation(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    old_session_id = registry.root_session_id(42)
+    old_send_started = asyncio.Event()
+    old_cleanup_started = asyncio.Event()
+    old_response_cancelled = asyncio.Event()
+    original_cancel_client_tasks = adapter._cancel_client_tasks
+
+    async def block_old_client_cleanup(*args: object) -> None:
+        old_cleanup_started.set()
+        await original_cancel_client_tasks(*args)
+
+    async with ClientSession() as client:
+        old = await client.ws_connect(adapter.cdp_ws_url)
+        old_server_ws = adapter._client_ws
+        assert old_server_ws is not None
+        original_send_json = old_server_ws.send_json
+
+        async def block_old_response(payload: dict, *args: object, **kwargs: object) -> None:
+            if payload.get("id") == 1:
+                old_send_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    old_response_cancelled.set()
+                    raise
+            await original_send_json(payload, *args, **kwargs)
+
+        with (
+            patch.object(adapter, "_cancel_client_tasks", side_effect=block_old_client_cleanup),
+            patch.object(old_server_ws, "send_json", side_effect=block_old_response),
+        ):
+            await old.send_json(
+                {
+                    "id": 1,
+                    "sessionId": old_session_id,
+                    "method": "Page.navigate",
+                    "params": {"url": "https://old.example"},
+                }
+            )
+            await asyncio.wait_for(old_send_started.wait(), 1)
+
+            disconnect_task = asyncio.create_task(adapter.on_extension_disconnect())
+            await asyncio.wait_for(old_cleanup_started.wait(), 1)
+
+            new = await client.ws_connect(adapter.cdp_ws_url)
+            registry.register_tab(42, "https://example.com", "Example")
+            new_session_id = registry.root_session_id(42)
+            navigation_key = (None, "Page.navigate")
+            relay.block_send_keys.add(navigation_key)
+            await new.send_json(
+                {
+                    "id": 1,
+                    "sessionId": new_session_id,
+                    "method": "Page.navigate",
+                    "params": {"url": "https://new.example"},
+                }
+            )
+            await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 42,
+                    "method": "Page.frameNavigated",
+                    "params": {
+                        "frame": {
+                            "id": "frame-42",
+                            "url": "https://new.example",
+                            "title": "New",
+                        }
+                    },
+                },
+            )
+
+            await asyncio.wait_for(disconnect_task, 2)
+            await asyncio.wait_for(old_response_cancelled.wait(), 1)
+            relay.release_send[navigation_key].set()
+            messages = [await new.receive_json(timeout=2) for _ in range(2)]
+            assert registry.target_info_for_tab(42)["url"] == "https://new.example"
+            await new.close()
+
+    assert messages == [
+        {
+            "id": 1,
+            "sessionId": new_session_id,
+            "result": {"forwardedMethod": "Page.navigate"},
+        },
+        {
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-42",
+                    "url": "https://new.example",
+                    "title": "New",
+                }
+            },
+            "sessionId": new_session_id,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_navigation_cleanup_after_new_navigation_flush_is_noop(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    old_send_started = asyncio.Event()
+    release_old_send = asyncio.Event()
+    sent: list[dict] = []
+
+    async def record_send(_ws: object, payload: dict, _scope_guard: tuple[int, int] | None = None) -> None:
+        if payload.get("id") == "old":
+            old_send_started.set()
+            await release_old_send.wait()
+        sent.append(payload)
+
+    adapter._client_ws = MagicMock(closed=False)
+    adapter._client_ws.close = AsyncMock()
+    old_ws = MagicMock()
+    new_ws = MagicMock()
+    old_session_id = registry.root_session_id(42)
+    old_marker = await adapter._begin_navigation(42)
+    old_cleanup = asyncio.create_task(
+        adapter._finish_navigation(
+            old_ws,
+            "old",
+            old_session_id,
+            42,
+            old_marker,
+            result={"source": "old"},
+        )
+    )
+
+    with patch.object(adapter, "_send", side_effect=record_send):
+        await asyncio.wait_for(old_send_started.wait(), 1)
+        adapter._reset_connection_state()
+        registry.register_tab(42, "https://example.com", "Example")
+        new_session_id = registry.root_session_id(42)
+
+        new_marker = await adapter._begin_navigation(42)
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 42,
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "frame-42",
+                        "url": "https://new.example",
+                        "title": "New",
+                    }
+                },
+            },
+        )
+        await adapter._finish_navigation(
+            new_ws,
+            "new",
+            new_session_id,
+            42,
+            new_marker,
+            result={"source": "new"},
+        )
+        assert sent == [
+            {"id": "new", "sessionId": new_session_id, "result": {"source": "new"}},
+            {
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "frame-42",
+                        "url": "https://new.example",
+                        "title": "New",
+                    }
+                },
+                "sessionId": new_session_id,
+            },
+        ]
+        assert not adapter._navigation_in_flight
+        assert not adapter._navigation_events
+
+        latest_marker = await adapter._begin_navigation(42)
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {"tabId": 42, "method": "Page.lifecycleEvent", "params": {"name": "init"}},
+        )
+        release_old_send.set()
+        await asyncio.wait_for(old_cleanup, 1)
+        assert adapter._navigation_in_flight[42] == {latest_marker}
+        assert len(adapter._navigation_events[42]) == 1
+
+        await adapter._finish_navigation(
+            new_ws,
+            "latest",
+            new_session_id,
+            42,
+            latest_marker,
+            result={"source": "latest"},
+        )
+
+    assert sent[-2:] == [
+        {"id": "latest", "sessionId": new_session_id, "result": {"source": "latest"}},
+        {
+            "method": "Page.lifecycleEvent",
+            "params": {"name": "init"},
+            "sessionId": new_session_id,
+        },
+    ]
+    assert not adapter._navigation_in_flight
+    assert not adapter._navigation_events
+
+
+@pytest.mark.asyncio
+async def test_stale_navigation_batch_is_dropped_after_connection_reset(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    old_session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    old_event_started = asyncio.Event()
+    release_old_event = asyncio.Event()
+    old_event_finished = asyncio.Event()
+    old_cleanup_started = asyncio.Event()
+    release_old_cleanup = asyncio.Event()
+    original_cancel_client_tasks = adapter._cancel_client_tasks
+
+    async def block_old_client_cleanup(*args: object) -> None:
+        old_cleanup_started.set()
+        await release_old_cleanup.wait()
+        await original_cancel_client_tasks(*args)
+
+    async with ClientSession() as client:
+        old = await client.ws_connect(adapter.cdp_ws_url)
+        old_server_ws = adapter._client_ws
+        assert old_server_ws is not None
+        original_send_json = old_server_ws.send_json
+
+        async def block_old_event(payload: dict, *args: object, **kwargs: object) -> None:
+            if payload.get("method") == "Page.lifecycleEvent":
+                old_event_started.set()
+                await release_old_event.wait()
+                old_event_finished.set()
+                return
+            await original_send_json(payload, *args, **kwargs)
+
+        with (
+            patch.object(adapter, "_cancel_client_tasks", side_effect=block_old_client_cleanup),
+            patch.object(old_server_ws, "send_json", side_effect=block_old_event),
+        ):
+            await old.send_json(
+                {
+                    "id": 1,
+                    "sessionId": old_session_id,
+                    "method": "Page.navigate",
+                    "params": {"url": "https://old.example"},
+                }
+            )
+            await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 42,
+                    "method": "Page.lifecycleEvent",
+                    "params": {"frameId": "frame-42", "name": "init"},
+                },
+            )
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 42,
+                    "method": "Page.frameNavigated",
+                    "params": {
+                        "frame": {
+                            "id": "frame-42",
+                            "url": "https://old.example/commit",
+                            "title": "Old",
+                        }
+                    },
+                },
+            )
+            relay.release_send[navigation_key].set()
+            assert await receive_response(old, 1) == {
+                "id": 1,
+                "sessionId": old_session_id,
+                "result": {"forwardedMethod": "Page.navigate"},
+            }
+            await asyncio.wait_for(old_event_started.wait(), 1)
+
+            disconnect_task = asyncio.create_task(adapter.on_extension_disconnect())
+            await asyncio.wait_for(old_cleanup_started.wait(), 1)
+
+            new = await client.ws_connect(adapter.cdp_ws_url)
+            registry.register_tab(42, "https://new.example", "New")
+            new_session_id = registry.root_session_id(42)
+            assert new_session_id != old_session_id
+
+            release_old_event.set()
+            await asyncio.wait_for(old_event_finished.wait(), 1)
+            release_old_cleanup.set()
+            await asyncio.wait_for(disconnect_task, 2)
+
+            with pytest.raises(TimeoutError):
+                await new.receive_json(timeout=0.05)
+            assert registry.target_info_for_tab(42)["url"] == "https://new.example"
+            await new.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_navigation_overflow_batch_is_dropped_after_connection_reset(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    adapter._client_ws = MagicMock(closed=False)
+    adapter._client_ws.close = AsyncMock()
+    sent: list[dict] = []
+    flush_started = asyncio.Event()
+    release_flush = asyncio.Event()
+    original_flush = adapter._flush_navigation_events
+
+    async def pause_flush(
+        tab_id: int,
+        events: list[dict] | None = None,
+        event_generation: int | None = None,
+        *,
+        forward_navigation_sensitive: bool = True,
+    ) -> None:
+        flush_started.set()
+        await release_flush.wait()
+        await original_flush(
+            tab_id,
+            events,
+            event_generation,
+            forward_navigation_sensitive=forward_navigation_sensitive,
+        )
+
+    async def record_send(_ws: object, payload: dict, _scope_guard: tuple[int, int] | None = None) -> None:
+        sent.append(payload)
+
+    await adapter._begin_navigation(42)
+    for index in range(cdp_adapter_module._NAVIGATION_EVENT_BUFFER_LIMIT):
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 42,
+                "method": "Network.requestWillBeSent",
+                "params": {"requestId": f"request-{index}"},
+            },
+        )
+
+    with (
+        patch.object(adapter, "_flush_navigation_events", side_effect=pause_flush),
+        patch.object(adapter, "_send", side_effect=record_send),
+        patch.object(cdp_adapter_module.LOG, "debug") as debug,
+    ):
+        overflow_task = asyncio.create_task(
+            adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 42,
+                    "method": "Page.frameNavigated",
+                    "params": {
+                        "frame": {
+                            "id": "frame-42",
+                            "url": "https://old.example/commit",
+                            "title": "Old",
+                        }
+                    },
+                },
+            )
+        )
+        await asyncio.wait_for(flush_started.wait(), 1)
+        adapter._reset_connection_state()
+        registry.register_tab(42, "https://new.example", "New")
+        release_flush.set()
+        await asyncio.wait_for(overflow_task, 1)
+
+        debug.assert_called_once_with(
+            "browser_extension_stale_navigation_event_batch_dropped",
+            tab_id=42,
+            batch_generation=0,
+            current_generation=1,
+            buffered_event_count=cdp_adapter_module._NAVIGATION_EVENT_BUFFER_LIMIT,
+        )
+
+    assert sent == []
+    assert registry.target_info_for_tab(42)["url"] == "https://new.example"
+
+
+@pytest.mark.asyncio
+async def test_stale_navigation_detach_batch_is_dropped_after_connection_reset(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    adapter._client_ws = MagicMock(closed=False)
+    adapter._client_ws.close = AsyncMock()
+    sent: list[dict] = []
+    flush_started = asyncio.Event()
+    release_flush = asyncio.Event()
+    original_flush = adapter._flush_navigation_events
+
+    async def pause_flush(
+        tab_id: int,
+        events: list[dict] | None = None,
+        event_generation: int | None = None,
+        *,
+        forward_navigation_sensitive: bool = True,
+    ) -> None:
+        flush_started.set()
+        await release_flush.wait()
+        await original_flush(
+            tab_id,
+            events,
+            event_generation,
+            forward_navigation_sensitive=forward_navigation_sensitive,
+        )
+
+    async def record_send(_ws: object, payload: dict, _scope_guard: tuple[int, int] | None = None) -> None:
+        sent.append(payload)
+
+    await adapter._begin_navigation(42)
+    await adapter.handle_extension_event(
+        "debugger.event",
+        {
+            "tabId": 42,
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-42",
+                    "url": "https://old.example/commit",
+                    "title": "Old",
+                }
+            },
+        },
+    )
+
+    with (
+        patch.object(adapter, "_flush_navigation_events", side_effect=pause_flush),
+        patch.object(adapter, "_send", side_effect=record_send),
+        patch.object(cdp_adapter_module.LOG, "debug") as debug,
+    ):
+        detach_task = asyncio.create_task(adapter._abort_navigation(42))
+        await asyncio.wait_for(flush_started.wait(), 1)
+        adapter._reset_connection_state()
+        registry.register_tab(42, "https://new.example", "New")
+        release_flush.set()
+        await asyncio.wait_for(detach_task, 1)
+
+        debug.assert_called_once_with(
+            "browser_extension_stale_navigation_event_batch_dropped",
+            tab_id=42,
+            batch_generation=0,
+            current_generation=1,
+            buffered_event_count=1,
+        )
+
+    assert sent == []
+    assert registry.target_info_for_tab(42)["url"] == "https://new.example"
+
+
+@pytest.mark.asyncio
+async def test_debugger_detached_discards_buffered_navigation_event_before_error_response(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    relay.fail_send_keys[navigation_key] = ExtensionRequestError(
+        "RESTRICTED_URL", "Navigation to a restricted URL is not allowed"
+    )
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://restricted.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 42,
+                "method": "Page.frameNavigated",
+                "params": {"frame": {"id": "frame-42", "url": "https://restricted.example"}},
+            },
+        )
+
+        await adapter.handle_extension_event("debugger.detached", {"tabId": 42, "reason": "canceled_by_user"})
+        teardown = [await ws.receive_json(timeout=2) for _ in range(2)]
+        assert [message["method"] for message in teardown] == [
+            "Target.detachedFromTarget",
+            "Target.targetDestroyed",
+        ]
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        relay.release_send[navigation_key].set()
+        navigation_response = await receive_response(ws, 1)
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+    assert navigation_response == {
+        "id": 1,
+        "sessionId": session_id,
+        "error": {"code": -32000, "message": "RESTRICTED_URL: Navigation to a restricted URL is not allowed"},
+    }
+    assert teardown[0]["params"] == {"sessionId": session_id, "targetId": "tab-42"}
+    assert teardown[1]["params"] == {"targetId": "tab-42"}
+
+
+@pytest.mark.asyncio
+async def test_navigation_response_first_passes_events_through_unchanged(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        response = await receive_response(ws, 1)
+        event_params = {"frameId": "frame-42", "name": "init"}
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {"tabId": 42, "method": "Page.lifecycleEvent", "params": event_params},
+        )
+        event = await receive_event(ws, "Page.lifecycleEvent")
+
+    assert response == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert event == {"method": "Page.lifecycleEvent", "params": event_params, "sessionId": session_id}
+
+
+@pytest.mark.asyncio
+async def test_navigation_error_flushes_buffered_events(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    relay.fail_send_keys[navigation_key] = ExtensionRequestError("COMMAND_TIMEOUT", "navigation timed out")
+    navigation_events = [
+        {"method": "Page.frameStartedNavigating", "params": {"frameId": "frame-42"}},
+        {"method": "Page.lifecycleEvent", "params": {"frameId": "frame-42", "name": "init"}},
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+        for event in navigation_events:
+            await adapter.handle_extension_event("debugger.event", {"tabId": 42, **event})
+
+        relay.release_send[navigation_key].set()
+        messages = [await ws.receive_json(timeout=2) for _ in range(len(navigation_events) + 1)]
+
+    assert messages[0] == {
+        "id": 1,
+        "sessionId": session_id,
+        "error": {"code": -32000, "message": "COMMAND_TIMEOUT: navigation timed out"},
+    }
+    assert [message["method"] for message in messages[1:]] == [event["method"] for event in navigation_events]
+
+
+@pytest.mark.asyncio
+async def test_navigation_events_for_another_tab_are_not_held(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://one.example", "One")
+    registry.register_tab(43, "https://two.example", "Two")
+    session_id = registry.root_session_id(42)
+    other_session_id = registry.root_session_id(43)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+        event_params = {"frameId": "frame-43", "name": "init"}
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {"tabId": 43, "method": "Page.lifecycleEvent", "params": event_params},
+        )
+        other_tab_event = await receive_event(ws, "Page.lifecycleEvent")
+
+        relay.release_send[navigation_key].set()
+        navigation_response = await receive_response(ws, 1)
+
+    assert other_tab_event == {
+        "method": "Page.lifecycleEvent",
+        "params": event_params,
+        "sessionId": other_session_id,
+    }
+    assert navigation_response["result"] == {"forwardedMethod": "Page.navigate"}
+
+
+@pytest.mark.asyncio
+async def test_navigation_event_buffer_overflow_flushes_and_warns(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    event_count = cdp_adapter_module._NAVIGATION_EVENT_BUFFER_LIMIT + 1
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+        with patch.object(cdp_adapter_module.LOG, "warning") as warning:
+            for index in range(event_count):
+                await adapter.handle_extension_event(
+                    "debugger.event",
+                    {
+                        "tabId": 42,
+                        "method": "Network.requestWillBeSent",
+                        "params": {"requestId": f"request-{index}"},
+                    },
+                )
+
+            relay.release_send[navigation_key].set()
+            messages = [await ws.receive_json(timeout=2) for _ in range(event_count + 1)]
+            warning.assert_called_once()
+
+    assert [message["params"]["requestId"] for message in messages[:-1]] == [
+        f"request-{index}" for index in range(event_count)
+    ]
+    assert messages[-1] == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert warning.call_args.args == ("browser_extension_navigation_event_buffer_overflow",)
+    assert warning.call_args.kwargs["tab_id"] == 42
+    assert warning.call_args.kwargs["forwarded_non_navigation_event_count"] == event_count
+    assert warning.call_args.kwargs["buffered_navigation_event_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_navigation_event_overflow_keeps_sensitive_events_until_response(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    navigation_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigation_key)
+    network_event_count = 2500
+    navigation_events = [
+        {"method": "Page.frameStartedLoading", "params": {"frameId": "frame-42"}},
+        {
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-42",
+                    "url": "https://destination.example",
+                    "title": "Destination",
+                }
+            },
+        },
+        {"method": "Page.lifecycleEvent", "params": {"frameId": "frame-42", "name": "init"}},
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://destination.example"},
+            }
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(navigation_key, asyncio.Event()).wait(), 1)
+
+        for index in range(network_event_count):
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 42,
+                    "method": "Network.requestWillBeSent",
+                    "params": {"requestId": f"request-{index}"},
+                },
+            )
+
+        early_messages = [await ws.receive_json(timeout=2) for _ in range(network_event_count)]
+        assert [message["method"] for message in early_messages] == ["Network.requestWillBeSent"] * network_event_count
+        assert [message["params"]["requestId"] for message in early_messages] == [
+            f"request-{index}" for index in range(network_event_count)
+        ]
+
+        for event in navigation_events:
+            await adapter.handle_extension_event("debugger.event", {"tabId": 42, **event})
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        relay.release_send[navigation_key].set()
+        messages = [await ws.receive_json(timeout=2) for _ in range(len(navigation_events) + 1)]
+
+    assert messages[0] == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert [message["method"] for message in messages[1:]] == [event["method"] for event in navigation_events]
+    assert registry.target_info_for_tab(42)["url"] == "https://destination.example"
+
+
+@pytest.mark.asyncio
+async def test_overlapping_navigation_error_waits_for_earlier_response_before_flushing_events(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    navigation_count = 0
+    original_request = relay.request
+
+    async def request_in_answer_order(op: str, args: dict, timeout: float = 30.0) -> dict:
+        nonlocal navigation_count
+        if op == "debugger.send" and args["method"] == "Page.navigate":
+            navigation_count += 1
+            if navigation_count == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+                raise ExtensionRequestError("RESOURCE_LIMIT", "navigation rejected")
+        return await original_request(op, args, timeout)
+
+    relay.request = request_in_answer_order
+    navigation_events = [
+        {
+            "method": "Page.frameNavigated",
+            "params": {"frame": {"id": "frame-42", "url": "https://destination.example", "title": "Destination"}},
+        },
+        {"method": "Page.lifecycleEvent", "params": {"frameId": "frame-42", "name": "init"}},
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://first.example"},
+            }
+        )
+        await asyncio.wait_for(first_started.wait(), 1)
+        await ws.send_json(
+            {
+                "id": 2,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://second.example"},
+            }
+        )
+        await asyncio.wait_for(second_started.wait(), 1)
+
+        second_error = await receive_response(ws, 2)
+        for event in navigation_events:
+            await adapter.handle_extension_event("debugger.event", {"tabId": 42, **event})
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        release_first.set()
+        messages = [await ws.receive_json(timeout=2) for _ in range(len(navigation_events) + 1)]
+
+    assert second_error == {
+        "id": 2,
+        "sessionId": session_id,
+        "error": {"code": -32000, "message": "RESOURCE_LIMIT: navigation rejected"},
+    }
+    assert messages[0] == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert [message["method"] for message in messages[1:]] == [event["method"] for event in navigation_events]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_navigation_responses_flush_interleaved_events_after_both_responses(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    navigation_count = 0
+    original_request = relay.request
+
+    async def request_in_answer_order(op: str, args: dict, timeout: float = 30.0) -> dict:
+        nonlocal navigation_count
+        if op == "debugger.send" and args["method"] == "Page.navigate":
+            navigation_count += 1
+            if navigation_count == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+                await release_second.wait()
+        return await original_request(op, args, timeout)
+
+    relay.request = request_in_answer_order
+    navigation_events = [
+        {"method": "Page.frameStartedNavigating", "params": {"frameId": "frame-42", "url": "https://first.example"}},
+        {"method": "Page.lifecycleEvent", "params": {"frameId": "frame-42", "name": "init"}},
+        {
+            "method": "Page.frameNavigated",
+            "params": {"frame": {"id": "frame-42", "url": "https://second.example", "title": "Second"}},
+        },
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://first.example"},
+            }
+        )
+        await asyncio.wait_for(first_started.wait(), 1)
+        await ws.send_json(
+            {
+                "id": 2,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://second.example"},
+            }
+        )
+        await asyncio.wait_for(second_started.wait(), 1)
+
+        await adapter.handle_extension_event("debugger.event", {"tabId": 42, **navigation_events[0]})
+        release_first.set()
+        first_response = await receive_response(ws, 1)
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        await adapter.handle_extension_event("debugger.event", {"tabId": 42, **navigation_events[1]})
+        await adapter.handle_extension_event("debugger.event", {"tabId": 42, **navigation_events[2]})
+        release_second.set()
+        messages = [await ws.receive_json(timeout=2) for _ in range(len(navigation_events) + 1)]
+
+    assert first_response == {
+        "id": 1,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert messages[0] == {
+        "id": 2,
+        "sessionId": session_id,
+        "result": {"forwardedMethod": "Page.navigate"},
+    }
+    assert [message["method"] for message in messages[1:]] == [event["method"] for event in navigation_events]
+
+
+@pytest.mark.asyncio
+async def test_navigation_completion_does_not_flush_events_while_another_navigation_is_outstanding(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    session_id = registry.root_session_id(42)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    navigation_count = 0
+    original_request = relay.request
+
+    async def request_with_second_completion_first(op: str, args: dict, timeout: float = 30.0) -> dict:
+        nonlocal navigation_count
+        if op == "debugger.send" and args["method"] == "Page.navigate":
+            navigation_count += 1
+            if navigation_count == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+        return await original_request(op, args, timeout)
+
+    relay.request = request_with_second_completion_first
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json(
+            {
+                "id": 1,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://first.example"},
+            }
+        )
+        await asyncio.wait_for(first_started.wait(), 1)
+        await ws.send_json(
+            {
+                "id": 2,
+                "sessionId": session_id,
+                "method": "Page.navigate",
+                "params": {"url": "https://second.example"},
+            }
+        )
+        await asyncio.wait_for(second_started.wait(), 1)
+        assert await receive_response(ws, 2) == {
+            "id": 2,
+            "sessionId": session_id,
+            "result": {"forwardedMethod": "Page.navigate"},
+        }
+
+        event = {"method": "Page.lifecycleEvent", "params": {"frameId": "frame-42", "name": "init"}}
+        await adapter.handle_extension_event("debugger.event", {"tabId": 42, **event})
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        release_first.set()
+        assert await receive_response(ws, 1) == {
+            "id": 1,
+            "sessionId": session_id,
+            "result": {"forwardedMethod": "Page.navigate"},
+        }
+        assert await receive_event(ws, "Page.lifecycleEvent") == {
+            "method": "Page.lifecycleEvent",
+            "params": event["params"],
+            "sessionId": session_id,
+        }
 
 
 @pytest.mark.parametrize(
@@ -1510,6 +2552,162 @@ async def test_get_target_info_returns_registered_child_target(
         response = await receive_response(ws, 1)
 
     assert response == {"id": 1, "result": {"targetInfo": child_target_info}}
+
+
+@pytest.mark.asyncio
+async def test_root_session_target_info_is_answered_locally_but_explicit_target_is_forwarded(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(13, "https://example.com", "Example")
+    root_session_id = registry.root_session_id(13)
+    alias_session_id = registry.create_root_session_alias(13)
+    adapter._active_scope_generation(13)
+    adapter._attached_tabs.add(13)
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "sessionId": alias_session_id, "method": "Target.getTargetInfo", "params": {}})
+        local_response = await receive_response(ws, 1)
+        await ws.send_json(
+            {
+                "id": 2,
+                "sessionId": alias_session_id,
+                "method": "Target.getTargetInfo",
+                "params": {"targetId": "tab-13"},
+            }
+        )
+        forwarded_response = await receive_response(ws, 2)
+        await ws.send_json({"id": 3, "method": "Target.detachFromTarget", "params": {"sessionId": alias_session_id}})
+        assert await receive_response(ws, 3) == {"id": 3, "result": {}}
+        await ws.send_json({"id": 4, "sessionId": root_session_id, "method": "Runtime.evaluate", "params": {}})
+        main_response = await receive_response(ws, 4)
+
+    assert local_response["result"]["targetInfo"]["targetId"] == "tab-13"
+    assert forwarded_response["result"] == {"forwardedMethod": "Target.getTargetInfo"}
+    assert main_response["result"] == {"forwardedMethod": "Runtime.evaluate"}
+    assert relay.calls == [
+        (
+            "debugger.send",
+            {"tabId": 13, "method": "Target.getTargetInfo", "params": {"targetId": "tab-13"}},
+        ),
+        (
+            "debugger.send",
+            {"tabId": 13, "method": "Runtime.evaluate", "params": {}},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_revoked_root_session_target_info_uses_forwarded_error(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(14, "https://example.com", "Example")
+    adapter._active_scope_generation(14)
+    adapter._attached_tabs.add(14)
+    alias_session_id = registry.create_root_session_alias(14)
+    lock = adapter._attach_locks.setdefault(14, asyncio.Lock())
+    await lock.acquire()
+    removal_task = asyncio.create_task(adapter._remove_tab_with_events(14))
+    try:
+        await asyncio.sleep(0)
+        relay.fail_next = BrowserExtensionBrokerError("LEASE_REQUIRED", "Tab 14 is not in the controlled scope")
+        async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "sessionId": alias_session_id, "method": "Target.getTargetInfo", "params": {}})
+            response = await receive_response(ws, 1)
+    finally:
+        lock.release()
+        await removal_task
+
+    assert response == {
+        "id": 1,
+        "sessionId": alias_session_id,
+        "error": {"code": -32000, "message": "LEASE_REQUIRED: Tab 14 is not in the controlled scope"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_target_attachment_snapshot_requires_attached_live_root_target(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(15, "https://example.com", "Example")
+    generation = adapter._active_scope_generation(15)
+    assert generation is not None
+    target_id = registry.target_id_for_tab(15)
+
+    assert adapter.target_attachment_snapshot(target_id) is False
+    adapter._attached_tabs.add(15)
+    assert adapter.target_attachment_snapshot(target_id) is True
+
+    await adapter.handle_extension_event("debugger.detached", {"tabId": 15, "reason": "canceled_by_user"})
+    assert adapter.target_attachment_snapshot(target_id) is False
+
+
+@pytest.mark.asyncio
+async def test_debugger_detached_relay_clears_page_attachment_and_forwards_target_detach_once(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(15, "https://example.com", "Example")
+    adapter._active_scope_generation(15)
+    adapter._attached_tabs.add(15)
+    target_id = registry.target_id_for_tab(15)
+    session_id = registry.root_session_id(15)
+    runtime = BrowserExtensionRuntime(relay, adapter)
+
+    page = MagicMock()
+    page.is_closed.return_value = False
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock(return_value={"targetInfo": {"targetId": target_id}})
+    cdp_session.detach = AsyncMock()
+    page.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=cdp_session))
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        assert await runtime.page_debugger_attached(page) is True
+        await adapter.handle_extension_event("debugger.detached", {"tabId": 15, "reason": "controllability_lost"})
+        await adapter.handle_extension_event("debugger.detached", {"tabId": 15, "reason": "controllability_lost"})
+        assert await runtime.page_debugger_attached(page) is False
+        assert adapter.target_attachment_snapshot(target_id) is False
+
+        detached = await receive_event(ws, "Target.detachedFromTarget")
+        destroyed = await receive_event(ws, "Target.targetDestroyed")
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+    assert detached["params"] == {"sessionId": session_id, "targetId": target_id}
+    assert destroyed["params"] == {"targetId": target_id}
+    assert 15 not in adapter._attached_tabs
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(15)
+
+
+@pytest.mark.asyncio
+async def test_target_attachment_snapshot_rejects_revoked_disconnect_and_reset(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(16, "https://example.com", "Example")
+    generation = adapter._active_scope_generation(16)
+    assert generation is not None
+    target_id = registry.target_id_for_tab(16)
+    adapter._attached_tabs.add(16)
+    assert adapter.target_attachment_snapshot(target_id) is True
+
+    adapter._revoke_tab_scope(16)
+    assert adapter.target_attachment_snapshot(target_id) is False
+
+    adapter._begin_tab_scope(16)
+    adapter._attached_tabs.add(16)
+    assert adapter.target_attachment_snapshot(target_id) is True
+    await adapter.on_extension_disconnect()
+    assert adapter.target_attachment_snapshot(target_id) is False
+
+    registry.register_tab(16, "https://example.com", "Example")
+    adapter._active_scope_generation(16)
+    adapter._attached_tabs.add(16)
+    adapter._reset_connection_state()
+    assert adapter.target_attachment_snapshot(target_id) is False
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import BlockedHost
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import (
@@ -99,6 +100,23 @@ class _EventEmitter:
         for callback in list(self.listeners.get(event, [])):
             callback(value)
         return value
+
+
+class _SnapshotFlakyContext(_EventEmitter):
+    """A BrowserContext whose ``.pages`` read raises on the first (pre-action) snapshot but succeeds
+    afterward, so the pre-action baseline is unavailable while the post-action read is fine."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pages: list = []
+        self._fail_next = True
+
+    @property
+    def pages(self) -> list:
+        if self._fail_next:
+            self._fail_next = False
+            raise RuntimeError("context pages unavailable at pre-action snapshot")
+        return list(self._pages)
 
 
 def _download(*, path: Path | None = None, failure: str | None = None, save_as: object = None) -> MagicMock:
@@ -194,6 +212,170 @@ async def _run_false_click_observation(
             file_download_false_click_eligible=True,
         )
     return results, action, context, page, storage
+
+
+@pytest.mark.asyncio
+async def test_false_click_popup_claim_survives_dispatcher_context_var_miss(tmp_path: Path) -> None:
+    """The download-popup claim recorder must not depend on ``skyvern_context.current()`` at
+    popup-event-dispatch time. Playwright dispatches the popup event on its connection task, whose
+    ContextVar snapshot can be empty/stale, so ``current()`` returns ``None`` inside the callback even
+    though the action coroutine has a valid owning context. This is one of the two silent sub-causes of
+    the SKY-15371 wedge (producer miss): a callback that reads ``current() -> None`` records nothing, so
+    the credit seam later has no claim to close and the popup lingers. Capturing the owning context in
+    the action coroutine keeps the claim recorded.
+
+    Deterministic reproduction of the dispatcher miss: ``current()`` returns the owning context in the
+    action coroutine but ``None`` while the popup event is being dispatched; the claim must still be
+    recorded.
+    """
+    rig = _make_false_click_observation_context()
+    task, _step, context, page, _scraped_page, _action = rig
+    # Baseline of the initiating page's context, so the action-coroutine delta signal can also see the
+    # popup; the callback signal alone still records it when the context.pages read is unused.
+    context.pages = [page]
+    popup = _EventEmitter(context)
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+    dispatching_popup_event = {"active": False}
+
+    def _current() -> SkyvernContext | None:
+        return None if dispatching_popup_event["active"] else owning_ctx
+
+    def click_effect(ctx_emitter: _EventEmitter, page_emitter: _EventEmitter) -> None:
+        dispatching_popup_event["active"] = True
+        try:
+            ctx_emitter.pages.append(popup)
+            page_emitter.emit("popup", popup)
+        finally:
+            dispatching_popup_event["active"] = False
+
+    with patch(
+        "skyvern.webeye.actions.handler.skyvern_context.current",
+        MagicMock(side_effect=_current),
+    ):
+        await _run_false_click_observation(tmp_path, click_effect=click_effect, rig=rig, grace=0.0)
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is popup for candidate in recorded), (
+        "download-popup claim was lost: the recorder read skyvern_context.current() (None at popup "
+        "dispatch) instead of the owning context captured in the action coroutine"
+    )
+
+
+@pytest.mark.asyncio
+async def test_false_click_records_context_delta_popup_without_popup_event(tmp_path: Path) -> None:
+    """The second producer signal: a new same-context Page that appears during the action but never
+    fires a page-level ``popup`` event (noopener/attribution miss) is still recorded via the
+    post-action ``context.pages`` identity delta. The initiating page and every baseline page are
+    excluded, so the opener and pre-existing tabs are never claimed."""
+    rig = _make_false_click_observation_context()
+    task, _step, context, page, _scraped_page, _action = rig
+    preexisting = _EventEmitter(context)
+    context.pages = [page, preexisting]  # baseline: initiating page + a pre-existing tab
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+    delta_popup = _EventEmitter(context)
+
+    def click_effect(ctx_emitter: _EventEmitter, page_emitter: _EventEmitter) -> None:
+        # A new same-context page appears, but NO page.on("popup") event is dispatched for it.
+        ctx_emitter.pages.append(delta_popup)
+
+    with patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx):
+        await _run_false_click_observation(tmp_path, click_effect=click_effect, rig=rig, grace=0.0)
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is delta_popup for candidate in recorded), "context-delta popup was not recorded"
+    assert all(candidate is not page for candidate in recorded), "initiating page must be excluded from the delta"
+    assert all(candidate is not preexisting for candidate in recorded), "baseline pre-existing page must be excluded"
+
+
+@pytest.mark.asyncio
+async def test_false_click_event_and_delta_dedupe_to_single_claim(tmp_path: Path) -> None:
+    """When the same popup is seen by BOTH the causal popup-event callback and the post-action
+    context.pages delta, exact-identity dedup in the claim store records it once (so credit closes it
+    once). This is the "union of two acquisition signals, exact-identity deduped" the contract requires."""
+    rig = _make_false_click_observation_context()
+    task, _step, context, page, _scraped_page, _action = rig
+    context.pages = [page]
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+    popup = _EventEmitter(context)
+
+    def click_effect(ctx_emitter: _EventEmitter, page_emitter: _EventEmitter) -> None:
+        ctx_emitter.pages.append(popup)  # delta signal
+        page_emitter.emit("popup", popup)  # causal event signal (same Page)
+
+    with patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx):
+        await _run_false_click_observation(tmp_path, click_effect=click_effect, rig=rig, grace=0.0)
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert sum(1 for candidate in recorded if candidate is popup) == 1, "event + delta must dedupe to one claim"
+
+
+@pytest.mark.asyncio
+async def test_false_click_event_only_popup_recorded_via_captured_context_at_dispatch_miss(tmp_path: Path) -> None:
+    """Isolates the causal-callback signal from the delta: the popup fires a page-level event but never
+    enters ``context.pages`` (so the post-action delta cannot see it) AND ``current()`` is None at
+    dispatch. Only recording into the context captured in the action coroutine saves the claim --
+    reverting the callback to ``skyvern_context.current()`` at dispatch time loses it. Load-bearing for
+    the callback mutation check."""
+    rig = _make_false_click_observation_context()
+    task, _step, context, page, _scraped_page, _action = rig
+    context.pages = [page]  # the popup is deliberately NOT added -> the delta signal is empty
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+    popup = _EventEmitter(context)
+    dispatching_popup_event = {"active": False}
+
+    def _current() -> SkyvernContext | None:
+        return None if dispatching_popup_event["active"] else owning_ctx
+
+    def click_effect(ctx_emitter: _EventEmitter, page_emitter: _EventEmitter) -> None:
+        dispatching_popup_event["active"] = True
+        try:
+            page_emitter.emit("popup", popup)  # event only; never added to context.pages
+        finally:
+            dispatching_popup_event["active"] = False
+
+    with patch(
+        "skyvern.webeye.actions.handler.skyvern_context.current",
+        MagicMock(side_effect=_current),
+    ):
+        await _run_false_click_observation(tmp_path, click_effect=click_effect, rig=rig, grace=0.0)
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is popup for candidate in recorded), (
+        "event-only popup lost: the callback must record into the captured owning context, not current()"
+    )
+
+
+@pytest.mark.asyncio
+async def test_false_click_unavailable_baseline_does_not_claim_preexisting_tab(tmp_path: Path) -> None:
+    """If the pre-action ``context.pages`` snapshot FAILS (baseline unavailable) while the post-action
+    read succeeds, the delta must NOT run. Otherwise every pre-existing tab other than the initiating
+    page looks new, and durable credit would close unrelated tabs. No popup event fires here, so the
+    delta is the only possible claim source; with an unavailable baseline it records nothing.
+    Load-bearing: a snapshot failure that returns ``[]`` instead of ``None`` makes the delta claim the
+    pre-existing tab and fails this test."""
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), workflow_run_id="wr-flaky-baseline", download_timeout=0.05)
+    step = make_step(now, task, step_id="step-flaky-baseline", status=StepStatus.created, order=0, output=None)
+
+    context = _SnapshotFlakyContext()
+    page = _EventEmitter(context)
+    preexisting = _EventEmitter(context)
+    context._pages = [page, preexisting]  # initiating page + a pre-existing tab, both same context
+    scraped_page = MagicMock(_browser_state=MagicMock())
+    scraped_page._browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    action = ClickAction(element_id="download-link", download=False)
+    rig = (task, step, context, page, scraped_page, action)
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+
+    # No popup event is dispatched by the inner action, so the post-action delta is the only claim path.
+    with patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx):
+        await _run_false_click_observation(tmp_path, rig=rig, grace=0.0)
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert all(candidate is not preexisting for candidate in recorded), (
+        "pre-existing tab was wrongly claimed when the pre-action baseline snapshot was unavailable"
+    )
+    assert not recorded, "no claim may be recorded when the baseline was unavailable and no popup event fired"
 
 
 @pytest.mark.asyncio
@@ -524,9 +706,9 @@ async def test_false_click_grace_zero_closes_only_download_popup(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_false_click_grace_zero_runs_no_persistence_setup(tmp_path: Path) -> None:
-    # At grace=0 no persistence-only setup may run -- get_download_dir must not be called and no
-    # storage listing happens -- while the captured popup is still closed and the original page
-    # restored.
+    # At grace=0 no persistence-only setup may run -- no remote storage listing happens -- while the
+    # captured popup is still closed and the original page restored. get_download_dir is now read once
+    # for the v4 pre-action local download baseline (a local-directory read, not persistence).
     downloaded_path = tmp_path / "captured_no_setup.pdf"
     downloaded_path.write_bytes(b"content")
     rig = _make_false_click_observation_context()
@@ -545,7 +727,7 @@ async def test_false_click_grace_zero_runs_no_persistence_setup(tmp_path: Path) 
         tmp_path, click_effect=click, rig=rig, grace=0, get_download_dir_mock=get_download_dir_mock
     )
 
-    get_download_dir_mock.assert_not_called()
+    get_download_dir_mock.assert_called_once_with(run_id="wr-popup")
     storage.list_downloaded_files_in_browser_session.assert_not_called()
     popup.close.assert_awaited_once()
     scraped_page._browser_state.navigate_to_url.assert_awaited_once_with(page=page, url="https://example.test/files")
@@ -1041,6 +1223,178 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
     assert results[-1].skip_remaining_actions is True
     assert isinstance(results[-1], ActionFailure)
     assert [error.error_code for error in action.errors or []] == ["download_failed"]
+
+
+@pytest.mark.asyncio
+async def test_handle_action_download_recovery_new_context_does_not_claim_preexisting_page() -> None:
+    """Working-page recovery can reconnect into a NEW BrowserContext, replacing the working page. The
+    action-window page delta is baselined against the ORIGINAL context; after replacement the current
+    page belongs to context B, whose pre-existing tabs were never opened by this action and must never
+    be claimed (or closed on later credit). The baseline must carry the original BrowserContext identity
+    so a context replacement claims zero delta pages, rather than treating every pre-existing page in
+    context B as newly opened."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+
+    context_a = page.context  # baseline context A
+    context_a.pages = [page]
+
+    context_b = MagicMock(name="context-B")
+    recovered_page = MagicMock(name="B1-working")  # new working page in context B
+    recovered_page.url = page.url
+    recovered_page.is_closed.return_value = False
+    recovered_page.context = context_b
+    recovered_page.expose_binding = AsyncMock()
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    preexisting_b2 = MagicMock(name="B2-preexisting")  # pre-existing tab already open in context B
+    preexisting_b2.is_closed.return_value = False
+    preexisting_b2.context = context_b
+    context_b.pages = [recovered_page, preexisting_b2]
+
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.new_page = AsyncMock(return_value=recovered_page)
+    browser_state.navigate_to_url = AsyncMock()
+    browser_state.set_active_page = AsyncMock()
+
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+
+    async def close_page_during_click(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        page.is_closed.return_value = True  # forces working-page recovery into context B
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=close_page_during_click),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert all(candidate is not preexisting_b2 for candidate in recorded), (
+        "a pre-existing tab in the reconnected context was wrongly claimed as an action-owned popup"
+    )
+    assert not recorded, "context replacement must claim zero delta pages"
+
+
+@pytest.mark.asyncio
+async def test_handle_action_download_recovery_same_context_still_claims_new_popup() -> None:
+    """The context-identity guard must not disable legitimate capture: when working-page recovery stays
+    inside the ORIGINAL BrowserContext, a genuinely new popup opened during the action is still claimed
+    (only cross-context replacement zeroes the delta)."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+
+    context_a = page.context  # recovery stays in this same context
+    context_a.pages = [page]
+
+    recovered_page = MagicMock(name="recovered-working")
+    recovered_page.url = page.url
+    recovered_page.is_closed.return_value = False
+    recovered_page.context = context_a  # SAME context as the baseline
+    recovered_page.expose_binding = AsyncMock()
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    new_popup = MagicMock(name="new-popup")  # a real net-new popup opened during the action
+    new_popup.is_closed.return_value = False
+    new_popup.context = context_a
+
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.new_page = AsyncMock(return_value=recovered_page)
+    browser_state.navigate_to_url = AsyncMock()
+    browser_state.set_active_page = AsyncMock()
+
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+
+    async def open_popup_and_close_page(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        context_a.pages = [page, new_popup]  # popup opened in context A during the action
+        page.is_closed.return_value = True  # forces recovery, but back into context A
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=open_popup_and_close_page),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    recorded = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is new_popup for candidate in recorded), (
+        "same-context recovery must still claim a genuinely new popup"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reused_claimed_page_retired_at_next_action_entry_survives_later_credit(tmp_path: Path) -> None:
+    """R1: an earlier no-credit action left popup Q claimed; a later action enters the real handle_action
+    seam with Q as its initiating page (Q has graduated to navigation state) and opens popup R. When
+    durable credit later runs it must close only R and leave Q open. On the pre-fix head both close,
+    because Q's stale claim is never retired when its Page is reused."""
+    rig = _make_false_click_observation_context()
+    task, _step, context, page_q, _scraped_page, _action = rig
+    owning_ctx = SkyvernContext(task_id=task.task_id)
+    # Action 1's leftover: Q is a claimed popup that never received a durable download.
+    owning_ctx.record_download_popup_claim(task.task_id, page_q)
+    context.pages = [page_q]
+
+    r_popup = _EventEmitter(context)
+    for popup in (page_q, r_popup):  # make both closeable for the real credit consumer
+        popup.is_closed = MagicMock(return_value=False)
+        popup.close = AsyncMock()
+
+    def click_effect(_ctx: _EventEmitter, page_emitter: _EventEmitter) -> None:
+        page_emitter.emit("popup", r_popup)  # action 2's window opens popup R
+
+    with patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=owning_ctx):
+        await _run_false_click_observation(tmp_path, click_effect=click_effect, rig=rig, grace=0.0)
+
+    claims_after = owning_ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is r_popup for candidate in claims_after), "action 2's popup R must be claimed"
+
+    agent = ForgeAgent()
+    credit_browser_state = MagicMock()
+    credit_browser_state.browser_context = context
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=owning_ctx):
+        await agent._close_credited_download_popups(task, credit_browser_state)
+
+    r_popup.close.assert_awaited_once()  # durable credit closes the current action's popup R
+    page_q.close.assert_not_called()  # Q, reused as action 2's initiating page, stays open
 
 
 @pytest.mark.asyncio
@@ -1797,8 +2151,13 @@ async def test_handle_action_remote_crdownload_signal_enters_completion_before_r
     assert all(not filename.endswith(".crdownload") for filename in results[-1].downloaded_files)
 
 
+# A Chrome-native ``<final>.crdownload`` and the CDP interceptor's ``<final>.<32-hex>.crdownload`` both settle
+# to the ``existing.pdf`` already in the baseline; neither may read as a new download credited to this action.
+@pytest.mark.parametrize("existing_partial_name", ["existing.pdf.crdownload", f"existing.pdf.{'0' * 32}.crdownload"])
 @pytest.mark.asyncio
-async def test_handle_action_preexisting_remote_crdownload_does_not_signal_new_download() -> None:
+async def test_handle_action_preexisting_remote_crdownload_does_not_signal_new_download(
+    existing_partial_name: str,
+) -> None:
     now = datetime.now(UTC)
     organization = make_organization(now)
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
@@ -1808,7 +2167,7 @@ async def test_handle_action_preexisting_remote_crdownload_does_not_signal_new_d
     )
     task.browser_session_id = "bs-1"
     task.download_timeout = 0.01
-    existing_partial_uri = "s3://bucket/browser_sessions/bs-1/downloads/existing.pdf.crdownload"
+    existing_partial_uri = f"s3://bucket/browser_sessions/bs-1/downloads/{existing_partial_name}"
     existing_final_uri = "s3://bucket/browser_sessions/bs-1/downloads/existing.pdf"
     downloading_uris = [existing_partial_uri]
     downloaded_uris: list[str] = []

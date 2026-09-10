@@ -64,6 +64,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     with_copilot_code_mode_metadata,
 )
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
@@ -1450,6 +1451,32 @@ def _prior_copilot_workflow_yaml(
     return None
 
 
+def _pending_proposal_connected_account_id(pending_proposal_yaml: str) -> str | None:
+    """Zero or several bound accounts leave the choice to the picker rather than guessing one."""
+    bound = [
+        credential_id
+        for credential_id in workflow_credential_ids(pending_proposal_yaml)
+        if credential_id.startswith("goac_")
+    ]
+    return bound[0] if len(bound) == 1 else None
+
+
+def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str) -> None:
+    # The button posts a structured action, so the message is the server's own
+    # receipt line rather than client prose the turn would have to interpret.
+    chat_request.message = TEST_END_TO_END_TURN_MESSAGE
+    chat_request.workflow_yaml = pending_proposal_yaml
+    derived_account_id = (
+        _pending_proposal_connected_account_id(pending_proposal_yaml)
+        if chat_request.selected_connected_account_id is None
+        else None
+    )
+    # The provenance flag is server-owned on this action, so it is stamped either way and a
+    # client-sent value never survives to mislabel the selection.
+    chat_request.selected_connected_account_id = chat_request.selected_connected_account_id or derived_account_id
+    chat_request.selected_connected_account_from_pending_proposal = derived_account_id is not None
+
+
 def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
     if not workflow_yaml:
         return 0
@@ -1816,10 +1843,11 @@ async def _new_copilot_chat_post(
             if blockless_fallback is not None:
                 chat_request.workflow_yaml = blockless_fallback
 
+            # Provenance is server-owned on every turn, so a client-sent value can never label a
+            # human pick as server-derived; only the action below sets it true.
+            chat_request.selected_connected_account_from_pending_proposal = False
+
             if chat_request.product_action == "test_end_to_end":
-                # The button posts a structured action, so the message is the server's own
-                # receipt line rather than client prose the turn would have to interpret.
-                chat_request.message = TEST_END_TO_END_TURN_MESSAGE
                 pending_proposal_yaml = _prior_copilot_workflow_yaml(
                     proposed_workflow=chat.proposed_workflow,
                     persisted_workflow_yaml=None,
@@ -1832,7 +1860,7 @@ async def _new_copilot_chat_post(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="No pending proposal to test end to end.",
                     )
-                chat_request.workflow_yaml = pending_proposal_yaml
+                _apply_test_end_to_end_action(chat_request, pending_proposal_yaml)
 
             await stream.send(
                 WorkflowCopilotProcessingUpdate(

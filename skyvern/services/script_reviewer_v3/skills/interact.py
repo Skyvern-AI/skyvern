@@ -28,6 +28,7 @@ import structlog
 
 from skyvern.services.script_reviewer_v3.redaction import REDACTED_SECRET_PLACEHOLDER, redact_sensitive_value
 from skyvern.services.script_reviewer_v3.skills.base import Skill, SkillError, SkillResult
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, mask_otp_values_in_html
 
 LOG = structlog.get_logger()
 
@@ -49,12 +50,12 @@ def _get_page(context: Any) -> Any:
 async def _dom_hash(page: Any) -> str:
     """Stable hash of the visible body innerHTML — used to detect mutation."""
     try:
-        html = await page.evaluate("() => document.body.innerHTML")
+        html = await page.evaluate("() => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(document.body, true);}")
     except Exception:
         return "<<eval_error>>"
     if not isinstance(html, str):
         html = str(html)
-    return hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return hashlib.sha256(mask_otp_values_in_html(html).encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 async def _safe_url(page: Any) -> str:
@@ -83,14 +84,16 @@ async def _handler_live_get_dom(args: dict[str, Any], context: Any) -> SkillResu
         if selector and isinstance(selector, str):
             html = await asyncio.wait_for(
                 page.evaluate(
-                    "(sel) => {const e = document.querySelector(sel); return e ? e.outerHTML : null;}",
+                    "(sel) => {"
+                    + OTP_INPUT_PRIVACY_JS
+                    + "const e = document.querySelector(sel); return e ? otpSafeHtml(e) : null;}",
                     selector,
                 ),
                 timeout=_LIVE_READ_TIMEOUT_MS / 1000,
             )
         else:
             html = await asyncio.wait_for(
-                page.evaluate("() => document.body.outerHTML"),
+                page.evaluate("() => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(document.body);}"),
                 timeout=_LIVE_READ_TIMEOUT_MS / 1000,
             )
     except asyncio.TimeoutError:
@@ -102,6 +105,7 @@ async def _handler_live_get_dom(args: dict[str, Any], context: Any) -> SkillResu
         return SkillResult.not_available(f"selector {selector!r} matched no element")
     if not isinstance(html, str):
         html = str(html)
+    html = mask_otp_values_in_html(html)
     html_chars = len(html)
     sensitive_value = getattr(context, "value", None) if getattr(context, "value_is_sensitive", False) else None
     html = redact_sensitive_value(html, sensitive_value)
@@ -129,7 +133,9 @@ async def _handler_live_query_all(args: dict[str, Any], context: Any) -> SkillRe
     try:
         elements = await asyncio.wait_for(
             page.evaluate(
-                """(sel) => {
+                """(sel) => {"""
+                + OTP_INPUT_PRIVACY_JS
+                + """
                     const els = Array.from(document.querySelectorAll(sel));
                     return els.slice(0, 20).map(e => ({
                         tag: e.tagName.toLowerCase(),
@@ -137,7 +143,7 @@ async def _handler_live_query_all(args: dict[str, Any], context: Any) -> SkillRe
                         classes: e.className && typeof e.className === 'string' ? e.className.split(/\\s+/).filter(Boolean).slice(0, 10) : [],
                         text: (e.textContent || '').trim().slice(0, 80),
                         visible: !!(e.offsetParent !== null),
-                        attrs: Object.fromEntries(Array.from(e.attributes).filter(a => ['name','aria-label','role','data-testid','placeholder','href','type'].includes(a.name)).map(a => [a.name, a.value])),
+                        attrs: Object.fromEntries(Array.from(e.attributes).filter(a => ['name','aria-label','role','data-testid','placeholder','href','type'].includes(a.name)).map(a => [a.name, isOtpInputValueSecret(e) ? otpSafeInputAttribute(e, a.name, a.value) : a.value])),
                     }));
                 }""",
                 selector,

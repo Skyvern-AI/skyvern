@@ -42,6 +42,7 @@ def connected_account_choice_context(
     outcome: TurnOutcome | None,
     *,
     explicit_selected_connection_id: str | None = None,
+    from_pending_proposal: bool = False,
 ) -> str:
     """Expose the validated picker selection as context; authorization remains in request policy."""
     choices = outcome.connected_account_choices if outcome is not None else None
@@ -51,7 +52,7 @@ def connected_account_choice_context(
     if choices:
         payload["connected_account_choices"] = [choice.model_dump(mode="json") for choice in choices]
     if explicit_selected_connection_id is not None:
-        payload["selection_source"] = "user_picker"
+        payload["selection_source"] = "pending_proposal_binding" if from_pending_proposal else "user_picker"
         payload["selected_connection_id"] = explicit_selected_connection_id
     return json.dumps(payload, separators=(",", ":"))
 

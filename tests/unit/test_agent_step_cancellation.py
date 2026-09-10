@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from asyncio import CancelledError
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -24,7 +24,7 @@ import pytest
 from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt, SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
@@ -32,6 +32,7 @@ from skyvern.webeye.actions.actions import ClickAction
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _StepHarness:
@@ -42,15 +43,22 @@ class _StepHarness:
         self.browser_state = browser_state
         self.page = page
 
-    async def run(self):
-        context = SkyvernContext(
+    async def run(
+        self,
+        *,
+        totp_codes: dict[str, str | None] | None = None,
+        multi_field_totp: dict[str, MultiFieldTotpAttempt] | None = None,
+    ):
+        self.context = SkyvernContext(
             task_id=self.task.task_id,
             step_id=None,
             organization_id=self.task.organization_id,
             workflow_run_id=self.task.workflow_run_id,
             tz_info=ZoneInfo("UTC"),
+            totp_codes=totp_codes if totp_codes is not None else {},
+            multi_field_totp=multi_field_totp if multi_field_totp is not None else {},
         )
-        skyvern_context.set(context)
+        skyvern_context.set(self.context)
         try:
             return await self.agent.agent_step(
                 task=self.task,
@@ -69,8 +77,8 @@ def _make_harness(
 ) -> _StepHarness:
     """Common agent_step setup shared by every seam test.
 
-    Applies the single process-global ``asyncio.sleep`` patch for this module here so no test adds
-    its own. Callers still install their own ``parse_actions`` / ``handle_action`` /
+    Patches sleep only in the agent module with ``ScopedAsyncio``.
+    Callers install their own ``parse_actions`` / ``handle_action`` /
     ``must_get_working_page`` / ``update_step`` behavior to shape the specific seam under test.
     """
     agent = ForgeAgent()
@@ -108,12 +116,11 @@ def _make_harness(
     agent.handle_potential_OTP_actions = AsyncMock(return_value=(json_response, []))
 
     agent.record_artifacts_after_action = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
     agent.check_user_goal_complete = AsyncMock()
 
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
 
     llm_handler_mock = AsyncMock(return_value=json_response)
@@ -211,11 +218,24 @@ async def test_agent_step_reraises_cancelled_error(monkeypatch: pytest.MonkeyPat
 
     harness.agent.update_step = AsyncMock(side_effect=fake_update_step)
 
+    task_id = harness.task.task_id
     with pytest.raises(CancelledError):
-        await harness.run()
+        await harness.run(
+            totp_codes={f"{task_id}_secret": "JBSWY3DPEHPK3PXP", f"{task_id}_totp_cache": "123456"},
+            multi_field_totp={
+                task_id: MultiFieldTotpAttempt(
+                    box_element_ids=[f"box-{i}" for i in range(6)],
+                    expected_digits=6,
+                    code_source="secret",
+                )
+            },
+        )
 
     # The cancelled step is still recorded as failed (so it is not left orphaned as `running`).
     assert StepStatus.failed in update_statuses
+    assert task_id not in harness.context.multi_field_totp
+    assert f"{task_id}_secret" not in harness.context.totp_codes
+    assert f"{task_id}_totp_cache" not in harness.context.totp_codes
 
 
 @pytest.mark.asyncio

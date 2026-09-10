@@ -112,7 +112,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_state_load": "0a0e90bab93ce9c33d61cd1e5f9965bf34a516a03936f6ff3e99b8d28fe15dbe",
     "skyvern_state_save": "59ec8d8dddef8e351e3cd786ae4fb5d205dee4c45187ec7fe8d48d3a60429a2f",
     "skyvern_tab_close": "273b18bbace4c75ea1c23ba7056ba0770224a27f6e81aa72c09a925b6a8a0873",
-    "skyvern_tab_list": "871df6226eb641a88e8d2cc91a36c357d0472ea2e7d3ebea1660d83517b65425",
+    "skyvern_tab_list": "feb277c12c9394d5a75b3aa3bd400c53af29e2cec7873632b495ef052fbd3d90",
     "skyvern_tab_new": "677fc2136550cc9ee2a4328cee890a3ef0439c41c7febc275af195bfd21c0a33",
     "skyvern_tab_switch": "4bad7852b8db4c9e1b7e421e12ad36a59321bdbf98c1203295259c6b6d3cdb96",
     "skyvern_tab_wait_for_new": "2b0131b628f71645137af7ca78af6d997126b0e1e302d8816cbeeba3ab41e0e2",

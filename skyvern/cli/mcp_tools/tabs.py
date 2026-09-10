@@ -14,7 +14,8 @@ from typing import Annotated, Any
 import structlog
 from pydantic import BaseModel, Field
 
-from skyvern.cli.core.browser_ops import do_screenshot
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.cli.core.browser_ops import do_navigate, do_screenshot
 from skyvern.cli.core.guards import GuardError, validate_wait_until
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.utils.url_validators import validate_fetch_url
@@ -101,7 +102,8 @@ async def skyvern_tab_list(
     """List all open browser tabs with their URLs, titles, and active status.
 
     Returns an array of tabs, each with tab_id (session-scoped identifier for switching),
-    index (position), url, title, and is_active flag.
+    index (position), url, title, and is_active flag. Extension sessions also include
+    debugger_attached, the locally known debugger attachment state.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -116,15 +118,24 @@ async def skyvern_tab_list(
     raw_pages = browser._browser_context.pages
     active_page = page.page  # The raw Playwright Page currently active
 
+    extension_runtime = None
+    if ctx.mode == "extension":
+        extension_runtime = BrowserExtensionRuntime.instance()
+
     tabs = []
     for i, p in enumerate(raw_pages):
-        tabs.append(await _tab_info_with_title(p, index=i, is_active=(p is active_page)))
+        tab = (await _tab_info_with_title(p, index=i, is_active=(p is active_page))).model_dump()
+        if ctx.mode == "extension":
+            tab["debugger_attached"] = (
+                await extension_runtime.page_debugger_attached(p) if extension_runtime is not None else False
+            )
+        tabs.append(tab)
 
     return make_result(
         "skyvern_tab_list",
         browser_context=ctx,
         data={
-            "tabs": [t.model_dump() for t in tabs],
+            "tabs": tabs,
             "count": len(tabs),
             "active_tab_id": str(id(active_page)),
         },
@@ -174,9 +185,14 @@ async def skyvern_tab_new(
 
     prev_active = state._active_page
     new_page = None
+    page_created = False
+    navigate_result = None
+    can_access_localhost = ctx.can_access_localhost is True
+    is_localhost_destination = is_localhost_url(url) if url else False
     with Timer() as timer:
         try:
             new_page = await browser._browser_context.new_page()
+            page_created = True
             state._active_page = new_page
             # New tab has no iframes yet — clear stale frame reference
             state._working_frame = None
@@ -190,32 +206,62 @@ async def skyvern_tab_new(
             timer.mark("new_page")
 
             if url:
-                await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                navigate_result = await do_navigate(
+                    new_page,
+                    url,
+                    timeout=30000,
+                    wait_until="domcontentloaded",
+                    can_access_localhost=can_access_localhost,
+                    is_localhost_destination=is_localhost_destination,
+                )
                 timer.mark("navigate")
-        except Exception as e:
-            # Clean up the orphan tab and restore the previous active page
-            try:
+        except Exception as e:  # noqa: BLE001
+            if not page_created:
                 state._active_page = prev_active
-                if new_page is not None:
-                    await new_page.close()
-            except Exception:
-                pass
+                hint = "The new tab could not be created; the previous active tab was unchanged."
+                details = None
+            elif new_page is not None and not new_page.is_closed() and new_page in browser._browser_context.pages:
+                state._active_page = new_page
+                tab_id = str(id(new_page))
+                hint = f"Tab {tab_id} remains open and active. Check URL or browser state."
+                details = {"tab_id": tab_id}
+            else:
+                state._active_page = prev_active
+                hint = "The new tab closed during navigation; the previous active tab was restored."
+                details = None
             return make_result(
                 "skyvern_tab_new",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check URL or browser state", exc=e),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), hint, details=details, exc=e),
             )
 
     pages = browser._browser_context.pages
     index = pages.index(new_page) if new_page in pages else len(pages) - 1
-    tab = await _tab_info_with_title(new_page, index=index, is_active=True)
+    if navigate_result is None:
+        tab = (await _tab_info_with_title(new_page, index=index, is_active=True)).model_dump()
+    else:
+        tab = TabInfo(
+            tab_id=str(id(new_page)),
+            index=index,
+            url=navigate_result.url,
+            title=navigate_result.title,
+            is_active=True,
+        ).model_dump()
+
+    warnings = []
+    if navigate_result is not None and navigate_result.load_state != "domcontentloaded":
+        warnings.append(
+            "Navigation succeeded but the page never reached 'domcontentloaded'; "
+            f"it settled at '{navigate_result.load_state}'. The page is loaded — retrying the navigation will not help."
+        )
 
     return make_result(
         "skyvern_tab_new",
         browser_context=ctx,
-        data=tab.model_dump(),
+        data=tab,
+        warnings=warnings,
         timing_ms=timer.timing_ms,
     )
 

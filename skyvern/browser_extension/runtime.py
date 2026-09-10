@@ -7,8 +7,10 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol, cast
+from weakref import WeakKeyDictionary, WeakSet
 
 import structlog
 
@@ -17,6 +19,7 @@ from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
+from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger(__name__)
 
@@ -24,6 +27,7 @@ _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 _BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
 _PAIRING_BUSY_WAIT_SECONDS = 30.0
+_PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS = 2.0
 
 
 class _Adapter(Protocol):
@@ -37,6 +41,8 @@ class _Adapter(Protocol):
     async def handle_extension_event(self, event: str, params: dict) -> None: ...
 
     async def on_extension_disconnect(self) -> None: ...
+
+    def target_attachment_snapshot(self, target_id: str) -> bool: ...
 
 
 class _Relay(Protocol):
@@ -90,6 +96,9 @@ class BrowserExtensionRuntime:
         self._relay = relay
         self._adapter = adapter
         self._stopped = False
+        self._page_target_ids: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
+        self._page_target_binding_tasks: WeakKeyDictionary[Any, asyncio.Task[str | None]] = WeakKeyDictionary()
+        self._page_close_hooks: WeakSet[Any] = WeakSet()
 
     @classmethod
     async def get_or_start(cls, port: int | None = None) -> BrowserExtensionRuntime:
@@ -176,6 +185,147 @@ class BrowserExtensionRuntime:
 
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
+
+    async def page_debugger_attached(self, page: Any) -> bool:
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            self._invalidate_page_binding(page)
+            return False
+        try:
+            target_id = await self._target_id_for_page(page)
+            if target_id is None or not self._runtime_is_connected() or self._page_is_closed(page):
+                return False
+            return self._adapter.target_attachment_snapshot(target_id)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_attachment_snapshot_failed", error_type=type(exc).__name__)
+            return False
+
+    async def _target_id_for_page(self, page: Any) -> str | None:
+        try:
+            target_id = self._page_target_ids.get(page)
+        except TypeError:
+            return None
+        if target_id is not None:
+            return target_id
+
+        self._install_page_close_hook(page)
+        try:
+            binding_task = self._page_target_binding_tasks.get(page)
+        except TypeError:
+            return None
+        if binding_task is None:
+            binding_task = asyncio.create_task(self._bind_page_target(page))
+            self._page_target_binding_tasks[page] = binding_task
+
+            def remove_binding_task(finished_task: asyncio.Future[str | None]) -> None:
+                try:
+                    if self._page_target_binding_tasks.get(page) is finished_task:
+                        self._page_target_binding_tasks.pop(page, None)
+                except TypeError:
+                    return
+
+            binding_task.add_done_callback(remove_binding_task)
+        try:
+            target_id = await asyncio.shield(binding_task)
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if binding_task.cancelled() and (current_task is None or current_task.cancelling() == 0):
+                return None
+            raise
+        if target_id is not None and not self._page_is_closed(page) and self._runtime_is_connected():
+            self._page_target_ids[page] = target_id
+        return target_id
+
+    async def _bind_page_target(self, page: Any) -> str | None:
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            return None
+        acquisition_task = asyncio.create_task(page.context.new_cdp_session(page))
+        cdp_session: Any = None
+        try:
+            done, _ = await asyncio.wait(
+                {acquisition_task},
+                timeout=_PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS,
+            )
+            if not done:
+                acquisition_task.add_done_callback(self._schedule_late_page_target_alias_detach)
+                return None
+            cdp_session = acquisition_task.result()
+            result = await asyncio.wait_for(cdp_session.send("Target.getTargetInfo"), timeout=2.0)
+            target_info = result.get("targetInfo") if isinstance(result, dict) else None
+            target_id = target_info.get("targetId") if isinstance(target_info, dict) else None
+            return target_id if isinstance(target_id, str) and target_id else None
+        except asyncio.CancelledError:
+            if not acquisition_task.done():
+                acquisition_task.add_done_callback(self._schedule_late_page_target_alias_detach)
+            elif cdp_session is None:
+                self._schedule_late_page_target_alias_detach(acquisition_task)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_target_binding_failed", error_type=type(exc).__name__)
+            return None
+        finally:
+            if cdp_session is not None:
+                await self._detach_page_target_alias(cdp_session)
+
+    def _schedule_late_page_target_alias_detach(self, acquisition_task: asyncio.Task[Any]) -> None:
+        if acquisition_task.cancelled():
+            return
+        try:
+            cdp_session = acquisition_task.result()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_late_page_target_acquisition_failed", error_type=type(exc).__name__)
+            return
+        if cdp_session is not None:
+            asyncio.create_task(self._detach_page_target_alias(cdp_session))
+
+    @staticmethod
+    async def _detach_page_target_alias(cdp_session: Any) -> None:
+        try:
+            await asyncio.wait_for(cdp_session.detach(), timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            with contained_effect(
+                "browser_extension_page_target_alias_detach_failed",
+                error_type=type(exc).__name__,
+            ):
+                LOG.debug("browser_extension_page_target_alias_detach_failed", error_type=type(exc).__name__)
+
+    def _install_page_close_hook(self, page: Any) -> None:
+        try:
+            if page in self._page_close_hooks:
+                return
+            page.once("close", lambda *_: self._invalidate_page_binding(page))
+            self._page_close_hooks.add(page)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_close_hook_failed", error_type=type(exc).__name__)
+
+    def _invalidate_page_binding(self, page: Any) -> None:
+        with suppress(TypeError):
+            self._page_target_ids.pop(page, None)
+            binding_task = self._page_target_binding_tasks.pop(page, None)
+            self._page_close_hooks.discard(page)
+            if binding_task is not None:
+                binding_task.cancel()
+
+    def _clear_page_bindings(self) -> None:
+        for binding_task in list(self._page_target_binding_tasks.values()):
+            binding_task.cancel()
+        self._page_target_ids.clear()
+        self._page_target_binding_tasks.clear()
+        self._page_close_hooks.clear()
+
+    @staticmethod
+    def _page_is_closed(page: Any) -> bool:
+        try:
+            return page.is_closed()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_closed_check_failed", error_type=type(exc).__name__)
+            return True
+
+    def _runtime_is_connected(self) -> bool:
+        try:
+            return self.extension_connected
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_connection_check_failed", error_type=type(exc).__name__)
+            return False
 
     async def broker_build_status(self) -> dict[str, Any] | None:
         """Broker-reported extension_build status, or None outside broker mode."""
@@ -302,6 +452,7 @@ class BrowserExtensionRuntime:
             if self._stopped:
                 return
             self._stopped = True
+            self._clear_page_bindings()
             try:
                 await self._relay.stop()
             finally:

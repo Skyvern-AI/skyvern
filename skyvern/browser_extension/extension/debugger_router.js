@@ -100,7 +100,7 @@ export class DebuggerRouter {
             return false;
           }
         }
-        this.clearDetachedState(tabId, token);
+        this.clearDetachedState(tabId, token, "reset");
         return true;
       }),
     );
@@ -256,7 +256,7 @@ export class DebuggerRouter {
             "Chrome could not detach the debugger from this tab.",
           );
         } else {
-          this.clearDetachedState(tabId, token);
+          this.clearDetachedState(tabId, token, "detached");
           await this.tabScope.handleDebuggerDetachLocked(tabId, lease);
           return {};
         }
@@ -265,7 +265,7 @@ export class DebuggerRouter {
           "The debugger is not attached to this tab.",
         );
       }
-      this.clearDetachedState(tabId, token);
+      this.clearDetachedState(tabId, token, "detached");
       await this.tabScope.handleDebuggerDetachLocked(tabId, lease);
       return {};
     });
@@ -316,15 +316,7 @@ export class DebuggerRouter {
       }
       let urlChangeGranted = false;
       if (URL_CHANGING_CDP_METHODS.has(values.method)) {
-        // Page.navigate binds the grant to its target URL; history/reload
-        // navigations have no knowable target, so their grant matches any
-        // single URL change.
-        lease.allowUrlChange(
-          values.method === "Page.navigate" &&
-            typeof values.params?.url === "string"
-            ? values.params.url
-            : null,
-        );
+        lease.allowUrlChange();
         urlChangeGranted = true;
       }
       const childTarget = this.childTargets.get(values.sessionId);
@@ -351,19 +343,13 @@ export class DebuggerRouter {
       );
       let result;
       try {
-        result = await (childAutoAttach
-          ? this.sendCommandWithTimeout(
-              target,
-              values.method,
-              values.params ?? {},
-              commandTimeoutMs,
-            )
-          : this.sendCommandWithTimeout(
-              target,
-              values.method,
-              values.params ?? {},
-              commandTimeoutMs,
-            ));
+        result = await this.sendCommandWithTimeout(
+          target,
+          values.method,
+          values.params ?? {},
+          commandTimeoutMs,
+          lease,
+        );
       } catch (error) {
         if (urlChangeGranted) {
           lease.revokeUrlChange();
@@ -372,7 +358,7 @@ export class DebuggerRouter {
           error instanceof ProtocolError &&
           error.code === ERROR_CODES.COMMAND_TIMEOUT
         ) {
-          if (lease.isCurrent() && !childAutoAttach) {
+          if (error.commandTimedOut === true && !childAutoAttach) {
             await this.recoverTimedOutCommandLocked(tabId);
           }
           throw error;
@@ -410,16 +396,38 @@ export class DebuggerRouter {
     });
   }
 
-  async sendCommandWithTimeout(target, method, params, timeoutMs) {
-    return this.withTimeout(
+  async sendCommandWithTimeout(
+    target,
+    method,
+    params,
+    timeoutMs,
+    lease = null,
+  ) {
+    let timedOut = false;
+    const command = this.withTimeout(
       () => chrome.debugger.sendCommand(target, method, params),
       timeoutMs,
-      () =>
-        new ProtocolError(
+      () => {
+        timedOut = true;
+        const error = new ProtocolError(
           ERROR_CODES.COMMAND_TIMEOUT,
           `Chrome debugger command timed out: ${method}`,
-        ),
+        );
+        error.commandTimedOut = true;
+        return error;
+      },
     );
+    if (lease?.invalidated === undefined) {
+      return command;
+    }
+    try {
+      return await Promise.race([command, lease.invalidated]);
+    } catch (error) {
+      if (timedOut && error instanceof ProtocolError) {
+        error.commandTimedOut = true;
+      }
+      throw error;
+    }
   }
 
   commandTimeoutWithinLease(
@@ -477,7 +485,7 @@ export class DebuggerRouter {
           return new Error("timeout");
         },
       );
-      this.clearDetachedState(tabId, token);
+      this.clearDetachedState(tabId, token, "command_timeout");
     } catch {
       if (timedOut) {
         this.quarantineTab(tabId, token, "command_timeout");
@@ -485,7 +493,7 @@ export class DebuggerRouter {
       } else if (await this.isDebuggerStillAttached(tabId)) {
         this.quarantineTab(tabId, token, "command_timeout_detach_failed");
       } else {
-        this.clearDetachedState(tabId, token);
+        this.clearDetachedState(tabId, token, "command_timeout");
       }
     }
   }
@@ -527,13 +535,13 @@ export class DebuggerRouter {
         this.quarantineTab(tabId, token, "detach_timeout");
         this.trackLateDetach(tabId, token, detachPromise);
       } else if (!(await this.isDebuggerStillAttached(tabId))) {
-        this.clearDetachedState(tabId, token);
+        this.clearDetachedState(tabId, token, "controllability_lost");
       } else {
         this.quarantineTab(tabId, token, "detach_failed");
       }
       return;
     }
-    this.clearDetachedState(tabId, token);
+    this.clearDetachedState(tabId, token, "controllability_lost");
   }
 
   nextStateToken() {
@@ -541,21 +549,30 @@ export class DebuggerRouter {
     return this.stateSequence;
   }
 
-  clearDetachedState(tabId, token = null) {
+  clearDetachedState(tabId, token = null, reason = "reset") {
     if (token !== null && this.attachStates.get(tabId)?.token !== token) {
       return;
     }
-    this.attachedTabs.delete(tabId);
+    this.notifyDetached(tabId, reason);
     this.attachStates.delete(tabId);
     this.forgetChildTargets(tabId);
     this.onAttachedChange();
   }
 
   quarantineTab(tabId, token, reason) {
-    this.attachedTabs.delete(tabId);
+    this.notifyDetached(tabId, "quarantined");
     this.attachStates.set(tabId, { status: "quarantined", token, reason });
     this.forgetChildTargets(tabId);
     this.onAttachedChange();
+  }
+
+  notifyDetached(tabId, reason) {
+    // Delete before notifying so late Chrome callbacks cannot emit a duplicate.
+    if (!this.attachedTabs.delete(tabId)) {
+      return false;
+    }
+    this.sendEvent(EVENTS.DEBUGGER_DETACHED, { tabId, reason });
+    return true;
   }
 
   trackLateAttach(tabId, token, attachPromise) {
@@ -586,7 +603,7 @@ export class DebuggerRouter {
             return new Error("timeout");
           },
         );
-        this.clearDetachedState(tabId, token);
+        this.clearDetachedState(tabId, token, "attach_failed");
       } catch {
         if (timedOut) {
           this.quarantineTab(tabId, token, "late_attach_detach_timeout");
@@ -594,7 +611,7 @@ export class DebuggerRouter {
         } else if (await this.isDebuggerStillAttached(tabId)) {
           this.quarantineTab(tabId, token, "late_attach_detach_failed");
         } else {
-          this.clearDetachedState(tabId, token);
+          this.clearDetachedState(tabId, token, "attach_failed");
         }
       }
     });
@@ -616,7 +633,7 @@ export class DebuggerRouter {
       .then(
         () =>
           this.tabScope.runTabOperation(tabId, async () => {
-            this.clearDetachedState(tabId, token);
+            this.clearDetachedState(tabId, token, "quarantined");
           }),
         () =>
           this.tabScope.runTabOperation(tabId, async () => {
@@ -626,7 +643,7 @@ export class DebuggerRouter {
             if (await this.isDebuggerStillAttached(tabId)) {
               this.quarantineTab(tabId, token, "detach_failed");
             } else {
-              this.clearDetachedState(tabId, token);
+              this.clearDetachedState(tabId, token, "quarantined");
             }
           }),
       )
@@ -637,6 +654,13 @@ export class DebuggerRouter {
     try {
       await this.tabScope.assertControllableLocked(tabId, lease);
     } catch (error) {
+      // COMMAND_TIMEOUT identifies lease cancellation from cancelForTabUpdate; the tab may still be controllable.
+      if (
+        error instanceof ProtocolError &&
+        error.code === ERROR_CODES.COMMAND_TIMEOUT
+      ) {
+        throw error;
+      }
       await this.detachIfAttachedLocked(tabId);
       throw error;
     }
@@ -696,14 +720,11 @@ export class DebuggerRouter {
     }
     await this.tabScope.runTabOperation(source.tabId, async (lease) => {
       lease.assertCurrent();
-      this.attachedTabs.delete(source.tabId);
-      this.attachStates.delete(source.tabId);
-      this.forgetChildTargets(source.tabId);
-      this.onAttachedChange();
-      this.sendEvent(EVENTS.DEBUGGER_DETACHED, {
-        tabId: source.tabId,
-        reason: typeof reason === "string" ? reason : "unknown",
-      });
+      this.clearDetachedState(
+        source.tabId,
+        null,
+        typeof reason === "string" ? reason : "unknown",
+      );
       await this.tabScope.handleDebuggerDetachLocked(source.tabId, lease);
     });
   }

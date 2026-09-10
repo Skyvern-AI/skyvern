@@ -153,7 +153,7 @@ def _skyvern_ctx() -> Iterator[None]:
 @pytest_asyncio.fixture
 async def page_factory() -> AsyncIterator[Callable[[str], Awaitable[Page]]]:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         context = await browser.new_context()
 
         async def _make_page(html: str) -> Page:

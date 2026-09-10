@@ -156,6 +156,14 @@ class WorkflowCopilotChatRequest(BaseModel):
     selected_connected_account_id: str | None = Field(
         None, description="Google account explicitly selected in the chat picker; validated against this organization."
     )
+    selected_connected_account_from_pending_proposal: bool = Field(
+        False,
+        description=(
+            "Server-set provenance for selected_connected_account_id: true when the route derived it from the "
+            "pending proposal's binding instead of the user picking it. Carries no authority; a client-sent "
+            "value can only weaken the recorded claim."
+        ),
+    )
     audio_artifact_id: str | None = Field(
         None,
         description="Artifact ID for audio captured while dictating this message.",

@@ -17,6 +17,8 @@ from typing import Any
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
+
 TOOL_NAME = "inspect_locator_matches"
 MAX_SELECTORS = 8
 MAX_MATCHES = 5
@@ -52,8 +54,11 @@ TOOL_SCHEMA: dict[str, Any] = {
 
 # One expression per match: the element's own identity plus its descendants, so a wrapper and the
 # node holding the number are distinguishable without the caller guessing at structure.
-_MATCH_FACTS = """
-(el) => {
+_MATCH_FACTS = (
+    """
+(el) => {"""
+    + OTP_INPUT_PRIVACY_JS
+    + """
   const clip = (s, n) => (typeof s === 'string' ? s.trim().slice(0, n) : null);
   const identity = (node, textChars) => ({
     tag: node.tagName ? node.tagName.toLowerCase() : null,
@@ -65,7 +70,7 @@ _MATCH_FACTS = """
   });
   const self = identity(el, %(text_chars)d);
   self.title = el.getAttribute ? el.getAttribute('title') : null;
-  self.outer_html = clip(el.outerHTML, %(html_chars)d);
+  self.outer_html = clip(otpSafeHtml(el), %(html_chars)d);
   const kids = Array.from(el.querySelectorAll('*')).slice(0, %(max_desc)d);
   self.descendants = kids.map((node, index) => {
     const d = identity(node, %(desc_chars)d);
@@ -75,6 +80,7 @@ _MATCH_FACTS = """
   return self;
 }
 """
+)
 
 
 SELECTOR_BUDGET_SECONDS = 8.0

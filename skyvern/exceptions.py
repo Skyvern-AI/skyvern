@@ -1730,6 +1730,16 @@ class ScriptNotFound(SkyvernHTTPException):
         super().__init__(f"Script {script_id} not found")
 
 
+class MultiFieldTotpGroupChanged(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("The verification widget changed during code entry; the step must be re-planned.")
+
+
+class MultiFieldTotpGroupGone(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("The verification widget changed after a preceding action; the step must be re-planned.")
+
+
 class NoTOTPSecretFound(SkyvernException):
     def __init__(self) -> None:
         super().__init__("No TOTP secret found")

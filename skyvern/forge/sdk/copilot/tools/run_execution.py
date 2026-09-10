@@ -227,6 +227,7 @@ from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import (
     _analyze_run_blocks,
     _artifact_challenge_flag_from_result,
+    _latch_suppression_blocker_message,
     _looks_like_anti_bot_blocker,
     _run_blocks_structured_blocker_message,
     _safe_read_workflow_run,
@@ -4783,6 +4784,10 @@ def _record_run_blocks_result(
         copilot_ctx.last_failed_workflow_yaml = None
         copilot_ctx.last_test_failure_reason = None
         copilot_ctx.last_test_suspicious_success = False
+        latch_blocker = _latch_suppression_blocker_message(result, copilot_ctx)
+        # Absent rather than False on any turn that never reached the latch, so a span consumer can
+        # tell "the latch saw no blocker" apart from "the latch never ran".
+        record_gate_decision(copilot_ctx, {"run_output_latch_blocker_detected": bool(latch_blocker)})
         terminal_ready = (
             not isinstance(result, _ExecutionResult) or result.execution.source_is_current(copilot_ctx)
         ) and terminal_ready_for_latch(
@@ -4793,7 +4798,7 @@ def _record_run_blocks_result(
             unverified=unverified,
             composition_unverified=composition_unverified,
             artifact_reason=artifact_reason,
-            structured_blocker=structured_blocker,
+            structured_blocker=latch_blocker,
             empty_data_blocks=empty_data_blocks,
         )
         copilot_ctx.verified_terminal_proposal_ready = terminal_ready
@@ -4809,7 +4814,7 @@ def _record_run_blocks_result(
                     "completed_block_labels": completed_block_labels,
                     "all_run_blocks_completed": all_run_blocks_completed,
                     "artifact_reason": artifact_reason,
-                    "structured_blocker": structured_blocker,
+                    "latch_blocker": latch_blocker,
                     "empty_data_blocks": empty_data_blocks,
                     "terminal_ready": terminal_ready,
                 },

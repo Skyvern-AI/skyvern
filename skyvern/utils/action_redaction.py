@@ -51,6 +51,11 @@ def redact_input_text_payload_for_log(action_payload: Mapping[str, Any], *, valu
             if timing_info.get("totp_secret"):
                 timing_info["totp_secret"] = REDACTED_OTP_SECRET
             redacted_payload["totp_timing_info"] = timing_info
+            if timing_info.get("is_totp_sequence") is True:
+                redacted_payload["reasoning"] = "Entered a one-time code digit."
+                for field_name in ("intention", "response"):
+                    if redacted_payload.get(field_name):
+                        redacted_payload[field_name] = "*"
     return redacted_payload
 
 

@@ -29,6 +29,70 @@ if TYPE_CHECKING:
     # Deferred import: skyvern_context.py sits below the service layer and
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
+    from skyvern.webeye.actions.actions import Action
+
+
+@dataclass
+class MultiFieldTotpAttempt:
+    box_element_ids: list[str]
+    expected_digits: int
+    code_source: str
+    valid_from: float | None = None
+    valid_until: float | None = None
+    filled_code_hash: str | None = None
+    filled_at: float | None = None
+    fill_verified: bool = False
+    hint_code: str | None = field(default=None, repr=False)
+    credential_placeholders: frozenset[str] = field(default_factory=frozenset, repr=False)
+
+
+def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[str, Any]:
+    """Copy element metadata while removing non-empty values from it and its descendants."""
+    redacted = dict(element_data)
+    attributes = element_data.get("attributes")
+    if isinstance(attributes, dict):
+        redacted["attributes"] = dict(attributes)
+        if attributes.get("value") not in (None, ""):
+            redacted["attributes"]["value"] = "*"
+    children = element_data.get("children")
+    if isinstance(children, list):
+        redacted["children"] = [
+            redact_multi_field_totp_element_data(child) if isinstance(child, dict) else child for child in children
+        ]
+    return redacted
+
+
+def action_for_multi_field_totp_persistence(action: Action) -> Action:
+    """Return a safe copy of a multi-box OTP action for database persistence."""
+    timing_info = action.totp_timing_info
+    if not timing_info or not timing_info.get("is_totp_sequence"):
+        return action
+
+    updates: dict[str, Any] = {
+        "text": "*",
+        "reasoning": "Entered a one-time code digit.",
+        "totp_timing_info": {
+            key: timing_info[key]
+            for key in ("is_totp_sequence", "action_index", "box_element_ids", "code_source")
+            if key in timing_info
+        },
+    }
+    if action.intention is not None:
+        updates["intention"] = "*"
+    if action.response is not None:
+        updates["response"] = "*"
+    if action.skyvern_element_data is not None:
+        updates["skyvern_element_data"] = redact_multi_field_totp_element_data(action.skyvern_element_data)
+    if action.input_or_select_context is not None:
+        updates["input_or_select_context"] = action.input_or_select_context.model_copy(
+            update={
+                key: "Entered a one-time code digit."
+                for key, value in action.input_or_select_context.model_dump().items()
+                if isinstance(value, str)
+            }
+        )
+    return action.model_copy(update=updates)
+
 
 LOG = structlog.get_logger()
 
@@ -257,6 +321,8 @@ class SkyvernContext:
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -538,6 +604,33 @@ class SkyvernContext:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
+    def reset_attempt(self, task_id: str) -> None:
+        attempt = self.multi_field_totp.get(task_id)
+        if attempt is None:
+            return
+        attempt.valid_from = None
+        attempt.valid_until = None
+        attempt.filled_code_hash = None
+        attempt.filled_at = None
+        attempt.fill_verified = False
+        self.totp_codes.pop(f"{task_id}_totp_cache", None)
+
+    def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
+        attempt = self.multi_field_totp.pop(task_id, None)
+        self.seed_generated_totp_values.pop(task_id, None)
+        self.totp_codes.pop(task_id, None)
+        self.totp_codes.pop(f"{task_id}_secret", None)
+        cached_code = self.totp_codes.pop(f"{task_id}_totp_cache", None)
+        if (
+            restore_unverified_external
+            and attempt is not None
+            and attempt.code_source == "external"
+            and attempt.filled_code_hash is not None
+            and not attempt.fill_verified
+            and cached_code
+        ):
+            self.totp_codes[task_id] = cached_code
+
     def register_secret_value(self, value: str | None, *, hide_from_model: bool = False) -> None:
         """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed).
         When hide_from_model is True, also scrub it from the model's own view of tool output via hide_from_model()."""
@@ -601,6 +694,23 @@ class SkyvernContext:
         claims = self.download_popup_claims.setdefault(task_id, [])
         if all(existing is not page for existing in claims):
             claims.append(page)
+
+    def discard_download_popup_claim(self, task_id: str, page: Page) -> bool:
+        """Retire a stale claim once its exact Page is reused as a later action's initiating page.
+        Removes only entries where ``existing is page``, preserves sibling claims and other task
+        buckets, deletes the task key when its bucket becomes empty, and returns whether a claim was
+        removed."""
+        claims = self.download_popup_claims.get(task_id)
+        if not claims:
+            return False
+        remaining = [existing for existing in claims if existing is not page]
+        if len(remaining) == len(claims):
+            return False
+        if remaining:
+            self.download_popup_claims[task_id] = remaining
+        else:
+            del self.download_popup_claims[task_id]
+        return True
 
     def take_download_popup_claims(self, task_id: str) -> list[Page]:
         return self.download_popup_claims.pop(task_id, [])

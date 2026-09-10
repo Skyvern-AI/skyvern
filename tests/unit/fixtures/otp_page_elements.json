@@ -1,0 +1,67 @@
+[
+  {
+    "id": "fixture-root",
+    "tagName": "div",
+    "frame": "frame-a",
+    "attributes": {},
+    "children": [
+      {
+        "id": "fixture-panel",
+        "tagName": "div",
+        "frame": "frame-a",
+        "attributes": {},
+        "children": [
+          {
+            "id": "fixture-box-0",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          },
+          {
+            "id": "fixture-box-1",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          },
+          {
+            "id": "fixture-box-2",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          },
+          {
+            "id": "fixture-box-3",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          },
+          {
+            "id": "fixture-box-4",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          },
+          {
+            "id": "fixture-box-5",
+            "tagName": "input",
+            "frame": "frame-a",
+            "attributes": {"type": "text", "maxlength": "1", "inputmode": "numeric"},
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "fixture-submit",
+    "tagName": "button",
+    "frame": "frame-a",
+    "attributes": {"type": "button"},
+    "children": []
+  }
+]

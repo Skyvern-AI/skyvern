@@ -34,14 +34,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
 )
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 # Keep stripped-body evaluate results under the shared MCP response cap while
 # preserving as much below-fold page structure as possible.
 COMPOSITION_STRIPPED_HTML_MAX_CHARS = 135000
 COMPOSITION_STRIPPED_HTML_EXPRESSION = (
-    "(() => {"
-    "  const b = document.body; if (!b) return '';"
-    "  const c = b.cloneNode(true);"
+    "(() => {" + OTP_INPUT_PRIVACY_JS + "  const b = document.body; if (!b) return '';"
+    "  const inert = document.implementation.createHTMLDocument('');"
+    "  const c = inert.importNode(b, true);"
+    "  const aligned = otpMaskHtmlCopy(b, c);"
     "  const sourceNodes = [b, ...b.querySelectorAll('*')];"
     "  const cloneNodes = [c, ...c.querySelectorAll('*')];"
     "  const cloneBySource = new Map(sourceNodes.map((source, index) => [source, cloneNodes[index]]));"
@@ -119,7 +121,7 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
     "    }"
     "  };"
     "  const computedVisibility = new Map();"
-    "  for (let i = 0; i < sourceNodes.length; i++) {"
+    "  for (let i = 0; aligned && i < sourceNodes.length; i++) {"
     "    const source = sourceNodes[i]; const clone = cloneNodes[i];"
     "    let style; try { style = window.getComputedStyle(source); } catch (e) { continue; }"
     "    const parentVisibility = computedVisibility.get(source.parentElement) || '';"
@@ -526,7 +528,14 @@ const lower = (v) => String(v == null ? '' : v).toLowerCase();
 // Cap fields in-page so a giant element can't bloat the JSON past the size bound; Python re-bounds.
 const FIELD_CAP = 2048;
 const cap = (s) => (s.length > FIELD_CAP ? s.slice(0, FIELD_CAP) : s);
-const attr = (el, k) => { const v = el && el.getAttribute ? el.getAttribute(k) : null; return typeof v === 'string' ? cap(v.trim()) : ''; };
+const attr = (el, k) => {
+  const value = el && el.getAttribute ? el.getAttribute(k) : null;
+  if (typeof value !== 'string') return '';
+  const safe = (k === 'value' || k === 'placeholder') && isOtpInputValueSecret(el)
+    ? otpSafeInputAttribute(el, k, value)
+    : value;
+  return cap(safe.trim());
+};
 const nodeText = (el) => { if (!el) return ''; return cap(String(el.textContent || '').replace(/\s+/g, ' ').trim()); };
   const readsAsOneLeaf = (el) => {
     if (!el || !el.children || !el.children.length) return true;
@@ -876,7 +885,9 @@ const isFilled = (el) => {
 // Live DOM property state, which diverges from the markup attribute once the agent interacts.
 const observedValue = (el) => {
   try {
-    return typeof el.value === 'string' ? cap(el.value.trim()) : '';
+    if (typeof el.value !== 'string') return '';
+    const value = isOtpInputValueSecret(el) ? otpSafeInputAttribute(el, 'value', el.value) : el.value;
+    return cap(value.trim());
   } catch (e) {
     return '';
   }
@@ -1107,11 +1118,11 @@ for (const form of document.querySelectorAll('form')) {
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
-    // Observed state needs both a real <input> tag here and the reported attribute type at the
+    // Unmasked observed state needs both a real <input> tag here and the reported attribute type at the
     // Python and replay re-gates; the pair is deliberately an AND so a page that declares
     // type="date" on a textarea mirroring a password acquires no observed value.
     const observedType = tag === 'input' ? lower(node.type) : '';
-    if (OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
+    if (isOtpInputValueSecret(node) || OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
     if (OBSERVED_CHECKED_TYPES.has(observedType)) field.observed_checked = observedChecked(node);
     if (tag === 'select') {
       field.option_count = node.querySelectorAll('option').length;
@@ -1749,7 +1760,7 @@ def composition_structured_evidence_expression(
         f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
         f"const WITNESSED_VALUES={json.dumps(values[:_MAX_KEY_VALUE_RELATIONS])};"
     )
-    return "(() => {" + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
+    return "(() => {" + OTP_INPUT_PRIVACY_JS + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
 
 
 COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = composition_structured_evidence_expression()
