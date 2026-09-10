@@ -33,6 +33,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 
 class EventRelay:
@@ -218,7 +219,7 @@ class CancelledLargeResponseRelay(EventRelay):
 
 @pytest.mark.asyncio
 async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     events: list[tuple[str, dict]] = []
 
     async def on_event(event: str, params: dict) -> None:
@@ -226,7 +227,7 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
 
     relay = EventRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, on_event, auto_spawn=False)
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -258,10 +259,10 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
 
 @pytest.mark.asyncio
 async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = TabListRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -292,7 +293,7 @@ async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
 
 @pytest.mark.asyncio
 async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     observed_tabs: list[list[dict[str, Any]]] = []
 
     async def on_event(event: str, _params: dict) -> None:
@@ -305,7 +306,7 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
     await relay.hello()
     await _eventually(lambda: not server._extension_reset_quarantined)
     relay.scoped_tabs = [{"tabId": 11, "url": "https://example.test", "title": "Example"}]
-    client = BrokerClient(19778, on_event, auto_spawn=False)
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -323,10 +324,10 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
 
 @pytest.mark.asyncio
 async def test_client_preserves_extension_request_error_type() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = ErrorRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -341,7 +342,7 @@ async def test_client_preserves_extension_request_error_type() -> None:
 
 @pytest.mark.asyncio
 async def test_client_accepts_large_response_only_for_extension_request() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = LargeResponseRelay(
         "extension-secret",
         19778,
@@ -349,7 +350,7 @@ async def test_client_accepts_large_response_only_for_extension_request() -> Non
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -363,7 +364,7 @@ async def test_client_accepts_large_response_only_for_extension_request() -> Non
 
 @pytest.mark.asyncio
 async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = TwentyMiBResponseRelay(
         "extension-secret",
         19778,
@@ -371,7 +372,7 @@ async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> No
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -387,7 +388,7 @@ async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> No
 
 @pytest.mark.asyncio
 async def test_cancelled_large_response_is_discarded_without_closing_transport() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = CancelledLargeResponseRelay(
         "extension-secret",
         19778,
@@ -395,7 +396,7 @@ async def test_cancelled_large_response_is_discarded_without_closing_transport()
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     large_request = asyncio.create_task(client.request("debugger.send", {"tabId": 11}))
@@ -436,7 +437,7 @@ async def test_cancelled_large_response_is_discarded_without_closing_transport()
 async def test_cancellation_during_drain_keeps_late_large_response_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = CancelledLargeResponseRelay(
         "extension-secret",
         19778,
@@ -444,7 +445,7 @@ async def test_cancellation_during_drain_keeps_late_large_response_authorized(
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     writer = client._writer
@@ -499,7 +500,7 @@ async def test_cancellation_during_drain_keeps_late_large_response_authorized(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("extra_field", ["recoverySecret", "unexpected"])
 async def test_reauthentication_rejects_excess_response_fields(extra_field: str) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -523,7 +524,7 @@ async def test_reauthentication_rejects_excess_response_fields(extra_field: str)
 
 @pytest.mark.asyncio
 async def test_reauthentication_rejects_attacker_substituted_client_id() -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -544,7 +545,7 @@ async def test_reauthentication_rejects_attacker_substituted_client_id() -> None
 
 @pytest.mark.asyncio
 async def test_failed_reauthentication_never_falls_back_to_enrollment(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -626,7 +627,7 @@ async def test_operator_client_never_terminates_a_pre_upgrade_daemon(
     replacement broker back up, so on a generation mismatch they must leave the still-
     functioning daemon alone and report INCOMPATIBLE_BROKER rather than kill it out from
     under whoever depends on it."""
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
 
     with pytest.raises(BrowserExtensionBrokerError) as exc_info:
@@ -643,7 +644,7 @@ async def test_start_terminates_incompatible_daemon_and_reaches_compatible_broke
     """An in-place upgrade leaves an old-generation daemon running when a new client
     starts. start() must terminate it and reach the auto-spawn/reconnect path within
     one call, not merely fail with INCOMPATIBLE_BROKER and leave the caller stuck."""
-    client = BrokerClient(19778, _ignore_event, auto_spawn=True)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=True)
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
     monkeypatch.setattr(broker_client_module, "_ensure_broker_process", lambda _port, _paths: None)
     connect_after_spawn = AsyncMock()
@@ -662,7 +663,7 @@ async def test_stop_broker_terminates_a_pre_upgrade_daemon_despite_auto_spawn_fa
     """stop is explicitly destructive, unlike status/grant/revoke: even with
     auto_spawn=False, stop_broker() must terminate a mismatched-generation daemon
     directly rather than surface INCOMPATIBLE_BROKER and leave it running forever."""
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
 
     result = await client.stop_broker()
@@ -673,7 +674,7 @@ async def test_stop_broker_terminates_a_pre_upgrade_daemon_despite_auto_spawn_fa
 
 @pytest.mark.asyncio
 async def test_stale_ready_state_with_dead_process_is_spawnable(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     monkeypatch.setattr(
         broker_client_module,
         "read_broker_state",
@@ -708,7 +709,7 @@ async def test_client_retains_and_reaps_spawned_broker_process(monkeypatch: pyte
             self.was_polled = True
             return self.returncode
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     process = SpawnedProcess()
     connect = AsyncMock(side_effect=[BrowserExtensionNotConnectedError("not running"), None])
     monkeypatch.setattr(client, "_connect", connect)
@@ -741,7 +742,7 @@ async def test_client_stop_hands_live_spawned_process_to_daemon_waiter() -> None
             wait_finished.set()
             return 0
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     client._spawned_process = SpawnedProcess()  # type: ignore[assignment]
 
     try:
@@ -775,7 +776,7 @@ async def test_cancelled_start_registers_late_spawn_for_reaping(monkeypatch: pyt
         release_spawn.wait()
         return process
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     monkeypatch.setattr(client, "_connect", AsyncMock(side_effect=BrowserExtensionNotConnectedError("not running")))
     monkeypatch.setattr(broker_client_module, "_ensure_broker_process", blocked_spawn)
     start_task = asyncio.create_task(client.start())
@@ -929,7 +930,7 @@ def test_client_module_contains_no_extension_credential_access() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_field", ["clientId", "recoverySecret", "brokerGeneration", "brokerProof"])
 async def test_enrollment_response_schema_is_exact(missing_field: str) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
 
     def response(args: dict[str, Any], server_nonce: str) -> dict[str, Any]:
         client_nonce = args["clientNonce"]
@@ -951,7 +952,7 @@ async def test_enrollment_response_schema_is_exact(missing_field: str) -> None:
 
 @pytest.mark.asyncio
 async def test_enrollment_response_rejects_excess_fields() -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
 
     def response(args: dict[str, Any], server_nonce: str) -> dict[str, Any]:
         client_nonce = args["clientNonce"]
