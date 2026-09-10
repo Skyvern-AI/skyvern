@@ -15,6 +15,7 @@ import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata, CopilotEvalMode
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
@@ -203,8 +204,8 @@ class CredentialCheck(BaseModel):
 
 class ApprovedCredential(BaseModel):
     credential_id: str
-    # Set only for an approval minted from a carried proposal, whose reach stays the page that
-    # vouched for it. Empty for a credential the user named, which never carried an origin.
+    # Set for a credential-card selection or an answered carried proposal. The approval stays
+    # bound to that origin. Empty for a credential the user named without an origin.
     admitted_url: str = ""
 
 
@@ -694,7 +695,7 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
         sc.approved_connections.append(ApprovedCredential(credential_id=policy.selected_connected_account_id))
         if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
             sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
-    existing_ids = {record.credential_id for record in sc.approved_credentials}
+    existing_records = {record.credential_id: record for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
         # A credential the user picked from the card is durable approval even though the resume
         # stamped an origin for it; only page-vouched ids have to be re-earned.
@@ -714,7 +715,28 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
             and credential.credential_id != ctx.credential_pause_connected_credential_id
             and not carry_stamp_the_user_answered
         )
-        if credential.credential_id in existing_ids or stamped_by_page:
+        card_selected = credential.credential_id == ctx.credential_pause_connected_credential_id
+        if (
+            credential.credential_id in policy.persisted_workflow_credential_ids
+            and credential.credential_id not in settled_ids
+            and not card_selected
+            and not carry_stamp_the_user_answered
+        ):
+            # A saved binding grants authority through that workflow, not an independent chat
+            # approval that would outlive removal of the binding.
+            continue
+        source_url = policy.live_page_admitted_urls.get(credential.credential_id, "")
+        if source_url and (card_selected or carry_stamp_the_user_answered) and canonicalize_origin(source_url) is None:
+            continue
+        admitted_url = safe_admitted_url(source_url) if card_selected or carry_stamp_the_user_answered else ""
+        existing_record = existing_records.get(credential.credential_id)
+        if existing_record is not None:
+            # A new explicit card answer can bind a prior name-only approval, or select a new
+            # login origin. Page observations alone never rewrite durable user approval.
+            if card_selected and admitted_url:
+                existing_record.admitted_url = admitted_url
+            continue
+        if stamped_by_page:
             continue
         # An approval minted from a carry keeps the origin that vouched for the credential. Without
         # it the id is resolved on every later turn with nothing pinning it, and the fill seam's
@@ -722,14 +744,10 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
         sc.approved_credentials.append(
             ApprovedCredential(
                 credential_id=credential.credential_id,
-                admitted_url=(
-                    policy.live_page_admitted_urls.get(credential.credential_id, "")
-                    if carry_stamp_the_user_answered
-                    else ""
-                ),
+                admitted_url=admitted_url,
             )
         )
-        existing_ids.add(credential.credential_id)
+        existing_records[credential.credential_id] = sc.approved_credentials[-1]
     if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
         sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
     return sc.to_json_str()

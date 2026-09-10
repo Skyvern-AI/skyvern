@@ -21,7 +21,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     defang_card_text,
     request_credential_pause,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_origins
 from skyvern.forge.sdk.credential_site_policy import same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
@@ -278,9 +279,10 @@ def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: s
     if credential_id not in resolved_ids:
         return (
             f"The credential `{credential_id}` is not in the credentials resolved for this request, so it "
-            "cannot be filled into the live browser. Only credentials the user referenced (listed under "
-            "`resolved_credentials` in the request policy) may be scouted. Ask the user which saved "
-            "credential to use, or bind the credential as an untested draft parameter without running it."
+            "cannot be filled into the live browser yet. Use `list_credentials(exact_reference=...)` "
+            "for a credential the user already chose or the saved workflow binds. If the login is still "
+            "unresolved, call `request_credential` with the sign-in page URL so the user can pick or add "
+            "a credential in chat, then continue."
         )
     return None
 
@@ -331,9 +333,9 @@ def _missing_credential_origin_error(credential_id: str, page_url: str | None) -
     if page_url:
         origin = loggable_origin(page_url)
         return (
-            f"Credential `{credential_id}` cannot be filled on {origin}: the user has not named this site "
-            f"in this chat. Ask the user to confirm the sign-in site by pasting its URL — {origin} — "
-            "then retry."
+            f"Credential `{credential_id}` has no established login origin for {origin}. "
+            f"Call `request_credential` with the sign-in page URL on {origin} so the user can "
+            "select or add its login in chat, then continue."
         )
     return (
         f"Credential `{credential_id}` cannot be filled: no live page is open. "
@@ -369,18 +371,12 @@ _CREDENTIAL_CARD_FALLBACK = (
 )
 
 
-def _unprovided_login_page_error(login_page_url: str) -> str:
-    origin = loggable_origin(login_page_url) if login_page_url else "that page"
-    return (
-        f"No credential can be requested for {origin}: that site has not been named in this chat. "
-        "The sign-in page URL has to come from the user before a login can be requested for it."
-    )
-
-
 async def _request_credential(login_page_url: str, reason: str, copilot_ctx: CopilotContext) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
-    if not isinstance(policy, RequestPolicy) or _user_provided_site_url_match(policy, login_page_url)[0] is None:
-        return {"ok": False, "error": _unprovided_login_page_error(login_page_url)}
+    if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
+        return {"ok": False, "error": "Credential selection is unavailable on a raw-secret or ungrounded turn."}
+    if not is_resolved_page_url(login_page_url) or canonicalize_origin(login_page_url) is None:
+        return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
 
     if copilot_ctx.credential_pause_used:
         return {
@@ -446,10 +442,11 @@ async def _request_credential(login_page_url: str, reason: str, copilot_ctx: Cop
 
 
 def _request_settled_credential(policy: RequestPolicy, credential_id: str) -> bool:
-    """A non-model signal already answered which credential: the user named it this turn, or it is
-    the only credential resolved for this request (e.g. the one card answer, carried)."""
+    """A user selection settles identity; a saved binding alone remains scoped to its saved origin."""
     if policy.current_turn_named_credential_ids == {credential_id}:
         return True
+    if credential_id in policy.persisted_workflow_credential_ids:
+        return credential_id in policy.prior_approved_credential_ids
     return {credential.credential_id for credential in policy.resolved_credentials} == {credential_id}
 
 
@@ -472,9 +469,8 @@ def _ambiguous_unbound_credential_steer(credential_id: str, page_url: str) -> st
     origin = loggable_origin(page_url)
     return (
         f"`{credential_id}` has no saved login page, so it is not established that it belongs to {origin}. "
-        "Ask the user to say which saved credential to use *and* to name the sign-in page, for example "
-        f'"use <exact name or cred_ id> at {origin}". A reply carrying only the credential grounds no '
-        "origin and refuses again, and a bare yes authorizes nothing."
+        f"Call `request_credential` with the sign-in page URL on {origin}; the user's card selection "
+        "settles both the credential and the site so the build can continue."
     )
 
 
@@ -488,12 +484,21 @@ async def _credential_fill_origin_grant(
     if prerequisite_error:
         return None, prerequisite_error
     policy = copilot_ctx.request_policy
-    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
 
     async def load_once() -> list[Credential]:
         if copilot_ctx.org_credentials_for_turn is None:
             copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
         return copilot_ctx.org_credentials_for_turn
+
+    if (
+        isinstance(policy, RequestPolicy)
+        and credential_id in policy.persisted_workflow_credential_ids
+        and credential_id not in {credential.credential_id for credential in policy.resolved_credentials}
+    ):
+        saved = next((item for item in await load_once() if item.credential_id == credential_id), None)
+        if saved is not None:
+            policy.resolved_credentials.append(saved)
+    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
 
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
@@ -503,6 +508,14 @@ async def _credential_fill_origin_grant(
             _log_fill_grant("admitted_or_tested", intended_url, credential_id)
             return _CredentialFillOriginGrant(intended_url), None
         page_url = await _live_working_page_url(copilot_ctx) or ""
+        if page_url and any(
+            _still_on_admitted_site(page_url, origin)
+            for origin in workflow_credential_origins(
+                copilot_ctx.persisted_workflow_yaml or "", require_canonical_origin=True
+            ).get(credential_id, [])
+        ):
+            _log_fill_grant("saved_workflow", page_url, credential_id)
+            return _CredentialFillOriginGrant(page_url), None
         # The vault entry names the site the user filed this credential under, so it answers where
         # the secret belongs without anyone having to run the test flow first.
         if page_url and any(_same_site(page_url, uri) for uri in await _vault_named_sites(copilot_ctx, credential_id)):
@@ -511,9 +524,18 @@ async def _credential_fill_origin_grant(
         if page_url:
             matched_url, site_level = _user_provided_site_url_match(policy, page_url)
             if matched_url is not None:
-                if _request_settled_credential(
-                    policy, credential_id
-                ) or credential_id == await _sole_org_password_credential_id(load_once):
+                settled = _request_settled_credential(policy, credential_id)
+                if not settled and credential_id in policy.persisted_workflow_credential_ids:
+                    admission = await admit_credential_for_live_page(
+                        policy,
+                        organization_id=copilot_ctx.organization_id,
+                        credential_id=credential_id,
+                        page_url=page_url,
+                        load_org_credentials=load_once,
+                    )
+                    if admission.steer:
+                        return None, admission.steer
+                if settled or credential_id == await _sole_org_password_credential_id(load_once):
                     # An origin-only match (no registrable site) keeps the origin-scoped grant so the
                     # release guard can still compare it; site matches travel the whole site.
                     _log_fill_grant("user_url", page_url, credential_id, policy.user_site_url_sources.get(matched_url))
@@ -805,12 +827,8 @@ async def _fill_credential_field_impl(
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         copilot_ctx.credential_fill_lock = lock
-    async with lock:
-        async with browser_page_custody_lock(copilot_ctx):
-            async with browser_evidence_commit_lock(copilot_ctx):
-                return await _fill_credential_field_impl_serial(
-                    copilot_ctx, selector, credential_id, field, submit_selector
-                )
+    async with lock, browser_page_custody_lock(copilot_ctx), browser_evidence_commit_lock(copilot_ctx):
+        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field, submit_selector)
 
 
 async def _fill_credential_field_impl_serial(

@@ -923,14 +923,15 @@ class RequestPolicy:
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
-    # The login page URLs a tool ask was formed against. A model-supplied URL reaches this list only
-    # after it matched a site in ``user_provided_site_urls``; the connected resume falls back to the
-    # classifier-authored ``login_page_urls`` when it is empty, which carries no such grounding.
+    # The validated login URLs the credential card asked the user to select a login for. The
+    # connected resume falls back to classifier-authored login_page_urls when this is empty.
     credential_ask_login_page_urls: list[str] = field(default_factory=list)
     # Credentials this turn resolved from an explicit user reference — an exact saved name or a
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # Explicit user approvals hydrated from the existing trusted structured chat context.
+    prior_approved_credential_ids: set[str] = field(default_factory=set)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -4171,6 +4172,7 @@ async def _seed_prior_approved_credentials(
     global_llm_context: str,
 ) -> None:
     approved_ids = _prior_approved_credential_ids(global_llm_context)
+    policy.prior_approved_credential_ids = approved_ids
     # An approval minted from a carry recorded the page that vouched for the credential; restoring it
     # keeps the fill pinned there instead of falling through to any site named in the conversation.
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
@@ -4450,14 +4452,17 @@ async def admit_credential_for_live_page(
         )
         return LiveCredentialAdmission(
             False,
-            steer=f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Ask the user which one to use, then fill it.",
+            steer=(
+                f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Call `request_credential` with this sign-in page URL "
+                "so the user can select or add the credential in Copilot."
+            ),
         )
     if resolution.verdict == "resolved":
         return LiveCredentialAdmission(
             False,
             steer=(
-                f"`{credential_id}` is not the saved credential for this login page. Ask the user which "
-                "saved credential to use here."
+                f"`{credential_id}` does not match this login page. The page uniquely matches saved credential "
+                f"`{resolution.candidates[0].credential_id}`; use that credential to continue."
             ),
         )
     return LiveCredentialAdmission(False)

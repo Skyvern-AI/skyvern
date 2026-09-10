@@ -84,7 +84,7 @@ def safe_admitted_url(url: str) -> str:
     if parsed is None or not parsed.hostname:
         return ""
     try:
-        port = f":{parsed.port}" if parsed.port else ""
+        port = f":{parsed.port}" if parsed.port is not None else ""
     except ValueError:
         port = ""
     # urlparse strips the brackets an IPv6 literal needs; without them the port reads as part of

@@ -766,10 +766,12 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
     typed_resume_arm = _typed_resume_arm(reference, policy)
+    if len(matches) == 1 and matches[0].credential_id in _saved_workflow_credential_ids(policy):
+        typed_resume_arm = typed_resume_arm or "saved_workflow"
     # The agent owns natural-language interpretation. This boundary verifies only
-    # objective provenance and identity: the proposed exact reference must be a
-    # complete saved reference in the literal current turn. It deliberately does
-    # not implement a second English policy language beside the agent.
+    # objective provenance and identity: an exact reference is grounded in the current
+    # turn, a structured selection, or the server-saved workflow. It deliberately
+    # does not implement a second English policy language beside the agent.
     if typed_resume_arm is None and reference not in grounded_references and (matches or not literal_reference):
         LOG.info(
             "copilot_credential_reference_not_literal",
