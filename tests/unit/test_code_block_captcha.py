@@ -10,6 +10,9 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 from tests.unit.conftest import ScopeRecordingAgentFunction
@@ -555,6 +558,111 @@ async def test_builtin_reports_whether_an_arm_ran(monkeypatch: pytest.MonkeyPatc
         is True
     )
     assert agent_function.solve_recaptcha_token.await_args.kwargs["browser_session_id"] == "bs-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [True, False])
+async def test_builtin_records_one_solver_action_with_nested_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    result: bool,
+) -> None:
+    async def ladder(page: RecordingPage, **_kwargs: object) -> bool:
+        await page.locator("#challenge").click()
+        return result
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page = RecordingPage(FakePage())
+
+    assert await block_module._code_block_solve_captcha_builtin(page, workflow_run_id="wr_test") is result
+
+    actions = page.recorded_actions()
+    assert [action.action_type for action in actions] == [ActionType.SOLVE_CAPTCHA, ActionType.CLICK]
+    assert [action.action_order for action in actions] == [0, 1]
+    assert actions[0].status == ActionStatus.completed
+    assert actions[0].response == str(result).lower()
+    assert actions[0].workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_builtin_records_sanitized_unsolved_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    sensitive = "https://example.com/account?token=solver-secret#challenge"
+
+    async def ladder(_page: RecordingPage, **_kwargs: object) -> bool:
+        raise CaptchaChallengeUnsolvedError(sensitive)
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page = RecordingPage(FakePage())
+
+    with pytest.raises(CodeBlockCaptchaError, match="CAPTCHA could not be solved"):
+        await block_module._code_block_solve_captcha_builtin(page)
+
+    [action] = page.recorded_actions()
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CodeBlockCaptchaError"
+    assert sensitive not in action.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_builtin_records_only_the_unexpected_failure_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    sensitive = "https://example.com/account?token=solver-secret#challenge"
+    error = RuntimeError(sensitive)
+
+    async def ladder(_page: RecordingPage, **_kwargs: object) -> bool:
+        raise error
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page = RecordingPage(FakePage())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await block_module._code_block_solve_captcha_builtin(page, workflow_run_id="wr_test")
+
+    assert exc_info.value is error
+    [action] = page.recorded_actions()
+    assert action.response == "RuntimeError"
+    assert action.workflow_run_id == "wr_test"
+    assert sensitive not in action.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_authored_code_cannot_override_solver_workflow_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    ladder_calls = 0
+
+    async def ladder(_page: RecordingPage, **_kwargs: object) -> bool:
+        nonlocal ladder_calls
+        ladder_calls += 1
+        return False
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page = RecordingPage(FakePage())
+    block = CodeBlock.model_construct(
+        code='await solve_captcha(page, workflow_run_id="wr_forged")',
+        label="captcha_run_binding",
+    )
+
+    with pytest.raises(TypeError, match="workflow_run_id"):
+        await block.generate_async_user_function(
+            block.code,
+            page,
+            workflow_run_id="wr_coordinator",
+            organization_id="o_coordinator",
+        )()
+
+    assert ladder_calls == 0
+    assert page.recorded_actions() == []
+
+    valid_page = RecordingPage(FakePage())
+    valid_block = CodeBlock.model_construct(code="await solve_captcha(page)", label="captcha_run_binding")
+    await valid_block.generate_async_user_function(
+        valid_block.code,
+        valid_page,
+        workflow_run_id="wr_coordinator",
+        organization_id="o_coordinator",
+    )()
+
+    [action] = valid_page.recorded_actions()
+    assert ladder_calls == 1
+    assert action.workflow_run_id == "wr_coordinator"
 
 
 def test_solve_captcha_is_reserved_in_sandbox_namespace() -> None:

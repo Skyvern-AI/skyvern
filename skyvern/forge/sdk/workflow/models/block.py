@@ -4519,15 +4519,35 @@ async def _code_block_solve_captcha_builtin(
     Delegates to solve_challenge_ladder and translates its neutral unsolved-signal into the
     code-block-specific error the code-block callers expect.
     """
-    try:
-        return await solve_challenge_ladder(
+
+    async def solve() -> bool:
+        try:
+            return await solve_challenge_ladder(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+        except CaptchaChallengeUnsolvedError as exc:
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+
+    if isinstance(page, RecordingPage):
+        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id)
+    return await solve()
+
+
+def _bind_code_block_solve_captcha(
+    organization_id: str | None,
+    workflow_run_id: str | None,
+) -> Callable[[Page | RecordingPage], Awaitable[bool]]:
+    async def solve_captcha(page: Page | RecordingPage) -> bool:
+        return await _code_block_solve_captcha_builtin(
             page,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
-            browser_session_id=browser_session_id,
         )
-    except CaptchaChallengeUnsolvedError as exc:
-        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+
+    return solve_captcha
 
 
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
@@ -5235,7 +5255,7 @@ class CodeBlock(Block):
             "Exception": Exception,
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
-            "solve_captcha": _code_block_solve_captcha_builtin,
+            "solve_captcha": _bind_code_block_solve_captcha(None, None),
             # Unbound: carries no run destination, so it fails closed. generate_async_user_function
             # replaces it with the run-bound helper; the name is present so preflight allows it.
             "click_and_claim_download": _bind_code_block_download_claim(
@@ -5285,11 +5305,7 @@ class CodeBlock(Block):
             _code_block_safe_print,
             parameters=app.AGENT_FUNCTION.serialize_codeblock_parameters(parameters or {}),
         )
-        safe_vars["solve_captcha"] = partial(
-            _code_block_solve_captcha_builtin,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-        )
+        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(organization_id, workflow_run_id)
         safe_vars["otp"] = partial(
             _code_block_otp_builtin,
             organization_id=organization_id,
