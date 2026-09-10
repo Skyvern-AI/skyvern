@@ -2200,7 +2200,7 @@ class ForgeAgent:
                 completion_blocker=completion_blocker,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
-                verification_blocker=verification_state.block_completion,
+                verification_blocker=verification_state.block_finish,
                 # Only for a bare task, where setup navigated this browser_state to task.url and the
                 # status unambiguously belongs to the starting posting. A workflow block reuses the
                 # browser_state across blocks, so its last status may be a prior block's — skip it there
