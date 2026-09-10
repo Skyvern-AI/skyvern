@@ -500,7 +500,9 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       streamCalls[0]!.onMessage(credentialFrame());
     });
     expect(
-      screen.getByText(/Copilot needs to sign in to news\.ycombinator\.com/),
+      screen.getByText(
+        "Copilot needs to sign in to https://news.ycombinator.com",
+      ),
     ).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Connect credential" }),

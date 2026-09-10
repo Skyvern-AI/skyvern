@@ -1107,7 +1107,11 @@ def test_allows_existing_workflow_credential_id_on_unrelated_turn() -> None:
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
 
 
-def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
+@pytest.mark.parametrize(
+    "url",
+    ["https://evil.example.test/login", "https://bücher.example/login", r"https://evil.example.test\login"],
+)
+def test_rejects_existing_workflow_credential_id_on_new_origin(url: str) -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(
             resolved_credentials=[],
@@ -1115,7 +1119,7 @@ def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
             existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
             credential_input_kind="none",
         ),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+        workflow_yaml=_workflow_yaml(url=url),
     )
 
     assert not verdict.allowed

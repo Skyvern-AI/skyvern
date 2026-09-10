@@ -329,6 +329,7 @@ def _policy_ctx(
             seeded_proposal_credential_ids=set(),
             carry_cited_credential_ids=set(),
             current_turn_named_credential_ids=set(),
+            persisted_workflow_credential_ids=set(),
             selected_connected_account_id=selected_connected_account_id,
         ),
     )

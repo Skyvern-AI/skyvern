@@ -144,3 +144,17 @@ async def test_the_user_naming_another_credential_settles_the_fill_on_that_one()
     assert data["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == {"cred_other"}
     assert _request_settled_credential(policy, "cred_other")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [True, False])
+async def test_saved_workflow_selection_resolves_but_a_canvas_proposal_does_not(saved: bool) -> None:
+    credential = _password_credential()
+    policy = RequestPolicy(
+        canonical_user_message="Run the whole workflow again",
+        persisted_workflow_credential_ids=[credential.credential_id] if saved else [],
+        existing_workflow_credential_ids=[credential.credential_id],
+    )
+    data = await _resolve(credential.name, policy, [credential])
+    assert data["status"] == ("resolved" if saved else "denied")
+    assert policy.current_turn_named_credential_ids == set()

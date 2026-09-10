@@ -779,7 +779,8 @@ async def list_credentials_tool(
     Use this to find credential IDs for login blocks.
 
     When the agent selects a saved name or credential ID that appears as a complete
-    credential reference in the latest literal user turn, pass it as `exact_reference`.
+    credential reference in the latest literal user turn, or is already selected in the saved
+    workflow or a credential-card reply, pass it as `exact_reference` without asking again.
     Exact mode verifies provenance and organization-wide cardinality, then atomically binds
     the single match into server-owned request authority. It does not classify the surrounding
     prose and never falls back to fuzzy search, discovery, or pagination. Zero or multiple exact
@@ -808,10 +809,12 @@ async def list_credentials_tool(
 async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, reason: str) -> str:
     """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
 
-    Use this instead of writing a prose question when the turn needs a login and no saved
-    credential covers that site. `login_page_url` must be a page on a site the user themselves
-    provided in this chat; `reason` is one sentence shown to the user saying why the login is
-    needed. The call waits for the user's answer and comes back `connected` with the credential
+    Use this instead of a prose question when a login still needs selection or setup, including
+    a sign-in page discovered while navigating. Reuse the user's existing choice, the saved
+    workflow's binding, or an unambiguous website match without asking again when it can fill.
+    `login_page_url` is the absolute HTTP(S) sign-in URL shown on the card; selecting a credential
+    authorizes it for that site. `reason` is one sentence explaining why the login is needed.
+    The call waits for the user's answer and comes back `connected` with the credential
     to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
     carries. One ask per turn.
     """
@@ -1561,17 +1564,18 @@ async def fill_credential_field_tool(
     An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
     the page left the one the fill acted on, so the field was cleared by its own submit.
 
-    Do not use this tool to reproduce an existing saved login block. Run that
-    block unchanged with `run_blocks_and_collect_debug`, then inspect the page
-    it reaches; the block's bound credential resolves in the workflow run.
+    To test an existing saved login block, run that block unchanged with `run_blocks_and_collect_debug`.
+    When repairing its login in the live browser, reuse the saved block's credential here;
+    its saved login origin, tested site, or vault site can authorize the fill without another ask.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id`: when a page observation returns
     `resolved_login_credential_id`, the server has already authorized that
     credential for this login page — pass that id. When it returns
-    `candidate_login_credentials`, ask the user which one to use and pass the
-    `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
+    `candidate_login_credentials`, reuse an existing user or saved-workflow choice if present;
+    otherwise call `request_credential` for the sign-in URL and pass the selected `credential_id`.
+    `field` is one of `username`, `password`, `totp`.
 
     `submit_selector` is optional and submits in the SAME call: pass the CSS
     selector of the form's submit control and this tool clicks it once the fill

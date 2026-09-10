@@ -449,6 +449,9 @@ async def _run_credential_pause(
     policy = getattr(ctx, "request_policy", None)
     # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
     # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
+    if isinstance(policy, RequestPolicy):
+        # Bind an answer to the URLs on this card, never an earlier unanswered ask.
+        policy.credential_ask_login_page_urls = list(login_page_urls)
     credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
