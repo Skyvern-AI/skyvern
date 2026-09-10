@@ -64,9 +64,12 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 # receive the basenames tools staged into the downloads dir this run, to exclude from detection.
 CompletionProbe = Callable[[frozenset[str]], Awaitable[str | None]]
 CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
-# Consulted from finish(completed) like CompletionBlocker, but takes no arguments -- it gates on
-# state the caller already tracks (e.g. a verification-code budget), not on staged downloads.
-VerificationBlocker = Callable[[], Awaitable[str | None]]
+# Consulted from finish for EVERY verdict, unlike CompletionBlocker: it takes the finish status and
+# gates on state the caller already tracks (e.g. a verification-code budget), not on staged
+# downloads. One callback, because a completed claim made on a blank verification step and a
+# non-complete verdict given up with polling budget still unspent are the same concern seen from two
+# sides; splitting them into two hooks would scatter it.
+VerificationBlocker = Callable[[str], Awaitable[str | None]]
 
 
 @dataclass
@@ -677,6 +680,10 @@ FAILURE_EVIDENCE_SETTLE_MAX_SECONDS = 8.0
 FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS = 60.0
 FAILURE_EVIDENCE_MIN_TOOL_CALLS = 3
 FAILURE_EVIDENCE_MIN_TURNS = 3
+# A verification give-up deferral asks for a BLOCKING poll slice (auth_tools caps one at 120s) on top
+# of that cycle, so the 60s above would let the gate convert an honest failure into the
+# budget-exhausted end it exists to prevent. Not imported from auth_tools: that module imports this one.
+VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS = 180.0
 
 
 def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
@@ -791,7 +798,11 @@ def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool) -> str
     return selector if isinstance(selector, str) and selector else None
 
 
-def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | None) -> bool:
+def _has_hold_headroom(
+    activity: ActivityRecency | None,
+    deadline_at: float | None,
+    min_deadline_headroom_seconds: float = FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS,
+) -> bool:
     """Whether a deferral has the budget to buy the re-verification turn it asks for.
 
     Without it the run ends budget_exhausted, which is unmapped and lands on failed -- turning an
@@ -814,7 +825,7 @@ def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | No
             return False
         if activity.perception_stall_imminent:
             return False
-    if deadline_at is not None and deadline_at - time.monotonic() < FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS:
+    if deadline_at is not None and deadline_at - time.monotonic() < min_deadline_headroom_seconds:
         return False
     return True
 
@@ -1312,7 +1323,14 @@ def make_finish_tool(
     completed-side cap, not per verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
-    terminated is never gated on either side.
+
+    `verification_blocker` is the one gate consulted for EVERY verdict: it refuses a completed claim
+    once the verification source terminally failed, and holds a failed OR terminated one while the
+    run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
+    a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
+    the callee (the budget shrinks under every productive hold) and refused here without the deadline
+    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
+    ungated on both sides.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -1426,17 +1444,36 @@ def make_finish_tool(
                 )
             if blocker_message:
                 return ToolResult.error(blocker_message)
-        if status == "completed" and verification_blocker is not None:
-            try:
-                verification_message = await verification_blocker()
-            except Exception:
-                # Fail closed: an exception here must not let a blank verification step read as done.
-                LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
-                return ToolResult.error(
-                    "Could not verify that the verification-code step completed cleanly; retry "
-                    "finish(status=completed) once verified, or finish with status=failed or "
-                    "status=terminated."
+        if verification_blocker is not None and (
+            status == "completed"
+            # A non-complete verdict is only ever HELD, never refused, so unlike the completed side it
+            # must fund the retry it asks for -- and that retry is a blocking poll slice, not just a
+            # re-observe. Absent the accounting to check that (no `activity`), the hold is not
+            # justifiable and the verdict stands.
+            or (
+                activity is not None
+                and _has_hold_headroom(
+                    activity,
+                    deadline_at,
+                    min_deadline_headroom_seconds=VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
                 )
+            )
+        ):
+            try:
+                verification_message = await verification_blocker(status)
+            except Exception:
+                if status == "completed":
+                    # Fail closed: an exception here must not let a blank verification step read as done.
+                    LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
+                    return ToolResult.error(
+                        "Could not verify that the verification-code step completed cleanly; retry "
+                        "finish(status=completed) once verified, or finish with status=failed or "
+                        "status=terminated."
+                    )
+                # Fail open on the give-up side: the opposite verdict. A broken gate must not trap a
+                # run that wants to end.
+                LOG.warning("taskv3 verification_blocker failed; honoring the verdict", exc_info=True)
+                verification_message = None
             if verification_message:
                 return ToolResult.error(verification_message)
         if (
