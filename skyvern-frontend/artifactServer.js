@@ -1,10 +1,24 @@
 import express from "express";
 import fs from "fs";
+import path from "path";
 import cors from "cors";
 
 const app = express();
 
 app.use(cors());
+
+export function getRecordingContentType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+
+  switch (extension) {
+    case ".webm":
+      return "video/webm";
+    case ".mp4":
+      return "video/mp4";
+    default:
+      return "application/octet-stream";
+  }
+}
 
 // Request logging middleware — logs method, path, status, and duration
 app.use((req, res, next) => {
@@ -28,11 +42,11 @@ app.use((req, res, next) => {
 
 app.get("/artifact/recording", (req, res) => {
   const range = req.headers.range;
-  const path = req.query.path;
-  if (!path || !range) {
+  const filePath = req.query.path;
+  if (!filePath || !range) {
     return res.status(400).send("Missing path or range header");
   }
-  const videoSize = fs.statSync(path).size;
+  const videoSize = fs.statSync(filePath).size;
   const chunkSize = 1 * 1e6;
   const start = Number(range.replace(/\D/g, ""));
   const end = Math.min(start + chunkSize, videoSize - 1);
@@ -41,10 +55,10 @@ app.get("/artifact/recording", (req, res) => {
     "Content-Range": `bytes ${start}-${end}/${videoSize}`,
     "Accept-Ranges": "bytes",
     "Content-Length": contentLength,
-    "Content-Type": "video/mp4",
+    "Content-Type": getRecordingContentType(filePath),
   };
   res.writeHead(206, headers);
-  const stream = fs.createReadStream(path, {
+  const stream = fs.createReadStream(filePath, {
     start,
     end,
   });
@@ -86,8 +100,10 @@ app.use((err, req, res, _next) => {
   res.status(500).send("Internal server error");
 });
 
-app.listen(9090, () => {
-  console.log(
-    `[${new Date().toISOString()}] Artifact server running at http://localhost:9090`,
-  );
-});
+if (process.env.NODE_ENV !== "test") {
+  app.listen(9090, () => {
+    console.log(
+      `[${new Date().toISOString()}] Artifact server running at http://localhost:9090`,
+    );
+  });
+}
