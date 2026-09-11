@@ -549,6 +549,28 @@ Groq specializes in fast inference for open-source models. Response times are ty
 
 ---
 
+## Atlas Cloud
+
+OpenAI-compatible inference for DeepSeek, Qwen, GLM, Kimi and MiniMax models at [atlascloud.ai](https://www.atlascloud.ai/).
+
+```bash .env
+ENABLE_ATLASCLOUD=true
+LLM_KEY=ATLASCLOUD
+ATLASCLOUD_API_KEY=apikey-...
+ATLASCLOUD_MODEL=deepseek-ai/deepseek-v4-pro
+```
+
+`ATLASCLOUD_API_BASE` defaults to `https://api.atlascloud.ai/v1` and only needs setting for a
+non-default endpoint.
+
+<Note>
+`deepseek-ai/deepseek-v4-pro` is a reasoning model: it spends completion tokens on a hidden chain of
+thought before the answer, so a small `LLM_CONFIG_MAX_TOKENS` can return an empty response with
+`finish_reason="length"`. Non-reasoning ids such as `deepseek-ai/DeepSeek-V3.1` are unaffected.
+</Note>
+
+---
+
 ## Using multiple models
 
 ### Primary and secondary models
