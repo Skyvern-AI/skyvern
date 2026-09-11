@@ -532,6 +532,31 @@ OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
 
 ---
 
+## TrustedRouter
+
+Access multiple models through a single API at [trustedrouter.com](https://trustedrouter.com/), with per-request routing and failover.
+
+```bash .env
+ENABLE_TRUSTEDROUTER=true
+LLM_KEY=TRUSTEDROUTER
+TRUSTEDROUTER_API_KEY=sk-tr-...
+TRUSTEDROUTER_MODEL=trustedrouter/auto
+```
+
+Model ids are namespaced — `anthropic/claude-opus-4-7` works, a bare `claude-opus-4-7` is rejected. Ids under `trustedrouter/` are routing policies rather than single models: each picks an upstream per request and fails over.
+
+| Model | Picks for |
+| ----- | --------- |
+| `trustedrouter/auto` | Capability, with failover |
+| `trustedrouter/fast` | Latency |
+| `trustedrouter/cheap` | Cost |
+| `trustedrouter/zdr` | Providers that retain no data |
+| `trustedrouter/e2e` | Confidential-compute providers |
+
+`zdr` and `e2e` constrain which upstreams may serve a request at all — relevant for Skyvern, since page content and screenshots go into these prompts.
+
+---
+
 ## Groq
 
 Inference on open-source models at [groq.com](https://groq.com/).
