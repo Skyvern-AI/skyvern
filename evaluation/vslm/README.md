@@ -9,15 +9,28 @@ vendor can reproduce a recall problem we hit while testing. The filter is off by
 default (`ENABLE_VSLM_TEXT_FILTER=False`) and fails open, so with the flag unset
 none of this code runs.
 
-## The finding
+## The findings
 
-The classifier drops sentences whose relevance is carried by an **identifier**.
-`Invoice #: 88213-B` scores 0.020 against the topic `invoice number`; the same
-fact written as narrative prose (`Account number 4471-99823-01 is enrolled in
-paperless billing.`) scores 0.990 against `account number`.
+Scores move as the vendor updates their service. Numbers below were re-measured
+2026-09-12; `repro_api.py` labels failures dynamically, so run it for current values.
+
+**1. Abbreviated identifier labels are dropped.** `Invoice #: 88213-B` scores
+**0.0029** against the topic `invoice number`, and `Acct No. 5590231` scores
+**0.0002** against `account number`. Spelled-out forms are handled correctly
+(`Invoice number INV-2026-04871 was issued on...` scores 0.9881), so this is
+narrower than it was on 2026-09-07, when the spelled-out forms failed too.
 
 For document extraction this is the wrong failure mode: labelled identifiers are
-exactly what users pull out of invoices, statements, and forms.
+exactly what users pull out of invoices, statements, and forms, and abbreviated
+labels are the common case on real ones.
+
+**2. Three agents score near zero on example queries from the vendor's own guide.**
+Batched with neutral filler, `reports_context_agent` scores 0.0036 on
+`segment performance`, `web_context_agent` 0.0047 on `central bank decisions`,
+and `social_media_context_agent` 0.002 on `brand sentiment` — all three are
+example queries listed for those agents in the integration guide. The same agents
+work on other topics (`reports_context_agent` scores 0.9996 on `capex outlook`),
+so this is topic-specific rather than an agent being offline.
 
 ## Reproduce
 
@@ -33,9 +46,10 @@ export ZQ_API_KEY=<key>
 python evaluation/vslm/repro_api.py
 ```
 
-Pure `urllib`, Python 3.8+. Four parts: identifier vs narrative sentences,
+Pure `urllib`, Python 3.8+. Five parts: identifier vs narrative sentences,
 one case across every topic-specification mode, the same case across all seven
-agents, and an identifier buried in a realistic document.
+agents, an identifier buried in a realistic document, and each agent against an
+example query from the vendor's own integration guide.
 
 ### 2. End-to-end through Skyvern (needs a configured LLM provider)
 

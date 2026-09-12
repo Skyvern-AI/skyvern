@@ -76,6 +76,73 @@ def score_of(payload, sentence):
     return None, sentence in payload.get("relevant_sentences", [])
 
 
+# Each agent paired with an example query taken verbatim from the vendor's
+# integration guide, plus an on-topic sentence for it.
+AGENT_DOC_QUERIES = [
+    (
+        "transcript_context_agent",
+        "tariff exposure",
+        "We expect tariffs on imported steel to increase our cost of goods sold by $50M in 2026.",
+    ),
+    (
+        "reports_context_agent",
+        "segment performance",
+        "Cloud Infrastructure segment revenue was $1.24 billion, an increase of 18% year over year.",
+    ),
+    (
+        "reports_context_agent",
+        "capex outlook",
+        "Capital expenditures are expected to reach $900 million in fiscal 2027.",
+    ),
+    (
+        "legal_context_agent",
+        "indemnification clauses",
+        "The Supplier shall indemnify and hold harmless the Customer against all third-party claims.",
+    ),
+    (
+        "log_context_agent",
+        "lateral movement",
+        "Detected SMB session from 10.4.2.19 to 10.4.2.88 using a service account outside its normal scope.",
+    ),
+    (
+        "web_context_agent",
+        "central bank decisions",
+        "The Federal Reserve held rates steady at its September meeting, citing cooling inflation.",
+    ),
+    (
+        "social_media_context_agent",
+        "brand sentiment",
+        "Honestly the new packaging is gorgeous, I'd buy it again just for the box.",
+    ),
+]
+
+FILLER = [
+    "Please retain this document for your records.",
+    "The accompanying notes are an integral part of these statements.",
+    "Follow us on social media for the latest updates.",
+]
+
+
+def part5():
+    """Each agent against a query from the vendor's own docs, batched with filler."""
+    print("\n" + "=" * 78)
+    print("PART 5 -- each agent against an example query from the vendor's own guide")
+    print("   batched with neutral filler, the way real usage sends sentences")
+    print("=" * 78)
+    print(f"  {'agent':<30} {'query':<26} {'on-topic':>9} {'filler':>8}")
+    failures = []
+    for agent, topic, sentence in AGENT_DOC_QUERIES:
+        payload = predict(agent, [sentence] + FILLER, topic=topic)
+        scores = {s["sentence"]: s["relevant_prob"] for s in payload.get("scores", [])}
+        good = scores.get(sentence, 0.0)
+        filler = max((scores.get(f, 0.0) for f in FILLER), default=0.0)
+        if good <= 0.5:
+            failures.append((agent, topic, good))
+        flag = "" if good > 0.5 else "   <-- DROPS ITS OWN DOCUMENTED USE CASE"
+        print(f"  {agent:<30} {topic:<26} {good:>9} {filler:>8}{flag}")
+    return failures
+
+
 def main():
     if not API_KEY:
         sys.exit("set ZQ_API_KEY first")
@@ -149,6 +216,8 @@ def main():
     print("\n  -> 'Invoice #: 88213-B' is dropped, so a downstream extractor asked for")
     print("     the invoice number returns null with no error raised.")
 
+    agent_failures = part5()
+
     print("\n" + "=" * 78)
     print(
         f"SUMMARY: {len(wrong)} of {len([c for c in CASES if c[3] == 'relevant'])} "
@@ -156,6 +225,12 @@ def main():
     )
     for cid, topic, sentence, prob in wrong:
         print(f"  case {cid}: prob={prob} topic={topic!r} sentence={sentence!r}")
+    print(
+        f"         {len(agent_failures)} of {len(AGENT_DOC_QUERIES)} agent/query pairs in Part 5 "
+        f"scored their own documented use case below 0.5"
+    )
+    for agent, topic, prob in agent_failures:
+        print(f"  {agent}: prob={prob} on documented query {topic!r}")
     print("=" * 78)
 
 
