@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_resolver import make_copilot_call_model_input_filter
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -2222,7 +2222,6 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     ctx.last_run_blocks_block_ids = ["wrb_old"]
     ctx.last_run_blocks_block_labels = ["extract"]
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")
-    ctx.last_run_outcome_block_labels = ["extract"]
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.completion_verification_result = object()  # type: ignore[assignment]
     ctx.outcome_verification_trace_snapshot = {"old": True}
@@ -2231,10 +2230,17 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     ctx.post_run_page_observation_workflow_run_id = "wr_old"
     ctx.post_run_page_observation_after_failed_test = True
     ctx.post_run_current_page_inspection_workflow_run_id = "wr_old"
-    ctx.block_state_map = {"extract": "completed"}
-    ctx.block_started_at_map = {"extract": "2026-08-10T01:00:00Z"}
-    ctx.block_ended_at_map = {"extract": "2026-08-10T01:00:01Z"}
-
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_old",
+        workflow_run_id="wr_old",
+        label="extract",
+        block_type="extraction",
+        status="failed",
+        iteration=1,
+        started_at="2026-08-10T01:00:00Z",
+        ended_at="2026-08-10T01:00:01Z",
+    )
     _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, None)
 
     assert ctx.last_run_blocks_workflow_run_id is None
@@ -2242,7 +2248,6 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     assert ctx.last_run_blocks_block_ids == []
     assert ctx.last_run_blocks_block_labels == []
     assert ctx.last_run_outcome is None
-    assert ctx.last_run_outcome_block_labels == []
     assert ctx.last_test_anti_bot is None
     assert ctx.completion_verification_result is None
     assert ctx.outcome_verification_trace_snapshot == {}
@@ -2251,10 +2256,8 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     assert ctx.post_run_page_observation_workflow_run_id is None
     assert ctx.post_run_page_observation_after_failed_test is False
     assert ctx.post_run_current_page_inspection_workflow_run_id is None
-    assert ctx.block_state_map == {}
-    assert ctx.block_started_at_map == {}
-    assert ctx.block_ended_at_map == {}
     assert ctx.run_outcome_trace == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
+    assert ctx.narrative_block_attempts["wrb_old"]["rawStatus"] == "failed"
 
 
 def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

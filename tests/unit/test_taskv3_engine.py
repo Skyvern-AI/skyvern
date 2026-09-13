@@ -17,6 +17,7 @@ import yarl
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -31,11 +32,18 @@ from skyvern.forge.taskv3.engine import (
     taskv3_runaway_backstops,
 )
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
-from skyvern.forge.taskv3.loop import LoopOutcome, SemanticCommitStats, ToolResult, ToolSpec, _ProgressEvidence
+from skyvern.forge.taskv3.loop import (
+    CODE_TOOL_NAME,
+    LoopOutcome,
+    SemanticCommitStats,
+    ToolResult,
+    ToolSpec,
+    _ProgressEvidence,
+)
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
+from tests.unit.test_taskv3_tools import _SURFACE_OFF_TOOL_NAMES, _FakePage, _fixed_page_provider
 
 
 @pytest.mark.asyncio
@@ -1470,3 +1478,184 @@ async def test_engine_forwards_the_error_code_mapping_to_the_finish_tool(monkeyp
         error_code_mapping=mapping,
     )
     assert finish_kwargs["error_code_mapping"] == mapping
+
+
+def _advertised(caller: _ScriptedCaller) -> set[str]:
+    """The tool names the MODEL was actually offered, read off the request the caller built."""
+    return {t["function"]["name"] for t in (caller.sent_tools or [])}
+
+
+def _stub_code_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("{}")
+
+    return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
+
+
+async def _run_to_finish(caller: _ScriptedCaller) -> None:
+    # A real run always carries a context with a run identity; the code tool is withheld without one,
+    # so a context-free call would exercise the identity gate rather than the surface under test.
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface"))
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(caller)
+
+    assert not asked
+    assert CODE_TOOL_NAME not in _advertised(caller)
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_add_and_replace_advertise_exact_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    add_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(add_caller)
+
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "replace")
+    replace_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(replace_caller)
+
+    # `add` keeps every action tool and gains the code tool; `replace` keeps only perception and
+    # waiting. `finish` is assembled after this filter and survives both, which is what makes a
+    # `replace` run able to end at all.
+    assert _advertised(add_caller) == _SURFACE_OFF_TOOL_NAMES | {CODE_TOOL_NAME, "finish"}
+    assert _advertised(replace_caller) == {"observe", "get_html", "look", "wait", CODE_TOOL_NAME, "finish"}
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3: the code tool and frame perception do not run together.
+
+    Code driving the page directly never reaches the wrapper that writes the realm-attributed
+    ledger, so in-frame fills and submits would be invisible to the data-loss guard and the
+    completion gate. Asserted at the advertised-tool set, not at the gate, because what matters is
+    that the model is never offered the tool -- a gate that runs and then leaks is still a leak.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_no_runner_leaves_every_surface_with_todays_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Today's actual state: the deployment has no runner, so the hook returns None.
+
+    The engine-level branch, not the helper's -- this is the path every run takes right now, and
+    `replace` reaching it must still leave the model able to act.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return None
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_a_raising_code_tool_hook_costs_the_tool_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`add` is meant to be purely additive, so a sandbox hiccup must not fail an otherwise fine run.
+
+    Asserted on the run's outcome as well as the advertised set: a withheld tool that still let the
+    exception escape would fail the task, which is the failure mode worth naming.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        raise RuntimeError("sandbox provisioning blew up")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface_raise"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_identity_is_not_given_a_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment keys a sandbox session on the run identity, so no identity means no tool.
+
+    Two runs sharing an empty identity would share a session. Withholding is the only answer that
+    cannot produce a collision.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext())
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert not asked
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}

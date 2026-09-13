@@ -8,12 +8,16 @@ import {
   SMTP_USERNAME_PARAMETER_KEY,
 } from "../../constants";
 import { NodeBaseData } from "../types";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import {
+  type EmailBodyFormat,
+  debuggableWorkflowBlockTypes,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type SendEmailNodeData = NodeBaseData & {
   recipients: string;
   subject: string;
   body: string;
+  bodyFormat: EmailBodyFormat;
   fileAttachments: string;
   sender: string;
   smtpHostSecretParameterKey?: string;
@@ -33,6 +37,7 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   recipients: "",
   subject: "",
   body: "",
+  bodyFormat: "text",
   fileAttachments: SKYVERN_DOWNLOAD_DIRECTORY,
   editable: true,
   label: "",

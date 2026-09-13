@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,9 +20,19 @@ from tests.unit.conftest import ScopeRecordingAgentFunction
 
 
 class FakeLocator:
-    def __init__(self, *, count: int = 0, checked: bool = False, input_values: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        count: int = 0,
+        checked: bool = False,
+        input_values: list[str] | None = None,
+        visible: bool = True,
+        box: dict[str, float] | None = None,
+    ) -> None:
         self._count = count
         self._checked = checked
+        self._visible = visible
+        self._box = box if box is not None else {"x": 10.0, "y": 10.0, "width": 300.0, "height": 80.0}
         self._input_values = list(input_values or [])
         self._input_value_calls = 0
         self.click = AsyncMock(side_effect=self._click)
@@ -33,7 +44,10 @@ class FakeLocator:
         return self._count
 
     async def is_visible(self) -> bool:
-        return True
+        return self._visible
+
+    async def bounding_box(self) -> dict[str, float]:
+        return self._box
 
     async def is_enabled(self) -> bool:
         return True
@@ -63,26 +77,48 @@ class FakeLocator:
         return self
 
 
+class FakeFrameElement:
+    def __init__(self, *, visible: bool) -> None:
+        self._visible = visible
+
+    async def is_visible(self) -> bool:
+        return self._visible
+
+
 class FakeFrame:
     def __init__(
         self,
         *,
         url: str,
-        anchor: FakeLocator,
+        anchor: FakeLocator | None = None,
         parent_frame: FakePage | None = None,
         detached: bool = False,
+        nested_marker: FakeLocator | None = None,
+        is_hcaptcha_marker: bool = False,
+        visible: bool = True,
     ) -> None:
         self.url = url
-        self.anchor = anchor
+        self.anchor = anchor or FakeLocator(count=0)
         self.parent_frame = parent_frame
         self.detached = detached
+        self.nested_marker = nested_marker or FakeLocator(count=0)
+        self.is_hcaptcha_marker = is_hcaptcha_marker
+        self._element = FakeFrameElement(visible=visible)
 
     def locator(self, selector: str) -> FakeLocator:
-        assert selector == "#recaptcha-anchor"
-        return self.anchor
+        if selector == "#recaptcha-anchor":
+            return self.anchor
+        if selector == captcha_solver_module._HCAPTCHA_MARKER_SELECTOR:
+            return self.nested_marker if self.is_hcaptcha_marker else FakeLocator(count=0)
+        if selector == captcha_solver_module._CAPTCHA_CHECKBOX_SELECTOR:
+            return FakeLocator(count=0)
+        return self.nested_marker
 
     def is_detached(self) -> bool:
         return self.detached
+
+    async def frame_element(self) -> FakeFrameElement:
+        return self._element
 
 
 class FakePage:
@@ -105,6 +141,8 @@ class FakePage:
         self.hcaptcha_marker = FakeLocator(count=1 if hcaptcha else 0)
         self.marker = FakeLocator(count=1 if (recaptcha or hcaptcha or turnstile) else 0)
         self.frames = list(frames or [])
+        self.main_frame = object()
+        self.viewport_size = {"width": 1280, "height": 720}
         self.url = url
         self.evaluated: list[str] = []
 
@@ -783,6 +821,272 @@ async def test_hcaptcha_marker_reaches_extension_arm(monkeypatch: pytest.MonkeyP
 
     assert await solve_challenge_ladder(page) is True
     agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_nested_visible_frame_marker_reaches_extension_arm_with_hcaptcha_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An hCaptcha marker that lives inside a visible child frame (not the main document) must still be
+    detected by the presence precheck and must select the hCaptcha extension-arm budget, not the shorter
+    generic one."""
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    resolve_calls: list[float] = []
+    monkeypatch.setattr(
+        agent_function,
+        "resolve_captcha_solver_extension_timeout",
+        lambda _page, default_timeout: resolve_calls.append(default_timeout) or default_timeout,
+    )
+    child_frame = FakeFrame(
+        url="https://app.example/challenge-frame",
+        nested_marker=FakeLocator(count=1),
+        is_hcaptcha_marker=True,
+        visible=True,
+    )
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+    assert resolve_calls == [captcha_solver_module._HCAPTCHA_ARM_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_nested_invisible_frame_marker_is_not_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A marker inside a child frame whose own frame element is not visible (e.g. a hidden badge frame)
+    must not count as a present challenge: no solver arm should be invoked."""
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(
+        url="https://app.example/hidden-frame",
+        nested_marker=FakeLocator(count=1),
+        is_hcaptcha_marker=True,
+        visible=False,
+    )
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nested_invisible_marker_in_visible_frame_is_not_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An embedded form frame commonly carries a hidden challenge widget (an invisible reCAPTCHA badge);
+    # only a match the user can actually see may send the page down the paid solver arms.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(
+        url="https://app.example/embedded-form",
+        nested_marker=FakeLocator(count=1, visible=False),
+        visible=True,
+    )
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+class _MatchList:
+    """Several matches in one frame, each with its own visibility and box."""
+
+    def __init__(self, matches: list[FakeLocator]) -> None:
+        self._matches = matches
+
+    async def count(self) -> int:
+        return len(self._matches)
+
+    def nth(self, index: int) -> FakeLocator:
+        return self._matches[index]
+
+
+@pytest.mark.asyncio
+async def test_nested_visible_marker_after_many_hidden_ones_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A single-page app can keep stale hidden widgets ahead of the live one in document order.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(url="https://app.example/challenge-frame", visible=True)
+    # The live widget sits past the old five-match prefix and is not the last match, so neither a
+    # first-N nor a last-only walk finds it.
+    matches = [FakeLocator(count=1, visible=False) for _ in range(8)]
+    matches[5] = FakeLocator(count=1)
+    child_frame.nested_marker = _MatchList(matches)  # type: ignore[assignment]
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True, (
+        "a visible match after hidden ones must count"
+    )
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_nested_offscreen_marker_is_not_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An embedded widget parked outside the viewport still reports is_visible(); it is not a gate the user sees.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(
+        url="https://app.example/offscreen-frame",
+        nested_marker=FakeLocator(count=1, box={"x": -5000.0, "y": 0.0, "width": 300.0, "height": 80.0}),
+        is_hcaptcha_marker=True,
+        visible=True,
+    )
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is False, "an off-screen match must not count"
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nested_onscreen_match_after_an_offscreen_one_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pairs with the off-screen test: an off-screen match ahead of a real one must not end the walk.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(url="https://app.example/challenge-frame", visible=True)
+    offscreen = FakeLocator(count=1, box={"x": -5000.0, "y": 0.0, "width": 300.0, "height": 80.0})
+    child_frame.nested_marker = _MatchList([offscreen, FakeLocator(count=1)])  # type: ignore[assignment]
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True, "an on-screen match must count"
+
+
+class _WedgedFrame:
+    url = "https://app.example/wedged"
+
+    async def frame_element(self) -> None:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_wedged_child_frames_cannot_outlast_the_scan_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each frame is bounded on its own, so without a whole-scan budget five wedged frames would cost five
+    # full per-frame bounds before the ladder could even decide nothing is there.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.3)
+    page = FakePage(frames=[_WedgedFrame() for _ in range(5)])
+
+    started = time.monotonic()
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
+    assert time.monotonic() - started < 1.0
+
+
+class _DetachedFrame:
+    url = "https://app.example/detached"
+
+    async def frame_element(self) -> None:
+        raise PlaywrightError("Frame was detached")
+
+
+@pytest.mark.asyncio
+async def test_a_frame_that_raises_does_not_abort_the_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Frames detach mid-probe on interstitial pages; one probe failing must not cost the frame that holds the gate.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    challenge = FakeFrame(url="https://app.example/challenge-frame", nested_marker=FakeLocator(count=1), visible=True)
+    page = FakePage(frames=[_DetachedFrame(), challenge])  # type: ignore[list-item]
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True, (
+        "a raising frame must not abort the scan"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_frame_behind_wedged_frames_is_still_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Frame order must not decide the verdict: wedged frames ahead of the challenge cannot spend the budget.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.5)
+    challenge = FakeFrame(url="https://app.example/challenge-frame", nested_marker=FakeLocator(count=1), visible=True)
+    page = FakePage(frames=[*(_WedgedFrame() for _ in range(4)), challenge])  # type: ignore[list-item]
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True, (
+        "a challenge behind wedged frames must be found"
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_frames_are_not_probed_unless_the_caller_opts_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The code-block builtin keeps the main-document-only presence check; only an opted-in caller
+    # (the Task V3 solve_captcha tool) reaches a challenge nested in a child frame.
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(
+        url="https://app.example/challenge-frame",
+        nested_marker=FakeLocator(count=1),
+        is_hcaptcha_marker=True,
+        visible=True,
+    )
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page) is False, "default path must not probe child frames"
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
 
 
 @pytest.mark.asyncio

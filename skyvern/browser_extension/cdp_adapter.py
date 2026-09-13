@@ -453,15 +453,25 @@ class ExtensionCdpAdapter:
             return events
 
         commit_indexes = [index for index, event in enumerate(events) if self._is_navigation_commit_event(event)]
-        if len(commit_indexes) >= _NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:
-            keep_indexes = set(commit_indexes[-_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:])
+        execution_context_indexes = [
+            index
+            for index, event in enumerate(events)
+            if isinstance(event.get("method"), str) and event["method"].startswith("Runtime.executionContext")
+        ]
+        priority_index_set = set(commit_indexes) | set(execution_context_indexes)
+        priority_indexes = sorted(priority_index_set)
+        if len(priority_indexes) >= _NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:
+            keep_indexes = set(priority_indexes[-_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:])
         else:
-            non_commit_indexes = [index for index in range(len(events)) if index not in commit_indexes]
-            keep_indexes = set(commit_indexes)
-            keep_indexes.update(non_commit_indexes[-(_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT - len(commit_indexes)) :])
+            other_indexes = [index for index in range(len(events)) if index not in priority_index_set]
+            keep_indexes = set(priority_indexes)
+            keep_indexes.update(other_indexes[-(_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT - len(priority_indexes)) :])
         retained_events = [event for index, event in enumerate(events) if index in keep_indexes]
         dropped_event_count = len(events) - len(retained_events)
         dropped_commit_event_count = len(commit_indexes) - sum(index in keep_indexes for index in commit_indexes)
+        dropped_execution_context_event_count = len(execution_context_indexes) - sum(
+            index in keep_indexes for index in execution_context_indexes
+        )
         LOG.warning(
             "browser_extension_navigation_sensitive_event_buffer_overflow",
             tab_id=tab_id,
@@ -470,6 +480,7 @@ class ExtensionCdpAdapter:
             dropped_event_count=dropped_event_count,
             dropped_non_commit_event_count=dropped_event_count - dropped_commit_event_count,
             dropped_commit_event_count=dropped_commit_event_count,
+            dropped_execution_context_event_count=dropped_execution_context_event_count,
             max_buffered_events=_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT,
         )
         return retained_events

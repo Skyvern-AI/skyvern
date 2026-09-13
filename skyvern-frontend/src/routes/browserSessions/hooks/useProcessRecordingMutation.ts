@@ -13,6 +13,7 @@ import {
 } from "@/store/useRecordingStore";
 import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
 import type { RecordedParameter } from "@/store/RecordedBlocksStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
   captureRecordBrowser,
   markRecordBrowserProcessed,
@@ -26,6 +27,7 @@ const useProcessRecordingMutation = ({
 }: {
   browserSessionId: string | null;
   onSuccess?: (args: {
+    recordingId: string | null;
     blocks: Array<WorkflowBlock>;
     parameters: Array<RecordedParameter>;
   }) => void;
@@ -66,6 +68,12 @@ const useProcessRecordingMutation = ({
       if (!workflowPermanentId) {
         throw new Error(
           "Cannot process recording without a valid agent permanent ID.",
+        );
+      }
+
+      if (useWorkflowHasChangesStore.getState().pendingRecordingId !== null) {
+        throw new Error(
+          "Save or discard the current workflow changes before processing another recording.",
         );
       }
 
@@ -111,6 +119,7 @@ const useProcessRecordingMutation = ({
           },
           {
             data: {
+              recording_id: string | null;
               blocks: Array<WorkflowBlock>;
               parameters: Array<RecordedParameter>;
             };
@@ -131,11 +140,12 @@ const useProcessRecordingMutation = ({
           ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({
+          recordingId: response.data.recording_id ?? null,
           blocks: response.data.blocks,
           parameters: response.data.parameters,
         }));
     },
-    onSuccess: ({ blocks, parameters }) => {
+    onSuccess: ({ recordingId, blocks, parameters }) => {
       const latencyMs =
         mutationStartedAtRef.current !== null
           ? Date.now() - mutationStartedAtRef.current
@@ -169,13 +179,18 @@ const useProcessRecordingMutation = ({
       recordingStore.clear();
 
       if (blocks && blocks.length > 0) {
+        if (recordingId && workflowPermanentId) {
+          useWorkflowHasChangesStore
+            .getState()
+            .setPendingRecording(recordingId, workflowPermanentId);
+        }
         toast({
           variant: "success",
           title: "Recording Processed",
           description: "The recording has been successfully processed.",
         });
 
-        onSuccess?.({ blocks, parameters: parameters });
+        onSuccess?.({ recordingId, blocks, parameters: parameters });
 
         return;
       }

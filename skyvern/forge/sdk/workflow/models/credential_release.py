@@ -161,6 +161,15 @@ class CredentialReleaseGuard:
         matches = self.matches(value)
         return matches[0] if matches else None
 
+    def matches_anywhere(self, value: object) -> list[ArmedSecret]:
+        """Every armed secret appearing anywhere in ``value``, ignoring the short-secret length
+        floor ``matches`` applies. For a channel with no release target, where refusal is the only
+        outcome, a false refusal is a visible authoring error but a missed short secret -- a CVV or
+        a 2-digit expiry embedded in a longer answer -- is a silent release."""
+        if not isinstance(value, str) or not value:
+            return []
+        return [entry for entry in self._armed if entry.secret_value in value]
+
     def matches(self, value: object) -> list[ArmedSecret]:
         if not isinstance(value, str) or not value:
             return []

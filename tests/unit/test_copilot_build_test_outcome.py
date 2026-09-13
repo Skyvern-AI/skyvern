@@ -72,7 +72,10 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    build_test_page_state_from_evidence,
+    inject_runtime_authoring_repair_context,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
@@ -303,6 +306,80 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     assert packet.failure is not None
     assert packet.failure.connect_failure == failure
     assert packet.canonical_workflow_yaml == "title: preserved draft"
+
+
+def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> None:
+    failure = BuildTestConnectFailure(
+        state="billing_credit_admission_refusal",
+        retry_action=None,
+    )
+
+    assert failure.model_dump(mode="json") == {
+        "state": "billing_credit_admission_refusal",
+        "workflow_run_id": None,
+        "workflow_run_block_id": None,
+        "task_id": None,
+        "browser_session_id": None,
+        "occupier_run_id": None,
+        "diagnostic": None,
+        "retry_action": None,
+    }
+    with pytest.raises(ValidationError):
+        BuildTestConnectFailure(state="billing_credit_admission_refusal")
+    with pytest.raises(ValidationError):
+        BuildTestConnectFailure(
+            state="billing_credit_admission_refusal",
+            browser_session_id="pbs_must_not_exist",
+            retry_action=None,
+        )
+    with pytest.raises(ValidationError):
+        BuildTestConnectFailure(state="already_closed", retry_action=None)
+
+
+def test_billing_refusal_preserves_prior_run_evidence_and_repair_context() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    prior = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id="wr_prior",
+        attempted_block_label="collect_credentials",
+        failed_block_labels=["collect_credentials"],
+        observed_evidence_summary="The prior run reached the form before its block failed.",
+    )
+    record_build_test_outcome(ctx, prior)
+    history_before = copy.deepcopy(ctx.recorded_build_test_outcome_history)
+    billing_result = {
+        "ok": False,
+        "data": {
+            "overall_status": "setup_failed",
+            "blocks": [],
+            "build_test_connect_failure": BuildTestConnectFailure(
+                state="billing_credit_admission_refusal",
+                retry_action=None,
+            ).model_dump(mode="json"),
+        },
+    }
+
+    billing_outcome = recorded_outcome_from_run_blocks_result(billing_result)
+    assert billing_outcome is not None
+    assert billing_outcome.workflow_run_id is None
+    assert billing_outcome.executed_block_labels == []
+    record_build_test_outcome(ctx, billing_outcome)
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.workflow_run_id == "wr_prior"
+    assert latest.observed_evidence_summary == prior.observed_evidence_summary
+    assert latest.connect_failure is not None
+    assert latest.connect_failure.state == "billing_credit_admission_refusal"
+    assert latest.connect_failure.retry_action is None
+    assert ctx.recorded_build_test_outcome_history == history_before
+    prompt = _recorded_build_test_outcome_prompt(ctx)
+    assert "No browser or run started" in prompt
+    assert "Billing" in prompt
 
 
 def test_connect_failure_clears_when_a_later_real_run_records_recovery() -> None:
@@ -2787,6 +2864,54 @@ def _oversized_packet(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacke
     )
 
 
+def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page_state() -> None:
+    evidence = {
+        "workflow_run_id": "wr_bindings",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "key_value_relations": [
+            {
+                "key_text": "Sessions started",
+                "value_text": "72.51k",
+                "container_selector": "div.query-value__container",
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+    }
+
+    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings")
+
+    assert from_evidence is not None
+    assert from_evidence.value_bindings == ["Sessions started=72.51k"]
+
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    result: dict[str, object] = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_bindings",
+            "overall_status": "failed",
+            "blocks": [{"label": "read_sessions", "status": "failed", "failure_reason": "RuntimeError"}],
+            "authoring_repair_context": {
+                "workflow_run_id": "wr_bindings",
+                "observed_after_workflow_run": True,
+                "page_value_bindings": ["Sessions started=72.51k"],
+            },
+        },
+    }
+    _record_run_blocks_result(ctx, result)
+
+    packet = build_test_evidence_packet(ctx, result)
+    projected = project_build_test_packet_for_llm(packet)
+
+    assert packet.failure is not None and packet.failure.page_state is not None
+    assert packet.failure.page_state.value_bindings == ["Sessions started=72.51k"]
+    assert projected.failure is not None and projected.failure.page_state is not None
+    assert projected.failure.page_state.value_bindings == ["Sessions started=72.51k"]
+
+
 def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_llm_projection() -> None:
     ctx = _locator_packet_ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -3104,6 +3229,53 @@ def test_every_run_outcome_return_path_preserves_the_typed_capture_fact(return_p
     assert outcome is not None
     assert outcome.page_capture is not None
     assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+def test_a_not_evaluated_run_keeps_the_page_values_it_captured() -> None:
+    """A completed-but-unevaluated run is when the model most needs what the page showed."""
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_not_evaluated_values",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "read_failure_rate",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"failure_rate": ""},
+                }
+            ],
+        },
+    }
+    page_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_not_evaluated_values",
+        "current_url": "https://dashboard.example.com/health",
+        "visible_text_excerpt": "Service health Failure rate 26.05 %",
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        page_evidence=page_evidence,
+        recorded_run_outcome=RecordedRunOutcome(
+            run_completed=True, verdict="not_evaluated", workflow_run_id="wr_not_evaluated_values"
+        ),
+        declared_goal_path_omissions=[{"block_label": "read_failure_rate", "output_path": "failure_rate"}],
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "run_completed_unevaluated"
+    assert "26.05 %" in outcome.observed_page_value_excerpt
+    # Declared-path omissions stay facts on this path; carrying them here would make the run graded.
+    assert outcome.missing_requested_output_facts == []
+    # The values must arrive without minting authority: page_evidence_refs feed structural_key, so
+    # an unevaluated run carrying them would report itself authoritative and be latched as
+    # run-backed evidence. Scope is this constructor; a run that later reaches
+    # bind_post_run_page_evidence has its refs overlaid there, which predates this pin.
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.page_evidence_refs == []
+    assert outcome.is_authoritative is False
 
 
 def test_page_capture_rejects_an_unavailable_page_without_its_typed_omission() -> None:
@@ -5393,6 +5565,9 @@ class _CheckoutPage:
         "#payment-methods": "Card, Wallet, Pay in 4",
         "#selected-product": "Running Jacket",
     }
+
+    def __init__(self) -> None:
+        self.context = MagicMock()
 
     async def inner_text(self, selector: str) -> str:
         return self._TEXT[selector]

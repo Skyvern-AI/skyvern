@@ -24,11 +24,9 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     CONSENT_OBSTRUCTION_KIND,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
-    interaction_evidence_is_bindable,
     merge_visual_composition_evidence,
     model_visible_composition_evidence,
     page_evidence_needs_visual_fallback,
-    page_records_share_location,
     parse_composition_html,
     stamp_page_evidence_provenance,
     unresolved_requested_targets,
@@ -74,7 +72,6 @@ from ._shared import (
     AdmittedOutputRead,
     _append_flow_evidence,
     _call_internal_browser_tool,
-    _composition_evidence_page_url,
     _composition_get_html,
     _composition_get_structured_evidence_result,
     _discovery_extract_current_url,
@@ -91,7 +88,6 @@ from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
     _mark_post_run_page_observed,
-    _page_evidence_matches_url_identity,
 )
 
 LOG = structlog.get_logger()
@@ -535,69 +531,6 @@ def _inspection_reached_via(*, use_current_page: bool, post_run: bool, earned_in
     if post_run:
         return "post_run"
     return "interaction" if earned_interaction else "current_page"
-
-
-def _latest_interaction_reached_flow_evidence(copilot_ctx: Any) -> tuple[int, str, dict[str, Any]] | None:
-    """Return interaction evidence for the browser's latest observed location.
-
-    This powers a live-page protection, so it answers where the browser is now rather than whether
-    the trajectory ever left that page. Historical authoring continuity is evaluated separately.
-    """
-    trajectory = getattr(copilot_ctx, "flow_evidence", None)
-    if not isinstance(trajectory, list):
-        return None
-    latest_observed_evidence = next(
-        (
-            entry["evidence"]
-            for entry in reversed(trajectory)
-            if isinstance(entry, dict)
-            and isinstance(entry.get("evidence"), dict)
-            and _composition_evidence_page_url(entry["evidence"])
-        ),
-        None,
-    )
-    if latest_observed_evidence is None:
-        return None
-    for entry in reversed(trajectory):
-        if not isinstance(entry, dict):
-            continue
-        reached_via = str(entry.get("reached_via") or "")
-        if reached_via not in {"interaction", "post_run"}:
-            continue
-        evidence = entry.get("evidence")
-        step = entry.get("step")
-        if isinstance(step, bool) or not isinstance(step, int) or not isinstance(evidence, dict):
-            continue
-        if not interaction_evidence_is_bindable(evidence):
-            continue
-        if not page_records_share_location(evidence, latest_observed_evidence):
-            continue
-        observed_url = _composition_evidence_page_url(evidence)
-        if observed_url:
-            return step, observed_url, evidence
-    return None
-
-
-def _non_current_inspection_regression_error(copilot_ctx: Any, *, entry_url: str) -> dict[str, Any] | None:
-    latest = _latest_interaction_reached_flow_evidence(copilot_ctx)
-    if latest is None:
-        return None
-    observation_step, observed_url, evidence = latest
-    if _page_evidence_matches_url_identity(evidence, entry_url):
-        return None
-    return {
-        "ok": False,
-        "data": {
-            "current_url": observed_url,
-            "observation_step": observation_step,
-        },
-        "error": (
-            "inspect_page_for_composition would navigate away from the latest interaction-reached page "
-            f'({observed_url}). Use inspect_page_for_composition(target_url="current_page") to inspect '
-            "the live page, or compose from the existing page evidence and pass observation_step "
-            f"{observation_step} in block_observation_refs for blocks that act on that reached page."
-        ),
-    }
 
 
 _COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
@@ -1235,9 +1168,6 @@ async def _inspect_page_for_composition_under_custody(
                 "error": "inspect_page_for_composition requires a URL, domain with an explicit path, or target_url='current_page'.",
             }
         entry_url = resolved_entry_url
-        regression_error = _non_current_inspection_regression_error(copilot_ctx, entry_url=entry_url)
-        if regression_error is not None:
-            return regression_error
 
     # Skip re-navigation when the inspect target is the page the browser is already on. A
     # passive client-side redirect can move the browser without a tool, so for a URL target

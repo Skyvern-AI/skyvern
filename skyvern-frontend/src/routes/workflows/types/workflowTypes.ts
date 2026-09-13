@@ -453,6 +453,8 @@ export type FileUploadBlock = WorkflowBlockBase & {
   sftp_host_key: string | null;
 };
 
+export type EmailBodyFormat = "text" | "html";
+
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
   smtp_host?: AWSSecretParameter;
@@ -467,6 +469,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments: Array<string>;
 };
 
@@ -499,6 +502,7 @@ export type HumanInteractionBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
 };
 
 export type DataExportBlock = WorkflowBlockBase & {

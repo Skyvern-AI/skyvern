@@ -11,6 +11,7 @@ import {
   type OptimisticStep,
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
 import { useProcessRecordingMutation } from "./useProcessRecordingMutation";
 
@@ -77,6 +78,10 @@ describe("useProcessRecordingMutation telemetry", () => {
     useRecordingStore.getState().setRecordingTransport("cdp");
     useRecordingStore.getState().setIsRecording(true);
     useRecordingStore.setState({ optimisticSteps: [optimisticStep] });
+    useWorkflowHasChangesStore.setState({
+      pendingRecordingId: null,
+      pendingRecordingWorkflowPermanentId: null,
+    });
     mocks.captureRecordBrowser.mockClear();
   });
 
@@ -134,6 +139,81 @@ describe("useProcessRecordingMutation telemetry", () => {
         recording_attempt_id: "attempt-1",
         interpretation_session_id: "interpretation-1",
       }),
+    );
+  });
+
+  it("keeps the durable recording id for the workflow save that follows", async () => {
+    mocks.post.mockResolvedValue({
+      data: {
+        recording_id: "br-1",
+        blocks: [{ block_type: "action", label: "click" }],
+        parameters: [],
+      },
+    });
+    const { result } = renderHook(
+      () =>
+        useProcessRecordingMutation({
+          browserSessionId: "pbs-1",
+        }),
+      { wrapper },
+    );
+
+    act(() => result.current.mutate({ draftSteps: [draftStep] }));
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
+      pendingRecordingId: "br-1",
+      pendingRecordingWorkflowPermanentId: "wpid-1",
+    });
+  });
+
+  it("lands recorded blocks when an older backend omits the recording id", async () => {
+    const onSuccess = vi.fn();
+    mocks.post.mockResolvedValue({
+      data: {
+        blocks: [{ block_type: "action", label: "click" }],
+        parameters: [],
+      },
+    });
+    const { result } = renderHook(
+      () =>
+        useProcessRecordingMutation({
+          browserSessionId: "pbs-1",
+          onSuccess,
+        }),
+      { wrapper },
+    );
+
+    act(() => result.current.mutate({ draftSteps: [draftStep] }));
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(onSuccess).toHaveBeenCalledWith({
+      recordingId: null,
+      blocks: [{ block_type: "action", label: "click" }],
+      parameters: [],
+    });
+    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBeNull();
+  });
+
+  it("does not process another recording before the pending one is saved", async () => {
+    useWorkflowHasChangesStore.setState({
+      pendingRecordingId: "br-pending",
+      pendingRecordingWorkflowPermanentId: "wpid-1",
+    });
+    const { result } = renderHook(
+      () =>
+        useProcessRecordingMutation({
+          browserSessionId: "pbs-1",
+        }),
+      { wrapper },
+    );
+
+    await expect(
+      act(async () => result.current.mutateAsync({ draftSteps: [draftStep] })),
+    ).rejects.toThrow("Save or discard the current workflow changes");
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
+      "br-pending",
     );
   });
 });

@@ -79,6 +79,14 @@ export interface BudgetExpiryOutcome {
   drain_fingerprint?: string | null;
 }
 
+export interface CopilotAttachedFile {
+  file_id: string;
+  filename: string;
+  size_bytes?: number | null;
+  // Resolved fresh by the server on every read; false once the file expires or is deleted.
+  available: boolean;
+}
+
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
   organization_id: string;
@@ -93,6 +101,7 @@ export interface WorkflowCopilotChatMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
   audio_artifact_id?: string | null;
+  attached_files?: CopilotAttachedFile[];
   global_llm_context: string | null;
   created_at: string;
   modified_at: string;
@@ -107,6 +116,7 @@ export interface WorkflowCopilotChatRequest {
   browser_session_id?: string | null;
   message: string;
   audio_artifact_id?: string | null;
+  attached_file_ids?: string[];
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
@@ -135,6 +145,7 @@ export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
   audio_artifact_id?: string | null;
+  attached_files?: CopilotAttachedFile[];
   created_at: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.

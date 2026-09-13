@@ -64,13 +64,23 @@ async def test_solve_captcha_solved_returns_ok(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.asyncio
 async def test_solve_captcha_absent_is_ok_and_steers_away(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No challenge present: the model must NOT loop on solve_captcha, so this is an ok whose content
-    # tells it to stop retrying — never an error it would retry.
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", AsyncMock(return_value=False))
+    # No challenge present: this must be an ok the model can retry after a fresh observe — never an
+    # error, and never a blanket instruction to stop calling solve_captcha, since a later page state
+    # (e.g. a frame-nested challenge that appears after further navigation) may genuinely have one.
+    ladder = AsyncMock(return_value=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
-    result = await tools[0].handler({})
+    handler = tools[0].handler
+
+    result = await handler({})
+
     assert result.status == "ok"
     assert "no" in result.content.lower() and "captcha" in result.content.lower()
+    assert "do not retry solve_captcha" not in result.content.lower()
+
+    # The cap is not consumed by an absent result: calling again still reaches the ladder.
+    await handler({})
+    assert ladder.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -105,7 +115,9 @@ async def test_solve_captcha_threads_ids(monkeypatch: pytest.MonkeyPatch) -> Non
         _task(workflow_run_id="wr_9", browser_session_id="bs_9"), _provider(page), organization_id="o_9"
     )
     await tools[0].handler({})
-    ladder.assert_awaited_once_with(page, organization_id="o_9", workflow_run_id="wr_9", browser_session_id="bs_9")
+    ladder.assert_awaited_once_with(
+        page, organization_id="o_9", workflow_run_id="wr_9", browser_session_id="bs_9", probe_child_frames=True
+    )
 
 
 @pytest.mark.asyncio

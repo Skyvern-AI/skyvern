@@ -136,6 +136,8 @@ export function ReviewGateCard({
   flash = false,
 }: ReviewGateCardProps) {
   const draft = turn?.draft ?? null;
+  const billingCreditRefusal =
+    turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
   const rejected = settled === "rejected";
   const accepted = settled === "accepted";
   const itemClassName = rejected
@@ -234,6 +236,18 @@ export function ReviewGateCard({
       ) : null}
       {pending && actionsEnabled ? (
         <div className="flex flex-wrap gap-2 border-t border-border/55 bg-slate-elevation1/55 px-3 py-2">
+          {billingCreditRefusal ? (
+            <p className="basis-full text-[11px] leading-snug text-muted-foreground">
+              No browser or run started because credits are exhausted.{" "}
+              <a
+                href="/billing"
+                className="font-medium text-sky-700 underline underline-offset-2 dark:text-sky-300"
+              >
+                Go to Billing
+              </a>
+              .
+            </p>
+          ) : null}
           <button
             type="button"
             onClick={onReview}
@@ -262,7 +276,7 @@ export function ReviewGateCard({
           >
             Reject
           </button>
-          {onTestEndToEnd ? (
+          {onTestEndToEnd && !billingCreditRefusal ? (
             <button
               type="button"
               onClick={onTestEndToEnd}
@@ -273,7 +287,7 @@ export function ReviewGateCard({
                 : "Test end-to-end"}
             </button>
           ) : null}
-          {onTestEndToEnd ? (
+          {onTestEndToEnd && !billingCreditRefusal ? (
             <p className="basis-full text-[11px] leading-snug text-muted-foreground">
               {verdict === "untested" &&
               turn &&

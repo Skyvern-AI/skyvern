@@ -1,4 +1,4 @@
-import { useReactFlow } from "@xyflow/react";
+import { useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
@@ -15,38 +15,40 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import { type AppNode, isWorkflowBlockNode } from "..";
+import { EmailBodyFormatSelect } from "../components/EmailBodyFormatSelect";
 import { type SendEmailNode } from "./types";
 import { useUpdate } from "../../useUpdate";
 
 function SendEmailEditor({ blockId }: { blockId: string }) {
-  const rf = useReactFlow<AppNode>();
-  const node = rf.getNode(blockId);
-  if (!node || !isWorkflowBlockNode(node) || node.type !== "sendEmail") {
+  // The sidebar mount lives outside the per-node renderer, so a useReactFlow().getNode(id)
+  // snapshot does not re-render after updateNodeData commits; subscribe to the data slice instead.
+  const nodeSlice = useNodesData<SendEmailNode>(blockId);
+  if (!nodeSlice || nodeSlice.type !== "sendEmail") {
     return null;
   }
-  return <SendEmailEditorBody blockId={blockId} node={node as SendEmailNode} />;
+  return <SendEmailEditorBody blockId={blockId} data={nodeSlice.data} />;
 }
 
 function SendEmailEditorBody({
   blockId,
-  node,
+  data,
 }: {
   blockId: string;
-  node: SendEmailNode;
+  data: SendEmailNode["data"];
 }) {
   const {
     editable,
     recipients,
     subject,
     body,
+    bodyFormat,
     fileAttachments,
     sender,
     customSmtpHost,
     customSmtpPort,
     customSmtpUsername,
     customSmtpPassword,
-  } = node.data;
+  } = data;
   const update = useUpdate<SendEmailNode["data"]>({ id: blockId, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
 
@@ -81,7 +83,14 @@ function SendEmailEditorBody({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs text-tertiary-foreground">Body</Label>
+        <div className="flex items-center justify-between">
+          <Label className="text-xs text-tertiary-foreground">Body</Label>
+          <EmailBodyFormatSelect
+            value={bodyFormat}
+            onChange={(next) => update({ bodyFormat: next })}
+            disabled={!editable}
+          />
+        </div>
         <WorkflowBlockInputTextarea
           aiImprove={AI_IMPROVE_CONFIGS.sendEmail.body}
           nodeId={blockId}

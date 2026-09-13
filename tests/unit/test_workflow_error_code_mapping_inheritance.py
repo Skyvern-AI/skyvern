@@ -475,6 +475,9 @@ class TestBlockTaskFailureRedaction:
             mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
             mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = lambda *_a, **_k: True
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = lambda *_a, **_k: {"sk4829137765"}
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.cancel_failure_evidence_capture = (
+                AsyncMock()
+            )
 
             result = await block.execute_safe(workflow_run_id="wr_test", current_index=None)
 

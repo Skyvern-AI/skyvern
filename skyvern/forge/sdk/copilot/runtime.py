@@ -62,6 +62,7 @@ from skyvern.webeye.browser_errors import (
 )
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -516,7 +517,6 @@ class AgentContext:
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
-    last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
@@ -1324,6 +1324,7 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     sentence = build_test_connect_failure_sentence(failure)
+    explicit_absence = failure.state == "billing_credit_admission_refusal"
     return {
         "ok": False,
         "error": sentence,
@@ -1331,10 +1332,26 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
             "overall_status": "setup_failed",
             "failure_reason": sentence,
             "browser_session_id": failure.browser_session_id,
-            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
+            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=not explicit_absence),
             "blocks": [],
         },
     }
+
+
+def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
+    if failure.state == "billing_credit_admission_refusal":
+        return {
+            "ok": False,
+            "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+            "data": {
+                "browser_session_acquisition_failure": {
+                    "state": failure.state,
+                    "retry_action": failure.retry_action,
+                }
+            },
+        }
+    return {"ok": False, "error": "Failed to create browser session"}
 
 
 async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailure | None:
@@ -1423,6 +1440,11 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
             await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
         retire_browser_session_id(ctx, installed_session_id)
         raise
+    except BrowserSessionCreditAdmissionRefusal:
+        return BuildTestConnectFailure(
+            state="billing_credit_admission_refusal",
+            retry_action=None,
+        )
     except Exception as e:
         LOG.warning("Failed to auto-create browser session", error=str(e), exc_info=True)
         # Cleanup keys off the local `session`, not ctx.browser_session_id --
@@ -1448,9 +1470,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
 
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
     failure = await _provision_browser_session(ctx)
-    if failure is None:
-        return None
-    return {"ok": False, "error": "Failed to create browser session"}
+    return None if failure is None else _browser_session_acquisition_failure_result(failure)
 
 
 async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any] | None:

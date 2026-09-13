@@ -589,6 +589,7 @@ class RealBrowserManager(BrowserManager):
         browser_address: str | None = None,
         cdp_port: int | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
     ) -> BrowserState:
@@ -648,7 +649,9 @@ class RealBrowserManager(BrowserManager):
                     cdp_port=cdp_port,
                     browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                     browser_profile_id=browser_profile_id,
+                    browser_session_id=browser_session_id,
                     engine_selection=selection,
+                    _reconcile_persistent_init_scripts=browser_session_id is not None,
                 )
             except BaseException:
                 # start() launched the local Node driver; stop it (time-bounded) so a failed context
@@ -672,6 +675,7 @@ class RealBrowserManager(BrowserManager):
                 browser_cleanup=browser_cleanup,
                 release_driver_on_close=browser_address is not None,
                 engine_selection=selection,
+                browser_context_route_policy_url=url,
             )
 
         # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
@@ -777,6 +781,10 @@ class RealBrowserManager(BrowserManager):
                     "organization_id": task.organization_id,
                     "expected_runnable_id": expected_runnable_id,
                     "download_run_id": download_run_id,
+                    "task_id": task.task_id,
+                    "workflow_run_id": None,
+                    "url": task.url,
+                    "workflow_permanent_id": task.workflow_permanent_id,
                 }
                 if expected_runnable_generation_id is not None:
                     get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
@@ -837,6 +845,7 @@ class RealBrowserManager(BrowserManager):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
+                browser_session_id=browser_session_id,
             )
 
             if browser_session_id:
@@ -861,6 +870,7 @@ class RealBrowserManager(BrowserManager):
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
+            browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(
             browser_state=browser_state,
@@ -998,6 +1008,10 @@ class RealBrowserManager(BrowserManager):
                         "organization_id": workflow_run.organization_id,
                         "expected_runnable_id": expected_runnable_id,
                         "download_run_id": download_run_id,
+                        "task_id": None,
+                        "workflow_run_id": workflow_run.workflow_run_id,
+                        "url": url,
+                        "workflow_permanent_id": workflow_run.workflow_permanent_id,
                         **(
                             {"expected_runnable_generation_id": expected_runnable_generation_id}
                             if expected_runnable_generation_id is not None
@@ -1058,6 +1072,10 @@ class RealBrowserManager(BrowserManager):
                                     "organization_id": workflow_run.organization_id,
                                     "expected_runnable_id": expected_runnable_id,
                                     "download_run_id": download_run_id,
+                                    "task_id": None,
+                                    "workflow_run_id": workflow_run.workflow_run_id,
+                                    "url": url,
+                                    "workflow_permanent_id": workflow_run.workflow_permanent_id,
                                     **(
                                         {
                                             "expected_runnable_generation_id": expected_runnable_generation_id,
@@ -1126,6 +1144,7 @@ class RealBrowserManager(BrowserManager):
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
             )
 
             if browser_session_id:
@@ -1158,6 +1177,7 @@ class RealBrowserManager(BrowserManager):
             cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
+            browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(
             browser_state=browser_state,
@@ -1725,6 +1745,10 @@ class RealBrowserManager(BrowserManager):
                         "organization_id": organization_id,
                         "expected_runnable_id": script_id,
                         "download_run_id": download_run_id,
+                        "task_id": context.task_id if context else None,
+                        "workflow_run_id": workflow_run_id,
+                        "url": None,
+                        "workflow_permanent_id": context.workflow_permanent_id if context else None,
                         **(
                             {"expected_runnable_generation_id": expected_runnable_generation_id}
                             if expected_runnable_generation_id is not None
@@ -1756,13 +1780,19 @@ class RealBrowserManager(BrowserManager):
                 proxy_location=proxy_location,
                 script_id=script_id,
                 organization_id=organization_id,
+                browser_session_id=browser_session_id,
             )
 
         if script_id:
             self.pages[script_id] = browser_state
         await browser_state.get_or_create_page(
             proxy_location=proxy_location,
+            task_id=context.task_id if context else None,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=context.workflow_permanent_id if context else None,
             script_id=script_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
         )
 
         return await _on_browser_state_acquired(browser_state, workflow_run_id)

@@ -182,10 +182,12 @@ export function hasFailedTestBlock(turn: TurnNarrativeState): boolean {
 }
 
 export function everyTestBlockExecuted(turn: TurnNarrativeState): boolean {
-  // Gates a claim about every step, so one executed block is not enough and an empty list is
-  // not vacuously true: the turn must carry blocks and none of them may still be drafted.
-  const blocks = latestBlocksByLabel(turn.blocks);
-  return blocks.length > 0 && blocks.every((b) => b.state !== "drafted");
+  // Gates a claim about every step, so only the proposal's own tested state can answer it. The
+  // projection is also absent when the proposal would not parse, and an unverifiable turn claims nothing.
+  const review = turn.review;
+  if (review === null) return false;
+  const proposed = review.blocks.filter((b) => b.change !== "removed");
+  return proposed.length > 0 && proposed.every((b) => b.neverTested !== true);
 }
 
 export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {

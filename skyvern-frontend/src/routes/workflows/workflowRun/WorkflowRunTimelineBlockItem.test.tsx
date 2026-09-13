@@ -487,6 +487,81 @@ describe("WorkflowRunTimelineBlockItem", () => {
       "Iteration 1",
       "Iteration 2",
     ]);
+    expect(screen.queryByText("No iterations")).toBeNull();
+  });
+
+  it.each([
+    ["for_loop", Status.Terminated, ["alpha", "beta"], "0/2"],
+    ["while_loop", Status.Completed, [], "0"],
+  ] as const)(
+    "labels an empty %s with status %s without a counter",
+    (blockType, status, loopValues, counter) => {
+      const loop = buildBlock({
+        workflow_run_block_id: "wrb_empty_loop",
+        block_type: blockType,
+        label: "iterate_items",
+        loop_values: [...loopValues],
+        status,
+      });
+
+      render(
+        <WorkflowRunTimelineBlockItem
+          activeItem={loop}
+          block={loop}
+          subItems={[]}
+          onActionClick={noop}
+          onBlockItemClick={noop}
+        />,
+      );
+
+      expect(screen.getByText("No iterations")).toBeDefined();
+      expect(screen.queryByText(counter)).toBeNull();
+    },
+  );
+
+  it("labels an empty loop when the run finalized with a stale running block status", () => {
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_stale_running_loop",
+      block_type: "for_loop",
+      label: "iterate_items",
+      loop_values: [],
+      status: Status.Running,
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={loop}
+        block={loop}
+        subItems={[]}
+        workflowRunIsFinalized
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("No iterations")).toBeDefined();
+  });
+
+  it("does not label a running loop as empty before iterations arrive", () => {
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_running_loop",
+      block_type: "for_loop",
+      label: "iterate_items",
+      loop_values: [],
+      status: Status.Running,
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={loop}
+        block={loop}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.queryByText("No iterations")).toBeNull();
   });
 
   it("expands a deep-linked loop with a selected iteration on initial mount", () => {

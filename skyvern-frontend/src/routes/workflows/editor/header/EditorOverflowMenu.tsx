@@ -103,7 +103,7 @@ export function EditorOverflowMenu({
   const handleTemplateToggle = () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
-      void onSave();
+      void onSave().catch(() => {});
     }
     templateMutation.mutate(newIsTemplate);
   };

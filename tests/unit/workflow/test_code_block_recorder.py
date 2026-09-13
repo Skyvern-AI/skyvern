@@ -1264,6 +1264,12 @@ class FakeWorkflowRunContext:
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
         self.credential_tested_urls: dict[str, str] = {}
+        self._failure_evidence_capture = None
+
+    start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture
+    authorize_failure_evidence_capture = WorkflowRunContext.authorize_failure_evidence_capture
+    cancel_failure_evidence_capture = WorkflowRunContext.cancel_failure_evidence_capture
+    drain_failure_evidence_capture = WorkflowRunContext.drain_failure_evidence_capture
 
     def get_block_metadata(self, label):  # noqa: ANN001, ANN201
         return {}

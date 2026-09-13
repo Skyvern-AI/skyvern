@@ -11,9 +11,15 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.secret_redaction import redact_secretlike_filename
 from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    MAX_ATTACHED_FILES_PER_MESSAGE,
+    CopilotAttachedFile,
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
@@ -23,6 +29,7 @@ TurnContextSection = Literal[
     "latest_assistant_proposal",
     "latest_run_result",
     "credential_metadata",
+    "attached_files",
 ]
 
 
@@ -86,6 +93,23 @@ class CredentialContext(BaseModel):
     omitted_credential_count: int = 0
 
 
+class AttachedFileContext(BaseModel):
+    files: list[CopilotAttachedFile] = Field(default_factory=list)
+    omitted_file_count: int = 0
+
+    def render_prompt_block(self) -> str:
+        lines: list[str] = []
+        for attached in self.files:
+            name = redact_secretlike_filename(attached.filename) or "(name unavailable)"
+            if attached.available:
+                lines.append(f"- {name} (file_id: {attached.file_id})")
+            else:
+                lines.append(f"- {name} (file_id: {attached.file_id}) — NO LONGER AVAILABLE")
+        if self.omitted_file_count:
+            lines.append(f"- ...and {self.omitted_file_count} older attachment(s) not listed")
+        return "\n".join(lines)
+
+
 class TurnContextPacket(BaseModel):
     workflow_context: WorkflowContext | None = None
     proposal_context: ProposalContext | None = None
@@ -94,6 +118,7 @@ class TurnContextPacket(BaseModel):
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
+    attached_file_context: AttachedFileContext | None = None
     omissions: list[TurnContextOmission] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
@@ -104,6 +129,7 @@ class TurnContextPacket(BaseModel):
             "runnable_draft_context",
             "run_context",
             "credential_context",
+            "attached_file_context",
         )
         return {
             "sections": [field for field in section_fields if getattr(self, field) is not None],
@@ -124,6 +150,7 @@ class TurnContextInputs(BaseModel):
     prior_workflow_yaml: str = ""
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list)
     prior_run_packet: dict[str, Any] | None = None
+    attached_files: list[CopilotAttachedFile] = Field(default_factory=list)
 
 
 def _dedupe_nonempty(values: list[str]) -> list[str]:
@@ -188,10 +215,12 @@ class TurnContextAssembler:
         workflow_char_budget: int = 12_000,
         proposal_char_budget: int = 2_000,
         credential_count_budget: int = 20,
+        attached_file_count_budget: int = MAX_ATTACHED_FILES_PER_MESSAGE,
     ) -> None:
         self.workflow_char_budget = workflow_char_budget
         self.proposal_char_budget = proposal_char_budget
         self.credential_count_budget = credential_count_budget
+        self.attached_file_count_budget = attached_file_count_budget
 
     def assemble(self, inputs: TurnContextInputs) -> TurnContextPacket:
         omissions: list[TurnContextOmission] = []
@@ -268,6 +297,9 @@ class TurnContextAssembler:
         credential_context, credential_omissions = self._credential_context(inputs.request_policy)
         omissions.extend(credential_omissions)
 
+        attached_file_context, attached_file_omissions = self._attached_file_context(inputs.attached_files)
+        omissions.extend(attached_file_omissions)
+
         packet = TurnContextPacket(
             workflow_context=workflow_context,
             proposal_context=proposal_context,
@@ -276,6 +308,7 @@ class TurnContextAssembler:
             transcript_context=transcript_context,
             run_context=run_context,
             credential_context=credential_context,
+            attached_file_context=attached_file_context,
             omissions=omissions,
         )
 
@@ -320,3 +353,21 @@ class TurnContextAssembler:
             credentials=[_safe_credential_metadata(credential) for credential in credentials],
             omitted_credential_count=omitted_count,
         ), omissions
+
+    def _attached_file_context(
+        self, attached_files: list[CopilotAttachedFile]
+    ) -> tuple[AttachedFileContext | None, list[TurnContextOmission]]:
+        if not attached_files:
+            return None, []
+        kept = attached_files[: self.attached_file_count_budget]
+        omitted_count = len(attached_files) - len(kept)
+        omissions = []
+        if omitted_count:
+            omissions.append(
+                TurnContextOmission(
+                    context_key="attached_files",
+                    reason="truncated_to_budget",
+                    detail=f"{omitted_count} attached file entries omitted",
+                )
+            )
+        return AttachedFileContext(files=kept, omitted_file_count=omitted_count), omissions

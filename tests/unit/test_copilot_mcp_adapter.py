@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -56,7 +57,7 @@ from tests.unit.copilot_test_helpers import (
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
 )
-from tests.unit.test_copilot_secret_scrub import _FakeClient, _make_server
+from tests.unit.test_copilot_secret_scrub import _FakeClient, _FakeRawResult, _make_server
 
 
 def _schema() -> dict:
@@ -259,8 +260,12 @@ _CONTEXT_EXIT_SECONDS = 1.0
 _CONTEXT_ENTER_MS = 4000
 _CONTEXT_EXIT_MS = 1000
 _GAP_WALL_MS = 10000
-_AN_HOUR_SECONDS = 3600.0
-_AN_HOUR_MS = 3_600_000
+_ACTION_OVERLAY_CASES = ["click", "type_text", "select_option", "click_no_browser"]
+_ACTION_ARGS = {
+    "click": {"selector": "#go"},
+    "type_text": {"selector": "#q", "text": "hello"},
+    "select_option": {"selector": "#s", "value": "a"},
+}
 _PHASE_KEYS = (
     "phase_session_prepare_ms",
     "phase_context_enter_ms",
@@ -1584,41 +1589,70 @@ class TestMCPToolTiming:
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("requires_browser", [False, True], ids=["no_browser", "browser"])
+    @pytest.mark.parametrize(
+        ("overlay_id", "payload"),
+        [
+            *(
+                pytest.param(
+                    overlay_id,
+                    {
+                        "ok": True,
+                        "data": {"selector": 'role=button[name="Go"]'},
+                        "browser_context": {"url": "https://example.test/form", "title": "Form"},
+                    },
+                    id=f"answered-{overlay_id}",
+                )
+                for overlay_id in _ACTION_OVERLAY_CASES
+            ),
+            pytest.param(
+                "click",
+                {
+                    "ok": False,
+                    "error": "Timeout 10000ms exceeded waiting for the element",
+                    "browser_context": {"url": "https://example.test/form", "title": "Form"},
+                },
+                id="inner_timeout-click",
+            ),
+        ],
+    )
     async def test_a_call_far_longer_than_any_plausible_ceiling_runs_to_completion(
-        self, requires_browser: bool, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, overlay_id: str, payload: dict[str, Any], _stub_browser_session: None
     ) -> None:
-        overlay = SchemaOverlay(requires_browser=requires_browser)
-        assert overlay.timeout is None
-        if requires_browser:
-            _install_timed_context(monkeypatch, _fake_clock)
-
-        dispatches = []
-
-        def _advance_an_hour() -> None:
-            dispatches.append(_fake_clock[0])
-            _fake_clock[0] += _AN_HOUR_SECONDS
-
-        server = _make_server(
-            make_copilot_ctx(browser_session_id="pbs_1"),
-            {"ok": True, "data": {"x": 1}},
-            overlay,
-            on_call=_advance_an_hour,
-        )
+        tool_name, overlay = _real_action_overlay(overlay_id)
+        immediate_client = _HeldClient(payload)
+        immediate_client.release.set()
+        immediate = await _overlay_server(
+            make_copilot_ctx(browser_session_id="pbs_1"), immediate_client, tool_name, overlay
+        ).call_tool(tool_name, _ACTION_ARGS[tool_name])
+        held_client = _HeldClient(payload)
+        held_server = _overlay_server(make_copilot_ctx(browser_session_id="pbs_1"), held_client, tool_name, overlay)
 
         with capture_logs() as captured:
-            result = await server.call_tool("evaluate", {"expression": "scan()"})
+            held = await _answer_after_loop_seconds(held_server, held_client, tool_name, 3600.0)
 
-        assert isinstance(result, CallToolResult)
-        assert result.isError is not True
-        assert len(dispatches) == 1
-        assert json.loads(result.content[0].text)["data"] == {"x": 1}
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["phase_dispatch_ms"] == _AN_HOUR_MS
-        around_the_dispatch = _SESSION_ONLY_MS + _CONTEXT_ENTER_MS + _CONTEXT_EXIT_MS if requires_browser else 0
-        assert record["wall_clock_ms"] == _AN_HOUR_MS + around_the_dispatch
-        assert record["phase_residual_ms"] == 0
+        assert len(held_client.dispatched) == 1
+        assert held_client.cancelled is False
+        assert held.content[0].text == immediate.content[0].text
+        projected = json.loads(held.content[0].text)
+        assert (projected["ok"], projected.get("error")) == (payload["ok"], payload.get("error"))
+        assert _timing_records(captured)[0]["call_status"] == ("ok" if payload["ok"] else "error")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("overlay_id", ["click", "click_no_browser"])
+    async def test_cancelling_an_action_in_flight_cancels_its_transport(
+        self, overlay_id: str, _stub_browser_session: None
+    ) -> None:
+        tool_name, overlay = _real_action_overlay(overlay_id)
+        client = _HeldClient({"ok": True})
+        server = _overlay_server(make_copilot_ctx(browser_session_id="pbs_1"), client, tool_name, overlay)
+        pending = asyncio.create_task(server.call_tool(tool_name, _ACTION_ARGS[tool_name]))
+        await asyncio.wait_for(client.started.wait(), timeout=5)
+
+        pending.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert client.cancelled is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
@@ -2402,17 +2436,64 @@ async def test_a_call_aimed_at_an_unavailable_browser_never_dispatches() -> None
     assert "recorded a browser" in payload["error"]
 
 
-def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
+def _overlay_server(
+    ctx: AgentContext, client: _FakeClient, tool_name: str, overlay: SchemaOverlay
+) -> SkyvernOverlayMCPServer:
     aliases = get_skyvern_mcp_alias_map()
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
-        overlays={"click": _build_skyvern_mcp_overlays()["click"]},
-        alias_map={"click": aliases["click"]},
-        allowlist=frozenset({aliases["click"]}),
+        overlays={tool_name: overlay},
+        alias_map={tool_name: aliases[tool_name]},
+        allowlist=frozenset({aliases[tool_name]}),
         context_provider=lambda: ctx,
     )
-    server._client = _FakeClient(payload)
+    server._client = client
     return server
+
+
+def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
+    return _overlay_server(ctx, _FakeClient(payload), "click", _build_skyvern_mcp_overlays()["click"])
+
+
+def _real_action_overlay(overlay_id: str) -> tuple[str, SchemaOverlay]:
+    if overlay_id == "click_no_browser":
+        return "click", replace(_build_skyvern_mcp_overlays()["click"], requires_browser=False)
+    return overlay_id, _build_skyvern_mcp_overlays()[overlay_id]
+
+
+class _HeldClient(_FakeClient):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.dispatched: list[str] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> _FakeRawResult:
+        self.dispatched.append(name)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return await super().call_tool(name, args, raise_on_error)
+
+
+async def _answer_after_loop_seconds(
+    server: SkyvernOverlayMCPServer, client: _HeldClient, tool_name: str, seconds: float
+) -> CallToolResult:
+    loop = asyncio.get_running_loop()
+    pending = asyncio.create_task(server.call_tool(tool_name, _ACTION_ARGS[tool_name]))
+    await asyncio.wait_for(client.started.wait(), timeout=5)
+    real_time = loop.time
+    # Moves the event loop's own clock, which asyncio.wait_for schedules against, without a real wait.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loop, "time", lambda: real_time() + seconds)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        client.release.set()
+        return await pending
 
 
 def _sensitive_click_ctx(*, registry_complete: bool) -> AgentContext:

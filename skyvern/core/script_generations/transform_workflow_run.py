@@ -9,7 +9,7 @@ from skyvern.forge import app
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, reasoning_is_turn_scoped
 
 LOG = structlog.get_logger(__name__)
 
@@ -30,6 +30,10 @@ def _process_action_for_block(
 ) -> dict[str, Any]:
     """Process a single action and add block-specific context like data extraction goal."""
     action_dump = action.model_dump()
+    if reasoning_is_turn_scoped(action_dump.get("description")):
+        # A v3 row's intention is a timeline display label ("Clicked a button"), not a prompt or a
+        # field-naming hint, so code generation keeps seeing none.
+        action_dump["intention"] = None
     action_dump["xpath"] = action.get_xpath()
     action_dump["has_mini_agent"] = action.has_mini_agent
     if (

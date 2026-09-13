@@ -50,6 +50,21 @@ def test_current_secret_values_for_redaction_respects_workflow_opt_out(
         assert api_handler_factory._current_secret_values_for_redaction() == set()
 
 
+def test_secret_values_for_drop_check_ignores_the_numeric_floor_and_the_opt_out(
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_drop",
+        mask_secrets=False,
+        secrets={"cvv": "123", "pin": "4821", "password": "real-password", "tiny": "ab"},
+    )
+    # The redaction set honors the opt-out (and floors short numbers); the drop-check set does neither,
+    # but still skips values too short to match anything meaningfully.
+    assert manager.get_secret_values_for_run("wr_drop") == set()
+    assert manager.secret_values_for_drop_check("wr_drop") == {"123", "4821", "real-password"}
+    assert manager.secret_values_for_drop_check("wr_unknown") == set()
+
+
 def test_current_secret_values_for_redaction_returns_values_when_workflow_opted_in(
     monkeypatch,
     workflow_context_manager_factory: Callable[..., WorkflowContextManager],

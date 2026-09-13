@@ -1,8 +1,11 @@
+import asyncio
 import copy
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -11,6 +14,7 @@ from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
@@ -97,6 +101,13 @@ NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
 # Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
 # value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
 _SECRET_SUBSTRING_MIN_LENGTH = 5
+
+
+@dataclass
+class _FailureEvidenceCapture:
+    workflow_run_block_id: str
+    authorization: asyncio.Event
+    task: asyncio.Task[None]
 
 
 def resolve_credential_parameter_binding(
@@ -288,7 +299,110 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        self.materialized_file_paths: dict[str, tuple[str, str]] = {}
         self.runtime_otp_values: set[str] = set()
+        self._failure_evidence_capture: _FailureEvidenceCapture | None = None
+
+    @property
+    def has_failure_evidence_capture(self) -> bool:
+        return self._failure_evidence_capture is not None
+
+    def start_failure_evidence_capture(
+        self,
+        workflow_run_block_id: str,
+        capture: Callable[[asyncio.Event], Awaitable[None]],
+    ) -> bool:
+        """Own one optional capture until it is authorized, cancelled, or drained."""
+        if self._failure_evidence_capture is not None:
+            LOG.warning(
+                "Skipping failure evidence capture because this run already owns one",
+                workflow_run_id=self.workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                owned_workflow_run_block_id=self._failure_evidence_capture.workflow_run_block_id,
+            )
+            return False
+
+        authorization = asyncio.Event()
+
+        async def run_capture() -> None:
+            try:
+                await capture(authorization)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning(
+                    "Failure evidence capture failed; continuing",
+                    workflow_run_id=self.workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(run_capture())
+        self._failure_evidence_capture = _FailureEvidenceCapture(
+            workflow_run_block_id=workflow_run_block_id,
+            authorization=authorization,
+            task=task,
+        )
+        return True
+
+    def authorize_failure_evidence_capture(self, workflow_run_block_id: str) -> bool:
+        capture = self._failure_evidence_capture
+        if capture is None or capture.workflow_run_block_id != workflow_run_block_id:
+            return False
+        capture.authorization.set()
+        return True
+
+    async def cancel_failure_evidence_capture(self) -> None:
+        capture = self._failure_evidence_capture
+        if capture is None:
+            return
+        capture.task.cancel()
+        try:
+            await asyncio.shield(capture.task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                with suppress(asyncio.CancelledError):
+                    await capture.task
+                raise
+            # The owned task reached its requested cancellation; its cancellation is consumed here.
+        finally:
+            if self._failure_evidence_capture is capture:
+                self._failure_evidence_capture = None
+
+    async def drain_failure_evidence_capture(self) -> None:
+        capture = self._failure_evidence_capture
+        if capture is None:
+            return
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                await asyncio.shield(capture.task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                capture.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await capture.task
+                raise
+            # A continuation can cancel the owned capture while cleanup is already draining it.
+            # Its cancellation is consumed here after the continuation has joined the task.
+        except TimeoutError:
+            LOG.warning(
+                "Failure evidence capture exceeded browser cleanup deadline; cancelling",
+                workflow_run_id=self.workflow_run_id,
+                workflow_run_block_id=capture.workflow_run_block_id,
+            )
+            capture.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await capture.task
+            # The suppressed join above also swallows a cancel aimed at this caller, so restore it
+            # the way both branches above do; cleanup owns the teardown that follows either way.
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                raise asyncio.CancelledError
+        finally:
+            if self._failure_evidence_capture is capture:
+                self._failure_evidence_capture = None
 
     def set_workflow(self, workflow: "Workflow") -> None:
         """
@@ -2001,6 +2115,18 @@ class WorkflowContextManager:
         if current_context is None:
             return set()
         return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
+    def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
+        """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only
+        DROPS page text on a match and never redacts with the set: a short PIN or CVV must still match."""
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return set()
+        secrets = self.workflow_run_contexts[workflow_run_id].secrets
+        # Three, not the redaction floor: a CVV is three digits, and anything shorter would drop nearly
+        # every label it was checked against.
+        return {
+            value for value in secrets.values() if isinstance(value, str) and len(value) >= 3 and value not in secrets
+        }
 
     async def register_block_parameters_for_workflow_run(
         self,

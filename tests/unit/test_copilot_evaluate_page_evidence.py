@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     OriginRunRedactionRegistry,
     browser_page_custody_lock,
     register_sensitive_origin_run_lease,
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _mark_pending_browser_interaction_observation,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools._shared import _append_flow_evidence
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
@@ -151,40 +154,21 @@ async def test_evaluate_text_only_challenge_payload_stays_diagnostic() -> None:
 
 
 @pytest.mark.asyncio
-async def test_target_url_inspection_does_not_navigate_away_from_interaction_evidence(
+async def test_target_url_inspection_refuses_while_a_sensitive_run_holds_the_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _ctx()
-    ctx.flow_evidence.append(
-        {
-            "evidence": {
-                "source_tool": "evaluate",
-                "current_url": "https://example.test/search/results?s=1",
-                "inspected_url": "https://example.test/search/results?s=1",
-                "forms": [],
-                "navigation_targets": [],
-                "result_containers": [{"tag": "table", "selector": "#results"}],
-                "challenge_controls": [],
-            },
-            "reached_via": "interaction",
-            "had_bounded_schema": True,
-            "step": 4,
-        }
-    )
-
-    async def unexpected_navigate(*_: object, **__: object) -> dict[str, object]:
-        raise AssertionError("target_url inspection should not navigate away from reached evidence")
-
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", unexpected_navigate)
+    ctx.browser_session_id = "pbs-debug"
+    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-active", session_id="pbs-debug")
+    navigate = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error", lambda *_a: None)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", navigate)
 
     result = await _inspect_page_for_composition_impl(ctx, "https://example.test/")
 
     assert result["ok"] is False
-    assert result["data"] == {
-        "current_url": "https://example.test/search/results?s=1",
-        "observation_step": 4,
-    }
-    assert 'target_url="current_page"' in result["error"]
+    assert result["error"] == SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR
+    navigate.assert_not_awaited()
 
 
 def _current_page_after_credential_run(monkeypatch: pytest.MonkeyPatch) -> CopilotContext:
@@ -752,6 +736,57 @@ async def test_a_non_scalar_read_returns_visible_designation_candidates_as_facts
 
 
 @pytest.mark.asyncio
+async def test_designation_candidates_are_redacted_and_bounded_before_the_model_sees_them() -> None:
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c0", outcome="the number of visitors", output_path="output.visitors")
+        ]
+    )
+    _append_flow_evidence(
+        ctx,
+        {
+            "source_tool": "inspect_page_for_composition",
+            "inspection_warnings": [],
+            "result_containers": [],
+            "key_value_relations": [
+                {
+                    "key_text": "Deploy key = " + "L" * 200,
+                    "value_text": "sk-live-abcdefghijklmnopqrstuvwxyz012345",
+                    "visible": True,
+                    "value_visible": True,
+                },
+                {"key_text": "Password", "value_text": "hunter2", "visible": True, "value_visible": True},
+                {"key_text": "API key", "value_text": "9f3c2201aa", "visible": True, "value_visible": True},
+                {
+                    "key_text": "Region = " + "L" * 200,
+                    "value_text": "us-east-1",
+                    "visible": True,
+                    "value_visible": True,
+                },
+            ],
+        },
+        reached_via="current_page",
+    )
+
+    await _evaluate_pre_hook({"expression": "document.body.innerText", "output_path": "output.visitors"}, ctx)
+    gathered = await _evaluate_post_hook(
+        {
+            "ok": True,
+            "data": {
+                "result": {"label": "Visitors", "value": "8.89K"},
+                "url": "https://dash.example.test/web",
+            },
+        },
+        raw={"name": "evaluate"},
+        ctx=ctx,
+    )
+
+    candidates = gathered["data"]["requested_output_designation_candidates"]
+    assert candidates == [{"label": "Region = " + "L" * 200, "value_text": "us-east-1"}]
+
+
+@pytest.mark.asyncio
 async def test_a_read_naming_an_output_the_request_never_asked_for_is_not_bound_to_it() -> None:
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 
@@ -880,3 +915,15 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
     assert result["resolved_login_credential_name"] == "analytics"
     assert ctx.request_policy.live_page_admitted_urls == {"cred_analytics": login_url}
     assert "tested_url" not in json.dumps(result)
+
+
+def test_evaluate_overlay_leaves_headroom_beneath_the_tools_own_deadline() -> None:
+    """An equal ceiling cancels the call before the tool's bound can report its factual TIMEOUT,
+    so the model would see the generic unknown-effect error instead."""
+    from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays
+
+    overlay = _build_skyvern_mcp_overlays()["evaluate"]
+
+    assert overlay.timeout is not None
+    assert overlay.timeout > DEFAULT_ACTION_TIMEOUT_MS / 1000, overlay.timeout

@@ -8,7 +8,7 @@ import {
   useCallback,
   memo,
 } from "react";
-import { getClient } from "@/api/AxiosClient";
+import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { ActionsApiResponse, getReadableActionType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
@@ -22,6 +22,9 @@ import {
   CheckIcon,
   ArrowUpIcon,
   Pencil1Icon,
+  FileIcon,
+  PlusIcon,
+  ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -39,6 +42,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  CopilotAttachedFile,
   WorkflowCopilotCancelRequest,
   WorkflowCopilotCancelSource,
   WorkflowCopilotChatHistoryMessage,
@@ -405,6 +409,106 @@ export interface ChatMessage {
   narrative?: TurnNarrativeState;
   // FE-synthetic rows (never persisted, never sent to the LLM).
   kind?: "run_lifecycle" | "status_notice";
+  attachedFiles?: CopilotAttachedFile[];
+}
+
+const ATTACHMENT_EXTENSIONS = [
+  ".csv",
+  ".xlsx",
+  ".xls",
+  ".pdf",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".webp",
+  ".tiff",
+  ".tif",
+] as const;
+const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.join(",");
+const ATTACHMENT_SIZE_LIMIT_BYTES = 10 * 1024 * 1024;
+// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the chat request.
+const ATTACHMENT_COUNT_LIMIT = 20;
+
+function isSupportedAttachment(file: File): boolean {
+  const filename = file.name.toLowerCase();
+  return ATTACHMENT_EXTENSIONS.some((extension) =>
+    filename.endsWith(extension),
+  );
+}
+
+function hasFileDragPayload(dataTransfer: DataTransfer): boolean {
+  return Array.from(dataTransfer.types).includes("Files");
+}
+
+function sameFileIds(turnFileIds: string[] | undefined, fileIds: string[]) {
+  return (
+    turnFileIds !== undefined &&
+    turnFileIds.length === fileIds.length &&
+    fileIds.every((fileId) => turnFileIds.includes(fileId))
+  );
+}
+
+// An in-flight or failed upload has no file id yet, so it is tracked beside the resolved ones.
+type PendingAttachment = {
+  localId: string;
+  filename: string;
+  status: "uploading" | "error";
+  error?: string;
+};
+
+function AttachmentChip({
+  filename,
+  available,
+  status,
+  error,
+  onRemove,
+}: {
+  filename: string;
+  available?: boolean;
+  status?: "uploading" | "error";
+  error?: string;
+  onRemove?: () => void;
+}) {
+  const unusable = status === "error" || available === false;
+  return (
+    <span
+      className={cn(
+        "flex max-w-[220px] items-center gap-1.5 rounded-md border px-2 py-1 text-[11.5px]",
+        unusable
+          ? "border-destructive/40 text-destructive"
+          : "border-white/10 bg-slate-elevation3 text-muted-foreground",
+      )}
+    >
+      {status === "uploading" ? (
+        <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
+      ) : unusable ? (
+        <ExclamationTriangleIcon className="h-3 w-3 shrink-0" />
+      ) : (
+        <FileIcon className="h-3 w-3 shrink-0" />
+      )}
+      <span className="min-w-0 flex-1 truncate" title={filename}>
+        {filename || "Unnamed file"}
+      </span>
+      {available === false ? (
+        <span className="shrink-0 text-[10px]">no longer available</span>
+      ) : null}
+      {status === "error" && error ? (
+        <span className="shrink-0 text-[10px]">{error}</span>
+      ) : null}
+      {onRemove ? (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`Remove ${filename}`}
+          className="shrink-0 rounded p-0.5 hover:bg-accent hover:text-accent-foreground"
+        >
+          <Cross2Icon className="h-3 w-3" />
+        </button>
+      ) : null}
+    </span>
+  );
 }
 
 function connectedAccountSelectionReceipt(
@@ -479,6 +583,7 @@ type QueuedPrompt = {
   reason: QueuedPromptReason;
   audioBlob?: Blob | null;
   idempotencyKey?: string;
+  attachments?: CopilotAttachedFile[];
 };
 
 type SendOptions = {
@@ -487,6 +592,7 @@ type SendOptions = {
   skipQueue?: boolean;
   audioBlob?: Blob | null;
   idempotencyKey?: string;
+  attachments?: CopilotAttachedFile[];
 };
 
 type WorkflowCopilotSsePayload =
@@ -630,6 +736,17 @@ const MessageItem = memo(
       return (
         <div className="flex justify-end">
           <div className="max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+            {message.attachedFiles && message.attachedFiles.length > 0 ? (
+              <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+                {message.attachedFiles.map((attached) => (
+                  <AttachmentChip
+                    key={attached.file_id}
+                    filename={attached.filename}
+                    available={attached.available}
+                  />
+                ))}
+              </div>
+            ) : null}
             <div className="flex items-end gap-2">
               <p className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
                 {message.content}
@@ -851,6 +968,47 @@ export function WorkflowCopilotChat({
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
+  const [attachments, setAttachments] = useState<CopilotAttachedFile[]>([]);
+  // A file returned to the tray after a failed send may already be saved on that message, so
+  // removing its chip must not delete it; only a never-posted upload is safe to delete.
+  const postedFileIds = useRef<Set<string>>(new Set());
+  // Files whose chat request is on the wire but not yet confirmed; a same-tick duplicate can hold the
+  // same ids, so nothing reached through that duplicate may delete them until the request settles.
+  const inFlightFileIds = useRef<Set<string>>(new Set());
+  // Files whose page-exit delete was issued and has not been answered yet, plus whether the page is
+  // currently hidden: an upload that lands while hidden has no chip anyone can act on.
+  const reclaimingFiles = useRef<Map<string, CopilotAttachedFile>>(new Map());
+  const pageHiddenRef = useRef(false);
+  const attachmentsRef = useRef<CopilotAttachedFile[]>([]);
+  attachmentsRef.current = attachments;
+  // Files a send has taken out of the tray but not yet posted; only unmount cleanup can reach them.
+  // One entry per send that has taken files out of the tray and not yet posted them. New chat can
+  // abort a send mid-preflight and let the next one start, so several can be waiting at once.
+  const unpostedSendsRef = useRef<Set<CopilotAttachedFile[]>>(new Set());
+  const composerMountedRef = useRef(true);
+  const returnFilesToTray = useCallback((files: CopilotAttachedFile[]) => {
+    // A file whose page-exit delete is on the wire, or already done, must not come back: its chip
+    // could never be removed again, since the second delete answers 404.
+    const restorable = files.filter(
+      (item) => !reclaimingFiles.current.has(item.file_id),
+    );
+    if (restorable.length === 0) return;
+    setAttachments((current) => {
+      const known = new Set(current.map((item) => item.file_id));
+      return [
+        ...current,
+        ...restorable.filter((item) => !known.has(item.file_id)),
+      ];
+    });
+  }, []);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  pendingAttachmentsRef.current = pendingAttachments;
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const fileDragDepthRef = useRef(0);
+  const [isFileDragging, setIsFileDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   // A stop is a round trip to the backend; without this the control stays
   // live-looking and users press it repeatedly.
@@ -945,6 +1103,7 @@ export function WorkflowCopilotChat({
     hadBlockTarget: boolean;
     browserSessionId: string | null;
     codeBlock: boolean | null;
+    attachmentIds: string[];
     completedNormally: boolean;
   } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
@@ -1571,6 +1730,12 @@ export function WorkflowCopilotChat({
     setQueuedPrompt(next);
   }, []);
 
+  // A queued message's files already left the tray, so throwing the queue away would strand them.
+  const discardQueuedPrompt = useCallback(() => {
+    returnFilesToTray(queuedPromptRef.current?.attachments ?? []);
+    updateQueuedPrompt(null);
+  }, [returnFilesToTray, updateQueuedPrompt]);
+
   const handleNewChat = () => {
     streamingAbortController.current?.abort();
     streamingAbortController.current = null;
@@ -1580,7 +1745,7 @@ export function WorkflowCopilotChat({
     setQuestionCancelToken(null);
     stopRecoveryPolls();
     setMessages([]);
-    updateQueuedPrompt(null);
+    discardQueuedPrompt();
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setPendingProposalTurnId(null);
@@ -1609,6 +1774,10 @@ export function WorkflowCopilotChat({
         sender: message.sender,
         content: message.content,
         timestamp: message.created_at,
+        attachedFiles:
+          message.attached_files && message.attached_files.length > 0
+            ? message.attached_files
+            : undefined,
         narrative: (() => {
           const hydrated = hydrateHistoryNarrative(
             message.narrative_payload,
@@ -1882,7 +2051,7 @@ export function WorkflowCopilotChat({
       }
       stopRecoveryPolls();
       setIsLoadingHistory(true);
-      updateQueuedPrompt(null);
+      discardQueuedPrompt();
       setRejectedTurnIds(new Set());
       setAcceptedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
@@ -1917,8 +2086,8 @@ export function WorkflowCopilotChat({
       workflowPermanentId,
       applyHistoryResponse,
       stopRecoveryPolls,
-      updateQueuedPrompt,
       repin,
+      discardQueuedPrompt,
     ],
   );
 
@@ -2133,6 +2302,250 @@ export function WorkflowCopilotChat({
     return latestChatId;
   };
 
+  const uploadAttachment = useCallback(
+    async (file: File) => {
+      if (file.size > ATTACHMENT_SIZE_LIMIT_BYTES) {
+        toast({
+          variant: "destructive",
+          title: "File too large",
+          description: `${file.name} exceeds the 10MB limit.`,
+        });
+        setPendingAttachments((prev) => [
+          ...prev,
+          {
+            localId: crypto.randomUUID(),
+            filename: file.name,
+            status: "error",
+            error: "over 10MB",
+          },
+        ]);
+        return;
+      }
+      const uploadingCount = pendingAttachmentsRef.current.filter(
+        (item) => item.status === "uploading",
+      ).length;
+      if (
+        attachmentsRef.current.length + uploadingCount >=
+        ATTACHMENT_COUNT_LIMIT
+      ) {
+        toast({
+          variant: "destructive",
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files.`,
+        });
+        return;
+      }
+      const localId = crypto.randomUUID();
+      setPendingAttachments((prev) => [
+        ...prev,
+        { localId, filename: file.name, status: "uploading" },
+      ]);
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const formData = new FormData();
+        formData.append("file", file);
+        const response = await client.post<
+          FormData,
+          { data: { file_id: string } }
+        >("/upload_file", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        if (!composerMountedRef.current || pageHiddenRef.current) {
+          // Nothing can reach this file: the composer is gone, or the page was left while the upload
+          // was still running, so page-exit cleanup never saw an id for it.
+          setPendingAttachments((prev) =>
+            prev.filter((item) => item.localId !== localId),
+          );
+          const abandoned: CopilotAttachedFile = {
+            file_id: response.data.file_id,
+            filename: file.name,
+            size_bytes: file.size,
+            available: true,
+          };
+          void removeUnsentUploadRef
+            .current(abandoned.file_id)
+            .then((deleted) => {
+              // A delete that never landed leaves the upload reachable only through a chip, so a
+              // page that comes back gets one rather than losing the file.
+              if (!deleted && composerMountedRef.current) {
+                returnFilesToTrayRef.current([abandoned]);
+              }
+            });
+          return;
+        }
+        setPendingAttachments((prev) =>
+          prev.filter((item) => item.localId !== localId),
+        );
+        setAttachments((prev) => [
+          ...prev.filter((item) => item.file_id !== response.data.file_id),
+          {
+            file_id: response.data.file_id,
+            filename: file.name,
+            size_bytes: file.size,
+            available: true,
+          },
+        ]);
+      } catch (error) {
+        setPendingAttachments((prev) =>
+          prev.map((item) =>
+            item.localId === localId
+              ? {
+                  ...item,
+                  status: "error",
+                  error: "upload failed",
+                }
+              : item,
+          ),
+        );
+        toast({
+          variant: "destructive",
+          title: "Upload failed",
+          description: `Could not attach ${file.name}. Try again.`,
+        });
+      }
+    },
+    [credentialGetter],
+  );
+
+  const removeUnsentUpload = useCallback(
+    async (fileId: string): Promise<boolean> => {
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        await client.delete(`/files/${fileId}`);
+        return true;
+      } catch (error) {
+        console.warn("Failed to delete removed attachment:", error);
+        return false;
+      }
+    },
+    [credentialGetter],
+  );
+
+  const removeUnsentUploadRef = useRef(removeUnsentUpload);
+  removeUnsentUploadRef.current = removeUnsentUpload;
+  const returnFilesToTrayRef = useRef(returnFilesToTray);
+  returnFilesToTrayRef.current = returnFilesToTray;
+
+  // Leaving the page skips React cleanup and cancels in-flight requests, so pagehide sends a keepalive
+  // delete the browser completes after the page is gone; unmount covers in-app navigation.
+  useEffect(() => {
+    composerMountedRef.current = true;
+    // The same Set for the component's lifetime; ids posted later are still visible through it.
+    const posted = postedFileIds.current;
+    const inFlight = inFlightFileIds.current;
+    const reclaimed = reclaimingFiles.current;
+    const deletions = new Map<string, Promise<boolean>>();
+    const abandonedFiles = () => {
+      const byId = new Map<string, CopilotAttachedFile>();
+      for (const attached of [
+        ...attachmentsRef.current,
+        ...(queuedPromptRef.current?.attachments ?? []),
+        ...[...unpostedSendsRef.current].flat(),
+      ]) {
+        const fileId = attached.file_id;
+        if (
+          posted.has(fileId) ||
+          inFlight.has(fileId) ||
+          reclaimed.has(fileId)
+        ) {
+          continue;
+        }
+        byId.set(fileId, attached);
+      }
+      return [...byId.values()];
+    };
+    const onPageHide = () => {
+      pageHiddenRef.current = true;
+      for (const attached of abandonedFiles()) {
+        reclaimed.set(attached.file_id, attached);
+        deletions.set(
+          attached.file_id,
+          deleteUploadedFileOnPageExit(attached.file_id),
+        );
+      }
+    };
+    // A back/forward-cached page can be evicted without ever running cleanup, so pagehide deletes even
+    // when the page may return; if it does, those files leave the tray instead of naming deleted uploads.
+    const onPageShow = (event: PageTransitionEvent) => {
+      pageHiddenRef.current = false;
+      if (!event.persisted || deletions.size === 0) {
+        return;
+      }
+      const attempts = [...deletions.entries()];
+      deletions.clear();
+      void Promise.all(
+        attempts.map(async ([fileId, attempt]) => ({
+          fileId,
+          deleted: await attempt,
+        })),
+      ).then((results) => {
+        // A delete the browser never completed leaves the upload reachable, so its file comes back
+        // to the tray, even if a send in the meantime cleared it, and can be tried again.
+        const kept: CopilotAttachedFile[] = [];
+        for (const { fileId, deleted } of results) {
+          if (deleted) {
+            continue;
+          }
+          const attached = reclaimed.get(fileId);
+          reclaimed.delete(fileId);
+          if (attached) {
+            kept.push(attached);
+          }
+        }
+        if (kept.length > 0 && composerMountedRef.current) {
+          returnFilesToTrayRef.current(kept);
+        }
+        const gone = new Set(
+          results.filter((result) => result.deleted).map((r) => r.fileId),
+        );
+        if (gone.size === 0 || !composerMountedRef.current) {
+          return;
+        }
+        setAttachments((current) =>
+          current.filter((attached) => !gone.has(attached.file_id)),
+        );
+        // Written through the ref and setter rather than updateQueuedPrompt so this effect keeps no
+        // dependencies: its cleanup deletes uploads and must run only on unmount.
+        const queued = queuedPromptRef.current;
+        if (
+          queued?.attachments?.some((attached) => gone.has(attached.file_id))
+        ) {
+          const kept = queued.attachments.filter(
+            (attached) => !gone.has(attached.file_id),
+          );
+          const next = { ...queued, attachments: kept };
+          queuedPromptRef.current = next;
+          setQueuedPrompt(next);
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === queued.id
+                ? {
+                    ...message,
+                    attachedFiles: kept.length > 0 ? kept : undefined,
+                  }
+                : message,
+            ),
+          );
+        }
+        toast({
+          title: "Attachments removed",
+          description:
+            "Files staged before you left the page were deleted. Attach them again to send.",
+        });
+      });
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      composerMountedRef.current = false;
+      for (const attached of abandonedFiles()) {
+        void removeUnsentUploadRef.current(attached.file_id);
+      }
+    };
+  }, []);
+
   const uploadDictationAudio = useCallback(
     async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
       if (!workflowPermanentId) {
@@ -2262,7 +2675,7 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId) {
       stopRecoveryPolls();
       setMessages([]);
-      updateQueuedPrompt(null);
+      discardQueuedPrompt();
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setPendingProposalTurnId(null);
@@ -2319,6 +2732,7 @@ export function WorkflowCopilotChat({
     updateQueuedPrompt,
     workflowPermanentId,
     applyHistoryResponse,
+    discardQueuedPrompt,
   ]);
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
@@ -2357,11 +2771,14 @@ export function WorkflowCopilotChat({
     if (!wasDiagnoseAction) {
       setInputValue((current) => (current.trim() ? current : queued.content));
     }
+    // The files belong to the message being edited, so they return to the tray with its text.
+    // Without this the resubmitted message silently goes out with no attachment.
+    returnFilesToTray(queued.attachments ?? []);
     window.requestAnimationFrame(() => {
       textareaRef.current?.focus();
       adjustTextareaHeight();
     });
-  }, [adjustTextareaHeight, updateQueuedPrompt]);
+  }, [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt]);
 
   const cancelSend = useCallback(
     async (
@@ -2534,6 +2951,95 @@ export function WorkflowCopilotChat({
   const hasPendingQuestion = questionInteractions.some(
     (item) => item.status === "pending",
   );
+  const uploadDroppedAttachments = useCallback(
+    (files: FileList) => {
+      const droppedFiles = Array.from(files);
+      const supportedFiles = droppedFiles.filter(isSupportedAttachment);
+      const unsupportedFiles = droppedFiles.filter(
+        (file) => !isSupportedAttachment(file),
+      );
+      const oversizedFiles = supportedFiles.filter(
+        (file) => file.size > ATTACHMENT_SIZE_LIMIT_BYTES,
+      );
+      const uploadableFiles = supportedFiles.filter(
+        (file) => file.size <= ATTACHMENT_SIZE_LIMIT_BYTES,
+      );
+      if (unsupportedFiles.length > 0) {
+        toast({
+          variant: "destructive",
+          title: "Unsupported file type",
+          description: `${unsupportedFiles.map((file) => file.name).join(", ")} cannot be attached.`,
+        });
+      }
+
+      const uploadingCount = pendingAttachmentsRef.current.filter(
+        (item) => item.status === "uploading",
+      ).length;
+      const availableSlots = Math.max(
+        0,
+        ATTACHMENT_COUNT_LIMIT - attachmentsRef.current.length - uploadingCount,
+      );
+      if (uploadableFiles.length > availableSlots) {
+        toast({
+          variant: "destructive",
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files.`,
+        });
+      }
+      oversizedFiles.forEach((file) => void uploadAttachment(file));
+      uploadableFiles
+        .slice(0, availableSlots)
+        .forEach((file) => void uploadAttachment(file));
+    },
+    [uploadAttachment],
+  );
+
+  const handleComposerDragEnter = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      fileDragDepthRef.current += 1;
+      if (!hasPendingQuestion) setIsFileDragging(true);
+    },
+    [hasPendingQuestion],
+  );
+
+  const handleComposerDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = hasPendingQuestion ? "none" : "copy";
+    },
+    [hasPendingQuestion],
+  );
+
+  const handleComposerDragLeave = useCallback(() => {
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setIsFileDragging(false);
+  }, []);
+
+  const handleComposerDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      fileDragDepthRef.current = 0;
+      setIsFileDragging(false);
+      if (hasPendingQuestion) {
+        toast({
+          title: "Answer the pending question first",
+          description: "You can attach files to your next message afterward.",
+        });
+        return;
+      }
+      uploadDroppedAttachments(event.dataTransfer.files);
+    },
+    [hasPendingQuestion, uploadDroppedAttachments],
+  );
+  useEffect(() => {
+    if (!hasPendingQuestion) return;
+    fileDragDepthRef.current = 0;
+    setIsFileDragging(false);
+  }, [hasPendingQuestion]);
   useEffect(() => {
     if (!hasPendingQuestion || !workflowCopilotChatId) return;
     let disposed = false;
@@ -2593,6 +3099,22 @@ export function WorkflowCopilotChat({
         return;
       }
       const isDrain = Boolean(options.queuedMessageId);
+      // The tray belongs to the message the user is composing, so only that send may spend it —
+      // whether it sends now, queues, or replaces a queued message. A drain carries the queued
+      // message's own files, and a programmatic send (Test end-to-end, an account choice, a block
+      // regeneration) is not the user's message at all; either taking the tray would attach the
+      // user's file to something they did not attach it to.
+      const composerSend =
+        messageOverride === undefined && options.attachments === undefined;
+      let sentAttachments =
+        options.attachments ?? (composerSend ? attachments : []);
+      // Only failed chips go: an upload can start while dictation finalizes, and that file is for the next message.
+      const clearSentTray = () => {
+        setAttachments([]);
+        setPendingAttachments((prev) =>
+          prev.filter((item) => item.status !== "error"),
+        );
+      };
       const action = resolveSendAction({
         inFlight: inFlightRef.current,
         hasQueuedPrompt: Boolean(queuedPromptRef.current),
@@ -2605,6 +3127,16 @@ export function WorkflowCopilotChat({
       if (action === "noop") {
         // Nothing was sent, so the arm must not survive onto whatever the user types next.
         productActionRef.current = null;
+        if (
+          composerSend &&
+          (attachments.length > 0 ||
+            pendingAttachments.some((item) => item.status === "uploading"))
+        ) {
+          toast({
+            title: "Add a message",
+            description: "Tell Copilot what to do with the attached file.",
+          });
+        }
         return;
       }
       if (!workflowPermanentId) {
@@ -2617,6 +3149,30 @@ export function WorkflowCopilotChat({
         return;
       }
 
+      // Only a composer-sourced send may be refused. A drain — with or without files of its own —
+      // has no stake in an upload meant for the next message, and its queued prompt is already
+      // cleared, so refusing it would drop that message with nothing left to re-drain.
+      if (
+        composerSend &&
+        pendingAttachments.some((item) => item.status === "uploading")
+      ) {
+        toast({
+          title: "Upload in progress",
+          description:
+            "Wait for the attachment to finish uploading, then send.",
+        });
+        return;
+      }
+      // A queued message's files return to the tray on edit or discard, so the tray can pass the
+      // per-message limit that attaching enforces; refuse before anything leaves it.
+      if (composerSend && attachments.length > ATTACHMENT_COUNT_LIMIT) {
+        toast({
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files. Remove ${attachments.length - ATTACHMENT_COUNT_LIMIT} to send.`,
+        });
+        return;
+      }
+
       let messageAudioBlob = options.audioBlob ?? null;
       if (!messageAudioBlob && messageOverride === undefined) {
         if (isSpeechListening) {
@@ -2624,12 +3180,36 @@ export function WorkflowCopilotChat({
         }
         messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
       }
+      if (composerSend) {
+        // The tray stays interactive while dictation finalizes, so a file removed then must not go.
+        sentAttachments = attachmentsRef.current;
+      }
+      // A delete is already on the wire for these, so no send may name them — a drain carries the
+      // queued message's own files and would otherwise skip this.
+      if (
+        sentAttachments.some((attached) =>
+          reclaimingFiles.current.has(attached.file_id),
+        )
+      ) {
+        sentAttachments = sentAttachments.filter(
+          (attached) => !reclaimingFiles.current.has(attached.file_id),
+        );
+        toast({
+          title: "Attachment removed",
+          description:
+            "A file attached to this message was deleted, so it was not sent.",
+        });
+      }
 
       if (action === "replace_queued") {
         const queued = queuedPromptRef.current;
         if (!queued) {
           return;
         }
+        const replacedAttachments =
+          composerSend && sentAttachments.length > 0
+            ? sentAttachments
+            : queued.attachments;
         // New text: the block-build scope and the end-to-end action belonged to the message being
         // replaced. Carrying the action over would run the whole workflow for real on text the user
         // wrote to say something else.
@@ -2641,11 +3221,33 @@ export function WorkflowCopilotChat({
           audioBlob: messageAudioBlob,
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
+          attachments: replacedAttachments,
         });
+        if (composerSend) {
+          clearSentTray();
+          // Files the replaced queued message carried and the new one does not were never sent,
+          // so they return to the tray rather than becoming unreachable uploads.
+          const kept = new Set(
+            (replacedAttachments ?? []).map((item) => item.file_id),
+          );
+          returnFilesToTray(
+            (queued.attachments ?? []).filter(
+              (item) => !kept.has(item.file_id),
+            ),
+          );
+        }
         setMessages((prev) =>
           prev.map((message) =>
             message.id === queued.id
-              ? { ...message, sender: "user", content: candidate }
+              ? {
+                  ...message,
+                  sender: "user",
+                  content: candidate,
+                  attachedFiles:
+                    replacedAttachments && replacedAttachments.length > 0
+                      ? replacedAttachments
+                      : undefined,
+                }
               : message,
           ),
         );
@@ -2666,7 +3268,11 @@ export function WorkflowCopilotChat({
           audioBlob: messageAudioBlob,
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
+          attachments: sentAttachments,
         });
+        if (composerSend) {
+          clearSentTray();
+        }
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
         if (!options.queuedMessageId) {
@@ -2676,6 +3282,8 @@ export function WorkflowCopilotChat({
               id: queuedId,
               sender: echoSenderForArmedAction(),
               content: candidate,
+              attachedFiles:
+                sentAttachments.length > 0 ? sentAttachments : undefined,
             },
           ]);
         }
@@ -2701,11 +3309,18 @@ export function WorkflowCopilotChat({
       }
 
       const userMessageId = options.queuedMessageId ?? Date.now().toString();
+      const sendOwnsTray = composerSend;
       const userMessage: ChatMessage = {
         id: userMessageId,
         sender: echoSenderForArmedAction(),
         content: candidate,
+        attachedFiles: sentAttachments.length > 0 ? sentAttachments : undefined,
       };
+      if (sendOwnsTray) {
+        clearSentTray();
+      }
+      const registeredAttachments = sentAttachments;
+      unpostedSendsRef.current.add(registeredAttachments);
 
       const cancelToken = crypto.randomUUID();
       pendingCancelToken.current = cancelToken;
@@ -2715,6 +3330,20 @@ export function WorkflowCopilotChat({
       pendingMessageId.current = userMessageId;
       if (!options.queuedMessageId) {
         setMessages((prev) => [...prev, userMessage]);
+      } else {
+        // Also when the filtered list is empty: a queued bubble must not keep showing files the
+        // request did not carry.
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === userMessageId
+              ? {
+                  ...message,
+                  attachedFiles:
+                    sentAttachments.length > 0 ? sentAttachments : undefined,
+                }
+              : message,
+          ),
+        );
       }
       const messageContent = candidate;
       if (messageOverride === undefined && !options.queuedMessageId) {
@@ -2732,6 +3361,7 @@ export function WorkflowCopilotChat({
         hadBlockTarget: blockBuildTargetLabelRef.current !== null,
         browserSessionId: liveBrowserSessionId ?? null,
         codeBlock: codeBlockModeEnabled ? codeBlockRequestOverride : false,
+        attachmentIds: sentAttachments.map((attached) => attached.file_id),
         completedNormally: false,
       };
       // Clear the prior turn's lingering narrative so the instant-ack placeholder's
@@ -2748,6 +3378,21 @@ export function WorkflowCopilotChat({
       // turn whose chat the user left is kept from arming a recovery re-read.
       let sendGeneration = recoveryGeneration.current;
       let streamTurnId: string | null = null;
+      let requestStarted = false;
+      // No message holds these files unless the server saved the turn before it was cut off, so they
+      // come back to the tray. Once the request went out they are kept if removed; before that, a
+      // removal still deletes them.
+      const returnPossiblySavedFiles = () => {
+        if (streamTurnId !== null || !composerMountedRef.current) {
+          return;
+        }
+        if (requestStarted) {
+          for (const attached of sentAttachments) {
+            postedFileIds.current.add(attached.file_id);
+          }
+        }
+        returnFilesToTray(sentAttachments);
+      };
       let streamChatId: string | null = null;
       let sawTerminalFrame = false;
       const shouldArmRecovery = () =>
@@ -2778,6 +3423,9 @@ export function WorkflowCopilotChat({
 
         if (!workflowId) {
           productActionRef.current = null;
+          // Nothing was sent, so whichever message these files came with — the composer's or a
+          // drained queued one, whose queued prompt is already gone — they return to the tray.
+          returnFilesToTray(sentAttachments);
           toast({
             title: "Missing agent",
             description: "Agent ID is required to chat.",
@@ -3085,6 +3733,45 @@ export function WorkflowCopilotChat({
           lastTurnRef.current.hadBlockTarget = targetBlockLabel !== null;
           lastTurnRef.current.codeBlock = requestCodeBlock;
         }
+        // Unmount cleanup has already deleted this send's files. Any other abort (New chat, a chat
+        // switch) leaves them unposted with no message holding them, so they go back to the tray.
+        if (!composerMountedRef.current || abortController.signal.aborted) {
+          if (composerMountedRef.current) {
+            returnFilesToTray(sentAttachments);
+          }
+          return;
+        }
+        unpostedSendsRef.current.delete(registeredAttachments);
+        // Leaving the page during the awaits above can have deleted these ids, so the last word on
+        // what this request carries is taken here rather than before them.
+        const reclaimedSinceSend = sentAttachments.filter((attached) =>
+          reclaimingFiles.current.has(attached.file_id),
+        );
+        if (reclaimedSinceSend.length > 0) {
+          sentAttachments = sentAttachments.filter(
+            (attached) => !reclaimingFiles.current.has(attached.file_id),
+          );
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === userMessageId
+                ? {
+                    ...message,
+                    attachedFiles:
+                      sentAttachments.length > 0 ? sentAttachments : undefined,
+                  }
+                : message,
+            ),
+          );
+          toast({
+            title: "Attachment removed",
+            description:
+              "A file attached to this message was deleted, so it was not sent.",
+          });
+        }
+        requestStarted = true;
+        for (const attached of sentAttachments) {
+          inFlightFileIds.current.add(attached.file_id);
+        }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -3097,6 +3784,9 @@ export function WorkflowCopilotChat({
             selected_connected_account_id:
               options.selectedConnectedAccountId ?? null,
             audio_artifact_id: audioArtifactId,
+            attached_file_ids: sentAttachments.map(
+              (attached) => attached.file_id,
+            ),
             workflow_yaml: workflowYaml,
             mode: "build",
             code_block: requestCodeBlock,
@@ -3213,6 +3903,11 @@ export function WorkflowCopilotChat({
                 }
                 latestTurnId.current = payload.turn_id;
                 streamTurnId = payload.turn_id;
+                // The server has saved these files on the turn. A same-tick duplicate queued behind it
+                // shares their ids, so editing that duplicate must not let a removal delete them.
+                for (const attached of sentAttachments) {
+                  postedFileIds.current.add(attached.file_id);
+                }
                 // The chat this turn belongs to, read while the server is
                 // announcing it. Reading the ref at arming time instead would
                 // bind the poll to whatever chat the user switched to since.
@@ -3258,6 +3953,10 @@ export function WorkflowCopilotChat({
               case "error": {
                 const frozenNarrative = applyStoredNarrativeEvent(payload);
                 sawTerminalFrame = true;
+                // The stream ends normally on an error frame, so the catch-path restore never runs.
+                if (streamTurnId === null) {
+                  returnFilesToTray(sentAttachments);
+                }
                 handleError(payload, frozenNarrative);
                 return true;
               }
@@ -3267,7 +3966,15 @@ export function WorkflowCopilotChat({
           },
           { signal: abortController.signal },
         );
+        // The streaming client resolves rather than throws on abort, so New chat, a chat switch, or
+        // Stop before turn_start ends here, not in the catch.
+        if (abortController.signal.aborted) {
+          returnPossiblySavedFiles();
+        }
       } catch (error) {
+        // A stream severed before turn_start may still have been saved by the server. An error frame
+        // before turn_start is definitive and leaves the files deletable.
+        returnPossiblySavedFiles();
         if (abortController.signal.aborted) {
           return;
         }
@@ -3305,6 +4012,12 @@ export function WorkflowCopilotChat({
         setNarrative(EMPTY_NARRATIVE);
         setLivePauseFrame(null);
       } finally {
+        if (requestStarted) {
+          for (const attached of sentAttachments) {
+            inFlightFileIds.current.delete(attached.file_id);
+          }
+        }
+        unpostedSendsRef.current.delete(registeredAttachments);
         // Read before the clears below null cancelInFlightController. A soft Stop
         // sets it synchronously and only aborts 15s later, so the abort signal
         // alone would let a user cancel arm the recovery poll.
@@ -3357,6 +4070,8 @@ export function WorkflowCopilotChat({
       credentialGetter,
       fetchRecordedActions,
       finalizeRecordedActionsPoll,
+      attachments,
+      pendingAttachments,
       focusTurnRun,
       followBuildLabel,
       getSaveData,
@@ -3374,6 +4089,7 @@ export function WorkflowCopilotChat({
       stopAllRecordedActionsPolls,
       requiresLiveBrowser,
       resyncProposalFromChatRow,
+      returnFilesToTray,
       rollbackPendingTerminalContinuation,
       startRecoveryPoll,
       stopSpeech,
@@ -3543,6 +4259,10 @@ export function WorkflowCopilotChat({
         lastTurn?.codeBlock ===
           (codeBlockModeEnabled ? codeBlockRequestOverride : false) &&
         (queuedPrompt.audioBlob ?? null) === null &&
+        sameFileIds(
+          lastTurn?.attachmentIds,
+          (queuedPrompt.attachments ?? []).map((attached) => attached.file_id),
+        ) &&
         queuedPrompt.selectedConnectedAccountId === undefined &&
         blockBuildTargetLabelRef.current === null,
     });
@@ -3571,6 +4291,7 @@ export function WorkflowCopilotChat({
       audioBlob: promptToSend.audioBlob,
       idempotencyKey: promptToSend.idempotencyKey,
       selectedConnectedAccountId: promptToSend.selectedConnectedAccountId,
+      attachments: promptToSend.attachments,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
@@ -3877,7 +4598,12 @@ export function WorkflowCopilotChat({
   // restore, so gate actions wait for idle.
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
-  const hasComposerText = inputValue.trim().length > 0;
+  // A staged attachment counts as content: with only a file in the tray the button would
+  // otherwise read as Stop during a turn, and clicking Send would cancel the turn instead.
+  const hasComposerText =
+    inputValue.trim().length > 0 ||
+    attachments.length > 0 ||
+    pendingAttachments.some((item) => item.status === "uploading");
   // The cycling verb row plus the stop button's orbiting ring carry the
   // working state, so the prose status line and the queued chip stand down.
   const showWorkingRow = isLoading;
@@ -4614,7 +5340,91 @@ export function WorkflowCopilotChat({
           </div>
         ) : null}
         <SelectedBlockChip />
-        <div className="flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring">
+        {hasPendingQuestion &&
+        (attachments.length > 0 ||
+          pendingAttachments.some((item) => item.status === "uploading")) ? (
+          // An answer goes through the question flow, which carries no files, so a file staged
+          // before the question arrived would otherwise look like part of the answer.
+          <p className="mb-1 text-xs text-muted-foreground">
+            Attached files will be sent with your next message, not with your
+            answer.
+          </p>
+        ) : null}
+        {attachments.length > 0 || pendingAttachments.length > 0 ? (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {attachments.map((attached) => (
+              <AttachmentChip
+                key={attached.file_id}
+                filename={attached.filename}
+                available={attached.available}
+                onRemove={() => {
+                  setAttachments((prev) =>
+                    prev.filter((item) => item.file_id !== attached.file_id),
+                  );
+                  if (
+                    !postedFileIds.current.has(attached.file_id) &&
+                    !inFlightFileIds.current.has(attached.file_id) &&
+                    // A page-exit delete is already on the wire for this one; a second request would
+                    // race it, and the 404 loser would put the chip back for a file that is gone.
+                    !reclaimingFiles.current.has(attached.file_id)
+                  ) {
+                    void removeUnsentUpload(attached.file_id).then(
+                      (deleted) => {
+                        if (deleted) {
+                          return;
+                        }
+                        // The upload is still stored, so the chip comes back rather than leaving a
+                        // file nothing can reach.
+                        returnFilesToTray([attached]);
+                        toast({
+                          title: "Could not remove file",
+                          description: `${attached.filename} is still attached. Try removing it again.`,
+                        });
+                      },
+                    );
+                  }
+                }}
+              />
+            ))}
+            {pendingAttachments.map((pending) => (
+              <AttachmentChip
+                key={pending.localId}
+                filename={pending.filename}
+                status={pending.status}
+                error={pending.error}
+                onRemove={
+                  pending.status === "error"
+                    ? () =>
+                        setPendingAttachments((prev) =>
+                          prev.filter(
+                            (item) => item.localId !== pending.localId,
+                          ),
+                        )
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        ) : null}
+        <div
+          role="group"
+          aria-label="Copilot message composer"
+          onDragEnter={handleComposerDragEnter}
+          onDragOver={handleComposerDragOver}
+          onDragLeave={handleComposerDragLeave}
+          onDrop={handleComposerDrop}
+          className="relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring"
+        >
+          {isFileDragging ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-2 rounded-lg border-2 border-dashed border-ring bg-slate-elevation2/95 text-sm font-medium text-foreground"
+            >
+              <FileIcon className="h-4 w-4" />
+              Drop files to attach
+            </div>
+          ) : null}
           <textarea
             ref={setTextareaRef}
             placeholder={composerPlaceholder({
@@ -4634,6 +5444,34 @@ export function WorkflowCopilotChat({
               overflowY: "hidden",
             }}
           />
+          <input
+            ref={attachmentInputRef}
+            type="file"
+            accept={ATTACHMENT_ACCEPT}
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              // Reset first: picking the same file twice in a row fires no change event otherwise.
+              event.target.value = "";
+              if (file) void uploadAttachment(file);
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => attachmentInputRef.current?.click()}
+            // An answer to a pending question is sent through the question flow, which carries
+            // no files, so offering the control here would stage a file nothing can send.
+            disabled={hasPendingQuestion}
+            title={
+              hasPendingQuestion
+                ? "Answer the pending question before attaching a file"
+                : "Attach a file"
+            }
+            aria-label="Attach a file"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
+          >
+            <PlusIcon className="h-4 w-4" />
+          </button>
           <SpeechInputButton
             isSupported={isSpeechSupported}
             isListening={isSpeechListening}

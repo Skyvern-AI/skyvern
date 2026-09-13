@@ -45,6 +45,7 @@ CREDENTIAL_FOLDER_PREFIX = "cfld"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
+BROWSER_RECORDING_PREFIX = "br"
 GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
@@ -91,6 +92,11 @@ UPLOADED_FILE_PREFIX = "file"
 def generate_workflow_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PREFIX}_{int_id}"
+
+
+def generate_browser_recording_id() -> str:
+    int_id = generate_id()
+    return f"{BROWSER_RECORDING_PREFIX}_{int_id}"
 
 
 def generate_workflow_permanent_id() -> str:

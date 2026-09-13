@@ -12,6 +12,8 @@ import re
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from skyvern.webeye.actions.actions import reasoning_is_turn_scoped
+
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
 
@@ -174,7 +176,8 @@ def build_action_summary(action: Action) -> dict:
 
     return {
         "action_type": action.action_type,
-        "intention": action.intention,
+        # A v3 row's intention is a timeline display label, not what the agent meant to do.
+        "intention": None if reasoning_is_turn_scoped(action.description) else action.intention,
         "reasoning": action.reasoning,
         "status": action.status,
         # Strip query params from URL — they can contain OAuth tokens, email

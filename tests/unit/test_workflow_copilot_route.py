@@ -26,9 +26,13 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
-from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
+    BuildTestConnectFailure,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
-from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.interruption import (
     DRAFT_AVAILABLE,
@@ -45,6 +49,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     InterruptedTurnFacts,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
     _completed_turn_id_for_idempotency_digest,
     _pending_turn_id_for_idempotency_digest,
@@ -61,6 +66,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotAttachedFile,
     CopilotPendingTurn,
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotChat,
@@ -182,6 +188,115 @@ async def test_pre_safety_route_error_never_persists_raw_secret(
     assert literal not in persisted
     assert workflow_copilot_route.UNSCREENED_MESSAGE_PLACEHOLDER in persisted
     workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_failing_before_it_starts_keeps_the_attached_files_on_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """Attachments are resolved before request config; a failure between the two writes the user
+    row through recovery, which must carry the files the normal start would have saved."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        workflow_copilot_route.app.DATABASE.uploaded_files,
+        "get_uploaded_files_by_ids",
+        AsyncMock(
+            return_value=[SimpleNamespace(file_id="file_1", filename="targets.xlsx", size_bytes=4, expires_at=None)]
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "_resolve_copilot_request_config",
+        AsyncMock(side_effect=RuntimeError("pre-start failure")),
+    )
+    request = _make_chat_request(mode="build", message="check every row").model_copy(
+        update={"attached_file_ids": ["file_1"]}
+    )
+
+    response = await workflow_copilot_chat_post(api_key_request, request, organization)
+    assert response is captured["sentinel"]
+    await captured["handler"](copilot_stream)
+
+    workflow_params.start_copilot_turn.assert_not_awaited()
+    user_rows = [
+        call.kwargs
+        for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") != WorkflowCopilotChatSender.AI
+    ]
+    assert [[f.file_id for f in row.get("attached_files") or []] for row in user_rows] == [["file_1"]]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_attachment_lookup_still_keeps_the_file_ids_on_the_user_row(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The recovery row is written from whatever resolution produced; when the lookup itself fails,
+    the ids the user attached must survive so a later turn or reload can resolve them."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        workflow_copilot_route.app.DATABASE.uploaded_files,
+        "get_uploaded_files_by_ids",
+        AsyncMock(side_effect=RuntimeError("transient lookup failure")),
+    )
+    request = _make_chat_request(mode="build", message="check every row").model_copy(
+        update={"attached_file_ids": ["file_1"]}
+    )
+
+    response = await workflow_copilot_chat_post(api_key_request, request, organization)
+    assert response is captured["sentinel"]
+    await captured["handler"](copilot_stream)
+
+    workflow_params.start_copilot_turn.assert_not_awaited()
+    user_rows = [
+        call.kwargs
+        for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") != WorkflowCopilotChatSender.AI
+    ]
+    assert [[f.file_id for f in row.get("attached_files") or []] for row in user_rows] == [["file_1"]]
 
 
 @pytest.mark.asyncio
@@ -833,6 +948,78 @@ async def test_finalise_normal_turn_keeps_an_explicit_test_model_response_verbat
     persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
     assert persisted["content"] == scripted_response
     assert persisted["narrative_payload"]["terminalMessage"] == scripted_response
+
+
+@pytest.mark.asyncio
+async def test_billing_no_start_summary_is_identical_in_stream_and_persisted_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    draft = MagicMock()
+    draft.model_dump.return_value = {"workflow_id": "wf-draft"}
+    ctx = CopilotContext(
+        organization_id="org-1",
+        workflow_id="wf-draft",
+        workflow_permanent_id="wpid-draft",
+        workflow_yaml="workflow: yes",
+        browser_session_id=None,
+        stream=MagicMock(),
+        last_workflow=draft,
+        last_workflow_yaml="workflow: yes",
+        last_update_block_count=1,
+        last_test_ok=False,
+        latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            connect_failure=BuildTestConnectFailure(
+                state="billing_credit_admission_refusal",
+                retry_action=None,
+            ),
+        ),
+    )
+    no_start_summary = agent_module._rewrite_failed_test_response("The test failed.", ctx)
+    payload = {
+        **_narrative_payload(),
+        "terminalMessage": no_start_summary,
+        "narrativeSummary": no_start_summary,
+        "turnFacts": _turn_facts(terminalCause="billing_credit_admission_refusal"),
+    }
+    agent_result = AgentResult(
+        user_response=no_start_summary,
+        updated_workflow=draft,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="review_untested",
+        narrative_payload=payload,
+        narrative_summary=no_start_summary,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert "couldn't start a test" in response_frame.message
+    assert "tested it" not in response_frame.message
+    assert persisted["content"] == response_frame.message
+    assert persisted["narrative_payload"]["terminalMessage"] == response_frame.message
+    assert persisted["narrative_payload"]["narrativeSummary"] == response_frame.message
 
 
 @pytest.mark.asyncio
@@ -3148,6 +3335,7 @@ class _FakeCopilotChatStore:
         content: str,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: Any = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
     ) -> WorkflowCopilotChatMessage:
         message = WorkflowCopilotChatMessage(
             workflow_copilot_chat_message_id=f"wccm-{len(self.messages)}",
@@ -3156,6 +3344,7 @@ class _FakeCopilotChatStore:
             content=content,
             turn_outcome=turn_outcome,
             narrative_payload=narrative_payload,
+            attached_files=attached_files or [],
             created_at=_NOW,
             modified_at=_NOW,
         )
@@ -3190,8 +3379,9 @@ class _FakeCopilotChatStore:
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: Any = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
     ) -> WorkflowCopilotChatMessage:
-        return self.add_message(sender, content, turn_outcome, narrative_payload)
+        return self.add_message(sender, content, turn_outcome, narrative_payload, attached_files)
 
     async def replace_workflow_copilot_chat_message(
         self,
@@ -3830,6 +4020,32 @@ async def test_persist_turn_messages_is_idempotent_for_one_turn(monkeypatch: pyt
     assert len(store.assistant_messages) == 1
     assert store.assistant_messages[0].turn_outcome is not None
     assert store.assistant_messages[0].turn_outcome.copilot_turn_id == "turn-a"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_never_started_keeps_its_attachments_on_the_recovery_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a turn fails before start_copilot_turn, recovery writes the user row itself; dropping
+    the files there makes them vanish on reload and from every later turn."""
+    chat = _make_persisted_chat([])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+
+    await _persist_turn_messages(
+        chat=chat,
+        turn_id="turn-a",
+        user_message="check every row",
+        audio_artifact_id=None,
+        user_row_already_persisted=False,
+        sender=WorkflowCopilotChatSender.USER,
+        assistant_content="The workflow could not be found.",
+        global_llm_context=None,
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.RECOVER),
+        narrative_payload=None,
+        attached_files=[CopilotAttachedFile(file_id="file_1", filename="targets.xlsx")],
+    )
+
+    assert [f.file_id for f in store.user_messages[0].attached_files] == ["file_1"]
 
 
 @pytest.mark.asyncio
@@ -4649,3 +4865,357 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
     dispatched = agent_mock.await_args.kwargs["chat_request"]
     assert dispatched.selected_connected_account_id == "goac_route_bound"
     assert dispatched.selected_connected_account_from_pending_proposal is True
+
+
+@pytest.mark.asyncio
+async def test_a_database_outage_reaches_the_user_as_a_dependency_failure_not_an_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The recovery writer reads history too, so an outage that killed the turn kills the writer.
+    The reply must still name the cause the route already diagnosed."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.get_workflow_copilot_chat_messages.side_effect = DatabaseConnectionUnavailableError(
+        "get_workflow_copilot_chat_messages", 3
+    )
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    await captured["handler"](copilot_stream)
+
+    errors = [
+        call.args[0].error
+        for call in copilot_stream.send.await_args_list
+        if getattr(call.args[0], "error", None) is not None
+    ]
+    assert errors, "a persistent outage must still terminate the stream"
+    assert "dependency stopped responding" in errors[-1]
+    assert "Copilot hit an internal error" not in errors[-1]
+
+
+@pytest.mark.asyncio
+async def test_recovery_writes_exactly_one_assistant_row_naming_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """A reachable database still persists the recovery reply, and persists it once."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = AgentResult(user_response="Here is the update.", updated_workflow=None, global_llm_context=None)
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise RuntimeError("the turn failed for a reason the database knows nothing about")
+        return []
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    workflow_params.get_workflow_copilot_chat_messages = history
+    await captured["handler"](copilot_stream)
+
+    ai_rows = [
+        call.kwargs
+        for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs["sender"] == WorkflowCopilotChatSender.AI
+    ]
+    assert len(ai_rows) == 1
+    assert "Copilot hit an internal error" in ai_rows[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_database_is_not_asked_to_persist_the_error_it_caused(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The recovery writer's own idempotency lookup would open a second full recovery budget
+    against a database that just exhausted one, doubling how long the caller waits."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = AgentResult(
+        user_response="unused", updated_workflow=None, global_llm_context=None, workflow_was_persisted=True
+    )
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    workflow_params.get_workflow_copilot_chat_messages = history
+    await captured["handler"](copilot_stream)
+
+    assert reads == 1, "recovery must not run a second full reconnection cycle"
+    restore.assert_not_awaited()
+    errors = [
+        call.args[0].error
+        for call in copilot_stream.send.await_args_list
+        if getattr(call.args[0], "error", None) is not None
+    ]
+    assert errors and "dependency stopped responding" in errors[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_rolled_back_before_its_write_failed_does_not_claim_the_workflow_survived(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """Finalisation rolls back before the write that fails, so the agent's pre-finalisation flag
+    is stale by the time recovery reads it."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=True,
+    )
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    async def landed_rollback(*args: Any, **kwargs: Any) -> None:
+        # What the real function does on success; a finalizer swallows the failure case.
+        marker = workflow_copilot_route._CANONICAL_ROLLED_BACK.get()
+        assert marker is not None
+        marker[0] = True
+
+    restore.side_effect = landed_rollback
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        # Succeeds for initial loading, then fails inside the finalizer's write — after its rollback.
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    workflow_params.get_workflow_copilot_chat_messages = history
+    await captured["handler"](copilot_stream)
+
+    restore.assert_awaited()
+    errors = [
+        call.args[0].error
+        for call in copilot_stream.send.await_args_list
+        if getattr(call.args[0], "error", None) is not None
+    ]
+    assert errors, "the turn must still terminate"
+    assert "was not modified" in errors[-1]
+    assert "preserved" not in errors[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_staged_commit_that_landed_before_the_write_failed_is_not_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """A staged turn leaves workflow_was_persisted false even after committing, so reading that
+    flag alone would tell the user nothing changed while canonical already holds the commit."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=False,
+        has_staged_proposal=True,
+        staged_workflow="title: Staged",
+    )
+    _restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    commit = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    workflow_params.get_workflow_copilot_chat_messages = history
+    await captured["handler"](copilot_stream)
+
+    commit.assert_awaited()
+    errors = [
+        call.args[0].error
+        for call in copilot_stream.send.await_args_list
+        if getattr(call.args[0], "error", None) is not None
+    ]
+    assert errors, "the turn must still terminate"
+    assert "preserved" in errors[-1]
+    assert "was not modified" not in errors[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_the_outage_defeated_does_not_claim_the_workflow_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """Finalizers swallow a failed restore, and a database that cannot be read is one that cannot
+    be written either — so the likely shape of this outage leaves the edits in place."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="", workflow_definition=None
+    )
+    agent_result = AgentResult(
+        user_response="done", updated_workflow=None, global_llm_context=None, workflow_was_persisted=True
+    )
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore.side_effect = DatabaseConnectionUnavailableError("update_workflow_definition", 3)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    workflow_params.get_workflow_copilot_chat_messages = history
+    await captured["handler"](copilot_stream)
+
+    restore.assert_awaited()
+    errors = [
+        call.args[0].error
+        for call in copilot_stream.send.await_args_list
+        if getattr(call.args[0], "error", None) is not None
+    ]
+    assert errors, "the turn must still terminate"
+    assert "preserved" in errors[-1]
+    assert "was not modified" not in errors[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update_fails", [False, True], ids=["landed", "failed"])
+async def test_restore_records_only_a_rollback_that_landed(
+    update_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The marker the outage reply reads is set here, so it has to mean the write succeeded."""
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        workflow_permanent_id="wpid-1",
+        title="Named agent",
+        description="",
+        workflow_definition=None,
+        proxy_location=None,
+        webhook_callback_url=None,
+        totp_verification_url=None,
+        totp_identifier=None,
+        persist_browser_session=False,
+        reuse_browser_session=False,
+        mask_secrets=False,
+        pin_saved_session_ip=False,
+        browser_profile_id=None,
+        browser_profile_key=None,
+        model=None,
+        max_screenshot_scrolls=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        run_with=None,
+        ai_fallback=None,
+        cache_key=None,
+        adaptive_caching=None,
+        enable_self_healing=None,
+        code_version=None,
+        run_sequentially=None,
+        sequential_key=None,
+        created_by=None,
+        edited_by=None,
+    )
+    update = AsyncMock(side_effect=RuntimeError("canonical write failed") if update_fails else None)
+    monkeypatch.setattr(
+        app,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(update_workflow_definition=update, get_workflow_by_permanent_id=AsyncMock()),
+    )
+    marker = [False]
+    token = workflow_copilot_route._CANONICAL_ROLLED_BACK.set(marker)
+    try:
+        with contextlib.suppress(RuntimeError):
+            await workflow_copilot_route._restore_workflow_definition(original_workflow, "org-1")
+    finally:
+        workflow_copilot_route._CANONICAL_ROLLED_BACK.reset(token)
+
+    update.assert_awaited_once()
+    assert marker[0] is not update_fails

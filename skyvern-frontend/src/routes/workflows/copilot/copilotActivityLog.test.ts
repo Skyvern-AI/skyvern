@@ -1346,7 +1346,7 @@ describe("deriveActivityLog", () => {
     );
   });
 
-  it("keeps a drafted block out of the run row and still renders it", () => {
+  it("does not project an evidence-free drafted block", () => {
     const log = deriveActivityLog(
       turnWith(repairLoopActivity(), [
         block({ state: "drafted", workflowRunBlockId: "", label: "block_2" }),
@@ -1360,10 +1360,9 @@ describe("deriveActivityLog", () => {
     ]);
     expect(runRows[0]?.blocks).toEqual([]);
 
-    const draftedRow = log.rows[log.rows.length - 1];
-    expect(draftedRow?.kind).toBe("author");
-    expect(draftedRow?.entries).toEqual([]);
-    expect(draftedRow?.blocks.map((b) => b.label)).toEqual(["block_2"]);
+    expect(
+      log.rows.some((row) => row.blocks.some((b) => b.label === "block_2")),
+    ).toBe(false);
   });
 
   it("files each run's blocks under the run row that produced them", () => {
@@ -1634,7 +1633,7 @@ describe("deriveActivityLog", () => {
     );
   });
 
-  it("degrades a reloaded block whose start time was not persisted", () => {
+  it("drops a legacy row with no persisted evidence", () => {
     const reloaded = applyNarrativeEvent(
       twoRunTurn(),
       terminalResponse({
@@ -1655,14 +1654,7 @@ describe("deriveActivityLog", () => {
     expect(reloaded.blocks[0]?.startedAt).toBeNull();
 
     const log = deriveActivityLog(reloaded);
-    expect(labelsPerRow(log)).toEqual([
-      [],
-      [],
-      [],
-      [],
-      [],
-      ["first_attempt", "second_attempt"],
-    ]);
+    expect(labelsPerRow(log)).toEqual([[], [], [], [], [], ["second_attempt"]]);
     expect(log.rows).toHaveLength(6);
   });
 
@@ -2125,7 +2117,7 @@ describe("deriveActivityLog", () => {
     expect(log.focusIndex).toBe(log.rows.length - 1);
   });
 
-  it("keeps a live row focused when an empty drafted block follows it", () => {
+  it("keeps a live row focused when state contains an evidence-free drafted block", () => {
     const log = deriveActivityLog(
       turnWith(
         [
@@ -2148,7 +2140,9 @@ describe("deriveActivityLog", () => {
     );
 
     expect(log.rows[log.liveIndex]?.pending).toBe(true);
-    expect(log.rows[log.rows.length - 1]?.blocks[0]?.state).toBe("drafted");
+    expect(
+      log.rows.some((row) => row.blocks.some((b) => b.state === "drafted")),
+    ).toBe(false);
     expect(log.focusIndex).toBe(log.liveIndex);
   });
 

@@ -878,6 +878,38 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert contract.repair_decision.target_blocks == ["search_registry"]
 
 
+def test_runtime_repair_context_keeps_a_runner_denials_named_replacement_whole() -> None:
+    # The secure runner's listener denial names its replacement after ~500 characters; the recorder
+    # must carry the block's failure reason far enough for the repair prompt to see that route.
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    listener_denial = (
+        "CodeBlock failed because it requested an unsupported browser operation at line 10: page.on is not "
+        "supported by the secure CodeBlock runner; a CodeBlock cannot register a browser event callback that "
+        "outlives it. Take the triggering action, then wait for its effect with a bounded call: "
+        "`await click_and_claim_download(page, selector)` for a download, "
+        "`await page.wait_for_url(url, timeout=...)` for navigation, or "
+        "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the page. "
+        "There is no brokered way to wait on a network response; wait on what the response renders instead."
+    )
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_listener",
+            "overall_status": "failed",
+            "blocks": [{"label": "block_6", "status": "failed", "failure_reason": listener_denial}],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending, CodeAuthoringRepairContext)
+    assert pending.reason_code == "runtime_block_failure"
+    assert "await page.wait_for_selector(selector, timeout=...)" in (pending.runtime_failure_reason or "")
+
+
 def test_runtime_key_error_for_missing_prior_output_records_typed_authoring_context() -> None:
     ctx = _ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -4739,6 +4771,112 @@ def test_a_select_on_a_real_option_still_leads_the_summary_cap() -> None:
 
     assert repair_context is not None
     assert repair_context.page_form_summaries[0] == "Departure month select Jan"
+
+
+def _metric_panel_page_evidence() -> dict[str, Any]:
+    return {
+        "visible_text_excerpt": "Sessions started 72.51k",
+        "key_value_relations": [
+            {
+                "key_text": "Sessions started",
+                "value_text": "72.51k",
+                "container_selector": "div.query-value__container",
+                "container_match_count": 1,
+                "visible": True,
+                "value_visible": True,
+            },
+            {
+                "key_text": "Failure rate",
+                "value_text": "30.21%",
+                "container_selector": "div.query-rate__container",
+                "container_match_count": 1,
+                "visible": True,
+                "value_visible": True,
+                "value_truncated": True,
+            },
+            {
+                "key_text": "Accept cookies",
+                "value_text": "Dismiss",
+                "visible": True,
+                "value_visible": True,
+            },
+        ],
+        "modal_overlays": [{"dismiss_controls": [{"text": "Accept cookies"}]}],
+    }
+
+
+def test_a_read_only_metric_page_hands_the_repair_turn_its_own_label_value_pairs() -> None:
+    ctx = _overlay_repair_ctx(_metric_panel_page_evidence())
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.observed_after_workflow_run is True
+    assert repair_context.page_value_bindings == ["Sessions started=72.51k"]
+    prompt = _code_authoring_repair_context_prompt(ctx)
+    assert "page_value_bindings: Sessions started=72.51k" in prompt.splitlines()
+    assert "query-value__container" not in prompt
+
+
+def test_a_page_value_binding_is_redacted_and_bounded_before_it_reaches_the_repair_prompt() -> None:
+    evidence = _metric_panel_page_evidence()
+    evidence["key_value_relations"].extend(
+        [
+            {
+                "key_text": "Deploy key = " + "L" * 200,
+                "value_text": "sk-live-abcdefghijklmnopqrstuvwxyz012345",
+                "visible": True,
+                "value_visible": True,
+            },
+            {"key_text": "Password", "value_text": "hunter2", "visible": True, "value_visible": True},
+            {"key_text": "API key", "value_text": "9f3c2201aa", "visible": True, "value_visible": True},
+            {
+                "key_text": "Region " + "L" * 200,
+                "value_text": "us-east-1" + "9" * 200,
+                "visible": True,
+                "value_visible": True,
+            },
+        ]
+    )
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    bindings = repair_context.page_value_bindings
+    label, value = bindings[-1].split("=", 1)
+    assert label.startswith("Region L") and len(label) == 80
+    assert value.startswith("us-east-1") and len(value) == 80
+    assert not [b for b in bindings if "Deploy key" in b or "hunter2" in b or "9f3c2201aa" in b or "REDACTED" in b]
+    prompt_line = next(
+        line
+        for line in _code_authoring_repair_context_prompt(ctx).splitlines()
+        if line.startswith("page_value_bindings: ")
+    )
+    assert prompt_line.endswith(bindings[-1])
+
+
+def test_page_value_binding_labels_separate_runtime_repair_root_cause_signatures() -> None:
+    def signature(bindings: list[str]) -> str | None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="get_failure_rate",
+            reason_code="runtime_block_failure",
+            observed_after_workflow_run=True,
+            page_value_bindings=bindings,
+        )
+        contract = build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_authoring_repair_result(repair_context),
+            ctx=_ctx(),
+        )
+        return contract.to_trace_data()["root_cause_signature"]
+
+    baseline = signature(["Sessions started=72.51k"])
+
+    assert baseline is not None
+    assert baseline != signature([])
+    assert baseline != signature(["Retries queued=72.51k"])
+    assert baseline == signature(["Sessions started=88.94k"])
 
 
 def _challenge_run_result() -> dict[str, Any]:

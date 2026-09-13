@@ -59,6 +59,7 @@ local = [
     "json-repair>=0.63.2,<0.64",
     "pypdf>=6.16.1,<7",
     "pdfplumber>=0.11.10,<0.12",
+    "beautifulsoup4>=4.14.3,<5",
     "psutil>=7.0.0",
     "tiktoken>=0.13.0",
     "anthropic>=0.122.0,<0.123",

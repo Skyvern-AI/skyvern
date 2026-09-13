@@ -292,13 +292,13 @@ describe("CodeBlockEditor in a read-only scope", () => {
   });
 });
 
-test("wires the jinja highlight into the code editor", () => {
+test("wires Jinja highlighting and Python syntax diagnostics into the code editor", () => {
   renderEditor();
 
-  // jinjaHighlight contributes 2 extensions (plugin + theme).
+  // Jinja contributes 2 extensions; Python diagnostics add a linter and gutter.
   expect(
     screen.getByTestId("code-editor").getAttribute("data-extension-count"),
-  ).toBe("2");
+  ).toBe("4");
 });
 
 describe("CodeBlockEditor error messages", () => {
@@ -578,17 +578,17 @@ describe("CodeBlockEditor step-to-code highlighting", () => {
     switchToCode();
 
     const editor = () => screen.getByTestId("code-editor");
-    // Baseline: jinja only (2 extensions), no active step.
-    expect(editor().getAttribute("data-extension-count")).toBe("2");
+    // Baseline: Jinja (2) + Python syntax diagnostics (2), no active step.
+    expect(editor().getAttribute("data-extension-count")).toBe("4");
 
     const stepButton = screen.getByRole("button", { name: /Open the page/ });
     fireEvent.click(stepButton);
-    // jinja (2) + lineHighlight field + theme (2) = 4.
-    expect(editor().getAttribute("data-extension-count")).toBe("4");
+    // Baseline (4) + lineHighlight field + theme (2) = 6.
+    expect(editor().getAttribute("data-extension-count")).toBe("6");
     expect(stepButton.getAttribute("aria-pressed")).toBe("true");
 
     fireEvent.click(stepButton);
-    expect(editor().getAttribute("data-extension-count")).toBe("2");
+    expect(editor().getAttribute("data-extension-count")).toBe("4");
     expect(stepButton.getAttribute("aria-pressed")).toBe("false");
   });
 });

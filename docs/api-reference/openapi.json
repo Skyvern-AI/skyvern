@@ -13563,6 +13563,14 @@
         ],
         "title": "DownloadToS3BlockYAML"
       },
+      "EmailBodyFormat": {
+        "type": "string",
+        "enum": [
+          "text",
+          "html"
+        ],
+        "title": "EmailBodyFormat"
+      },
       "EmailInboxBlock": {
         "properties": {
           "label": {
@@ -18517,6 +18525,10 @@
             "type": "string",
             "title": "Body",
             "default": "Your interaction is required for a workflow run!"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           }
         },
         "type": "object",
@@ -18620,6 +18632,10 @@
             "type": "string",
             "title": "Body",
             "default": "Your interaction is required for a workflow run!"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           }
         },
         "type": "object",
@@ -22545,6 +22561,10 @@
             "type": "string",
             "title": "Body"
           },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
+          },
           "file_attachments": {
             "items": {
               "type": "string"
@@ -22775,6 +22795,10 @@
           "body": {
             "type": "string",
             "title": "Body"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           },
           "file_attachments": {
             "anyOf": [
@@ -28561,6 +28585,18 @@
           "title": {
             "type": "string",
             "title": "Title"
+          },
+          "recording_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recording Id",
+            "description": "Durable browser recording to attach to the workflow version created by this save."
           },
           "description": {
             "anyOf": [

@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from fastapi import Depends, HTTPException, Path, Query, Request
+from fastapi import Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import ORJSONResponse
 from pydantic import ValidationError
 
@@ -47,6 +47,7 @@ from skyvern.schemas.browser_session_timeouts import (
     max_timeout_exceeded_warning,
 )
 from skyvern.schemas.browser_sessions import (
+    BrowserRecording,
     CreateBrowserSessionRequest,
     ExtendBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
@@ -672,7 +673,7 @@ async def process_recording(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
 
-    blocks, parameters = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
+    blocks, parameters, recording_id = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
         organization_id=current_org.organization_id,
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
@@ -684,4 +685,36 @@ async def process_recording(
         interpretation_session_id=recording_request.interpretation_session_id,
     )
 
-    return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)
+    return ProcessBrowserSessionRecordingResponse(recording_id=recording_id, blocks=blocks, parameters=parameters)
+
+
+@base_router.delete(
+    "/browser_recordings/{recording_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def delete_pending_recording(
+    recording_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await app.DATABASE.browser_recordings.delete_pending_recording(recording_id, current_org.organization_id)
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/versions/{version}/recording",
+    response_model=BrowserRecording,
+    include_in_schema=False,
+)
+async def get_workflow_version_recording(
+    workflow_permanent_id: str,
+    version: int,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserRecording:
+    recording = await app.DATABASE.browser_recordings.get_for_workflow_version(
+        workflow_permanent_id=workflow_permanent_id,
+        version=version,
+        organization_id=current_org.organization_id,
+    )
+    if recording is None:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return recording

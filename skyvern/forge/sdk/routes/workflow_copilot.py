@@ -1,13 +1,15 @@
 import asyncio
 import contextlib
+import contextvars
 import hashlib
 import hmac
 import re
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, cast, get_args
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
@@ -21,6 +23,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
@@ -53,6 +56,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
     build_recoverable_failure,
     format_recoverable_failure_reply,
+    iter_exception_chain,
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, resolve_repair_origin_binding
@@ -71,12 +75,13 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_cha
 from skyvern.forge.sdk.copilot.workflow_yaml import with_workflow_yaml_title
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
-from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, DuplicateCopilotTurnError, NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
     CopilotPendingTurn,
@@ -111,6 +116,7 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import is_blocked_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -717,7 +723,7 @@ async def _persist_proposed_workflow_state(
 
 
 def _as_utc(value: datetime) -> datetime:
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 async def _assistant_row_for_turn(chat: WorkflowCopilotChat, turn_id: str) -> WorkflowCopilotChatMessage | None:
@@ -769,6 +775,7 @@ async def _persist_turn_messages(
     turn_outcome: TurnOutcome | None,
     narrative_payload: TurnNarrativePayload | None,
     sender: WorkflowCopilotChatSender,
+    attached_files: list[CopilotAttachedFile] | None = None,
 ) -> WorkflowCopilotChatMessage | None:
     """The only writer of a copilot turn's chat rows; idempotent per ``turn_id``.
 
@@ -799,6 +806,7 @@ async def _persist_turn_messages(
                 sender=sender,
                 content=user_message,
                 audio_artifact_id=audio_artifact_id,
+                attached_files=attached_files,
             )
         )
 
@@ -883,7 +891,7 @@ def _interruption_facts(
 ) -> InterruptedTurnFacts:
     run_id = agent_result.cancellation_workflow_run_id if agent_result is not None else None
     return InterruptedTurnFacts(
-        recorded_at=datetime.now(timezone.utc).isoformat(),
+        recorded_at=datetime.now(UTC).isoformat(),
         iteration=agent_result.cancellation_iteration if agent_result is not None else None,
         workflow_permanent_id=chat.workflow_permanent_id,
         workflow_version=workflow.version if workflow is not None else None,
@@ -1148,7 +1156,7 @@ async def _persist_cancel_turn(
         turn_outcome=turn_outcome,
         narrative_payload=narrative_payload,
     )
-    response_time = assistant_message.created_at if assistant_message else datetime.now(timezone.utc)
+    response_time = assistant_message.created_at if assistant_message else datetime.now(UTC)
     try:
         await asyncio.shield(
             stream.send(
@@ -1189,6 +1197,7 @@ async def _finalise_normal_turn(
     agent_result: AgentResult,
     turn_id: str | None = None,
     user_row_already_persisted: bool = False,
+    attached_files: list[CopilotAttachedFile] | None = None,
 ) -> None:
     """Atomic post-agent finalisation: rollback, proposal, chat rows, RESPONSE.
 
@@ -1276,6 +1285,7 @@ async def _finalise_normal_turn(
         global_llm_context=updated_global_llm_context,
         turn_outcome=agent_result.turn_outcome,
         narrative_payload=narrative_payload,
+        attached_files=attached_files,
     )
 
     response_data = {
@@ -1283,7 +1293,7 @@ async def _finalise_normal_turn(
         "workflow_copilot_chat_id": chat.workflow_copilot_chat_id,
         "message": user_response,
         "updated_workflow": updated_workflow.model_dump(mode="json") if updated_workflow else None,
-        "response_time": assistant_message.created_at if assistant_message else datetime.now(timezone.utc),
+        "response_time": assistant_message.created_at if assistant_message else datetime.now(UTC),
         "total_tokens": agent_result.total_tokens,
         "response_type": agent_result.response_type,
         "resolved_model": agent_result.resolved_model,
@@ -1357,11 +1367,20 @@ async def _commit_staged_workflow(
     )
 
 
+_CANONICAL_ROLLED_BACK: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "copilot_canonical_rolled_back",
+    default=None,
+)
+
+
 async def _restore_workflow_definition(original_workflow: Workflow | None, organization_id: str) -> None:
     """Roll the workflow back to ``original_workflow``.
 
     Field list must stay in lockstep with ``_update_workflow``. May raise; callers
     treat a restore failure as best-effort (log and continue), not a hard error.
+
+    Records success in ``_CANONICAL_ROLLED_BACK`` for the turn that set it. Every finalizer
+    swallows a restore failure, so entering one is not evidence the edits are gone.
     """
     if not original_workflow:
         return
@@ -1414,6 +1433,11 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         preserve_completion_contract=False,
         validate_code_block_templates=False,
     )
+    # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
+    # mutable object shared by reference rather than a value set through the ContextVar.
+    marker = _CANONICAL_ROLLED_BACK.get()
+    if marker is not None:
+        marker[0] = True
 
 
 def _blockless_submission_fallback(
@@ -1643,6 +1667,12 @@ async def _new_copilot_chat_post(
         original_workflow: Workflow | None = None
         chat = None
         turn_started = False
+        # Unconfirmed until resolution replaces them: a failure inside the lookup itself still reaches
+        # recovery, which must not persist the user's row without the files they attached.
+        new_attached_files = [
+            CopilotAttachedFile(file_id=file_id, filename="", available=False)
+            for file_id in _normalized_attachment_ids(chat_request.attached_file_ids)
+        ]
         # Snapshot before any write this turn — lets a recovery handler tell
         # "this turn's own write already superseded it" from "the write itself
         # is what failed", which agent_result.updated_workflow alone can't.
@@ -1655,6 +1685,10 @@ async def _new_copilot_chat_post(
         # cancel handler would insert a second row for the same turn concurrently --
         # the read-then-create idempotency has no unique constraint to catch it.
         finalise_started = False
+        # Set by ``_restore_workflow_definition`` itself, so it means the rollback landed rather
+        # than that some finalizer tried one.
+        canonical_rolled_back: list[bool] = [False]
+        _CANONICAL_ROLLED_BACK.set(canonical_rolled_back)
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
         turn_index = 0
@@ -1673,6 +1707,37 @@ async def _new_copilot_chat_post(
                 turn_id=turn_id,
             )
 
+        async def _emit_unpersisted_failure(
+            failure: RecoverableFailure,
+            *,
+            failure_kind: CopilotFailureKind,
+            writer_exc: BaseException,
+        ) -> None:
+            """Terminal frame for a turn whose own row could not be written.
+
+            ``exc_info`` is the writer's failure; the ``diagnosed_`` fields name what failed the turn.
+            """
+            nonlocal terminal_frame_emitted
+            LOG.exception(
+                "Workflow copilot could not persist this turn's terminal row",
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat is not None else None,
+                diagnosed_failure_kind=failure.failure_kind,
+                diagnosed_internal_error_id=failure.internal_error_id,
+                diagnosed_exception_type=failure.exception_type,
+                writer_exception_type=type(writer_exc).__name__,
+            )
+            terminal_frame_emitted = True
+            await stream.send(
+                WorkflowCopilotStreamErrorUpdate(
+                    type=WorkflowCopilotStreamMessageType.ERROR,
+                    error=format_recoverable_failure_reply(failure),
+                    failure_kind=failure_kind,
+                    turn_id=turn_id,
+                    narrative_summary=None,
+                )
+            )
+
         async def _recover_from_route_exception(
             exc: BaseException,
             *,
@@ -1685,6 +1750,33 @@ async def _new_copilot_chat_post(
             """Shared by the LLMProviderError and generic Exception handlers below —
             only their log/user-facing strings and failure kind differ."""
             nonlocal terminal_frame_emitted
+            if any(isinstance(item, DatabaseConnectionUnavailableError) for item in iter_exception_chain(exc)):
+                # Rolling the workflow back and writing the reply are both database work, against a
+                # database that just exhausted a full reconnection budget. Report what is already
+                # known rather than spending more of the caller's wait on writes that cannot land;
+                # the pending turn is left for reconcile-on-read.
+                #
+                # A rollback this turn actually completed is the only thing that makes the agent's
+                # edits gone; a finalizer that attempted one and failed leaves them in place, and
+                # during an outage that is the likely shape. The staged commit is the normal
+                # finalizer's alone, and a staged turn leaves ``workflow_was_persisted`` false even
+                # after committing, so it has to be read separately or the reply denies a change the
+                # user can see.
+                committed_staged = (
+                    finalise_started
+                    and chat is not None
+                    and _should_commit_staged_workflow(chat.auto_accept, agent_result)
+                )
+                rolled_back = canonical_rolled_back[0]
+                persisted_directly = (
+                    agent_result is not None and agent_result.workflow_was_persisted and not rolled_back
+                )
+                await _emit_unpersisted_failure(
+                    build_recoverable_failure(exc, workflow_modified=committed_staged or persisted_directly),
+                    failure_kind=failure_kind,
+                    writer_exc=exc,
+                )
+                return
             restored = chat is not None and _should_restore_persisted_workflow(
                 chat.auto_accept,
                 agent_result,
@@ -1701,7 +1793,7 @@ async def _new_copilot_chat_post(
                     )
                     restore_failed = True
             if chat is not None:
-                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
+                workflow_modified = agent_result is not None and agent_result.workflow_was_persisted and not restored
                 # Pre-bake restored here: the recovered AgentResult has workflow_was_persisted=False,
                 # so _persist_proposed_workflow_state's own restored check would always read False.
                 recovered_result, failure = _build_recoverable_route_agent_result(
@@ -1753,18 +1845,28 @@ async def _new_copilot_chat_post(
                     if turn_started or opener_is_server_authored
                     else chat_request.model_copy(update={"message": UNSCREENED_MESSAGE_PLACEHOLDER})
                 )
-                await asyncio.shield(
-                    _finalise_normal_turn(
-                        stream=stream,
-                        chat=chat,
-                        organization_id=organization.organization_id,
-                        original_workflow=original_workflow,
-                        chat_request=recovery_chat_request,
-                        agent_result=recovered_result,
-                        turn_id=turn_id,
-                        user_row_already_persisted=turn_started,
+                try:
+                    await asyncio.shield(
+                        _finalise_normal_turn(
+                            stream=stream,
+                            chat=chat,
+                            organization_id=organization.organization_id,
+                            original_workflow=original_workflow,
+                            chat_request=recovery_chat_request,
+                            agent_result=recovered_result,
+                            turn_id=turn_id,
+                            user_row_already_persisted=turn_started,
+                            # Only a turn that never started writes the user row here, and it must
+                            # keep the files the normal start would have saved with it.
+                            attached_files=new_attached_files,
+                        )
                     )
-                )
+                except Exception as writer_exc:
+                    # The writer reads history too, so an outage that caused ``exc`` can take this
+                    # recovery down with it. Report the cause already diagnosed rather than letting
+                    # a second failure replace it with an unattributed one.
+                    await _emit_unpersisted_failure(failure, failure_kind=failure_kind, writer_exc=writer_exc)
+                    return
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
             else:
@@ -1800,7 +1902,7 @@ async def _new_copilot_chat_post(
                 WorkflowCopilotProcessingUpdate(
                     type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
                     status="Processing...",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                 )
             )
 
@@ -1827,6 +1929,14 @@ async def _new_copilot_chat_post(
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             )
+            turn_attached_files = await _resolve_copilot_attached_files(
+                file_ids=_turn_attachment_ids(chat_request, chat_messages),
+                organization_id=organization.organization_id,
+                known_filenames=_attachment_filenames_from_history(chat_messages),
+            )
+            new_attached_files = [
+                attached for attached in turn_attached_files if attached.file_id in set(chat_request.attached_file_ids)
+            ]
             prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
             copilot_config = await _resolve_copilot_request_config(
                 organization.organization_id,
@@ -1866,7 +1976,7 @@ async def _new_copilot_chat_post(
                 WorkflowCopilotProcessingUpdate(
                     type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
                     status="Thinking...",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                 )
             )
 
@@ -1957,7 +2067,7 @@ async def _new_copilot_chat_post(
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     pending_turn=CopilotPendingTurn(
                         turn_id=turn_id,
-                        started_at=datetime.now(timezone.utc),
+                        started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
                         pre_turn_workflow=original_workflow.model_dump(mode="json"),
                         pre_turn_proposed_workflow=proposed_workflow_at_turn_start,
@@ -1975,6 +2085,7 @@ async def _new_copilot_chat_post(
                     # dedicated classifier finds a secret outside deterministic redaction patterns.
                     user_message=UNSCREENED_MESSAGE_PLACEHOLDER,
                     audio_artifact_id=chat_request.audio_artifact_id,
+                    attached_files=new_attached_files,
                     sender=_turn_opener_sender(chat_request),
                 )
             except DuplicateCopilotTurnError as exc:
@@ -2025,6 +2136,7 @@ async def _new_copilot_chat_post(
                     chat_request=chat_request,
                     chat_history=convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
                     prior_user_messages=convert_to_history_messages(chat_messages),
+                    attached_files=turn_attached_files,
                     global_llm_context=global_llm_context,
                     llm_api_handler=llm_api_handler,
                     raw_secret_safety_handler=raw_secret_safety_handler,
@@ -2153,25 +2265,35 @@ async def _new_copilot_chat_post(
                 # User cancel landed before the agent started running, so
                 # the agent_result.cancelled branch above couldn't run.
                 # _persist_cancel_turn skips rollback when agent_result is None.
-                await asyncio.shield(
-                    _persist_cancel_turn(
-                        stream=stream,
-                        chat=chat,
-                        organization_id=organization.organization_id,
-                        original_workflow=None,
-                        user_message=chat_request.message,
-                        agent_result=None,
-                        audio_artifact_id=chat_request.audio_artifact_id,
-                        turn_id=turn_id,
-                        keep_pending_proposal=chat_request.keep_pending_proposal,
-                        prior_global_llm_context=global_llm_context,
-                        user_row_already_persisted=turn_started,
-                        cancel_source=user_cancel_source[0],
-                        sender=_turn_opener_sender(chat_request),
-                        effective_mode=effective_mode,
-                        code_available=current_code_available,
+                try:
+                    await asyncio.shield(
+                        _persist_cancel_turn(
+                            stream=stream,
+                            chat=chat,
+                            organization_id=organization.organization_id,
+                            original_workflow=None,
+                            user_message=chat_request.message,
+                            agent_result=None,
+                            audio_artifact_id=chat_request.audio_artifact_id,
+                            turn_id=turn_id,
+                            keep_pending_proposal=chat_request.keep_pending_proposal,
+                            prior_global_llm_context=global_llm_context,
+                            user_row_already_persisted=turn_started,
+                            cancel_source=user_cancel_source[0],
+                            sender=_turn_opener_sender(chat_request),
+                            effective_mode=effective_mode,
+                            code_available=current_code_available,
+                        )
                     )
-                )
+                except Exception as writer_exc:
+                    # This handler has no sibling: the route-level ``except Exception`` is its peer,
+                    # so without this the stop report dies with no attributable frame at all.
+                    await _emit_unpersisted_failure(
+                        build_recoverable_failure(writer_exc, workflow_modified=False),
+                        failure_kind="server",
+                        writer_exc=writer_exc,
+                    )
+                    return
                 terminal_frame_emitted = True
                 LOG.info(
                     "Workflow copilot agent cancelled by user during pre-agent setup",
@@ -2194,23 +2316,30 @@ async def _new_copilot_chat_post(
                 if chat is not None and turn_started and not finalise_started:
                     # Shielded so the row lands even though this await re-raises the
                     # cancellation immediately; nothing may follow it in this branch.
-                    await asyncio.shield(
-                        _persist_interrupted_turn(
-                            chat,
-                            turn_id,
-                            facts=_interruption_facts(
+                    # A write that cannot reach the database leaves the pending turn for
+                    # reconcile-on-read; the cancellation still has to propagate.
+                    with contained_effect(
+                        "interrupted-turn row for an operational cancel",
+                        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                        turn_id=turn_id,
+                    ):
+                        await asyncio.shield(
+                            _persist_interrupted_turn(
                                 chat,
-                                original_workflow,
-                                agent_result,
-                                authored_edits_saved=None,
-                            ),
-                            user_message=chat_request.message,
-                            user_row_already_persisted=turn_started,
-                            sender=_turn_opener_sender(chat_request),
-                            effective_mode=effective_mode,
-                            code_available=current_code_available,
+                                turn_id,
+                                facts=_interruption_facts(
+                                    chat,
+                                    original_workflow,
+                                    agent_result,
+                                    authored_edits_saved=None,
+                                ),
+                                user_message=chat_request.message,
+                                user_row_already_persisted=turn_started,
+                                sender=_turn_opener_sender(chat_request),
+                                effective_mode=effective_mode,
+                                code_available=current_code_available,
+                            )
                         )
-                    )
                 raise
         except Exception as exc:
             await _recover_from_route_exception(
@@ -2261,6 +2390,90 @@ async def _get_or_create_workflow_copilot_chat(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
+
+
+def _normalized_attachment_ids(file_ids: list[str]) -> list[str]:
+    # An id is a machine-generated format, so anything that is not one never reaches the row or
+    # the prompt: an id carrying newlines would otherwise render as extra prompt lines that every
+    # later turn of the chat replays.
+    return list(dict.fromkeys(file_id.strip() for file_id in file_ids if file_id and is_uploaded_file_id(file_id)))
+
+
+async def _resolve_copilot_attached_files(
+    *,
+    file_ids: list[str],
+    organization_id: str,
+    known_filenames: dict[str, str] | None = None,
+) -> list[CopilotAttachedFile]:
+    """Resolve attachment ids against this organization's own upload rows.
+
+    A caller names a file only by id; the display name comes from the row, or — for a file whose
+    row is already gone — from the name this chat recorded when it was still live, so the reply
+    can say which file needs reattaching. An id that no longer resolves is returned as
+    unavailable rather than dropped: the turn still runs, and the model reports the real state.
+    """
+    requested = _normalized_attachment_ids(file_ids)
+    if not requested:
+        return []
+    # Chunked so a long chat's id history stays under the driver's bind-parameter ceiling.
+    by_id = {}
+    for start in range(0, len(requested), 500):
+        for row in await app.DATABASE.uploaded_files.get_uploaded_files_by_ids(
+            file_ids=requested[start : start + 500], organization_id=organization_id
+        ):
+            by_id[row.file_id] = row
+    now = datetime.now(UTC)
+    resolved: list[CopilotAttachedFile] = []
+    for file_id in requested:
+        uploaded_file = by_id.get(file_id)
+        # An expired row still resolves until the hourly purge retires it, and a workflow built on a
+        # file about to disappear would break on its next run, so it is not offered as usable.
+        live = uploaded_file is not None and (
+            uploaded_file.expires_at is None or _as_utc(uploaded_file.expires_at) > now
+        )
+        if uploaded_file is not None and live:
+            resolved.append(
+                CopilotAttachedFile(
+                    file_id=uploaded_file.file_id,
+                    filename=uploaded_file.filename,
+                    size_bytes=uploaded_file.size_bytes,
+                    available=True,
+                )
+            )
+            continue
+        resolved.append(
+            CopilotAttachedFile(
+                file_id=file_id,
+                filename=uploaded_file.filename
+                if uploaded_file is not None
+                else (known_filenames or {}).get(file_id, ""),
+                available=False,
+            )
+        )
+    return resolved
+
+
+def _attachment_filenames_from_history(messages: list[WorkflowCopilotChatMessage]) -> dict[str, str]:
+    return {
+        attached.file_id: attached.filename
+        for message in messages
+        for attached in message.attached_files
+        if attached.filename
+    }
+
+
+def _turn_attachment_ids(
+    chat_request: WorkflowCopilotChatRequest, messages: list[WorkflowCopilotChatMessage]
+) -> list[str]:
+    """Every file this chat has attached, most recently attached first.
+
+    A follow-up turn carries no ids of its own, so without the prior rows the file the user
+    attached one message ago would silently leave the conversation.
+    """
+    ids = list(chat_request.attached_file_ids)
+    for message in reversed(messages):
+        ids.extend(attached.file_id for attached in message.attached_files)
+    return ids
 
 
 async def _validate_copilot_audio_artifact_id(
@@ -2516,7 +2729,7 @@ async def _recover_interrupted_copilot_turn(
         chat,
         entry.turn_id,
         facts=InterruptedTurnFacts(
-            recorded_at=datetime.now(timezone.utc).isoformat(),
+            recorded_at=datetime.now(UTC).isoformat(),
             workflow_permanent_id=chat.workflow_permanent_id,
             workflow_version=pre_turn_version if isinstance(pre_turn_version, int) else None,
             authored_edits_saved=False if canonical_rolled_back else None,
@@ -2535,11 +2748,11 @@ async def _recover_interrupted_copilot_turn(
 async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organization_id: str) -> None:
     if not chat.pending_turns:
         return
-    abandoned_before = datetime.now(timezone.utc) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
+    abandoned_before = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
     for entry in sorted(chat.pending_turns.values(), key=lambda item: _as_utc(item.started_at)):
         pending_questions = [item for item in entry.question_interactions if item.status == "pending"]
         if pending_questions:
-            if question_wait_is_live(entry.question_heartbeat_at, datetime.now(timezone.utc)):
+            if question_wait_is_live(entry.question_heartbeat_at, datetime.now(UTC)):
                 continue
             for item in pending_questions:
                 recorded = await app.DATABASE.workflow_params.interrupt_copilot_question(
@@ -2639,7 +2852,7 @@ async def workflow_copilot_chat_history(
             ),
             None,
         ),
-        chat_history=convert_to_history_messages(chat_messages),
+        chat_history=await _history_with_resolved_attachments(chat_messages, organization.organization_id),
         proposed_workflow=chat.proposed_workflow if chat else None,
         auto_accept=chat.auto_accept if chat else None,
         work_plan=chat.work_plan if chat else [],
@@ -2900,6 +3113,35 @@ async def workflow_copilot_apply_proposed_workflow(
     return new_workflow
 
 
+async def _history_with_resolved_attachments(
+    messages: list[WorkflowCopilotChatMessage], organization_id: str
+) -> list[WorkflowCopilotChatHistoryMessage]:
+    """Re-resolve every attachment this chat carries before serving it.
+
+    The row records identity, never availability: a file that expired since it was attached must
+    render as missing on reload rather than as a reference the user can still act on.
+    """
+    history = convert_to_history_messages(messages)
+    resolved = {
+        attached.file_id: attached
+        for attached in await _resolve_copilot_attached_files(
+            file_ids=[attached.file_id for message in messages for attached in message.attached_files],
+            organization_id=organization_id,
+            known_filenames=_attachment_filenames_from_history(messages),
+        )
+    }
+    for message in history:
+        message.attached_files = [
+            resolved[attached.file_id]
+            if attached.file_id in resolved
+            # An id the resolver would not accept, so nothing confirmed it. Serving the stored
+            # entry would claim the file is still usable; say we could not confirm it instead.
+            else attached.model_copy(update={"available": False})
+            for attached in message.attached_files
+        ]
+    return history
+
+
 def convert_to_history_messages(
     messages: list[WorkflowCopilotChatMessage],
 ) -> list[WorkflowCopilotChatHistoryMessage]:
@@ -2908,6 +3150,7 @@ def convert_to_history_messages(
             sender=message.sender,
             content=message.content,
             audio_artifact_id=message.audio_artifact_id,
+            attached_files=message.attached_files,
             turn_outcome=message.turn_outcome,
             created_at=message.created_at,
             narrative_payload=message.narrative_payload,
@@ -2941,5 +3184,5 @@ async def workflow_copilot_convert_yaml_to_blocks(
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to convert workflow YAML: {str(e)}",
+            detail=f"Failed to convert workflow YAML: {e!s}",
         )

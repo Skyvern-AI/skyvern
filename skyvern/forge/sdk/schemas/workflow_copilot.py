@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, field_validator
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
@@ -125,6 +125,41 @@ def chat_history_role(sender: WorkflowCopilotChatSender) -> str:
     return WorkflowCopilotChatSender.USER.value if sender in TURN_OPENER_SENDERS else sender.value
 
 
+_MAX_ATTACHED_FILENAME_CHARS = 255
+# The prompt lists this many files per turn, current message first, so every file one message
+# can carry is always visible to the model.
+MAX_ATTACHED_FILES_PER_MESSAGE = 20
+
+
+def _bounded_filename(value: Any) -> Any:
+    """Cap a stored display name: the upload limit measures only file contents, and this name is
+    replayed into every later prompt of the chat."""
+    return value[:_MAX_ATTACHED_FILENAME_CHARS] if isinstance(value, str) else value
+
+
+def _attached_files_or_empty(value: Any) -> Any:
+    """A row written before the column existed reads back as NULL, and ``model_validate`` on the
+    row passes that key explicitly — so a ``default_factory`` never fires and validation fails."""
+    return [] if value is None else value
+
+
+class CopilotAttachedFile(BaseModel):
+    """An uploaded file the user attached to a copilot turn.
+
+    ``file_id`` is the only value a workflow dereferences: the storage URI behind it is read from
+    the organization's ``uploaded_files`` row, never from this record. ``available`` is resolved
+    fresh on every read, so an expired or deleted file reports as missing rather than as a
+    reference the model can still use.
+    """
+
+    file_id: str = Field(..., description="Uploaded file id from POST /v1/upload_file")
+    filename: Annotated[str, BeforeValidator(_bounded_filename)] = Field(
+        ..., description="Display name recorded at upload time"
+    )
+    size_bytes: int | None = Field(None, description="Size recorded at upload time")
+    available: bool = Field(True, description="Whether the file still resolves for this organization")
+
+
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -133,6 +168,9 @@ class WorkflowCopilotChatMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     audio_artifact_id: str | None = Field(None, description="Artifact ID for audio captured during dictation")
+    attached_files: Annotated[list[CopilotAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
     narrative_payload: TurnNarrativePayload | None = Field(
@@ -167,6 +205,14 @@ class WorkflowCopilotChatRequest(BaseModel):
     audio_artifact_id: str | None = Field(
         None,
         description="Artifact ID for audio captured while dictating this message.",
+    )
+    attached_file_ids: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] = Field(
+        default_factory=list,
+        max_length=MAX_ATTACHED_FILES_PER_MESSAGE,
+        description=(
+            "Ids of files uploaded through POST /v1/upload_file that the user attached to this message. "
+            "Only ids are accepted; the display name is read from this organization's own upload record."
+        ),
     )
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
     mode: Literal["build"] | None = Field(
@@ -279,6 +325,9 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
+    attached_files: Annotated[list[CopilotAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
     narrative_payload: TurnNarrativePayload | None = Field(
         None,

@@ -140,6 +140,7 @@ from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
 from .discovery import _rank_discovery_entrypoint_candidates as _rank_discovery_entrypoint_candidates
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
+from .errors import copilot_tool_failure
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
 from .frontier import _JINJA_LITERAL_ROOTS as _JINJA_LITERAL_ROOTS
 from .frontier import _JINJA_RUNTIME_GLOBAL_ROOTS as _JINJA_RUNTIME_GLOBAL_ROOTS
@@ -274,6 +275,7 @@ def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[st
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="update_workflow",
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
@@ -390,7 +392,7 @@ def _stored_workflow_yaml(copilot_ctx: Any) -> str:
     return stored_workflow_yaml(copilot_ctx)
 
 
-@function_tool(name_override="edit_block", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="edit_block", strict_mode=False)
 async def edit_block_tool(
     ctx: RunContextWrapper,
     label: str,
@@ -448,6 +450,7 @@ async def edit_block_tool(
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="edit_block_and_run",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -567,7 +570,7 @@ async def edit_block_and_run_tool(
     )
 
 
-@function_tool(name_override="add_block", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="add_block", strict_mode=False)
 async def add_block_tool(
     ctx: RunContextWrapper,
     after_label: str,
@@ -636,7 +639,7 @@ async def add_block_tool(
     )
 
 
-@function_tool(name_override="delete_block")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="delete_block")
 async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     """Remove one block from the workflow by label.
 
@@ -768,7 +771,7 @@ async def _verify_requested_output_reads(
     return verified, unverified
 
 
-@function_tool(name_override="list_credentials")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="list_credentials")
 async def list_credentials_tool(
     ctx: RunContextWrapper,
     page: int = 1,
@@ -805,7 +808,7 @@ async def list_credentials_tool(
     return json.dumps(sanitized)
 
 
-@function_tool(name_override="request_credential")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="request_credential")
 async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, reason: str) -> str:
     """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
 
@@ -836,7 +839,7 @@ async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, r
     return json.dumps(result)
 
 
-@function_tool(name_override="ask_user")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="ask_user")
 async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionInput]) -> str:
     """Ask the user questions in an inline card and receive their response before continuing.
 
@@ -855,7 +858,7 @@ async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionIn
 
 # This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
 # Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
-@function_tool(name_override="set_work_plan")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
 async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str]) -> str:
     """Replace your own work plan for this chat with `items`, in the order you mean to do them.
 
@@ -873,7 +876,7 @@ async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str])
     return json.dumps(await set_work_plan(ctx.context, WorkPlanArguments(items=items)))
 
 
-@function_tool(name_override="list_integrations")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
     never tokens). Each entry has `connection_id`, `provider`, `name`, `state`,
@@ -926,6 +929,7 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="run_blocks_and_collect_debug",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -1021,7 +1025,10 @@ async def run_blocks_tool(
 
 
 @function_tool(
-    name_override="test_workflow_from_blank_browser", timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS, strict_mode=False
+    failure_error_function=copilot_tool_failure,
+    name_override="test_workflow_from_blank_browser",
+    timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
+    strict_mode=False,
 )
 async def test_workflow_from_blank_browser_tool(
     ctx: RunContextWrapper, parameters: dict[str, Any] | None = None
@@ -1048,7 +1055,7 @@ async def test_workflow_from_blank_browser_tool(
     return json.dumps(sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result))
 
 
-@function_tool(name_override="get_run_results")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="get_run_results")
 async def get_run_results_tool(
     ctx: RunContextWrapper,
     workflow_run_id: str | None = None,
@@ -1075,6 +1082,7 @@ async def get_run_results_tool(
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="update_and_run_blocks",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -1342,7 +1350,9 @@ def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: st
     )
 
 
-@function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)
+@function_tool(
+    failure_error_function=copilot_tool_failure, name_override="discover_workflow_entrypoint", strict_mode=False
+)
 async def discover_workflow_entrypoint_tool(
     ctx: RunContextWrapper,
     site_or_url: str,
@@ -1376,7 +1386,7 @@ async def discover_workflow_entrypoint_tool(
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
-@function_tool(name_override="search_web", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="search_web", strict_mode=False)
 async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int = 10) -> str:
     """Search the web for pages matching a query, when you need candidate sites rather than one known page.
 
@@ -1407,7 +1417,9 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
-@function_tool(name_override="inspect_page_for_composition", strict_mode=False)
+@function_tool(
+    failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
+)
 async def inspect_page_for_composition_tool(
     ctx: RunContextWrapper,
     target_url: str,
@@ -1540,7 +1552,7 @@ async def inspect_page_for_composition_tool(
         return finish(result, source_browser_session_id)
 
 
-@function_tool(name_override="fill_credential_field", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="fill_credential_field", strict_mode=False)
 async def fill_credential_field_tool(
     ctx: RunContextWrapper,
     selector: str,

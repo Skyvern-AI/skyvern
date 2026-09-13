@@ -1815,6 +1815,7 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression[:200],
                 )
+                skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
 
             LOG.warning(
@@ -1836,6 +1837,7 @@ class SkyvernFrame:
                         "Skyvern timed out trying to analyze the page after navigation recovery",
                         expression=expression[:200],
                     )
+                    skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
                 try:
                     async with asyncio.timeout(inject_budget):
@@ -1848,6 +1850,7 @@ class SkyvernFrame:
                         expression=expression[:200],
                         exc_info=True,
                     )
+                    skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
                 except Exception as inject_err:
                     # RuntimeError (main-world Runtime.evaluate payloads) is engine-agnostic; the
@@ -1870,6 +1873,7 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression[:200],
                 )
+                skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
@@ -1883,6 +1887,7 @@ class SkyvernFrame:
                     expression=expression[:200],
                     exc_info=True,
                 )
+                skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except Exception as retry_err:
                 if not (isinstance(retry_err, RuntimeError) or _is_engine_error(retry_err, engine_selection)):
@@ -2186,7 +2191,13 @@ class SkyvernFrame:
             )
         finally:
             if x is not None and y is not None:
-                await skyvern_frame.safe_scroll_to_x_y(x, y)
+                # Courtesy restore of the pre-screenshot scroll position, bounded because it runs
+                # while the caller's screenshot budget is already unwinding: an unresponsive page
+                # here would extend that budget by however long the evaluation hangs, and a caller
+                # waiting to publish an established failure would wait with it.
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS / 1000):
+                        await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
     @traced(name="skyvern.browser.split_screenshots")

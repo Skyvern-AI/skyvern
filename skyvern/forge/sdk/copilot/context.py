@@ -9,7 +9,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
@@ -100,9 +100,63 @@ class NarrativeBlock(TypedDict):
     outcomeRole: NotRequired[RunOutcomeRole]
 
 
-class BlockRunIdentity(NamedTuple):
-    workflow_run_block_id: str
-    iteration: int
+# A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
+# is unbounded without this. Mirror MAX_BLOCK_ATTEMPTS in narrativeState.ts.
+MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
+
+
+class NarrativeBlockAttempt(TypedDict):
+    workflowRunBlockId: str
+    workflowRunId: str | None
+    label: str
+    blockType: str
+    rawStatus: str
+    lastSeenIteration: int
+    startedAt: str | None
+    endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
+
+
+def upsert_narrative_block_attempt(
+    archive: dict[str, NarrativeBlockAttempt],
+    *,
+    workflow_run_block_id: str,
+    workflow_run_id: str | None,
+    label: str,
+    block_type: str,
+    status: str,
+    iteration: int,
+    started_at: str | None,
+    ended_at: str | None,
+) -> NarrativeBlockAttempt:
+    attempt = archive.get(workflow_run_block_id)
+    if attempt is None:
+        attempt = {
+            "workflowRunBlockId": workflow_run_block_id,
+            "workflowRunId": workflow_run_id,
+            "label": label,
+            "blockType": block_type,
+            "rawStatus": status,
+            "lastSeenIteration": iteration,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+        }
+        archive[workflow_run_block_id] = attempt
+        while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
+            del archive[next(iter(archive))]
+        return attempt
+
+    attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    attempt["label"] = label or attempt["label"]
+    attempt["blockType"] = block_type or attempt["blockType"]
+    attempt["rawStatus"] = status
+    attempt["lastSeenIteration"] = iteration
+    if attempt["startedAt"] is None and started_at is not None:
+        attempt["startedAt"] = started_at
+    attempt["endedAt"] = None if status == "running" else ended_at or attempt["endedAt"]
+    return attempt
 
 
 class NarrativeConnectedAccountChoice(TypedDict):
@@ -119,10 +173,33 @@ class NarrativeTurnFacts(TypedDict):
     runCompleted: bool | None
     terminalCause: str | None
     blocksRunThisTurn: int | None
+    # The failed run's own recorded reason, secret-scrubbed at source. Carried as evidence so a
+    # terminal that ships no model reply still shows why the run failed, in the run's words.
+    # NotRequired: rows persisted before it was published carry no such key.
+    recordedFailure: NotRequired[str | None]
     authoredBlockCount: NotRequired[int]
     matchingSourceBlockCount: NotRequired[int]
     # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
     ranCleanOnCurrentSource: bool
+
+
+class HistoricalNarrativeTurnFacts(TypedDict, total=False):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    authoredBlockCount: int
+    matchingSourceBlockCount: int
+    ranCleanOnCurrentSource: bool
+
+
+class HistoricalTurnFactsProjection(TypedDict):
+    scope: Literal["originating_turn"]
+    turnId: NotRequired[str]
+    turnIndex: NotRequired[int]
+    facts: HistoricalNarrativeTurnFacts
 
 
 class NarrativeBudgetExpiry(TypedDict):
@@ -326,6 +403,7 @@ class CodeAuthoringRepairContext(BaseModel):
     observed_after_workflow_run: bool = False
     rendered_value_excerpt: str | None = None
     page_form_summaries: list[str] = Field(default_factory=list)
+    page_value_bindings: list[str] = Field(default_factory=list)
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
@@ -1238,12 +1316,7 @@ class CopilotContext(AgentContext):
     clear_persisted_completion_contract: bool = False
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     prior_block_count: int | None = None
-    block_state_map: dict[str, str] = field(default_factory=dict)
-    block_started_at_map: dict[str, str] = field(default_factory=dict)
-    block_ended_at_map: dict[str, str] = field(default_factory=dict)
-    # Keyed by label, so a label that ran more than once in a turn keeps only its
-    # last run's identity.
-    block_run_identity_map: dict[str, BlockRunIdentity] = field(default_factory=dict)
+    narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
 

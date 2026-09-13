@@ -18,7 +18,7 @@ import pytest
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -81,7 +81,6 @@ def test_recorded_execution_labels_accumulate_across_runs_and_ignore_unexecuted_
             ok=False,
         ),
     )
-    ctx.block_state_map.clear()
     _record_executed_block_labels(
         ctx,
         _run_result(
@@ -330,7 +329,6 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
         workflow_run_id="wr_test",
         run_completed=False,
     )
-    assert ctx.last_run_outcome_block_labels == final.block_labels
 
 
 def test_challenge_failure_records_observation_without_halting_agent() -> None:
@@ -532,7 +530,6 @@ async def test_recording_error_emits_no_invented_frame(monkeypatch: pytest.Monke
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", reason_code="blocker_reported")
-    ctx.last_run_outcome_block_labels = ["search_registry_person"]
 
     outcome = _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
 
@@ -915,22 +912,34 @@ def _payload_ctx() -> CopilotContext:
         SimpleNamespace(block_type=None, label="untested_block"),
     ]
     ctx.staged_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=workflow_blocks))  # type: ignore[assignment]
-    ctx.block_state_map = {
-        "open_registry_search": "completed",
-        "search_registry_person": "completed",
-    }
+    for index, label in enumerate(("open_registry_search", "search_registry_person"), start=1):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id=f"wrb_{index}",
+            workflow_run_id="wr_test",
+            label=label,
+            block_type="task",
+            status="completed",
+            iteration=1,
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:00:01+00:00",
+        )
     return ctx
 
 
 def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
     ctx = _payload_ctx()
-    ctx.last_run_outcome = RecordedRunOutcome(
-        verdict="not_demonstrated",
-        reason_code="blocker_reported",
-        display_reason="The search form is gated by a human verification challenge.",
-        role="interim_build_test",
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+    ctx.last_run_blocks_block_ids = ["wrb_1", "wrb_2"]
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason="The search form is gated by a human verification challenge.",
+            role="interim_build_test",
+        ),
     )
-    ctx.last_run_outcome_block_labels = ["open_registry_search", "search_registry_person"]
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
 
@@ -940,9 +949,7 @@ def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
         assert by_label[label]["outcome"] == "not_demonstrated"
         assert by_label[label]["outcomeReason"] == "The search form is gated by a human verification challenge."
         assert by_label[label]["outcomeRole"] == "interim_build_test"
-    assert "outcome" not in by_label["untested_block"]
-    assert "outcomeReason" not in by_label["untested_block"]
-    assert "outcomeRole" not in by_label["untested_block"]
+    assert "untested_block" not in by_label
 
 
 def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> None:

@@ -4,12 +4,18 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
+from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_write_diff import (
     PER_PATCH_CHAR_CAP,
     TURN_PATCH_CHAR_BUDGET,
     build_code_write_diffs,
 )
-from skyvern.forge.sdk.copilot.context import BlockRunIdentity, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    MAX_NARRATIVE_BLOCK_ATTEMPTS,
+    CopilotContext,
+    NarrativeBlockAttempt,
+    upsert_narrative_block_attempt,
+)
 from skyvern.forge.sdk.copilot.narration import (
     MAX_BLOCK_ACTIVITY_ENTRIES,
     MAX_DESIGN_ACTIVITY_ENTRIES,
@@ -21,6 +27,12 @@ from skyvern.forge.sdk.copilot.narration import (
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _reconcile_narrative_block_attempts,
+    _stash_recorded_run_outcome,
+)
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 _SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
 
@@ -206,7 +218,21 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     ctx = _ctx()
     ctx.staged_workflow = _staged("step_1", "step_2")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
-    ctx.block_state_map = {"step_1": "completed", "step_2": "running"}
+    for workflow_run_block_id, label, status in (
+        ("wrb_1", "step_1", "completed"),
+        ("wrb_2", "step_2", "running"),
+    ):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id="wr_1",
+            label=label,
+            block_type="task",
+            status=status,
+            iteration=1,
+            started_at=_TS.isoformat(),
+            ended_at=_TS.isoformat() if status == "completed" else None,
+        )
     ctx.turn_id = "turn-1"
     ctx.turn_index = 2
 
@@ -248,20 +274,27 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     assert blocks_by_label["step_2"]["activity"] == []
 
 
-def test_build_narrative_payload_persists_block_run_identity() -> None:
+def test_build_narrative_payload_serializes_only_observed_attempts() -> None:
     ctx = _ctx()
     ctx.staged_workflow = _staged("step_1", "drafted_only")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
-    ctx.block_state_map = {"step_1": "completed"}
-    ctx.block_run_identity_map = {"step_1": BlockRunIdentity(workflow_run_block_id="wrb_1", iteration=6)}
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_1",
+        workflow_run_id="wr_1",
+        label="step_1",
+        block_type="task",
+        status="completed",
+        iteration=6,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:05+00:00",
+    )
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message=None, narrative_summary=None)
 
-    blocks_by_label = {b["label"]: b for b in payload["blocks"]}
-    assert blocks_by_label["step_1"]["workflowRunBlockId"] == "wrb_1"
-    assert blocks_by_label["step_1"]["lastSeenIteration"] == 6
-    assert "workflowRunBlockId" not in blocks_by_label["drafted_only"]
-    assert blocks_by_label["drafted_only"]["lastSeenIteration"] == 0
+    assert [block["label"] for block in payload["blocks"]] == ["step_1"]
+    assert payload["blocks"][0]["workflowRunBlockId"] == "wrb_1"
+    assert payload["blocks"][0]["lastSeenIteration"] == 6
 
 
 def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
@@ -273,7 +306,197 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
 
     assert payload["designActivity"] == []
+    assert payload["blocks"] == []
+
+
+def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() -> None:
+    ctx = _ctx()
+    ctx.staged_workflow = _staged("step_1")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_first",
+        workflow_run_id="wr_first",
+        label="step_1",
+        block_type="task",
+        status="failed",
+        iteration=1,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:05+00:00",
+    )
+    ctx.last_run_blocks_workflow_run_id = "wr_first"
+    ctx.last_run_blocks_block_ids = ["wrb_first"]
+    ctx.last_run_blocks_block_labels = ["step_1"]
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            display_reason="The first attempt failed.",
+            workflow_run_id="wr_first",
+            run_completed=False,
+        ),
+    )
+    clear_active_run_evidence_on_workflow_edit(ctx)
+
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_retry",
+        workflow_run_id="wr_retry",
+        label="step_1",
+        block_type="task",
+        status="completed",
+        iteration=4,
+        started_at="2026-01-01T00:00:06+00:00",
+        ended_at="2026-01-01T00:00:09+00:00",
+    )
+    ctx.last_run_blocks_workflow_run_id = "wr_retry"
+    ctx.last_run_blocks_block_ids = ["wrb_retry"]
+    ctx.last_run_blocks_block_labels = ["step_1"]
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_evaluated",
+            workflow_run_id="wr_retry",
+            run_completed=True,
+        ),
+    )
+
+    state = NarratorState()
+    state.block_activity = {
+        "step_1": [build_tool_result_activity("edit_block", "Edited", True, 3, "edit", timestamp=_TS)]
+    }
+    ctx.narrator_state = state
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert [block["workflowRunBlockId"] for block in payload["blocks"]] == ["wrb_first", "wrb_retry"]
+    assert [block.get("outcome") for block in payload["blocks"]] == ["not_demonstrated", "not_evaluated"]
     assert payload["blocks"][0]["activity"] == []
+    assert [entry["id"] for entry in payload["blocks"][1]["activity"]] == ["tr-edit"]
+
+
+def test_run_row_reconciliation_records_terminal_attempts_in_chronological_order() -> None:
+    ctx = _ctx()
+    rows = [
+        WorkflowRunBlock(
+            workflow_run_block_id=f"wrb_{label}",
+            workflow_run_id="wr_full",
+            organization_id="org",
+            block_type="task",
+            label=label,
+            status=status,
+            created_at=_TS,
+            modified_at=_TS,
+        )
+        for label, status in (("block_2", "completed"), ("block_1", "failed"))
+    ]
+
+    _reconcile_narrative_block_attempts(ctx, rows)
+
+    assert list(ctx.narrative_block_attempts) == ["wrb_block_2", "wrb_block_1"]
+    assert [attempt["rawStatus"] for attempt in ctx.narrative_block_attempts.values()] == [
+        "completed",
+        "failed",
+    ]
+
+
+def test_attempt_archive_keeps_only_the_most_recent_attempts() -> None:
+    archive: dict[str, NarrativeBlockAttempt] = {}
+    for i in range(MAX_NARRATIVE_BLOCK_ATTEMPTS + 1):
+        upsert_narrative_block_attempt(
+            archive,
+            workflow_run_block_id=f"wrb_iter_{i}",
+            workflow_run_id="wr_loop",
+            label="loop_body",
+            block_type="task",
+            status="completed",
+            iteration=i,
+            started_at=None,
+            ended_at=None,
+        )
+
+    assert len(archive) == MAX_NARRATIVE_BLOCK_ATTEMPTS
+    assert "wrb_iter_0" not in archive
+    assert next(iter(archive)) == "wrb_iter_1"
+
+
+def test_run_row_reconciliation_puts_both_ends_of_elapsed_on_the_database_clock() -> None:
+    ctx = _ctx()
+    poll_started_at = "2025-12-31T23:59:57+00:00"
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_block_1",
+        workflow_run_id="wr_full",
+        label="block_1",
+        block_type="task",
+        status="running",
+        iteration=1,
+        started_at=poll_started_at,
+        ended_at=None,
+    )
+    db_ended_at = _TS.replace(second=30)
+
+    _reconcile_narrative_block_attempts(
+        ctx,
+        [
+            WorkflowRunBlock(
+                workflow_run_block_id="wrb_block_1",
+                workflow_run_id="wr_full",
+                organization_id="org",
+                block_type="task",
+                label="block_1",
+                status="completed",
+                created_at=_TS,
+                modified_at=_TS.replace(second=45),
+                duration=30.0,
+            )
+        ],
+    )
+
+    attempt = ctx.narrative_block_attempts["wrb_block_1"]
+    assert attempt["startedAt"] == _TS.isoformat()
+    assert attempt["endedAt"] == db_ended_at.isoformat()
+
+
+def test_run_row_reconciliation_ignores_row_writes_that_land_after_the_block_finished() -> None:
+    ctx = _ctx()
+    watched_start, watched_end = "2026-01-01T00:00:01+00:00", "2026-01-01T00:00:06+00:00"
+    for status, started_at, ended_at in (("running", watched_start, None), ("completed", None, watched_end)):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id="wrb_watched",
+            workflow_run_id="wr_full",
+            label="watched",
+            block_type="task",
+            status=status,
+            iteration=1,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+    description_written_at = _TS.replace(second=40)
+    rows = [
+        WorkflowRunBlock(
+            workflow_run_block_id=f"wrb_{label}",
+            workflow_run_id="wr_full",
+            organization_id="org",
+            block_type="task",
+            label=label,
+            status="completed",
+            created_at=_TS,
+            modified_at=description_written_at,
+            duration=duration,
+        )
+        for label, duration in (("watched", None), ("fast", 2.0), ("untimed", None))
+    ]
+
+    _reconcile_narrative_block_attempts(ctx, rows)
+
+    watched = ctx.narrative_block_attempts["wrb_watched"]
+    assert (watched["startedAt"], watched["endedAt"]) == (watched_start, watched_end)
+    fast = ctx.narrative_block_attempts["wrb_fast"]
+    assert (fast["startedAt"], fast["endedAt"]) == (_TS.isoformat(), _TS.replace(second=2).isoformat())
+    untimed = ctx.narrative_block_attempts["wrb_untimed"]
+    assert (untimed["startedAt"], untimed["endedAt"]) == (_TS.isoformat(), None)
 
 
 def test_build_narrative_payload_persists_review_projection() -> None:

@@ -67,14 +67,24 @@ from skyvern.cli.core.guards import (
     validate_button,
     validate_wait_until,
 )
+from skyvern.cli.core.js_dispatch import (
+    cancellation_pending,
+    deadline_ended_the_call,
+    record_unreported_timeout,
+    unwrap_caller_js_error,
+    without_navigation_recovery,
+)
 from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install_ngrok, offer_setup_auth
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.core.telemetry import capture_cli_tool_call
 from skyvern.cli.lazy import SkyvernTyperGroup
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.utils.env_paths import EnvIntent
+from skyvern.webeye.utils.page import SkyvernFrame
 
 browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
@@ -1185,7 +1195,25 @@ def evaluate(
         await _apply_cli_frame_state(page)
         # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
         _ = page.locator_scope
-        result = await page.evaluate(expression)
+        deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+        try:
+            result = await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                # Logged verbatim on timeout, and a caller's expression can carry data no log
+                # processor knows to redact; the evaluation itself runs the real expression below.
+                expression="skyvern browser evaluate caller expression",
+                evaluate_expression=without_navigation_recovery(lambda: page.evaluate(expression)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+        except Exception as exc:
+            if cancellation_pending():
+                raise asyncio.CancelledError from exc
+            original = unwrap_caller_js_error(exc)
+            if isinstance(original, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(original, deadline):
+                raise
+            record_unreported_timeout(original)
+            raise SkyvernPageAnalysisTimeout(str(original)) from original
         return {"result": result}
 
     try:
@@ -1194,9 +1222,23 @@ def evaluate(
         output(data, action="evaluate", json_mode=json_output)
     except typer.BadParameter:
         raise
+    except SkyvernPageAnalysisTimeout as e:
+        _handle_tool_error(
+            e,
+            tool="skyvern_evaluate",
+            hint=(
+                "The expression never settled within the browser action deadline, so whether it already "
+                "took effect is unknown — read the page before retrying, since a re-run would repeat "
+                "anything it did."
+            ),
+            json_output=json_output,
+        )
     except Exception as e:
         _handle_tool_error(
-            e, tool="skyvern_evaluate", hint="Check JavaScript syntax and page state.", json_output=json_output
+            unwrap_caller_js_error(e),
+            tool="skyvern_evaluate",
+            hint="Check JavaScript syntax and page state.",
+            json_output=json_output,
         )
 
 

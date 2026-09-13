@@ -94,6 +94,8 @@ from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CodeAuthoringRepairContext,
     CopilotContext,
+    HistoricalNarrativeTurnFacts,
+    HistoricalTurnFactsProjection,
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
@@ -195,7 +197,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     close_browser_session_quietly,
     resolve_persistent_browser_state,
 )
-from skyvern.forge.sdk.copilot.runtime_authoring_repair import OBSTRUCTION_SUMMARY_MAX_CHARS
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    OBSTRUCTION_SUMMARY_MAX_CHARS,
+    PAGE_VALUE_BINDING_TEXT_MAX_CHARS,
+    RUNTIME_FAILURE_REASON_MAX_CHARS,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import (
@@ -204,6 +210,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
+from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -251,6 +258,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotAttachedFile,
     WorkflowCopilotChatHistoryMessage,
     chat_history_role,
 )
@@ -460,6 +468,71 @@ async def _resolve_live_browser_session_id(
         return requested
 
 
+def _historical_turn_facts_projection(
+    narrative_payload: TurnNarrativePayload | None,
+) -> HistoricalTurnFactsProjection | None:
+    if not isinstance(narrative_payload, dict):
+        return None
+    raw_facts = narrative_payload.get("turnFacts")
+    if not isinstance(raw_facts, dict):
+        return None
+
+    facts: HistoricalNarrativeTurnFacts = {}
+    facts_available = raw_facts.get("factsAvailable")
+    if isinstance(facts_available, bool):
+        facts["factsAvailable"] = facts_available
+
+    run_id = raw_facts.get("runId")
+    if run_id is None and "runId" in raw_facts:
+        facts["runId"] = None
+    elif isinstance(run_id, str) and run_id.strip():
+        facts["runId"] = run_id
+
+    run_completed = raw_facts.get("runCompleted")
+    if run_completed is None and "runCompleted" in raw_facts:
+        facts["runCompleted"] = None
+    elif isinstance(run_completed, bool):
+        facts["runCompleted"] = run_completed
+
+    evaluation_state = raw_facts.get("evaluationState")
+    if evaluation_state is None and "evaluationState" in raw_facts:
+        facts["evaluationState"] = None
+    elif isinstance(evaluation_state, str) and evaluation_state:
+        facts["evaluationState"] = evaluation_state
+
+    terminal_cause = raw_facts.get("terminalCause")
+    if terminal_cause is None and "terminalCause" in raw_facts:
+        facts["terminalCause"] = None
+    elif isinstance(terminal_cause, str) and terminal_cause:
+        facts["terminalCause"] = terminal_cause
+
+    blocks_run = raw_facts.get("blocksRunThisTurn")
+    if blocks_run is None and "blocksRunThisTurn" in raw_facts:
+        facts["blocksRunThisTurn"] = None
+    elif isinstance(blocks_run, int) and not isinstance(blocks_run, bool) and blocks_run >= 0:
+        facts["blocksRunThisTurn"] = blocks_run
+
+    for fact_name in ("authoredBlockCount", "matchingSourceBlockCount"):
+        count = raw_facts.get(fact_name)
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            facts[fact_name] = count
+
+    ran_clean = raw_facts.get("ranCleanOnCurrentSource")
+    if isinstance(ran_clean, bool):
+        facts["ranCleanOnCurrentSource"] = ran_clean
+
+    if not facts:
+        return None
+    projection: HistoricalTurnFactsProjection = {"scope": "originating_turn", "facts": facts}
+    turn_id = narrative_payload.get("turnId")
+    if isinstance(turn_id, str) and turn_id:
+        projection["turnId"] = turn_id
+    turn_index = narrative_payload.get("turnIndex")
+    if isinstance(turn_index, int) and not isinstance(turn_index, bool) and turn_index >= 0:
+        projection["turnIndex"] = turn_index
+    return projection
+
+
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
     if not chat_history:
         return ""
@@ -467,6 +540,7 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
 
     lines: list[str] = []
     for msg in chat_history:
+        role = chat_history_role(msg.sender)
         questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
         for raw in questions:
             interaction = QuestionInteraction.model_validate(raw)
@@ -474,7 +548,10 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
                 lines.append(f"ask_user result: {json.dumps(interaction.tool_result())}")
             else:
                 lines.append(f"ask_user request: {interaction.model_dump_json()}")
-        lines.append(f"{chat_history_role(msg.sender)}: {msg.content}")
+        lines.append(f"{role}: {msg.content}")
+        historical_facts = _historical_turn_facts_projection(msg.narrative_payload) if role == "ai" else None
+        if historical_facts is not None:
+            lines.append(f"historical_turn_facts: {json.dumps(historical_facts, separators=(',', ':'))}")
         expiry = serialize_prior_budget_expiry(msg.turn_outcome)
         if expiry is not None:
             lines.append(f"turn_outcome: {expiry}")
@@ -666,6 +743,7 @@ def _store_turn_context_packet_on_context(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     prior_copilot_workflow_yaml: str | None,
     prior_run_packet: dict[str, Any] | None = None,
+    attached_files: Sequence[CopilotAttachedFile] = (),
 ) -> None:
     ctx.turn_context_packet = TurnContextAssembler().assemble(
         TurnContextInputs(
@@ -675,6 +753,7 @@ def _store_turn_context_packet_on_context(
             prior_workflow_yaml=prior_copilot_workflow_yaml or "",
             prior_run_packet=prior_run_packet,
             chat_history=chat_history,
+            attached_files=list(attached_files),
         )
     )
 
@@ -871,9 +950,10 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         lines.append(f"refiner_selector: {_clean_authoring_repair_prompt_atom(repair_context.refiner_selector)}")
     if repair_context.reason_code == "runtime_block_failure":
         if repair_context.runtime_failure_reason:
-            lines.append(
-                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            runtime_failure_reason = _clean_authoring_repair_prompt_atom(
+                repair_context.runtime_failure_reason, max_chars=RUNTIME_FAILURE_REASON_MAX_CHARS
             )
+            lines.append(f"runtime_failure_reason: {runtime_failure_reason}")
         if repair_context.runtime_failure_class:
             lines.append(
                 f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
@@ -903,6 +983,11 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         lines.append(f"observed_after_workflow_run: {str(repair_context.observed_after_workflow_run).lower()}")
         if repair_context.page_form_summaries:
             lines.append(f"page_forms: {_render_authoring_repair_prompt_list(repair_context.page_form_summaries)}")
+        if repair_context.page_value_bindings:
+            bindings = _render_authoring_repair_prompt_list(
+                repair_context.page_value_bindings, max_chars=PAGE_VALUE_BINDING_TEXT_MAX_CHARS
+            )
+            lines.append(f"page_value_bindings: {bindings}")
         if repair_context.page_result_summaries:
             lines.append(f"page_results: {_render_authoring_repair_prompt_list(repair_context.page_result_summaries)}")
         if repair_context.rendered_value_excerpt:
@@ -925,9 +1010,10 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             lines.append(f"page_obstructions: {rendered_obstructions}")
     if repair_context.reason_code == "metadata_reject":
         if repair_context.runtime_failure_reason:
-            lines.append(
-                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            runtime_failure_reason = _clean_authoring_repair_prompt_atom(
+                repair_context.runtime_failure_reason, max_chars=RUNTIME_FAILURE_REASON_MAX_CHARS
             )
+            lines.append(f"runtime_failure_reason: {runtime_failure_reason}")
         if repair_context.runtime_failure_class:
             lines.append(
                 f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
@@ -1223,6 +1309,18 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
             for fact in outcome.missing_requested_output_facts
             if isinstance(fact, dict) and isinstance(fact.get("output_path"), str) and fact.get("output_path")
         ]
+        if not output_paths and outcome.reason_code == "run_completed_unevaluated":
+            # An unevaluated run carries no output facts by contract, so the paths to bind come from
+            # what the blocks declared. Other failures keep the values-only rendering: a repair
+            # prompt for a failed operation must not be redirected into keyed extraction.
+            output_paths = list(
+                dict.fromkeys(
+                    cleaned
+                    for label in (outcome.executed_block_labels or outcome.block_labels)
+                    for path in _goal_value_paths_for_code_block(ctx, label)
+                    if (cleaned := _clean_authoring_repair_prompt_atom(path.removeprefix("$.")))
+                )
+            )
         scaffold_lines = observed_value_extraction_scaffold_lines(rendered_values, output_paths)
         lines.extend(scaffold_lines)
         LOG.info(
@@ -1299,6 +1397,7 @@ def _build_user_context(
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
+    attached_files_summary: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -1321,6 +1420,7 @@ def _build_user_context(
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
+        attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
     )
 
 
@@ -1470,6 +1570,14 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             block_word = "block" if positive_block_count == 1 else "blocks"
             draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
 
+        connect_failure = _terminal_connect_failure(ctx)
+        if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
+            return (
+                f"I created {draft_phrase}, but I couldn't start a test. "
+                f"{build_test_connect_failure_sentence(connect_failure)} "
+                f"The draft is untested.{keep_draft_affordance}"
+            )
+
         # No run row means nothing executed, so claiming the draft was tested is false.
         if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and ctx.last_run_blocks_workflow_run_id is None:
             return (
@@ -1545,20 +1653,23 @@ def _blocks_run_this_turn(ctx: CopilotContext) -> int | None:
 
 
 def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
-    # An empty completion ends the turn before any other latch can describe the reply that ships,
-    # so it outranks them all. The deadline owns capacity, so it wins if both capacity latches are set.
-    if ctx.empty_completion is True:
-        return "empty_completion"
-    if ctx.copilot_total_timeout_exceeded is True:
-        return "deadline_expired"
-    if ctx.copilot_max_turns_exceeded is True:
-        return "max_turns_exceeded"
+    # Execution facts outrank capacity: a deadline that lands on top of an already-established
+    # block failure describes when the turn stopped, not why the work failed, and rendering it
+    # first drops the only actionable fact the turn produced. Acquisition still beats an older
+    # operation fact, so a second build test's connect failure keeps its fresh-session recovery.
+    # An empty completion still outranks both capacity latches: it describes the reply that ships.
     connect_failure = _terminal_connect_failure(ctx)
     if connect_failure is not None:
         return connect_failure.state
     failed_operation = _terminal_failed_operation(ctx)
     if failed_operation is not None:
         return failed_operation.kind
+    if ctx.empty_completion is True:
+        return "empty_completion"
+    if ctx.copilot_total_timeout_exceeded is True:
+        return "deadline_expired"
+    if ctx.copilot_max_turns_exceeded is True:
+        return "max_turns_exceeded"
     return None
 
 
@@ -1631,6 +1742,11 @@ def _turn_fact_bundle(
         "runCompleted": run_outcome.run_completed if run_outcome is not None else None,
         "terminalCause": terminal_cause,
         "blocksRunThisTurn": blocks_run_this_turn,
+        "recordedFailure": (
+            resolved_outcome.display_reason
+            if resolved_outcome is not None and resolved_outcome.verdict == "not_demonstrated"
+            else None
+        ),
         # Overwritten below, once the coverage counts it reads are in place.
         "ranCleanOnCurrentSource": False,
     }
@@ -1982,8 +2098,6 @@ def _build_narrative_payload(
     design_activity: list[NarrativeActivityEntry] = narrator_state.design_activity if narrator_state is not None else []
     block_labels: list[str] = []
     blocks: list[NarrativeBlock] = []
-    recorded_outcome = ctx.last_run_outcome
-    outcome_labels = set(ctx.last_run_outcome_block_labels) if recorded_outcome is not None else set()
     staged = ctx.staged_workflow
     if staged is not None and getattr(staged, "workflow_definition", None) is not None:
         for block in staged.workflow_definition.blocks:
@@ -1991,33 +2105,31 @@ def _build_narrative_payload(
             if not isinstance(label, str) or not label:
                 continue
             block_labels.append(label)
-            block_type_value = getattr(block, "block_type", None)
-            if block_type_value is not None and hasattr(block_type_value, "value"):
-                block_type = block_type_value.value
-            else:
-                block_type = str(block_type_value or "task")
-            raw_status = ctx.block_state_map.get(label)
-            run_identity = ctx.block_run_identity_map.get(label)
-            block_entry: NarrativeBlock = {
-                "label": label,
-                "blockType": block_type,
-                "state": _block_ui_state(
-                    raw_status,
-                    drafted_fallback=ctx.has_staged_proposal,
-                ),
-                "lastSeenIteration": run_identity.iteration if run_identity is not None else 0,
-                "activity": list(block_activity.get(label, [])),
-                "startedAt": ctx.block_started_at_map.get(label),
-                "endedAt": ctx.block_ended_at_map.get(label),
-            }
-            if run_identity is not None:
-                block_entry["workflowRunBlockId"] = run_identity.workflow_run_block_id
-            if recorded_outcome is not None and label in outcome_labels:
-                block_entry["outcome"] = recorded_outcome.verdict
-                block_entry["outcomeRole"] = recorded_outcome.role
-                if recorded_outcome.display_reason is not None:
-                    block_entry["outcomeReason"] = recorded_outcome.display_reason
-            blocks.append(block_entry)
+    newest_attempt_by_label = {
+        attempt["label"]: attempt["workflowRunBlockId"] for attempt in ctx.narrative_block_attempts.values()
+    }
+    for attempt in ctx.narrative_block_attempts.values():
+        block_entry: NarrativeBlock = {
+            "label": attempt["label"],
+            "workflowRunBlockId": attempt["workflowRunBlockId"],
+            "blockType": attempt["blockType"],
+            "state": _block_ui_state(attempt["rawStatus"], drafted_fallback=False),
+            "lastSeenIteration": attempt["lastSeenIteration"],
+            "activity": (
+                list(block_activity.get(attempt["label"], []))
+                if newest_attempt_by_label.get(attempt["label"]) == attempt["workflowRunBlockId"]
+                else []
+            ),
+            "startedAt": attempt["startedAt"],
+            "endedAt": attempt["endedAt"],
+        }
+        if "outcome" in attempt:
+            block_entry["outcome"] = attempt["outcome"]
+        if "outcomeRole" in attempt:
+            block_entry["outcomeRole"] = attempt["outcomeRole"]
+        if "outcomeReason" in attempt:
+            block_entry["outcomeReason"] = attempt["outcomeReason"]
+        blocks.append(block_entry)
     draft: NarrativeDraft | None = (
         {"blockCount": len(block_labels), "blockLabels": block_labels, "summary": None}
         if ctx.has_staged_proposal
@@ -4750,6 +4862,7 @@ async def run_copilot_agent(
     security_rules: str = "",
     config: CopilotConfig | None = None,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
+    attached_files: Sequence[CopilotAttachedFile] = (),
     turn_index: int | None = None,
     turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
@@ -4797,6 +4910,7 @@ async def run_copilot_agent(
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
                     prior_user_messages=prior_user_messages,
+                    attached_files=attached_files,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
                     ctx_sink=ctx_sink,
@@ -4898,6 +5012,7 @@ async def _run_copilot_turn_impl(
     turn_id: str,
     turn_index: int,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
+    attached_files: Sequence[CopilotAttachedFile] = (),
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
     ctx_sink: list[CopilotContext] | None = None,
@@ -5094,6 +5209,7 @@ async def _run_copilot_turn_impl(
             chat_history=chat_history,
             prior_run_packet=prior_run_packet,
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+            attached_files=attached_files,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         return _build_request_policy_clarification_result(
@@ -5223,11 +5339,14 @@ async def _run_copilot_turn_impl(
 
     user_workflow_change_summary = ""
     runnable_draft_summary = ""
+    attached_files_summary = ""
     if isinstance(ctx.turn_context_packet, TurnContextPacket):
         if ctx.turn_context_packet.workflow_change_context is not None:
             user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
         if ctx.turn_context_packet.runnable_draft_context is not None:
             runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
+        if ctx.turn_context_packet.attached_file_context is not None:
+            attached_files_summary = ctx.turn_context_packet.attached_file_context.render_prompt_block()
 
     scoped_global_llm_context = safe_global_llm_context
     prior_choice_context = connected_account_choice_context(
@@ -5267,6 +5386,7 @@ async def _run_copilot_turn_impl(
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
+        attached_files_summary=attached_files_summary,
     )
     initial_input: str | list[dict[str, str]] = user_message
     if direct_test_handoff is not None:

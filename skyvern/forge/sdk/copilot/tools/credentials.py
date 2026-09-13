@@ -8,7 +8,11 @@ import structlog
 import yaml
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
+)
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     credential_reference_spans,
     grounded_credential_references,
@@ -174,6 +178,7 @@ def _google_sheet_connection_bindings_from_workflow_definition(
 
 _GOOGLE_SHEETS_BLOCK_TYPES = {"google_sheets_read", "google_sheets_write"}
 _GOOGLE_CONNECTION_PREFIX = "goac_"
+_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE = "unapproved_google_connection_reference"
 
 
 def _is_templated_credential_value(value: str) -> bool:
@@ -220,7 +225,7 @@ def _named_google_sheet_blocks(
     ]
 
 
-def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Collection[str]) -> list[str]:
+def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], selected_labels: set[str] | None) -> list[str]:
     """Templated Sheets `credential_id` slots not backed by credential-typed workflow parameters.
     A slot is backed only when it is a bare `{{ key }}` for such a parameter; a dotted path, a
     filter, or a `{% %}` expression names no parameter the boundary can vouch for, so it renders at
@@ -230,7 +235,7 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Colle
     credential_keys = set(credential_param_ids(parameters))
     return [
         reference
-        for block in workflow_blocks(parsed, selected_labels=set(labels))
+        for block in workflow_blocks(parsed, selected_labels=selected_labels)
         if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
         and isinstance((reference := block.get("credential_id")), str)
         and _is_templated_credential_value(reference)
@@ -241,16 +246,18 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Colle
     ]
 
 
-def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str] | None) -> list[str]:
+    """Unresolved Google connection references; `labels=None` reads the whole workflow definition."""
     parsed = {"workflow_definition": _workflow_definition_as_dict(workflow_definition)}
+    selected_labels = set(labels) if labels is not None else None
     return list(
         dict.fromkeys(
             [
                 *(
                     str(block["credential_id"]).strip()
-                    for block in _named_google_sheet_blocks(parsed, selected_labels=set(labels))
+                    for block in _named_google_sheet_blocks(parsed, selected_labels=selected_labels)
                 ),
-                *_unbacked_templated_google_sheet_slots(parsed, labels),
+                *_unbacked_templated_google_sheet_slots(parsed, selected_labels),
             ]
         )
     )
@@ -601,9 +608,76 @@ def _credential_run_approval_blocker_signal(
         ),
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
-        internal_reason_code="unapproved_google_connection_reference",
+        internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
         blocked_tool="update_and_run_blocks",
+        # The id list is the opaque subset; the count covers every reference, including named
+        # connections and template expressions the trace deliberately does not carry.
+        extra={
+            "unapproved_google_connection_ids": [
+                reference
+                for reference in unapproved_google_ids
+                if reference.startswith(_GOOGLE_CONNECTION_PREFIX) and not _is_templated_credential_value(reference)
+            ],
+            "unapproved_google_reference_count": len(unapproved_google_ids),
+        },
     )
+
+
+def _workflow_wide_unapproved_google_references(workflow_definition: Any, approved_ids: set[str]) -> set[str]:
+    google_ids = {
+        credential_id
+        for credential_id in _extract_credential_ids_from_workflow_definition(workflow_definition)
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+    return (google_ids | set(_google_connection_reference_ids(workflow_definition, None))) - approved_ids
+
+
+def _non_sheets_google_connection_ids(workflow_definition: Any) -> set[str]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return {
+        credential_id
+        for block in workflow_blocks({"workflow_definition": definition})
+        if block.get("block_type") not in _GOOGLE_SHEETS_BLOCK_TYPES
+        for credential_id in _extract_credential_ids_from_tool_value(block.get("credential_id"))
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+
+
+def _saved_unapproved_google_connection_ids(request_policy: RequestPolicy | None, approved_ids: set[str]) -> set[str]:
+    if request_policy is None:
+        return set()
+    return {
+        credential_id
+        for credential_id in request_policy.persisted_workflow_credential_ids
+        if not _CREDENTIAL_ID_RE.fullmatch(credential_id.strip())
+    } - approved_ids
+
+
+def _retire_stale_google_connection_denial(
+    ctx: CopilotContext,
+    *,
+    workflow_definition: Any,
+    additional_approved_ids: Collection[str] = (),
+) -> None:
+    """Drop an earlier attempt's denial once nothing it could have named is unapproved any more.
+    The clear removes every signal holding this reason code, including a later dispatch's live
+    denial, so any Google reference still unapproved in the executing or the saved definition
+    keeps them all standing."""
+    stale = ctx.blocker_signal
+    if not isinstance(stale, CopilotToolBlockerSignal):
+        return
+    if stale.internal_reason_code != _UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE:
+        return
+    durably_approved = _approved_run_credential_ids(ctx.request_policy)
+    approved = durably_approved | set(additional_approved_ids)
+    if _workflow_wide_unapproved_google_references(workflow_definition, approved):
+        return
+    if _non_sheets_google_connection_ids(workflow_definition) - durably_approved:
+        return
+    if _saved_unapproved_google_connection_ids(ctx.request_policy, approved):
+        return
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE}))
+    ctx.connected_account_recovery_choices = []
 
 
 async def _server_verified_google_account_choices(

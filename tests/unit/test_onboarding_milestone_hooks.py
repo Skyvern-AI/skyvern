@@ -581,7 +581,12 @@ class TestWorkflowRunCompleteHookFires:
             mock_app.AGENT_FUNCTION = mock_agent_fn
             mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
             mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = True
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.drain_failure_evidence_capture = (
+                AsyncMock()
+            )
             mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+            mock_app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id = AsyncMock(return_value=[])
 
             from skyvern.forge.sdk.workflow.service import WorkflowService
 

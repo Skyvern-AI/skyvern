@@ -23,7 +23,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, TypeVar
+from typing import Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 
 import structlog
 
@@ -57,6 +57,33 @@ class ToolResult:
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
+
+
+# The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
+# tools, read here). Internal to the loop: only `content` is ever shown to the model, so they cost no
+# tokens. The label composition itself -- the floor vocabulary, the shape filter, the secret matcher --
+# lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
+TARGET_LABEL_DATA_KEY = "target_label"
+TARGET_KIND_DATA_KEY = "target_kind"
+
+
+class RoundAction(NamedTuple):
+    """One dispatched page action, as the caller persists it."""
+
+    tool: str
+    args: dict[str, Any]
+    succeeded: bool
+    # The target's page-visible name, read off the element before the action ran. None when the tool
+    # names no element, when the target has no readable name, or when the probe could not run.
+    target_name: str | None = None
+    # The target's role/type, from a fixed vocabulary (see target_label.py) -- computed the same time
+    # as target_name and independent of whether a name was found.
+    target_kind: str | None = None
+    # Whether this action consumed a budget unit. Carried rather than re-derived from the tool name
+    # downstream: the loop already read it off the ToolSpec, and a second name list is a second place
+    # for a new tool to be missing from.
+    billable: bool = False
+
 
 # A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
 # completed with that reason, without the model ever calling finish. A blocker consulted from
@@ -741,9 +768,21 @@ async def _sample_probe(probe: Callable[[], Awaitable[str | None]], deadline_at:
         return None
 
 
+# The code tool drives the page through Playwright directly, so the loop sees one tool call where an
+# arbitrary number of clicks and submits may have happened. Named here, beside the detector, because
+# the detector is what has to know: it is the one fact about that tool the submit guards need, and a
+# guard that learns about a caller from a list somebody remembered to update is the shape of the bug
+# this closes.
+CODE_TOOL_NAME = "execute_python"
+
+
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them."""
-    return tool_name == "click" or _is_enter_submit(tool_name, args)
+    """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them.
+
+    The code tool counts too: its body is opaque to the loop, so it is treated as possibly having
+    submitted rather than as certainly not having.
+    """
+    return tool_name in ("click", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
 
 
 def _is_finish(tool_name: str) -> bool:
@@ -1761,7 +1800,7 @@ async def run_agent_tool_loop(
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     deadline_seconds: float | None = None,
@@ -1851,12 +1890,12 @@ async def run_agent_tool_loop(
                 # voided (they were chosen on a page declared stale), the signal is re-armed for
                 # another attempt (bounded by the cap), and the model is told the reload failed.
                 LOG.warning("taskv3 loop page reload failed after refresh signal", tool=tool_name, exc_info=True)
-                round_actions.append((*reload_record, False))
+                round_actions.append(RoundAction(*reload_record, False))
                 ctx.refresh_working_page = True
                 _append_skipped_tool_results(st.messages, remaining, "a page reload was requested but failed")
                 st.reload_failed_nudge_due = True
                 return True
-            round_actions.append((*reload_record, True))
+            round_actions.append(RoundAction(*reload_record, True))
         LOG.info("taskv3 loop honored page refresh signal", tool=tool_name, turn=st.turns)
         # The reloaded document is a new baseline for every ledger that described the old one, and a
         # look taken before it would hand the model marks that no longer exist. That includes the
@@ -2281,7 +2320,7 @@ async def run_agent_tool_loop(
         st.budget_extended_notice = None
         st.reload_failed_nudge_due = False
         action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
-        round_actions: list[tuple[str, dict[str, Any], bool]] = []
+        round_actions: list[RoundAction] = []
         # A hard 404/410 from an in-loop navigate, applied only AFTER the batch so a same-turn fallback
         # navigate can clear it — the model is told to batch aggressively, and terminating on the first
         # of a batched [navigate(dead), navigate(live)] would discard the recovery it planned.
@@ -2863,7 +2902,16 @@ async def run_agent_tool_loop(
                 # Dispatched page actions enter the round with their outcome: a failed billable round
                 # still consumed budget and must persist (else later blocks undercount the run
                 # budget); recordable tools persist for artifact parity without billing/budget.
-                round_actions.append((tool_name, args, result.status == "ok"))
+                round_actions.append(
+                    RoundAction(
+                        tool_name,
+                        args,
+                        result.status == "ok",
+                        result_data.get(TARGET_LABEL_DATA_KEY) or None,
+                        result_data.get(TARGET_KIND_DATA_KEY) or None,
+                        spec.billable,
+                    )
+                )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):

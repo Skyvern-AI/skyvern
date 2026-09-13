@@ -21,6 +21,7 @@ from skyvern.webeye.browser_retirement import (
     BrowserRetirementReason,
 )
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal  # noqa: F401
 
 # Not a RunType member, so the reaper cannot resolve it by matching that enum. Both the writer of
 # a standalone-task lease and the reaper's liveness check must agree on this exact string, or the
@@ -122,6 +123,10 @@ class PersistentSessionsManager(Protocol):
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        url: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState | None:
         """Get the browser state for a session."""
         ...

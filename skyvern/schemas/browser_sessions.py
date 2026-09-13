@@ -1,3 +1,6 @@
+from datetime import datetime
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
@@ -149,6 +152,9 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
 
 
 class ProcessBrowserSessionRecordingResponse(BaseModel):
+    recording_id: str | None = Field(
+        description="ID of the durable, redacted recording created when processing produced workflow blocks."
+    )
     blocks: list[WorkflowDefinitionYamlBlocksItem] = Field(
         default=[],
         description="List of workflow blocks generated from the processed browser session recording.",
@@ -157,3 +163,17 @@ class ProcessBrowserSessionRecordingResponse(BaseModel):
         default=[],
         description="List of workflow parameters generated from the processed browser session recording.",
     )
+
+
+class BrowserRecording(BaseModel):
+    recording_id: str
+    organization_id: str
+    recording_attempt_id: str
+    browser_session_id: str
+    workflow_permanent_id: str
+    workflow_id: str | None = None
+    workflow_version: int | None = None
+    evidence: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    created_at: datetime
+    modified_at: datetime

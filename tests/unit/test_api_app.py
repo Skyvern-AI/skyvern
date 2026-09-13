@@ -1,4 +1,8 @@
-"""Connection-level database failures answer 503; server-raised ones stay on the 500 path."""
+"""Connection-level database failures answer 503; server-raised ones stay on the 500 path.
+
+Handlers are registered through the app's own registrar so a type the real app covers
+cannot be missing here, or vice versa.
+"""
 
 import sqlite3
 
@@ -9,23 +13,24 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.exc import OperationalError
 
-from skyvern.forge.api_app import db_unavailable_handler
+from skyvern.forge.api_app import register_db_unavailable_handlers
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
 
 
-def _app(dbapi_error: BaseException) -> FastAPI:
+def _app(error: BaseException) -> FastAPI:
     app = FastAPI()
-    app.add_exception_handler(OperationalError, db_unavailable_handler)
+    register_db_unavailable_handlers(app)
 
     @app.get("/read")
     @app.post("/write")
     async def failing() -> None:
-        raise OperationalError("SELECT 1", {}, dbapi_error)
+        raise error
 
     return app
 
 
-async def _call(dbapi_error: BaseException, method: str, path: str) -> httpx.Response:
-    transport = httpx.ASGITransport(app=_app(dbapi_error))
+async def _call(error: BaseException, method: str, path: str) -> httpx.Response:
+    transport = httpx.ASGITransport(app=_app(error))
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.request(method, path)
 
@@ -42,7 +47,7 @@ async def _call(dbapi_error: BaseException, method: str, path: str) -> httpx.Res
     ids=["refused", "57P03", "08006", "53300"],
 )
 async def test_connection_failure_on_a_read_is_503_with_retry_after(dbapi_error: BaseException) -> None:
-    response = await _call(dbapi_error, "GET", "/read")
+    response = await _call(OperationalError("SELECT 1", {}, dbapi_error), "GET", "/read")
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "1"
@@ -52,7 +57,9 @@ async def test_connection_failure_on_a_read_is_503_with_retry_after(dbapi_error:
 @pytest.mark.asyncio
 async def test_connection_failure_on_a_write_is_503_without_a_retry_hint() -> None:
     response = await _call(
-        psycopg.errors.ConnectionFailure("server closed the connection unexpectedly"), "POST", "/write"
+        OperationalError("INSERT 1", {}, psycopg.errors.ConnectionFailure("server closed the connection unexpectedly")),
+        "POST",
+        "/write",
     )
 
     assert response.status_code == 503
@@ -71,4 +78,13 @@ async def test_connection_failure_on_a_write_is_503_without_a_retry_hint() -> No
 )
 async def test_server_raised_and_non_postgres_errors_stay_on_the_500_path(dbapi_error: BaseException) -> None:
     with pytest.raises(OperationalError):
-        await _call(dbapi_error, "GET", "/read")
+        await _call(OperationalError("SELECT 1", {}, dbapi_error), "GET", "/read")
+
+
+@pytest.mark.asyncio
+async def test_a_read_that_exhausted_its_reconnects_answers_like_the_driver_error_it_replaced() -> None:
+    """Recovering the read inside the repository must not downgrade the endpoint's answer."""
+    response = await _call(DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3), "GET", "/read")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"

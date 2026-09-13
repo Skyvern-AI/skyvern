@@ -249,8 +249,9 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
 _AUTHOR_DOWNLOAD_GUIDANCE = (
     "A correct click reached a download affordance on the current page. Author ONE terminal "
     "download code block as a single `await click_and_claim_download(page, selector)` call with the "
-    "captured affordance selector — not page.expect_download (the sandboxed runner cannot execute "
-    "it), not a static-fetch request, and not another page re-evaluation. The platform clicks the "
+    "captured affordance selector — not page.expect_download (the selector is already known, so the "
+    "one-call helper is the simpler form here), not a static-fetch request, and not "
+    "another page re-evaluation. The platform clicks the "
     "affordance once, claims the fired browser download, and registers it to the workflow output "
     "surface (downloaded_files); never place file bytes or URLs in the chat reply. The call returns "
     "the sanitized file name as a plain string — bind it and return it as-is. It is not a Download "
@@ -299,8 +300,7 @@ _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
 
 # Sandbox helper that clicks a download affordance and claims the fired browser download into the
-# run download directory — the one fired-download terminal shape both engines execute (the secure
-# runner cannot broker page.expect_download).
+# run download directory — the fired-download terminal shape both engines execute for one known affordance.
 DOWNLOAD_CLAIM_HELPER_NAME = "click_and_claim_download"
 
 
@@ -392,8 +392,8 @@ def code_is_download_intent(code: str) -> bool:
     """True when a code block authors a download: it uses the `page.expect_download` context-manager
     idiom, any event-based `"download"` capture (`wait_for_event`/`expect_event`/`on`/`once`/
     `add_listener`), or the `click_and_claim_download` helper anywhere, or returns/binds a dict
-    literal carrying an execution-layer download registration key. It stays deliberately broader
-    than the runner's own policy — the denied `page.expect_download` idiom still counts — because
+    literal carrying an execution-layer download registration key. It stays deliberately broad —
+    every download idiom counts, whether or not the runner accepts it — because
     its consumer is the unregistered-download telemetry in workflow/models/block.py, which measures
     authorship rather than validity."""
     if not code.strip():

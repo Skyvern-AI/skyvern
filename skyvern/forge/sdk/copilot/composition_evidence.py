@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
@@ -2492,7 +2492,7 @@ def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> 
     return relations, truncated, reveal_truncated
 
 
-def clearable_dismiss_texts(evidence: dict[str, Any]) -> set[str]:
+def clearable_dismiss_texts(evidence: Mapping[str, Any]) -> set[str]:
     """The texts of the dismiss controls the captured dialogs offer."""
     texts: set[str] = set()
     for overlay in evidence.get("modal_overlays") or []:

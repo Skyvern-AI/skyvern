@@ -772,6 +772,7 @@ async def test_workflow_update_preserves_all_update_safe_settings_when_omitted(
         "folder_id",
         "enable_self_healing",
         "code_version",
+        "recording_id",
     }
     assert set(workflow_tools._WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS) == (
         set(WorkflowCreateYAMLRequest.model_fields) - excluded_fields

@@ -1098,6 +1098,13 @@ class CDPDownloadInterceptor:
         self._remember_download_directory(self._output_dir)
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir, dir_changed=dir_changed)
 
+    @property
+    def proxy_auth_credentials(self) -> tuple[str, str] | None:
+        """Credentials already entrusted to this context's request-stage CDP owner."""
+        if self._proxy_username and self._proxy_password:
+            return self._proxy_username, self._proxy_password
+        return None
+
     def rebind_download_scope(
         self,
         *,

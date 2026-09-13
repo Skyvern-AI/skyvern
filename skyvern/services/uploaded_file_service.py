@@ -282,6 +282,9 @@ async def delete_files_attached_to_run(*, run_id: str) -> int:
 async def resolve_file_reference(*, file_id: str, organization_id: str) -> str | None:
     """Return the storage URI behind a file id, or None when the org has no such live file.
 
+    A row past its ``expires_at`` reports as missing rather than handing back a URI whose object the
+    next purge deletes.
+
     This is what lets a caller hand the agent a file id instead of a presigned URL: the URI is
     read from the row rather than taken from input, and the storage layer re-checks it against
     the organization's prefix before any bytes are read.
@@ -289,7 +292,16 @@ async def resolve_file_reference(*, file_id: str, organization_id: str) -> str |
     uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
         file_id=file_id, organization_id=organization_id
     )
-    return uploaded_file.storage_uri if uploaded_file else None
+    if uploaded_file is None:
+        return None
+    # The purge runs hourly, so an expired row can still name live bytes. The retention the caller
+    # was promised governs the dereference, not when the sweep happens to run.
+    expires_at = uploaded_file.expires_at
+    if expires_at is not None:
+        expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        if expiry <= datetime.now(timezone.utc):
+            return None
+    return uploaded_file.storage_uri
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

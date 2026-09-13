@@ -785,6 +785,7 @@ class TestForLoopSkipsUnparseableFile:
 
         workflow_run_context = MagicMock()
         workflow_run_context.has_value.return_value = False
+        workflow_run_context.cancel_failure_evidence_capture = AsyncMock()
 
         with (
             patch.object(Block, "execute_safe", autospec=True, side_effect=fake_execute_safe),
@@ -899,6 +900,7 @@ class TestForLoopSkipsUnparseableFile:
 
         workflow_run_context = MagicMock()
         workflow_run_context.has_value.return_value = False
+        workflow_run_context.cancel_failure_evidence_capture = AsyncMock()
 
         with (
             patch.object(Block, "execute_safe", autospec=True, side_effect=fake_execute_safe),

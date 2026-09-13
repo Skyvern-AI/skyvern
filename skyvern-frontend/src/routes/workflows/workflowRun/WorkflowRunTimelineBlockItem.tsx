@@ -16,6 +16,7 @@ import {
 } from "@/api/types";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { InlineMarkdown } from "@/components/AgentMarkdown";
+import { statusIsFinalized } from "@/routes/tasks/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -1101,6 +1102,11 @@ function WorkflowRunTimelineBlockItem({
     () => (isLoopBlock ? getLoopIterationGroups(subItems) : []),
     [isLoopBlock, subItems],
   );
+  const hasNoLoopIterations =
+    isLoopBlock &&
+    loopIterationGroups.length === 0 &&
+    (workflowRunIsFinalized ||
+      (block.status !== null && statusIsFinalized({ status: block.status })));
   const hasRenderableNestedChildren = subItems.some(
     (item) => isBlockItem(item) || (renderThoughts && isThoughtItem(item)),
   );
@@ -1316,9 +1322,14 @@ function WorkflowRunTimelineBlockItem({
                 {actionCount} {actionCount === 1 ? "action" : "actions"}
               </span>
             )}
-            {loopCounter && (
+            {loopCounter && !hasNoLoopIterations && (
               <span className="shrink-0 rounded bg-muted px-1 text-[10px] tabular-nums text-tertiary-foreground dark:bg-slate-700">
                 {loopCounter}
+              </span>
+            )}
+            {hasNoLoopIterations && (
+              <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground dark:bg-slate-700">
+                No iterations
               </span>
             )}
             {duration && (

@@ -5,6 +5,7 @@ import ast
 import asyncio
 import builtins
 import codecs
+import contextlib
 import copy
 import csv
 import hashlib
@@ -19,6 +20,7 @@ import shutil
 import smtplib
 import socket
 import ssl
+import tempfile
 import textwrap
 import unicodedata
 import uuid
@@ -33,7 +35,19 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, TypeVar, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Awaitable,
+    Callable,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    Union,
+    cast,
+)
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import aiofiles
@@ -48,7 +62,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import Page
+from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -149,7 +163,7 @@ from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_
 from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
@@ -160,6 +174,16 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
+from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+    AuthorizedFileAccessError,
+    AuthorizedFileMaterialization,
+    AuthorizedFileMaterializationFailure,
+    MaterializedAuthorizedFile,
+    bind_inline_attach_authorized_file,
+    capture_authorized_file,
+    inline_authorized_file_path,
+    unbound_attach_authorized_file,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -229,6 +253,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_full_template_reference,
 )
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -269,6 +294,7 @@ from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
     resolve_fetch_host_ips,
 )
+from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_artifacts import DownloadBinding
@@ -286,7 +312,7 @@ from skyvern.webeye.navigation import (
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.agent_functions import CodeBlockEngineFailure
@@ -1170,11 +1196,13 @@ class Block(BaseModel, abc.ABC):
                     proxy_location=workflow_run.proxy_location,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    browser_context_route_policy_url=browser_state.browser_context_route_policy_url,
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     cdp_connect_headers=workflow_run.cdp_connect_headers,
                     browser_address=workflow_run.browser_address,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    browser_session_id=browser_session_id,
                 )
                 LOG.info(
                     "Rebuilt a disconnected browser state before block execution",
@@ -1554,6 +1582,11 @@ class Block(BaseModel, abc.ABC):
                 current_index=current_index,
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
+
+            # A prior failed code block may still own an exact-page capture. Settle it after this
+            # block has a row, so a settlement failure uses the normal scrubbed failure path, but
+            # before this successor can read from or mutate the browser.
+            await self.get_workflow_run_context(workflow_run_id).cancel_failure_evidence_capture()
 
             current_context = skyvern_context.current()
             # Script-mode descriptions are cosmetic; loop iterations reuse the first description.
@@ -3309,6 +3342,7 @@ class ForLoopBlock(Block):
             LOG.info("Starting loop iteration", loop_idx=loop_idx)
 
             if loop_idx > 0:
+                await workflow_run_context.cancel_failure_evidence_capture()
                 await self._reset_browser_tabs_for_iteration(
                     workflow_run_id, organization_id, browser_session_id, loop_baseline_pages
                 )
@@ -3979,6 +4013,12 @@ class WhileLoopBlock(Block):
             }
             workflow_run_context.update_block_metadata(self.label, condition_metadata)
 
+            # A failed body block may have returned under next_loop_on_failure while its
+            # exact-page evidence capture is still pending. Prompt conditions can touch the
+            # browser before another child reaches execute_safe, so settle that owned capture
+            # before condition evaluation can observe or mutate the page.
+            await workflow_run_context.cancel_failure_evidence_capture()
+
             try:
                 should_continue = await self._evaluate_condition(
                     workflow_run_context,
@@ -4472,6 +4512,19 @@ class CodeBlockDownloadClaimError(Exception):
 
 
 CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
+# Attach at-failure evidence only while the row is still this attempt's unsuccessful outcome.
+# A heal or a later attempt leaves it running/completed, and that result must not be overwritten.
+_UNSUCCESSFUL_TERMINAL_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed, BlockStatus.terminated, BlockStatus.canceled, BlockStatus.timed_out}
+)
+
+
+class _StagedFrame(NamedTuple):
+    """A frame read from the failing page before anything could navigate it; None if capture failed."""
+
+    screenshot: bytes | None
+
+
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 # An exception can carry a whole page's text. Bound the persisted reason below the parameter
 # scrubber's disclosure budget, past which it fails closed and returns nothing at all.
@@ -4983,6 +5036,8 @@ async def _code_block_click_and_claim_download_builtin(
     workflow_run_id: str | None = None,
     download_binding: DownloadBinding | None = None,
     download_evidence: DownloadEvidenceProbe | None = None,
+    action: Callable[[], Awaitable[None]] | None = None,
+    timeout_seconds: float | None = None,
 ) -> str:
     """Click ``selector`` once and confirm the browser download it fires, returning the sanitized
     suggested filename as a summary.
@@ -4991,13 +5046,14 @@ async def _code_block_click_and_claim_download_builtin(
     writer — the browser writing into the run download directory, or the session watcher on a
     provider-owned destination — and the execution layer registers from there. Copying or replaying
     here would add a second writer to a single-writer system (SKY-11371) and double-register the
-    delivered file, so the only thing this operation owns is the click and the event."""
+    delivered file, so the only thing this operation owns is the trigger and the event. ``action``
+    replaces the click when the trigger runs elsewhere, as for a brokered ``page.expect_download``."""
     if download_binding is None or download_binding not in (DownloadBinding.RUN_DIR, DownloadBinding.SESSION_DIR):
         raise CodeBlockDownloadClaimError(
             "click_and_claim_download is only supported when downloads are bound to a known destination."
         )
     resolved_selector = str(selector or "").strip()
-    if not resolved_selector:
+    if action is None and not resolved_selector:
         raise CodeBlockDownloadClaimError("click_and_claim_download requires the selector of the affordance to click.")
     click_error: BaseException | None = None
     # Only a binding whose delivery this page cannot observe can reach the grace branch below, so
@@ -5008,17 +5064,29 @@ async def _code_block_click_and_claim_download_builtin(
         else None
     )
     # A provider-owned session delivers the bytes on its own connection, so this page may never see
-    # the event at all (SKY-11371). Wait briefly for one rather than spending the full window on an
-    # event that is not this binding's proof of delivery.
-    observe_seconds = (
-        _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS
-        if download_binding is DownloadBinding.SESSION_DIR
-        else _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
-    )
+    # the event at all (SKY-11371). Wait briefly for one — even when the caller asked for longer,
+    # since registration evidence, not the event, is that binding's proof of delivery.
+    # Always finite: Playwright removes an abandoned claim's listeners only when its timeout fires,
+    # so an unbounded window would strand them on a page later blocks reuse.
+    if download_binding is DownloadBinding.SESSION_DIR:
+        observe_seconds: float = min(
+            timeout_seconds if timeout_seconds is not None else _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
+            _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
+        )
+    elif timeout_seconds is not None:
+        observe_seconds = timeout_seconds
+    else:
+        observe_seconds = _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
+    if observe_seconds <= 0:
+        # Playwright reads a non-positive window as "wait forever" and then reaps nothing.
+        observe_seconds = _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
     try:
         async with page.expect_download(timeout=observe_seconds * 1000) as claim:
             try:
-                await page.locator(resolved_selector).click(timeout=_DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS * 1000)
+                if action is None:
+                    await page.locator(resolved_selector).click(timeout=_DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS * 1000)
+                else:
+                    await action()
             except Exception as exc:
                 click_error = exc
                 raise
@@ -5058,7 +5126,11 @@ async def _code_block_click_and_claim_download_builtin(
             # succeeded; the execution layer still reports an unregistered intent when nothing
             # arrives.
             return delivered_name or _DOWNLOAD_CLAIM_FALLBACK_STEM
-        raise CodeBlockDownloadClaimError("Clicking the affordance did not fire a browser download.") from exc
+        raise CodeBlockDownloadClaimError(
+            "Clicking the affordance did not fire a browser download."
+            if action is None
+            else "The page.expect_download block did not fire a browser download."
+        ) from exc
 
     monitor_owns_binding = _download_monitor_owns_binding(page)
     # An event that fired is not a download that finished: a cancelled or failed transfer would
@@ -5115,6 +5187,56 @@ def _bind_code_block_download_claim(
     return click_and_claim_download
 
 
+async def _code_block_clear_browser_data_builtin(page: Page | RecordingPage) -> None:
+    """Drop every cookie in the run's browser context and all stored data for the current page's
+    origin, the way a block navigating to the browser's clear-browsing-data page meant to; the author
+    is choosing to lose the session, so nothing is restored afterwards."""
+    real_page = page._underlying_page if isinstance(page, RecordingPage) else page
+    context = real_page.context
+    origin = _page_origin(real_page.url)
+    LOG.info("Code block clearing browser data", origin=origin)
+    await context.clear_cookies()
+    if not origin:
+        return
+    cdp_session = await context.new_cdp_session(real_page)
+    try:
+        await cdp_session.send("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"})
+        # Storage.clearDataForOrigin leaves the open tab's sessionStorage in place.
+        await cdp_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
+    finally:
+        await cdp_session.detach()
+
+
+CLEAR_BROWSER_DATA_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await clear_browser_data(page)",
+    "shadowed_by_parameter": "clear_browser_data",
+    "on_parameter_collision": (
+        "Both executors bind a declared clear_browser_data parameter to its value instead of the helper. "
+        "Before calling the helper, rename that parameter to an unused name, preserve its value/default, "
+        "and update its block bindings, code/template references, and caller-supplied run input keys."
+    ),
+    "parameters": {"page": {"accepted_type": "current_code_block_page"}},
+    "returns": {"type": "null"},
+    "effect": (
+        "Every cookie in the run's browser context is dropped, and all stored data (local and session "
+        "storage, IndexedDB, caches) for the page's current origin. Nothing is restored afterwards."
+    ),
+    "usage": (
+        "For a site that requires a clean session before sign-in: read page.url, await the helper, then "
+        "await page.goto(url). Browser settings pages such as chrome://settings cannot be navigated to."
+    ),
+}
+
+
+def _page_origin(url: str) -> str:
+    """The page's origin as CDP's ``securityOrigin`` spells it: never the userinfo a URL can carry."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
+
+
 def _bind_code_block_search_web(
     page: Page | RecordingPage | None,
 ) -> Callable[[str, int], Awaitable[web_search.WebSearchObservation]]:
@@ -5132,6 +5254,79 @@ def _bind_code_block_search_web(
         )
 
     return search_web
+
+
+def _link_without_overwrite(source: str, directory: str) -> str:
+    """Hard-link `source` into `directory` under its own name, or `name (n).ext` when that is taken."""
+    stem, suffix = os.path.splitext(os.path.basename(source))
+    candidate, attempt = os.path.join(directory, os.path.basename(source)), 0
+    while True:
+        try:
+            os.link(source, candidate)
+            return candidate
+        except FileExistsError:
+            attempt += 1
+            candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
+
+
+_LATE_SAFE_GLOBALS = frozenset({"round", "abs", "attach_authorized_file", "clear_browser_data"})
+
+CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
+
+
+def _code_block_dialog_context(page: Page | RecordingPage) -> BrowserContext:
+    raw_page = page._underlying_page if isinstance(page, RecordingPage) else page
+    return raw_page.context
+
+
+def refuse_credential_dialog_prompt_text(
+    guard: CredentialReleaseGuard | None,
+    prompt_text: str | None,
+) -> None:
+    """A native dialog carries no release target of its own, so an armed secret in the answer text
+    is refused outright rather than compared against a site. Matched at any length, unlike a filled
+    field: refusal is the only outcome here, so a short secret embedded in a longer answer must not
+    slip through the length floor."""
+    if guard is None or prompt_text is None:
+        return
+    matched = guard.matches_anywhere(prompt_text)
+    if not matched:
+        return
+    guard.check_release(
+        matched[0],
+        None,
+        operation=CODE_BLOCK_DIALOG_POLICY_HELPER_NAME,
+        alternatives=matched[1:],
+    )
+
+
+def _bind_code_block_set_dialog_policy(
+    page: Page | RecordingPage | None,
+    credential_release_guard: CredentialReleaseGuard | None = None,
+) -> Callable[..., Awaitable[list[dict[str, str]]]]:
+    """Closure rather than a `partial`: a keyword default on a `partial` would let block code
+    override the page whose dialogs the declared policy answers."""
+
+    async def set_dialog_policy(
+        target_page: Page | RecordingPage, action: str, prompt_text: str | None = None
+    ) -> list[dict[str, str]]:
+        if page is None:
+            raise RuntimeError("set_dialog_policy is only supported while the run browser is open.")
+        if target_page is not page:
+            raise RuntimeError("set_dialog_policy requires the current CodeBlock page.")
+        if action not in dialog_handler.DIALOG_POLICY_ACTIONS:
+            raise ValueError("set_dialog_policy action must be 'accept' or 'dismiss'.")
+        if prompt_text is not None and not isinstance(prompt_text, str):
+            raise ValueError("set_dialog_policy prompt_text must be a string.")
+        if prompt_text is not None and action != "accept":
+            raise ValueError("set_dialog_policy prompt_text requires the 'accept' action.")
+        refuse_credential_dialog_prompt_text(credential_release_guard, prompt_text)
+        context = _code_block_dialog_context(page)
+        records = dialog_handler.take_dialog_records(context)
+        dialog_handler.set_dialog_policy(context, action, prompt_text)
+        return records
+
+    return set_dialog_policy
 
 
 class CodeBlock(Block):
@@ -5261,7 +5456,10 @@ class CodeBlock(Block):
             "click_and_claim_download": _bind_code_block_download_claim(
                 organization_id=None, workflow_run_id=None, download_binding=None
             ),
+            "attach_authorized_file": unbound_attach_authorized_file,
             "search_web": _bind_code_block_search_web(None),
+            "clear_browser_data": _code_block_clear_browser_data_builtin,
+            CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
 
     def generate_async_user_function(
@@ -5276,6 +5474,7 @@ class CodeBlock(Block):
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
+        authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -5317,13 +5516,41 @@ class CodeBlock(Block):
             download_binding=download_binding,
             download_evidence=download_evidence,
         )
+        safe_vars["attach_authorized_file"] = bind_inline_attach_authorized_file(
+            page,
+            authorized_file_materializations or {},
+            parameters,
+            download_root=settings.DOWNLOAD_PATH,
+            workflow_run_id=workflow_run_id or "",
+            organization_id=organization_id,
+            max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+            locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
+        )
         safe_vars["search_web"] = _bind_code_block_search_web(page)
+        safe_vars["page"] = page
+        safe_vars[CODE_BLOCK_DIALOG_POLICY_HELPER_NAME] = _bind_code_block_set_dialog_policy(
+            page,
+            page._credential_release_guard if isinstance(page, RecordingPage) else None,
+        )
+        # Python NFKC-normalizes identifiers at parse time, so the guard runs on the name the
+        # wrapper argument really binds under.
+        if any(
+            unicodedata.normalize("NFKC", key) == CODE_BLOCK_DIALOG_POLICY_HELPER_NAME for key in (parameters or {})
+        ):
+            raise ValueError(
+                f"'{CODE_BLOCK_DIALOG_POLICY_HELPER_NAME}' is a reserved CodeBlock builtin "
+                "and cannot be used as a parameter name."
+            )
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():
-                is_safe_var = key in safe_vars
-                is_numeric_builtin_shadow = key in {"round", "abs"}
-                if (not is_safe_var or is_numeric_builtin_shadow) and isinstance(value, Credential):
+                # Python binds identifiers under their NFKC spelling, including in wrapper arguments.
+                name = unicodedata.normalize("NFKC", key)
+                if name in parameter_defaults:
+                    continue
+                is_safe_var = name in safe_vars
+                is_late_safe_global = name in _LATE_SAFE_GLOBALS
+                if (not is_safe_var or is_late_safe_global) and isinstance(value, Credential):
                     # Rebind against the page this block actually runs on. The bind above happens
                     # before the page exists, and only object identity is unforgeable: authored code
                     # can define a class carrying any capability a structural check looks for, and
@@ -5333,20 +5560,19 @@ class CodeBlock(Block):
                     )
                 if not is_safe_var:
                     safe_vars[key] = value
-                # `round` and `abs` were valid parameter names before they became safe globals.
-                # Keep persisted/manual blocks working by letting their wrapper arguments shadow
-                # the globals, while blocks without those parameters still receive the builtins.
-                if (not is_safe_var or is_numeric_builtin_shadow) and (
-                    key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__")
+                # These were valid parameter names before they became safe globals. Keep
+                # persisted/manual blocks working by letting their wrapper arguments shadow the
+                # globals, while blocks without those parameters still receive the builtins.
+                if (not is_safe_var or is_late_safe_global) and (
+                    name.isidentifier() and not keyword.iskeyword(name) and not name.startswith("__")
                 ):
-                    parameter_defaults[key] = value
+                    parameter_defaults[name] = value
         default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return __capture_locals()
+    return {{key: value for key, value in __capture_locals().items() if key not in __param_defaults}}
 """
-        safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
@@ -5366,26 +5592,12 @@ async def wrapper({default_args}):
         )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
-        inner_function = user_function
-        if parameter_defaults:
-            excluded_parameter_keys = frozenset(parameter_defaults)
-
-            async def filtered_user_function() -> dict[str, Any]:
-                result: Any = await user_function()
-                # An explicit `return <non-dict>` in user code yields that value directly,
-                # not the __capture_locals() dict; only the implicit dict needs the injected
-                # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
-                if not isinstance(result, dict):
-                    return result
-                return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
-
-            inner_function = filtered_user_function
 
         async def timed_user_function() -> dict[str, Any]:
             started_at = monotonic()
             success = False
             try:
-                result: Any = await inner_function()
+                result: Any = await user_function()
                 success = True
                 return result
             finally:
@@ -5920,48 +6132,86 @@ async def wrapper({default_args}):
         self,
         value: str | dict[str, Any] | None,
         *,
+        parameter_key: str,
+        materialized_file_paths: dict[str, tuple[str, str]],
         workflow_run_id: str,
         organization_id: str | None,
-    ) -> str | dict[str, Any] | None:
+    ) -> AuthorizedFileMaterialization | None:
+        """None when the parameter carries no URI to materialize; a failure marker only when an
+        attempt was made and did not produce a run-authorized file."""
         uri: str | None = None
         if isinstance(value, str):
             uri = value
         elif isinstance(value, dict):
             uri = value.get("s3uri")
         if not uri or not str(uri).strip():
-            return value
+            return None
+        # A file:// URI names a local file, so it gets the run-scoped check below. download_file would
+        # resolve it against every run's downloads, and the copy-in there would admit another run's file.
+        if str(uri).startswith("file://"):
+            uri = parse_uri_to_path(str(uri))
         if str(uri).startswith("/"):
             try:
                 local_path = validate_local_file_path(str(uri), workflow_run_id)
                 if not os.path.isfile(local_path):
                     raise FileNotFoundError(f"Local file not found: {uri}")
-                return local_path
+                return capture_authorized_file(
+                    local_path,
+                    download_root=settings.DOWNLOAD_PATH,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+                )
             except FileNotFoundError:
                 pass
-            except PermissionError:
+            except (PermissionError, AuthorizedFileAccessError):
                 LOG.warning(
                     "CodeBlock file parameter path is outside the run's download directory; leaving the original value",
                     workflow_run_id=workflow_run_id,
                 )
-                return value
+                return AuthorizedFileMaterializationFailure()
         try:
-            output_dir = get_download_dir(workflow_run_id)
-            local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
-            # download_file routes managed storage (s3/azure) to a temp file outside the run
-            # dir; copy it under the run dir so it passes validate_local_file_path containment.
-            resolved = os.path.realpath(local_path)
-            allowed_dir = os.path.realpath(output_dir)
-            if not resolved.startswith(allowed_dir + os.sep):
-                contained = os.path.join(output_dir, os.path.basename(local_path))
-                shutil.copyfile(local_path, contained)
-                local_path = contained
-            return validate_local_file_path(local_path, workflow_run_id)
+            run_dir = get_download_dir(workflow_run_id)
+            # Download privately, then place at the run root, where downstream blocks look. A parameter keeps one
+            # root file: a rerun with the same downloaded name replaces it, a renamed download moves it.
+            output_dir = tempfile.mkdtemp(dir=run_dir)
+            try:
+                local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
+                # download_file routes managed storage (s3/azure) to a temp file outside the run
+                # dir; copy it under the run dir so it passes validate_local_file_path containment.
+                resolved = os.path.realpath(local_path)
+                allowed_dir = os.path.realpath(output_dir)
+                if not resolved.startswith(allowed_dir + os.sep):
+                    contained = os.path.join(output_dir, os.path.basename(local_path))
+                    shutil.copyfile(local_path, contained)
+                    local_path = contained
+                downloaded_name = os.path.basename(local_path)
+                claimed_name, root_path = materialized_file_paths.get(parameter_key, (None, None))
+                if root_path is not None and claimed_name == downloaded_name:
+                    os.replace(local_path, root_path)
+                else:
+                    previous_root_path = root_path
+                    root_path = _link_without_overwrite(local_path, run_dir)
+                    materialized_file_paths[parameter_key] = (downloaded_name, root_path)
+                    if previous_root_path is not None:
+                        Path(previous_root_path).unlink(missing_ok=True)
+            finally:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            return capture_authorized_file(
+                validate_local_file_path(root_path, workflow_run_id),
+                download_root=settings.DOWNLOAD_PATH,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+                # The run root may hold this file as `name (n).ext`; the destination should get the name it downloaded as.
+                filename=downloaded_name,
+            )
         except Exception:
             LOG.warning(
                 "Failed to materialize file parameter to a local path; leaving the original value",
                 workflow_run_id=workflow_run_id,
             )
-            return value
+            return AuthorizedFileMaterializationFailure()
 
     def _match_step_for_failing_line(self, failing_line: int) -> CodeBlockStep | None:
         """Advisory nearest-preceding-start match; a lone ``line_start`` (``line_end`` None) is
@@ -6618,66 +6868,180 @@ async def wrapper({default_args}):
                 status=status,
             )
 
-    async def _capture_failure_evidence(
+    def _failure_page_url(
         self,
         *,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
-        organization_id: str | None,
-        browser_state: BrowserState | None,
-        page: Page | None,
-    ) -> None:
-        """Persist the page the block died on, so the copilot repair loop can see it.
-
-        Entirely best-effort: this runs inside the failure path, so it must never raise and
-        never change the block outcome.
-        """
-        if not organization_id:
-            return
-        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
-        if not live_browser_state:
-            return
+        page: Page,
+    ) -> str | None:
+        """The page's URL at failure time. A fact, read synchronously; never waits on a frame."""
         try:
-            screenshot = await live_browser_state.take_fullpage_screenshot()
-        except Exception:
-            LOG.warning(
-                "Failed to capture the at-failure screenshot for a code block",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            screenshot = None
-        final_url: str | None = None
-        try:
-            failure_page = page or await live_browser_state.get_or_create_page()
             # A failing login/MFA step can leave a credential or a generated OTP in the query
             # string, and this URL is persisted and logged; mask before it leaves the page.
-            final_url = workflow_run_context.mask_secrets_in_data(failure_page.url) if failure_page else None
+            return workflow_run_context.mask_secrets_in_data(page.url)
         except Exception:
             LOG.warning(
                 "Failed to read the at-failure URL for a code block",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
+            return None
 
+    async def _stage_failure_screenshot(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        browser_state: BrowserState | None,
+        page: Page,
+    ) -> bytes | None:
+        """Read the optional frame from the supplied page without mutating persisted state."""
         try:
-            workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
+            # Bounded here, in seconds, because the frame is optional evidence: on the healable
+            # arm it is read before recovery runs, so an unbounded read would hold both the heal
+            # and the failure fact behind a stalled screenshot.
+            async with asyncio.timeout(settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000):
+                return await SkyvernFrame.take_scrolling_screenshot(
+                    page=page,
+                    mode=ScreenshotMode.LITE,
+                    engine_selection=browser_state.engine_selection if browser_state is not None else None,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            LOG.warning(
+                "At-failure screenshot exceeded its budget; continuing without a frame",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+        except Exception:
+            LOG.warning(
+                "Failed to capture the at-failure screenshot for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+    async def _capture_failure_evidence(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+        browser_state: BrowserState | None,
+        page: Page,
+        authorization: asyncio.Event,
+        staged_frame: _StagedFrame | None,
+    ) -> None:
+        """Read the frame (unless already staged), then attach it once the failure row is committed."""
+        screenshot = (
+            staged_frame.screenshot
+            if staged_frame is not None
+            else await self._stage_failure_screenshot(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_state=browser_state,
+                page=page,
+            )
+        )
+        await authorization.wait()
+        await self._attach_failure_screenshot(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            screenshot=screenshot,
+        )
+
+    async def _attach_failure_screenshot(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+        screenshot: bytes | None,
+    ) -> None:
+        """Attach the frame only while the original row remains the same unsuccessful attempt."""
+        if not screenshot:
+            return
+        try:
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                final_url=final_url,
             )
-            if screenshot:
-                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                    workflow_run_block=workflow_run_block,
-                    artifact_type=ArtifactType.SCREENSHOT_LLM,
-                    data=screenshot,
-                )
+            if (
+                workflow_run_block.workflow_run_id != workflow_run_id
+                or workflow_run_block.status not in _UNSUCCESSFUL_TERMINAL_BLOCK_STATUSES
+            ):
+                return
+            await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                workflow_run_block=workflow_run_block,
+                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                data=screenshot,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             LOG.warning(
                 "Failed to persist the at-failure evidence for a code block",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
+
+    async def _publish_failure_result_with_evidence(
+        self,
+        *,
+        build_failure_result: Callable[[], Awaitable[BlockResult]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+        staged_frame: _StagedFrame | None = None,
+        final_url: str | None = None,
+    ) -> BlockResult:
+        """Commit the failure with its end URL first; only the frame is optional and deferred."""
+        capture_owned = False
+        if organization_id and page is not None:
+            if final_url is None:
+                final_url = self._failure_page_url(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    page=page,
+                )
+            capture_owned = workflow_run_context.start_failure_evidence_capture(
+                workflow_run_block_id,
+                lambda authorization: self._capture_failure_evidence(
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                    authorization=authorization,
+                    staged_frame=staged_frame,
+                ),
+            )
+        try:
+            # The URL fact lands first, then the result. Arms that restore a parameter-redacted
+            # URL do so inside build_failure_result, so their scrubbed write is the last one to
+            # touch the row; this secret-masked fallback must never overwrite it.
+            await self._persist_captured_failure_final_url(
+                final_url=final_url,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+            result = await build_failure_result()
+        except BaseException:
+            if capture_owned:
+                await workflow_run_context.cancel_failure_evidence_capture()
+            raise
+        if capture_owned:
+            workflow_run_context.authorize_failure_evidence_capture(workflow_run_block_id)
+        return result
 
     async def _failure_output_with_downloads(
         self,
@@ -6846,23 +7210,10 @@ async def wrapper({default_args}):
         output_parameter_value: dict[str, Any] | list | str | None = None,
         error_codes: list[str] | None = None,
     ) -> BlockResult:
-        """Fail a code block after recording the page it died on.
+        """Commit a failed code block before authorizing its optional page evidence."""
 
-        Every non-healable exit routes through here so a new one inherits the capture instead of
-        silently reopening the blindness this closes.
-        """
-        await self._capture_failure_evidence(
-            workflow_run_context=workflow_run_context,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_state=browser_state,
-            page=page,
-        )
-        return await self.build_block_result(
-            success=False,
-            failure_reason=failure_reason,
-            output_parameter_value=(
+        async def build_failure_result() -> BlockResult:
+            failure_output = (
                 await self._failure_output_with_downloads(
                     engine=engine,
                     workflow_run_context=workflow_run_context,
@@ -6876,11 +7227,25 @@ async def wrapper({default_args}):
                     result=output_parameter_value,
                 )
                 or output_parameter_value
-            ),
-            status=status,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                output_parameter_value=failure_output,
+                status=status,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                error_codes=error_codes,
+            )
+
+        return await self._publish_failure_result_with_evidence(
+            build_failure_result=build_failure_result,
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
-            error_codes=error_codes,
+            browser_state=browser_state,
+            page=page,
         )
 
     async def _resolve_failure_with_heal(
@@ -6903,20 +7268,11 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any] | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
+        staged_frame: _StagedFrame | None = None
+        staged_failure_url: str | None = None
 
         def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
             return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
-
-        # Capture before the healable branch: a non-healable failure is exactly the case the
-        # repair loop has the least to go on.
-        await self._capture_failure_evidence(
-            workflow_run_context=workflow_run_context,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_state=browser_state,
-            page=page,
-        )
 
         if (
             organization_id
@@ -6986,8 +7342,7 @@ async def wrapper({default_args}):
                             bound_output, resolved_redaction_parameters
                         )
                         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, bound_output)
-                        await recorder.finalize(success=False)
-                        return await self.build_block_result(
+                        result = await self.build_block_result(
                             success=False,
                             failure_reason=binding_failure_reason,
                             output_parameter_value=bound_output,
@@ -6995,7 +7350,7 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
                         )
-                    if bound_output is not result.output_parameter_value:
+                    elif bound_output is not result.output_parameter_value:
                         result = await self.build_block_result(
                             success=result.success,
                             failure_reason=result.failure_reason,
@@ -7041,9 +7396,40 @@ async def wrapper({default_args}):
                         result.output_parameter_value,
                     )
                 await recorder.finalize(success=result.success)
-                return result
+                if result.success:
+                    return result
+
+                async def return_committed_final_failure() -> BlockResult:
+                    return result
+
+                return await self._publish_failure_result_with_evidence(
+                    build_failure_result=return_committed_final_failure,
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                    staged_frame=staged_frame,
+                    final_url=staged_failure_url,
+                )
             await recorder.finalize(success=False)
-            return _redact_codeblock_result(await build_failure_result(), resolved_redaction_parameters)
+
+            async def persist_unhealed_failure() -> BlockResult:
+                result = await build_failure_result()
+                return _redact_codeblock_result(result, resolved_redaction_parameters)
+
+            return await self._publish_failure_result_with_evidence(
+                build_failure_result=persist_unhealed_failure,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
+                staged_frame=staged_frame,
+                final_url=staged_failure_url,
+            )
 
         if not classification.healable:
             return await _finalize_heal_result(None)
@@ -7051,6 +7437,42 @@ async def wrapper({default_args}):
             return await _finalize_heal_result(None)
         if not organization_id:
             return await _finalize_heal_result(None)
+
+        # Recovery may navigate or replace the page. Read the failure-time URL and frame first,
+        # without starting an owned attachment task that could overlap recovery. Successful
+        # healing discards them; a final failure persists the URL with its row and authorizes
+        # the frame only after that.
+        if page is not None:
+            staged_failure_url = self._failure_page_url(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                page=page,
+            )
+            try:
+                staged_frame = _StagedFrame(
+                    await self._stage_failure_screenshot(
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        browser_state=browser_state,
+                        page=page,
+                    )
+                )
+            except asyncio.CancelledError:
+                # An outer deadline can expire inside this optional read. The failure is already
+                # established, so publish it with no frame and no heal attempt, then restore the
+                # cancellation; losing the fact to an artifact read is what this change removes.
+                LOG.warning(
+                    "Failure evidence staging was cancelled; publishing the failure without a frame",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                )
+                # Staged-with-no-frame, not unstaged: the sentinel stops the owned capture from
+                # taking a second screenshot that cleanup would then have to drain.
+                staged_frame = _StagedFrame(None)
+                with contextlib.suppress(BaseException):
+                    await _finalize_heal_result(None)
+                raise
 
         workflow_permanent_id = workflow_run_context.workflow_permanent_id
         workflow_id = workflow_run_context.workflow_id
@@ -7461,6 +7883,7 @@ async def wrapper({default_args}):
 
         # get all parameters into a dictionary
         parameter_values = {}
+        authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
         credential_parameter_keys: set[str] = set()
         credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
         for parameter in self.parameters:
@@ -7475,11 +7898,19 @@ async def wrapper({default_args}):
                     isinstance(parameter, WorkflowParameter)
                     and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
                 ):
-                    value = await self._materialize_file_parameter_path(
+                    materialization = await self._materialize_file_parameter_path(
                         value,
+                        parameter_key=parameter.key,
+                        materialized_file_paths=workflow_run_context.materialized_file_paths,
                         workflow_run_id=workflow_run_id,
                         organization_id=organization_id,
                     )
+                    if materialization is not None:
+                        authorized_file_materializations[parameter.key] = materialization
+                    if isinstance(materialization, MaterializedAuthorizedFile):
+                        value = inline_authorized_file_path(materialization, download_root=settings.DOWNLOAD_PATH)
+                        # A materialized input is part of the block's starting state, not a download it made.
+                        download_dir_before = local_download_dir_file_identities(resolved_download_id)
                 parameter_values[parameter.key] = value
                 continue
             credential_parameter_keys.add(parameter.key)
@@ -7617,6 +8048,7 @@ async def wrapper({default_args}):
                     workflow_run_context=workflow_run_context,
                     parameter_values=parameter_values,
                     credential_parameter_keys=credential_parameter_keys,
+                    authorized_file_materializations=authorized_file_materializations,
                     recording_page=recording_page,
                     download_run_id=resolved_download_id,
                     download_binding=download_binding_of(browser_state),
@@ -7775,9 +8207,16 @@ async def wrapper({default_args}):
                     # failure=None does not imply success: infra arms (no browser/page, runner raise,
                     # invalid output) return a failed block_result with no healable failure metadata.
                     if not secure_code_block_result.block_result.success:
-                        # No healable metadata means the repair loop has even less to go on here
-                        # than on the healable path, so the page evidence matters more, not less.
-                        await self._capture_failure_evidence(
+                        await recorder.finalize(success=False)
+                        failed_result = scrub_failed_block_result(secure_code_block_result.block_result)
+
+                        async def persist_secure_runner_failure() -> BlockResult:
+                            # The secure runner's metadata-less failure arms return through
+                            # codeblock.workflow._fail_block, which already persisted this result.
+                            return failed_result
+
+                        return await self._publish_failure_result_with_evidence(
+                            build_failure_result=persist_secure_runner_failure,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
@@ -7785,8 +8224,6 @@ async def wrapper({default_args}):
                             browser_state=browser_state,
                             page=page,
                         )
-                        await recorder.finalize(success=False)
-                        return scrub_failed_block_result(secure_code_block_result.block_result)
                     secure_output = secure_code_block_result.block_result.output_parameter_value
                     # The sidecar already saved what it downloaded, so read back rather than
                     # re-uploading; the save runs when the read-back does not account for the files
@@ -7906,6 +8343,7 @@ async def wrapper({default_args}):
                 download_run_id=resolved_download_id,
                 download_binding=download_binding_of(browser_state),
                 download_evidence=download_evidence,
+                authorized_file_materializations=authorized_file_materializations,
             )
             try:
                 result = await self.execute_user_function_with_timeout(
@@ -7913,6 +8351,26 @@ async def wrapper({default_args}):
                     settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
                 )
             finally:
+                # Before download settlement and before any at-failure evidence capture: both are
+                # trusted browser work on this page, and neither may get the sandbox's dialog answer.
+                try:
+                    dialog_handler.clear_dialog_policy(page.context)
+                except Exception:
+                    with contained_effect(
+                        "dialog policy revocation failure",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                    ):
+                        LOG.warning(
+                            "CodeBlock dialog policy could not be revoked; closing its browser context",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            engine="inline",
+                            exc_info=True,
+                        )
+                    with contextlib.suppress(Exception):
+                        await page.context.close()
                 try:
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                         async with settle_browser_downloads_for_context(page.context):
@@ -10468,6 +10926,7 @@ class SendEmailBlock(Block):
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] = []
     # Optional custom SMTP settings. When custom_smtp_host is set, the block sends through
     # this server instead of the platform default sender (the smtp_* secret parameters above).
@@ -10716,9 +11175,9 @@ class SendEmailBlock(Block):
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):
             # We're purposely not decrypting the body parameter value here because we don't want to expose secrets
             body_parameter_value = workflow_run_context.get_value(self.body)
-            msg.set_content(str(body_parameter_value))
+            email.set_body(msg, str(body_parameter_value), self.body_format)
         else:
-            msg.set_content(self.body)
+            email.set_body(msg, self.body, self.body_format)
 
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
@@ -12585,6 +13044,27 @@ class WaitBlock(Block):
         )
 
 
+def _human_interaction_html_footer(app_url: str, instructions: str, browser_session_url: str | None) -> str:
+    def link(url: str) -> str:
+        return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
+
+    instructions_html = html.escape(instructions).replace("\n", "<br/>")
+    paragraphs = [
+        f"<p>Kindly visit {link(app_url)}</p>",
+        f"<p>{instructions_html}</p>",
+    ]
+    if browser_session_url:
+        paragraphs.append(f"<p>To interact with the browser session directly, visit {link(browser_session_url)}</p>")
+    return "\n".join(paragraphs)
+
+
+def _human_interaction_text_body(body: str, app_url: str, instructions: str, browser_session_url: str | None) -> str:
+    text = f"{body}\n\nKindly visit {app_url}\n\n{instructions}\n\n"
+    if browser_session_url:
+        text += f"To interact with the browser session directly, visit {browser_session_url}\n\n"
+    return text
+
+
 class HumanInteractionBlock(BaseTaskBlock):
     """
     A block for human/agent interaction.
@@ -12612,6 +13092,7 @@ class HumanInteractionBlock(BaseTaskBlock):
     recipients: list[str] = []
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -12712,10 +13193,15 @@ class HumanInteractionBlock(BaseTaskBlock):
             )
 
         app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
-        body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
-        if browser_session_id:
-            browser_session_url = f"{settings.SKYVERN_APP_URL}/browser-session/{browser_session_id}"
-            body += f"To interact with the browser session directly, visit {browser_session_url}\n\n"
+        browser_session_url = (
+            f"{settings.SKYVERN_APP_URL}/browser-session/{browser_session_id}" if browser_session_id else None
+        )
+        if self.body_format == EmailBodyFormat.HTML:
+            body = self.body
+            html_footer: str | None = _human_interaction_html_footer(app_url, self.instructions, browser_session_url)
+        else:
+            body = _human_interaction_text_body(self.body, app_url, self.instructions, browser_session_url)
+            html_footer = None
         subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
 
         try:
@@ -12724,6 +13210,8 @@ class HumanInteractionBlock(BaseTaskBlock):
                 sender=self.sender,
                 subject=subject,
                 recipients=self.recipients,
+                body_format=self.body_format,
+                html_footer=html_footer,
             )
 
             email_success = True
@@ -13571,6 +14059,15 @@ class TaskV2Block(Block):
         # execute() can hand it off to the TaskV2 row verbatim.
         self._apply_workflow_system_prompt(workflow_run_context)
 
+    async def _settle_child_capture(self, task_v2: TaskV2 | None) -> None:
+        """The child ran on this run's browser. A failed child code block may still own an
+        exact-page capture, and the parent's next block settles only its own context, so the
+        child's is settled here, before the page is handed back."""
+        child_run_id = task_v2.workflow_run_id if task_v2 is not None else None
+        if not child_run_id or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(child_run_id):
+            return
+        await app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(child_run_id).cancel_failure_evidence_capture()
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -13686,14 +14183,21 @@ class TaskV2Block(Block):
         # even if it raises. Its own exception handlers mark the task as
         # failed/terminated with proper status, so we let exceptions propagate
         # to the status-mapping logic below.
-        task_v2 = await task_v2_service.run_task_v2(
-            organization=organization,
-            task_v2_id=task_v2.observer_cruise_id,
-            request_id=None,
-            max_steps_override=self.max_steps,
-            max_iterations_override=self.max_iterations,
-            browser_session_id=browser_session_id,
-        )
+        # The child run id is known before the call, so settlement is keyed on it in a finally:
+        # a raise here still returns the shared page, and a continue_on_failure parent can start
+        # its next browser block while the child's capture would otherwise still be scrolling.
+        initialized_child = task_v2
+        try:
+            task_v2 = await task_v2_service.run_task_v2(
+                organization=organization,
+                task_v2_id=task_v2.observer_cruise_id,
+                request_id=None,
+                max_steps_override=self.max_steps,
+                max_iterations_override=self.max_iterations,
+                browser_session_id=browser_session_id,
+            )
+        finally:
+            await self._settle_child_capture(initialized_child)
         result_dict = None
         if task_v2:
             result_dict = task_v2.output

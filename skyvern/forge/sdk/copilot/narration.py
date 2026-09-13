@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import BlockRunIdentity
+from skyvern.forge.sdk.copilot.context import NarrativeBlockAttempt, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -1059,10 +1059,7 @@ async def narrator_poll_tick(
     seen_block_states: dict[str, str],
     fetch_block_statuses: FetchBlockStatusesCallable,
     stream: EventSourceStream,
-    block_state_map: dict[str, str] | None = None,
-    block_started_at_map: dict[str, str] | None = None,
-    block_ended_at_map: dict[str, str] | None = None,
-    block_run_identity_map: dict[str, BlockRunIdentity] | None = None,
+    narrative_block_attempts: dict[str, NarrativeBlockAttempt] | None = None,
     workflow_run_id: str | None = None,
 ) -> NarratorPollTickResult:
     """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
@@ -1118,29 +1115,22 @@ async def narrator_poll_tick(
                     continue
                 event_ts = datetime.now(timezone.utc)
                 event_ts_iso = event_ts.isoformat()
-                if block_state_map is not None:
-                    block_state_map[event.block_label] = event.status
-                if block_run_identity_map is not None:
-                    block_run_identity_map[event.block_label] = BlockRunIdentity(
+                if narrative_block_attempts is not None:
+                    upsert_narrative_block_attempt(
+                        narrative_block_attempts,
                         workflow_run_block_id=event.block_id,
+                        workflow_run_id=workflow_run_id,
+                        label=event.block_label,
+                        block_type=event.block_type,
+                        status=event.status,
                         iteration=state.current_iteration,
+                        started_at=event_ts_iso if event.status == "running" else None,
+                        ended_at=event_ts_iso if event.status in _TERMINAL_BLOCK_STATUSES else None,
                     )
                 if event.status == "running":
                     state.running_block_label = event.block_label
                 elif event.status in _TERMINAL_BLOCK_STATUSES and state.running_block_label == event.block_label:
                     state.running_block_label = None
-                if (
-                    block_started_at_map is not None
-                    and event.status == "running"
-                    and event.block_label not in block_started_at_map
-                ):
-                    block_started_at_map[event.block_label] = event_ts_iso
-                # Clear endedAt on retry-back-to-running; overwrite on terminal
-                # events to keep latest-terminal semantics.
-                if block_ended_at_map is not None and event.status == "running":
-                    block_ended_at_map.pop(event.block_label, None)
-                if block_ended_at_map is not None and event.status in _TERMINAL_BLOCK_STATUSES:
-                    block_ended_at_map[event.block_label] = event_ts_iso
                 try:
                     await stream.send(
                         WorkflowCopilotBlockProgressUpdate(

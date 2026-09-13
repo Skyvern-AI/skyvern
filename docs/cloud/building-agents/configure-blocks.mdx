@@ -429,6 +429,7 @@ Send an email notification, optionally with file attachments from previous block
 | **Recipients** | text | Comma-separated email addresses |
 | **Subject** | text | Email subject line |
 | **Body** | text | Email body. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks). |
+| **Body format** | select | `Text` (default) sends the body exactly as written. `HTML` renders the body as a formatted email and adds a plain-text version for clients that cannot show HTML; `<script>`, `<iframe>`, `<object>`, `<embed>`, `<svg>`, `<math>`, meta refresh directives, event-handler attributes and links whose scheme is not `http`, `https`, `mailto`, `tel` or `cid` (inline `data:image` sources are kept) are removed before sending. Mail clients strip inline SVG anyway, so use a raster image instead. `{{ }}` and `{% %}` are parameter syntax, so wrap literal braces in `{% raw %}…{% endraw %}`. |
 | **File Attachments** | text | Path to files to attach |
 
 <Frame>
@@ -477,6 +478,7 @@ Pause the agent and request human input. Optionally sends an email notification 
 | **Recipients** | text | Email addresses to notify (comma-separated) |
 | **Subject** | text | Notification email subject |
 | **Body** | text | Notification email body |
+| **Body format** | select | `Text` (default) or `HTML`, as in the Send Email block. In HTML mode the run link, the instructions and the browser-session link are appended as an HTML footer inside `</body>` when the body is a full document. |
 
 Additional fields in **Advanced Settings:**
 

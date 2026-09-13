@@ -5,12 +5,15 @@ OSS-synced: only example.* placeholder targets and synthetic labels.
 
 from __future__ import annotations
 
+import ast
+
 import pytest
 
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     RENDER_TEMPLATE_SYNTAX_REASON_CODE,
     RENDER_UNDEFINED_NAME_REASON_CODE,
     CodeBlockRenderDiagnostic,
+    _build_typed_module,
     code_block_render_diagnostic,
 )
 
@@ -102,3 +105,12 @@ class TestCodeBlockRenderDiagnosticPasses:
     def test_jinja_free_code_passes(self) -> None:
         code = 'await page.goto("https://example.com")\nreturn {"output": {"a": 1}}'
         assert code_block_render_diagnostic(code, _BOUND_NAMES) is None
+
+
+def test_preflight_declares_normalized_parameters_once_and_omits_normalized_keywords() -> None:
+    source = _build_typed_module("result = ﬁle", parameter_keys=["ﬁle", "file", "ｉｆ", "_＿private"])
+    tree = ast.parse(source)
+    declared = [node.target.id for node in tree.body if isinstance(node, ast.AnnAssign)]
+    assert declared.count("file") == 1
+    assert "if" not in declared
+    assert "__private" not in declared

@@ -20,12 +20,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
+    clearable_dismiss_texts,
     has_bounded_page_schema,
     model_visible_composition_evidence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
+from skyvern.forge.sdk.copilot.output_extraction_plan import candidate_relations_from_packet, page_value_binding_text
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
@@ -42,11 +44,17 @@ _RUNTIME_SUMMARY_MAX_ITEMS = 5
 _RUNTIME_RESULT_SUMMARY_MAX_ITEMS = MAX_RESULT_CONTAINERS
 _OBSERVED_STATE_MAX_CHARS = 60
 _RENDERED_VALUE_EXCERPT_MAX_CHARS = 300
+_PAGE_VALUE_BINDING_MAX_ITEMS = 8
+_PAGE_VALUE_BINDING_MAX_CHARS = 80
+PAGE_VALUE_BINDING_TEXT_MAX_CHARS = 2 * _PAGE_VALUE_BINDING_MAX_CHARS + len("=")
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _OBSTRUCTION_KEYS = ("kind", "text", "visual_location")
 _OBSTRUCTION_CONTROL_KEYS = ("text",)
 _OBSTRUCTION_FIELD_MAX_CHARS = 160
 OBSTRUCTION_SUMMARY_MAX_CHARS = 1200
+# A runner denial names its sanctioned replacement after the denied call (a listener denial runs to
+# ~600 characters); a bound below that hands the repair turn the refusal without the route.
+RUNTIME_FAILURE_REASON_MAX_CHARS = 640
 _NO_DISMISS_CONTROL_SUMMARY = "obstruction present, no dismiss control found in page evidence"
 _KEY_ERROR_RE = re.compile(r"KeyError(?:\s*:|\()\s*['\"]([^'\"]+)['\"]")
 
@@ -341,6 +349,19 @@ def _has_rendered_value_excerpt(evidence: dict[str, Any]) -> bool:
     return bool(_bounded_runtime_text(evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS))
 
 
+def _runtime_page_value_bindings(evidence: Mapping[str, Any]) -> list[str]:
+    """The page's own label/value pairs; the producer redacts and bounds them, and no selector crosses."""
+    return [
+        page_value_binding_text(label, value)
+        for label, value in candidate_relations_from_packet(
+            evidence,
+            dismiss_texts=clearable_dismiss_texts(evidence),
+            limit=_PAGE_VALUE_BINDING_MAX_ITEMS,
+            max_chars=_PAGE_VALUE_BINDING_MAX_CHARS,
+        )
+    ]
+
+
 def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
     """Admit only a bounded, scrubbed page fact that can ground a repair.
 
@@ -379,6 +400,7 @@ def build_test_page_state_from_evidence(
         observed_after_workflow_run=True,
         rendered_value_excerpt=rendered_value_excerpt or None,
         form_summaries=_runtime_form_summaries(evidence.get("forms")),
+        value_bindings=_runtime_page_value_bindings(evidence),
         result_summaries=_runtime_result_summaries(evidence.get("result_containers")),
         action_summaries=_runtime_action_summaries(
             evidence.get("navigation_targets"), evidence.get("clickable_controls")
@@ -396,6 +418,7 @@ def build_test_page_state_from_evidence(
                 page_state.title,
                 page_state.rendered_value_excerpt,
                 page_state.form_summaries,
+                page_state.value_bindings,
                 page_state.result_summaries,
                 page_state.action_summaries,
                 page_state.challenge_summaries,
@@ -543,9 +566,11 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if block is not None:
         block_label = _bounded_runtime_text(block.get("label"), 80) or block_label
         failed_block_status = _bounded_runtime_text(block.get("status"), 40) or failed_block_status
-        failure_reason = _bounded_runtime_text(block.get("failure_reason"), 240)
-    failure_reason = failure_reason or _bounded_runtime_text(data.get("failure_reason"), 240)
-    failure_reason = failure_reason or _bounded_runtime_text(result.get("error"), 240)
+        failure_reason = _bounded_runtime_text(block.get("failure_reason"), RUNTIME_FAILURE_REASON_MAX_CHARS)
+    failure_reason = failure_reason or _bounded_runtime_text(
+        data.get("failure_reason"), RUNTIME_FAILURE_REASON_MAX_CHARS
+    )
+    failure_reason = failure_reason or _bounded_runtime_text(result.get("error"), RUNTIME_FAILURE_REASON_MAX_CHARS)
     if not block_label or not failure_reason:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
@@ -699,6 +724,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
         evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS
     )
     page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
+    page_value_bindings = _runtime_page_value_bindings(evidence)
     page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
     page_action_summaries = _runtime_action_summaries(
         evidence.get("navigation_targets"), evidence.get("clickable_controls")
@@ -714,6 +740,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             "page_evidence_source": _bounded_runtime_text(evidence.get("source_tool"), 80) or None,
             "observed_after_workflow_run": bool(
                 page_form_summaries
+                or page_value_bindings
                 or page_result_summaries
                 or page_action_summaries
                 or page_challenge_summaries
@@ -722,6 +749,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             ),
             "rendered_value_excerpt": rendered_value_excerpt or None,
             "page_form_summaries": page_form_summaries,
+            "page_value_bindings": page_value_bindings,
             "page_result_summaries": page_result_summaries,
             "page_action_summaries": page_action_summaries,
             "page_challenge_summaries": page_challenge_summaries,
@@ -761,6 +789,7 @@ def inject_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, 
         observed_after_workflow_run=repair_context.observed_after_workflow_run,
         workflow_run_id=repair_context.workflow_run_id,
         page_form_summary_count=len(repair_context.page_form_summaries),
+        page_value_binding_count=len(repair_context.page_value_bindings),
         page_result_summary_count=len(repair_context.page_result_summaries),
         page_action_summary_count=len(repair_context.page_action_summaries),
         page_obstruction_summary_count=len(repair_context.page_obstruction_summaries),

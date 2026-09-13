@@ -69,6 +69,7 @@ class Frame:
         self.page = page
         self.frame_id = frame_id
         self._parent = parent
+        self._parent_frame_id = parent.frame_id if parent is not None else None
         self._url = url
         self._name = ""
         self._detached = False
@@ -383,6 +384,13 @@ class Page:
     def owns_frame(self, frame_id: str) -> bool:
         return frame_id in self._frames
 
+    def _link_frame_parent(self, frame: Frame, parent_frame_id: str | None) -> None:
+        frame._parent_frame_id = parent_frame_id
+        frame._parent = self._frames.get(parent_frame_id or "")
+        for child in self._frames.values():
+            if child._parent is None and child._parent_frame_id == frame.frame_id:
+                child._parent = frame
+
     def note_download(self, download: Any) -> None:
         self._emit("download", download)
         self._context._emit("download", download)
@@ -464,6 +472,7 @@ class Page:
             resolved_parent = parent or self._frames.get(raw.get("parentId") or "")
             frame = Frame(self, frame_id, parent=resolved_parent, url=raw.get("url", ""))
             self._frames[frame_id] = frame
+        self._link_frame_parent(frame, parent.frame_id if parent is not None else raw.get("parentId"))
         frame._url = raw.get("url", frame._url)
         frame._name = raw.get("name", frame._name)
         if session is not None:
@@ -484,6 +493,7 @@ class Page:
         if frame is None:
             frame = Frame(self, frame_id, parent=self._frames.get(parent_id or ""), url=raw.get("url", ""))
             self._frames[frame_id] = frame
+        self._link_frame_parent(frame, parent_id)
         frame._url = raw.get("url", "")
         frame._name = raw.get("name", "")
         if parent_id is None:
@@ -493,9 +503,13 @@ class Page:
 
     def _on_frame_attached(self, params: dict) -> None:
         frame_id = params.get("frameId")
-        if not frame_id or frame_id in self._frames:
+        if not frame_id:
             return
-        self._frames[frame_id] = Frame(self, frame_id, parent=self._frames.get(params.get("parentFrameId") or ""))
+        frame = self._frames.get(frame_id)
+        if frame is None:
+            frame = Frame(self, frame_id)
+            self._frames[frame_id] = frame
+        self._link_frame_parent(frame, params.get("parentFrameId"))
 
     def _on_frame_detached(self, params: dict) -> None:
         # reason="swap" means the frame moved to another process, not that it went away. Dropping it
@@ -766,9 +780,9 @@ class Page:
         if frame.frame_id == self._main_frame_id:
             # Hosted by no element at all; asking would report a protocol error as "no owner".
             return None
-        # _on_frame_attached can arrive before its parent is known and never repairs _parent, so a
-        # parentless non-main frame is an orphan, not the document root -- still worth asking the page
-        # session about, which is what it got before this became parent-routed.
+        # An attach can briefly arrive before its parent. Until the later parent event repairs that
+        # link, this is an orphan rather than the document root, so the page session remains the only
+        # useful fallback.
         parent = frame.parent_frame or self.main_frame
         session = self.session_for_frame(parent.frame_id)
         try:
@@ -988,10 +1002,9 @@ class Page:
     async def expose_binding(self, name: str, callback: Callable[..., Any]) -> None:
         """Install `window[name]` and route its calls to `callback(source, payload)`.
 
-        Two production callers depend on this -- the transient page-text observer and the
-        exfiltration channel -- and both call it with an OBJECT from page JS while CDP's
-        `Runtime.addBinding` only accepts a string and only reports it back as one. So the raw
-        binding is registered under an internal name and a shim over it does the JSON, which is the
+        The exfiltration channel depends on this -- it calls the binding with an OBJECT from page JS
+        while CDP's `Runtime.addBinding` only accepts a string and only reports it back as one. So the
+        raw binding is registered under an internal name and a shim over it does the JSON, which is the
         same shape Playwright uses.
 
         The shim is installed twice on purpose: as an init script for documents that do not exist
@@ -999,9 +1012,9 @@ class Page:
         would otherwise see nothing until the next navigation.
 
         Limit worth stating: the shim resolves immediately rather than waiting for the Python
-        callback's return value. Both production callers are synchronous and return None, and the
-        page side does `Promise.resolve(window[name](...))` without reading the result. A caller that
-        needs a value back would need the reply plumbing this deliberately does not have.
+        callback's return value. The exfiltration channel caller is synchronous and returns None, and
+        the page side does `Promise.resolve(window[name](...))` without reading the result. A caller
+        that needs a value back would need the reply plumbing this deliberately does not have.
         """
         raw_name = f"__skycdp_binding_{name}"
         shim = (
@@ -1021,8 +1034,8 @@ class Page:
             try:
                 callback({"page": self, "frame": self.main_frame}, payload)
             except Exception:
-                # A raising callback must not kill the CDP read loop; the two production consumers
-                # record events, and losing one is better than losing the connection.
+                # A raising callback must not kill the CDP read loop; the exfiltration channel consumer
+                # records events, and dropping one is better than losing the connection.
                 LOG.warning("skycdp exposed binding callback raised", binding=name, exc_info=True)
 
         self._session.on("Runtime.bindingCalled", _on_binding_called)

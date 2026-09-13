@@ -3,13 +3,27 @@ import contextvars
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, AsyncContextManager, AsyncIterator, Callable
+from typing import Any, AsyncContextManager, AsyncIterator, Awaitable, Callable, TypeVar
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
+from skyvern.utils.contained_effects import contained_effect
+
 LOG = structlog.get_logger()
+
+R = TypeVar("R")
+
+# The binding cap across all attempts. A healthy attempt is already capped well below it by
+# DATABASE_POOL_TIMEOUT for checkout plus DATABASE_STATEMENT_TIMEOUT_MS for execution.
+_READ_RECOVERY_BUDGET_SECONDS = 120.0
+_READ_RECOVERY_ATTEMPTS = 3
+_READ_RECOVERY_BACKOFF_SECONDS = 0.2
+# A close on a broken socket can block on its ROLLBACK, and the expired deadline will not fire
+# a second time to interrupt it.
+_READ_RECOVERY_CLOSE_SECONDS = 5.0
 
 
 def read_retry(retries: int = 3) -> Callable:
@@ -55,6 +69,97 @@ def read_retry(retries: int = 3) -> Callable:
         return wrapper
 
     return decorator
+
+
+async def read_with_disconnect_recovery(
+    session_factory: "_SessionFactory",
+    read: Callable[[AsyncSession], Awaitable[R]],
+    *,
+    operation: str,
+    attempts: int = _READ_RECOVERY_ATTEMPTS,
+    backoff_seconds: float = _READ_RECOVERY_BACKOFF_SECONDS,
+    budget_seconds: float = _READ_RECOVERY_BUDGET_SECONDS,
+    **log_fields: Any,
+) -> R:
+    """Run an idempotent read, retrying a structurally invalidated connection on a fresh session.
+
+    Recovery starts only when SQLAlchemy itself marked the connection invalidated, so an unrelated
+    database error, or an ``OperationalError`` the driver did not tie to a dead connection, raises
+    on its first attempt. ``budget_seconds`` covers every attempt end to end -- checkout, execution,
+    session cleanup and backoff -- and external cancellation is never absorbed by it.
+
+    A caller that owns the session keeps it; every other read runs on a detached session this
+    helper closes under its own bound, so an expired deadline cannot then hang on that close.
+    """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    last_error: BaseException | None = None
+    attempt = 0
+    try:
+        async with asyncio.timeout(budget_seconds) as deadline:
+            while attempt < attempts:
+                # A caller-owned session carries uncommitted state a fresh connection cannot see, so
+                # its invalidation is the owner's to resolve; only an unbound read may reconnect.
+                caller_owned = session_factory.current() is not None
+                acquire_started = loop.time()
+                acquired_at: float | None = None
+                try:
+                    async with session_factory() if caller_owned else session_factory._detached_session() as session:
+                        await session.connection()
+                        acquired_at = loop.time()
+                        return await read(session)
+                except Exception as error:
+                    # Entry is strictly the driver's own invalidation flag. Once a disconnect is
+                    # confirmed, a retry that cannot even obtain a connection is the same outage, so
+                    # it exhausts the budget rather than escaping as an unattributed error. Keyed on
+                    # never reaching the query, because a refused checkout is not always a
+                    # ``DBAPIError``: asyncpg raises a bare ``ConnectionRefusedError``.
+                    invalidated = isinstance(error, DBAPIError) and error.connection_invalidated
+                    recovering = attempt > 0 and acquired_at is None
+                    if not invalidated and not recovering:
+                        raise
+                    last_error = error
+                    LOG.warning(
+                        "Database connection lost during read",
+                        operation=operation,
+                        db_read_attempt=attempt,
+                        db_read_recovering=recovering,
+                        db_read_caller_owned_session=caller_owned,
+                        db_connection_invalidated=invalidated,
+                        db_acquire_seconds=round((acquired_at or loop.time()) - acquire_started, 3),
+                        db_query_seconds=round(loop.time() - acquired_at, 3) if acquired_at else None,
+                        db_read_elapsed_seconds=round(loop.time() - started, 3),
+                        **log_fields,
+                    )
+                    if caller_owned:
+                        raise DatabaseConnectionUnavailableError(operation, attempt + 1) from error
+                    attempt += 1
+                    if attempt < attempts:
+                        await asyncio.sleep(backoff_seconds * (2 ** (attempt - 1)))
+    except TimeoutError:
+        # ``asyncio.TimeoutError`` is the builtin, so a socket timeout from inside the read would
+        # otherwise be reported as this budget expiring and claim attempts that never ran.
+        if not deadline.expired():
+            raise
+        LOG.error(
+            "Database read exhausted its recovery budget",
+            operation=operation,
+            db_read_attempt=attempt,
+            db_read_budget_seconds=budget_seconds,
+            db_read_elapsed_seconds=round(loop.time() - started, 3),
+            **log_fields,
+        )
+        raise DatabaseConnectionUnavailableError(operation, attempt + 1) from last_error
+
+    LOG.error(
+        "Database read could not reconnect",
+        operation=operation,
+        db_read_attempts_exhausted=True,
+        db_read_attempt=attempt,
+        db_read_elapsed_seconds=round(loop.time() - started, 3),
+        **log_fields,
+    )
+    raise DatabaseConnectionUnavailableError(operation, attempt) from last_error
 
 
 class BaseAlchemyDB:
@@ -106,6 +211,27 @@ class _SessionFactory:
         finally:
             self._session_ctx.reset(token)
             await session.close()
+
+    @asynccontextmanager
+    async def _detached_session(self) -> AsyncIterator[AsyncSession]:
+        """A session on its own connection, detached from any caller transaction.
+
+        It neither joins nor becomes the ambient session, so anything read through it cannot see
+        a caller's uncommitted rows. ``read_with_disconnect_recovery`` is its only caller, and
+        only for reads it has established no caller owns.
+        """
+        session = self._sessionmaker()
+        try:
+            yield session
+        finally:
+            # An abandoned session is better than an unbounded one: this close runs while a broken
+            # connection is the likely cause, and the pool reaps what it leaves behind.
+            try:
+                async with asyncio.timeout(_READ_RECOVERY_CLOSE_SECONDS):
+                    await session.close()
+            except TimeoutError:
+                with contained_effect("detached database session abandoned after a stalled close"):
+                    LOG.warning("Timed out closing a detached database session; abandoning it")
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[AsyncSession]:

@@ -1009,6 +1009,20 @@ class TestAttachFailedBlockScreenshots:
 
         monkeypatch.setattr(run_execution_module, "app", _AppStub())
 
+    def _add_artifact_store(self, *, run_block_artifact: object | None) -> None:
+        """Bolt an artifact store onto whatever app stub is already installed.
+
+        The run-results harness installs its own app, so replacing it here would strip the
+        collaborators ``_get_run_results`` needs.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        artifacts = MagicMock()
+        artifacts.get_artifact_by_entity_id = AsyncMock(return_value=run_block_artifact)
+        artifacts.get_artifacts_for_task_v2 = AsyncMock(return_value=[])
+        run_execution_module.app.DATABASE.artifacts = artifacts
+        run_execution_module.app.ARTIFACT_MANAGER = MagicMock(retrieve_artifact=AsyncMock(return_value=self.PNG_BYTES))
+
     @pytest.mark.asyncio
     async def test_failed_code_block_carries_screenshot_and_final_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The regression: a code block's screenshot lives on the workflow_run_block.
@@ -1094,7 +1108,7 @@ class TestAttachFailedBlockScreenshots:
             packet["current_url"] = end_url
 
         assert results[0]["at_failure_evidence"] == (
-            "No at-failure screenshot or final URL was persisted for this block."
+            "No at-failure screenshot or final URL is available for this block."
         )
         assert "final_url" not in results[0]
         assert "screenshot_b64" not in results[0]
@@ -1102,6 +1116,62 @@ class TestAttachFailedBlockScreenshots:
         assert packet["current_url_evidence"] == NO_PERSISTED_END_URL
         assert "current_url" not in packet
         assert packet["screenshot_base64"] is None
+
+    @pytest.mark.asyncio
+    async def test_credential_run_failure_still_reaches_the_model_with_its_at_failure_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-15899: a saved credential must not blind the repair loop.
+
+        Pins the call site with the real attach, because the regression was a guard around it:
+        every credential-bearing run had its captured frame and masked URL dropped, and the model
+        was told no evidence was persisted while the frame sat in the artifact store.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", "https://dash.example.com/board")
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=MagicMock())
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert failed_block["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert failed_block["final_url"] == "https://dash.example.com/board"
+        assert "at_failure_evidence" not in failed_block
+        assert _resolve_run_screenshot_b64(
+            live_capture=None, results=result["data"]["blocks"], run_ok=False
+        ) == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+
+    @pytest.mark.asyncio
+    async def test_credential_run_without_captured_evidence_says_so_without_inventing_a_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of SKY-15899: delivering evidence must not mean claiming it always exists."""
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", None)
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=None)
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert "screenshot_b64" not in failed_block
+        assert failed_block["at_failure_evidence"] == (
+            "No at-failure screenshot or final URL is available for this block."
+        )
+        assert _resolve_run_screenshot_b64(live_capture=None, results=result["data"]["blocks"], run_ok=False) is None
 
     @pytest.mark.asyncio
     async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(

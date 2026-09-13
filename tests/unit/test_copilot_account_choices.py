@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _extract_credential_ids_for_labels,
     _google_connection_reference_ids,
     _parsed_workflow_definition,
+    _retire_stale_google_connection_denial,
     canonicalize_named_google_sheet_bindings,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
@@ -1464,3 +1465,107 @@ def test_test_end_to_end_explicit_client_pick_is_still_labelled_as_a_user_picker
 
     assert chat_request.selected_connected_account_id == UNBOUND_ACCOUNT_ID
     assert '"selection_source":"user_picker"' in context
+
+
+def test_a_sheets_admission_cannot_retire_a_denial_a_non_sheets_block_still_earns() -> None:
+    policy = request_policy_module.RequestPolicy()
+    ctx = make_copilot_ctx(request_policy=policy)
+    signal = _credential_run_approval_blocker_signal(["goac_shared"], policy)
+    assert signal is not None
+    ctx.blocker_signal = signal
+    ctx.latest_tool_blocker_signal = signal
+    ctx.tool_blocker_signals = [signal]
+
+    _retire_stale_google_connection_denial(
+        ctx,
+        workflow_definition={
+            "parameters": [],
+            "blocks": [
+                {"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_shared"},
+                {"label": "sign_in", "block_type": "login", "credential_id": "goac_shared"},
+            ],
+        },
+        additional_approved_ids={"goac_shared"},
+    )
+
+    assert ctx.blocker_signal is signal
+
+
+def test_a_saved_named_connection_binding_holds_the_denial_open() -> None:
+    policy = request_policy_module.RequestPolicy()
+    policy.persisted_workflow_credential_ids = ["Team Sheet"]
+    ctx = make_copilot_ctx(request_policy=policy)
+    signal = _credential_run_approval_blocker_signal([], policy, google_reference_ids=["Team Sheet"])
+    assert signal is not None
+    ctx.blocker_signal = signal
+    ctx.latest_tool_blocker_signal = signal
+    ctx.tool_blocker_signals = [signal]
+
+    _retire_stale_google_connection_denial(
+        ctx,
+        workflow_definition={
+            "parameters": [],
+            "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_staged"}],
+        },
+        additional_approved_ids={"goac_staged"},
+    )
+
+    assert ctx.blocker_signal is signal
+
+
+def test_a_templated_connection_id_stays_out_of_the_blocker_trace() -> None:
+    policy = request_policy_module.RequestPolicy()
+    signal = _credential_run_approval_blocker_signal(["goac_plain"], policy, google_reference_ids=["goac_{{ suffix }}"])
+
+    assert signal is not None
+    assert signal.extra["unapproved_google_connection_ids"] == ["goac_plain"]
+    assert signal.extra["unapproved_google_reference_count"] == 2
+
+
+def test_staged_rebinding_cannot_retire_a_denial_the_saved_workflow_still_earns() -> None:
+    policy = request_policy_module.RequestPolicy()
+    policy.persisted_workflow_credential_ids = ["goac_saved"]
+    ctx = make_copilot_ctx(request_policy=policy)
+    signal = _credential_run_approval_blocker_signal(["goac_saved"], policy)
+    assert signal is not None
+    ctx.blocker_signal = signal
+    ctx.latest_tool_blocker_signal = signal
+    ctx.tool_blocker_signals = [signal]
+
+    _retire_stale_google_connection_denial(
+        ctx,
+        workflow_definition={
+            "parameters": [],
+            "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_staged"}],
+        },
+        additional_approved_ids={"goac_staged"},
+    )
+
+    assert ctx.blocker_signal is signal
+
+
+def test_retiring_a_stale_google_denial_never_widens_the_run_approved_ids() -> None:
+    policy = request_policy_module.RequestPolicy()
+    ctx = make_copilot_ctx(request_policy=policy)
+    signal = _credential_run_approval_blocker_signal(["goac_sheet"], policy)
+    assert signal is not None
+    ctx.blocker_signal = signal
+    ctx.latest_tool_blocker_signal = signal
+    ctx.tool_blocker_signals = [signal]
+    ctx.connected_account_recovery_choices = [
+        ConnectedAccountChoice(connection_id="goac_sheet", name="Sheets", state="active")
+    ]
+
+    _retire_stale_google_connection_denial(
+        ctx,
+        workflow_definition={
+            "parameters": [],
+            "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_sheet"}],
+        },
+        additional_approved_ids={"goac_sheet"},
+    )
+
+    assert ctx.blocker_signal is None
+    assert ctx.connected_account_recovery_choices == []
+    assert policy.run_approved_google_connection_ids == []
+    assert _approved_run_credential_ids(policy) == set()

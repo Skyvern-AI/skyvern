@@ -734,6 +734,7 @@ def block_yaml_to_block(
             recipients=block_yaml.recipients,
             subject=block_yaml.subject,
             body=block_yaml.body,
+            body_format=block_yaml.body_format,
             file_attachments=block_yaml.file_attachments or [],
         )
     elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
@@ -835,6 +836,7 @@ def block_yaml_to_block(
             recipients=block_yaml.recipients,
             subject=block_yaml.subject,
             body=block_yaml.body,
+            body_format=block_yaml.body_format,
         )
 
     elif block_yaml.block_type == BlockType.EXTRACTION:

@@ -6,13 +6,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
-
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 
 BlockerKind = Literal[
     "authority_denied",
@@ -186,7 +183,6 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
     last_run_outcome: Any | None
-    last_run_outcome_block_labels: list[str]
     last_test_anti_bot: str | None
     completion_verification_result: Any | None
     outcome_verification_trace_snapshot: dict[str, Any]
@@ -198,10 +194,6 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     post_run_page_observation_after_failed_test: bool
     post_run_page_observation_generation: int
     post_run_current_page_inspection_workflow_run_id: str | None
-    block_state_map: dict[str, str]
-    block_started_at_map: dict[str, str]
-    block_ended_at_map: dict[str, str]
-    block_run_identity_map: dict[str, BlockRunIdentity]
 
 
 def terminal_evidence_from_ctx(ctx: _TerminalEvidenceCtx) -> TerminalEvidence:
@@ -226,7 +218,6 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
-    ctx.last_run_outcome_block_labels = []
     ctx.last_test_anti_bot = None
     ctx.completion_verification_result = None
     ctx.outcome_verification_trace_snapshot = {}
@@ -238,10 +229,6 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.post_run_page_observation_after_failed_test = False
     ctx.post_run_page_observation_generation = 0
     ctx.post_run_current_page_inspection_workflow_run_id = None
-    ctx.block_state_map = {}
-    ctx.block_started_at_map = {}
-    ctx.block_ended_at_map = {}
-    ctx.block_run_identity_map = {}
 
 
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"

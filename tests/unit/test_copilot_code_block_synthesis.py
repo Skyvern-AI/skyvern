@@ -132,6 +132,66 @@ def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() 
     assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
 
 
+def test_authoring_parameter_snapshot_accepts_noncanonical_safe_key() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="ﬁle",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    assert 'page.locator("#location").fill(str(ﬁle))' in result.code
+    assert result.parameters == [{"key": "ﬁle"}]
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+@pytest.mark.parametrize("declared_key", ["ｐage", "ｉｆ", "_＿private"])
+def test_authoring_parameter_snapshot_rejects_keys_with_unsafe_normalized_names(declared_key: str) -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key=declared_key,
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is None or not result.diagnostics.grounded_submit_binding_fingerprints
+
+
 def test_authoring_parameter_snapshot_recovers_before_terminal_readiness_wait() -> None:
     trajectory = [
         _interaction(

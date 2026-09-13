@@ -545,6 +545,18 @@ class Settings(BaseSettings):
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
+    # Read, act in and verify inside child frames (SKY-14657). Covers perception, actuation and the
+    # element-probe realm as ONE unit on purpose: every partial state is worse than leaving it off.
+    # Perception alone mints refs a frame-blind resolver then reports stale, and perception plus
+    # actuation without the probe realm gives working actions whose readbacks answer about the main
+    # document instead of the element's own -- a verdict reported without being measured.
+    TASK_V3_FRAME_PERCEPTION: bool = False
+    # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
+    # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
+    # because the benchmark separated add from replace on speed alone, not on success. The code tool
+    # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
+    # there is no in-process execution path to fall back to.
+    TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False

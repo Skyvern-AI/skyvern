@@ -102,6 +102,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
+from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
     CreateScriptResponse,
@@ -761,6 +762,13 @@ async def _create_workflow_block_run_and_task(
             if not admitted:
                 raise RuntimeError("Recipe step was not admitted")
 
+    # The agent path settles a prior failed block's owned capture in execute_safe; a cached
+    # successor reaches the same browser here, so it settles it before its own reads. Kept above
+    # the creation try for the same reason recipe admission is: a failure here must surface, not
+    # become the sentinel that says this block has no run-block row.
+    if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        await app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).cancel_failure_evidence_capture()
+
     try:
         if task is not None and step is not None:
             # Reset the action order only after recipe admission has committed.
@@ -1245,9 +1253,12 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
             if not field_name:
                 continue
             # A v3 row's reasoning is the whole turn's text, shared across the round — not a
-            # per-field prompt; using it would give N fields one prompt naming all N.
-            per_action_reasoning = None if reasoning_is_turn_scoped(action.description) else action.reasoning
-            prompt_text = action.intention or per_action_reasoning or ""
+            # per-field prompt; using it would give N fields one prompt naming all N. Its intention is
+            # a timeline display label ("Typed into a text field"), not a prompt either.
+            turn_scoped = reasoning_is_turn_scoped(action.description)
+            per_action_reasoning = None if turn_scoped else action.reasoning
+            per_action_intention = None if turn_scoped else action.intention
+            prompt_text = per_action_intention or per_action_reasoning or ""
             if action.input_or_select_context and action.input_or_select_context.intention:
                 prompt_text = action.input_or_select_context.intention
             field_prompts.append({"name": field_name, "prompt": prompt_text})
@@ -3698,6 +3709,7 @@ async def send_email(
     custom_smtp_port: int | None = None,
     custom_smtp_username: str | None = None,
     custom_smtp_password: str | None = None,
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     sender = _render_template_with_label(sender, label)
@@ -3754,6 +3766,7 @@ async def send_email(
         recipients=recipients,
         subject=subject,
         body=body,
+        body_format=body_format,
         file_attachments=file_attachments,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,

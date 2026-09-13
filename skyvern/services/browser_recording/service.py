@@ -6,7 +6,7 @@ import pathlib
 import re
 import typing as t
 import zlib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import structlog
 
@@ -71,6 +71,212 @@ def summarize_exfiltrated_recording_events(events: list[ExfiltratedEvent]) -> di
         "recording_exfil_cdp_event_name_counts": cdp_by_event_name,
         "recording_exfil_console_dom_type_counts": console_by_dom_type,
         "recording_exfil_console_exfil_event_name_counts": console_by_exfil_event_name,
+    }
+
+
+def _durable_recording_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    try:
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+    except ValueError:
+        return ""
+    return urlunparse((parsed.scheme, host, "", "", "", ""))
+
+
+_DURABLE_TARGET_TAGS = frozenset(
+    {
+        "a",
+        "button",
+        "div",
+        "input",
+        "label",
+        "li",
+        "option",
+        "path",
+        "select",
+        "span",
+        "svg",
+        "textarea",
+    }
+)
+_DURABLE_TARGET_ROLES = frozenset(
+    {
+        "button",
+        "checkbox",
+        "combobox",
+        "gridcell",
+        "link",
+        "listbox",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "searchbox",
+        "slider",
+        "spinbutton",
+        "switch",
+        "tab",
+        "textbox",
+    }
+)
+_DURABLE_TARGET_INPUT_TYPES = frozenset(
+    {
+        "button",
+        "checkbox",
+        "color",
+        "date",
+        "datetime-local",
+        "email",
+        "file",
+        "hidden",
+        "image",
+        "month",
+        "number",
+        "password",
+        "radio",
+        "range",
+        "reset",
+        "search",
+        "submit",
+        "tel",
+        "text",
+        "time",
+        "url",
+        "week",
+    }
+)
+_DURABLE_TARGET_AUTOCOMPLETE_TOKENS = frozenset(
+    {
+        "additional-name",
+        "address-level1",
+        "address-level2",
+        "address-level3",
+        "address-level4",
+        "address-line1",
+        "address-line2",
+        "address-line3",
+        "bday",
+        "bday-day",
+        "bday-month",
+        "bday-year",
+        "billing",
+        "cc-additional-name",
+        "cc-csc",
+        "cc-exp",
+        "cc-exp-month",
+        "cc-exp-year",
+        "cc-family-name",
+        "cc-given-name",
+        "cc-name",
+        "cc-number",
+        "cc-type",
+        "country",
+        "country-name",
+        "current-password",
+        "email",
+        "family-name",
+        "given-name",
+        "honorific-prefix",
+        "honorific-suffix",
+        "impp",
+        "language",
+        "name",
+        "new-password",
+        "nickname",
+        "off",
+        "on",
+        "one-time-code",
+        "organization",
+        "organization-title",
+        "photo",
+        "postal-code",
+        "sex",
+        "shipping",
+        "street-address",
+        "tel",
+        "tel-area-code",
+        "tel-country-code",
+        "tel-extension",
+        "tel-local",
+        "tel-local-prefix",
+        "tel-local-suffix",
+        "tel-national",
+        "transaction-amount",
+        "transaction-currency",
+        "url",
+        "username",
+    }
+)
+
+
+def _allowlisted_target_value(value: str | None, allowed: frozenset[str]) -> str | None:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in allowed else None
+
+
+def _allowlisted_autocomplete(value: str | None) -> str | None:
+    tokens = (value or "").strip().lower().split()
+    if not tokens or any(token not in _DURABLE_TARGET_AUTOCOMPLETE_TOKENS for token in tokens):
+        return None
+    return " ".join(tokens)
+
+
+def build_durable_recording_evidence(actions: list[Action]) -> list[dict[str, t.Any]]:
+    evidence: list[dict[str, t.Any]] = []
+    for action in sorted(actions, key=lambda item: (item.timestamp_start, item.timestamp_end)):
+        target = {
+            key: value
+            for key, value in {
+                "tag_name": _allowlisted_target_value(action.target.tag_name, _DURABLE_TARGET_TAGS),
+                "role": _allowlisted_target_value(action.target.role, _DURABLE_TARGET_ROLES),
+                "input_type": _allowlisted_target_value(action.target.input_type, _DURABLE_TARGET_INPUT_TYPES),
+                "autocomplete": _allowlisted_autocomplete(action.target.autocomplete),
+            }.items()
+            if value is not None
+        }
+        evidence.append(
+            {
+                "kind": action.kind.value,
+                "timestamp_start": action.timestamp_start,
+                "timestamp_end": action.timestamp_end,
+                "url": _durable_recording_url(action.url),
+                "target": target,
+            }
+        )
+    return evidence
+
+
+def build_durable_recording_metadata(
+    *,
+    draft_steps: list[RecordingDraftStep] | None,
+    blocks: list[ProcessedBlock],
+    parameters: list[WorkflowDefinitionYamlParametersItem],
+    code_first: bool,
+    interpretation_session_id: str | None,
+) -> dict[str, t.Any]:
+    return {
+        "code_first": code_first,
+        "interpretation_session_id": interpretation_session_id,
+        "draft_steps": [
+            {
+                "step_id": step.step_id,
+                "action_kind": step.action_kind.value,
+                "block_type": step.block_type,
+                "status": step.status.value,
+                "editable_fields": [field.value for field in step.editable_fields],
+                "timestamp_start": step.timestamp_start,
+                "timestamp_end": step.timestamp_end,
+                "credential_kind": step.credential_kind,
+            }
+            for step in draft_steps or []
+        ],
+        "generated_blocks": [{"block_type": block.block_type} for block in blocks],
+        "generated_parameters": [{"parameter_type": parameter.parameter_type} for parameter in parameters],
     }
 
 
@@ -897,11 +1103,32 @@ class Processor:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
+        blocks, parameters, _, _ = await self.process_with_evidence(
+            compressed_chunks,
+            draft_steps=draft_steps,
+            code_first=code_first,
+            supports_credential_tokens=supports_credential_tokens,
+        )
+        return blocks, parameters
+
+    async def process_with_evidence(
+        self,
+        compressed_chunks: list[str],
+        draft_steps: list[RecordingDraftStep] | None = None,
+        code_first: bool = False,
+        supports_credential_tokens: bool = False,
+    ) -> tuple[
+        list[ProcessedBlock],
+        list[WorkflowDefinitionYamlParametersItem],
+        list[dict[str, t.Any]],
+        dict[str, t.Any],
+    ]:
+        events = self.compressed_chunks_to_events(compressed_chunks)
+        actions = self.events_to_actions(events)
+
         if code_first:
             # Code-first always re-derives selector-bearing actions from raw events;
             # draft steps carry no locators and act only as an edit overlay.
-            events = self.compressed_chunks_to_events(compressed_chunks)
-            actions = self.events_to_actions(events)
             code_first_result = actions_to_code_first_blocks(
                 actions, draft_steps, bind_credentials=supports_credential_tokens
             )
@@ -914,7 +1141,19 @@ class Processor:
                     recording_action_count=len(actions),
                     **self.identity,
                 )
-                return list(code_blocks), code_parameters
+                blocks: list[ProcessedBlock] = list(code_blocks)
+                return (
+                    blocks,
+                    code_parameters,
+                    build_durable_recording_evidence(actions),
+                    build_durable_recording_metadata(
+                        draft_steps=draft_steps,
+                        blocks=blocks,
+                        parameters=code_parameters,
+                        code_first=True,
+                        interpretation_session_id=self.interpretation_session_id,
+                    ),
+                )
             LOG.warning(
                 "record_browser.code_first_fallback_to_legacy",
                 recording_action_count=len(actions),
@@ -931,20 +1170,41 @@ class Processor:
             )
             blocks = self.drafts_to_blocks(draft_steps)
             parameters = self.blocks_to_parameters(blocks, bound_credential_ids(draft_steps))
-            return blocks, parameters
+            return (
+                blocks,
+                parameters,
+                build_durable_recording_evidence(actions),
+                build_durable_recording_metadata(
+                    draft_steps=draft_steps,
+                    blocks=blocks,
+                    parameters=parameters,
+                    code_first=code_first,
+                    interpretation_session_id=self.interpretation_session_id,
+                ),
+            )
 
-        events = self.compressed_chunks_to_events(compressed_chunks)
         LOG.info(
             "record_browser.process_recording_payload",
             recording_compressed_chunk_count=len(compressed_chunks),
             **summarize_exfiltrated_recording_events(events),
             **self.identity,
         )
-        actions = self._collapse_consecutive_waits(self.events_to_actions(events))
+        actions = self._collapse_consecutive_waits(actions)
         blocks = await self.actions_to_blocks(actions)
         parameters = self.blocks_to_parameters(blocks)
 
-        return blocks, parameters
+        return (
+            blocks,
+            parameters,
+            build_durable_recording_evidence(actions),
+            build_durable_recording_metadata(
+                draft_steps=None,
+                blocks=blocks,
+                parameters=parameters,
+                code_first=code_first,
+                interpretation_session_id=self.interpretation_session_id,
+            ),
+        )
 
 
 class BrowserSessionRecordingService:
@@ -959,7 +1219,7 @@ class BrowserSessionRecordingService:
         supports_credential_tokens: bool = False,
         recording_attempt_id: str | None = None,
         interpretation_session_id: str | None = None,
-    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem]]:
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem], str | None]:
         """
         Process compressed browser session recording events into workflow definition blocks.
         """
@@ -971,12 +1231,24 @@ class BrowserSessionRecordingService:
             interpretation_session_id=interpretation_session_id,
         )
 
-        return await processor.process(
+        blocks, parameters, evidence, metadata = await processor.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             code_first=code_first,
             supports_credential_tokens=supports_credential_tokens,
         )
+        if not blocks:
+            return blocks, parameters, None
+
+        recording = await app.DATABASE.browser_recordings.create_recording(
+            organization_id=organization_id,
+            recording_attempt_id=recording_attempt_id,
+            browser_session_id=browser_session_id,
+            workflow_permanent_id=workflow_permanent_id,
+            evidence=evidence,
+            metadata=metadata,
+        )
+        return blocks, parameters, recording.recording_id
 
 
 async def smoke() -> None:

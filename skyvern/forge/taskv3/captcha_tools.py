@@ -75,6 +75,7 @@ def build_captcha_tools(
                     organization_id=organization_id,
                     workflow_run_id=task.workflow_run_id,
                     browser_session_id=task.browser_session_id,
+                    probe_child_frames=True,
                 )
         except CaptchaChallengeUnsolvedError:
             failed_attempts += 1
@@ -99,8 +100,8 @@ def build_captcha_tools(
             return ToolResult.ok("captcha solved; re-observe the page and continue (e.g. retry submit).")
         # Absent: no challenge present. Cheap structural no-op that does not count toward the failure cap.
         return ToolResult.ok(
-            "no solvable captcha was detected on this page; do not retry solve_captcha — proceed with the "
-            "task or try another approach."
+            "no captcha challenge was detected in the page or its visible frames; nothing was solved. "
+            "Re-observe before calling solve_captcha again."
         )
 
     tool = ToolSpec(

@@ -13,6 +13,7 @@ alongside `make_finish_tool()`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import json
 import os
@@ -40,12 +41,15 @@ from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, o
 from skyvern.forge.taskv3.loop import (
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
+    TARGET_KIND_DATA_KEY,
+    TARGET_LABEL_DATA_KEY,
     SemanticCommitStats,
     ToolHandler,
     ToolResult,
     ToolSpec,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
+from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -66,6 +70,28 @@ InertTargetDiagnosis = Callable[[str, Exception], Awaitable["ToolResult | None"]
 # Cap on the page URL observe() echoes. Callers that register a secret URL for exact-match redaction
 # must register this prefix too, or the truncated echo survives the scrub.
 OBSERVE_URL_MAX_CHARS = 300
+
+# Split so the frame sentence tracks the capability rather than describing an aspiration. The two
+# tails are mutually exclusive and the flag picks one; nothing here ever tells the model it can reach
+# something no tool can, which is the failure direction that costs a turn every time it happens.
+_OBSERVE_DESCRIPTION_BASE = (
+    "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and "
+    "options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. "
+    "ref=12, no brackets) as the selector argument of click/hover/type/select_option/etc to act on it. A "
+    "ref names the element this reading described and keeps working while that element is on the page, "
+    "including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors "
+    "instead of acting on something else — re-observe and use a ref from the new reading. "
+)
+_OBSERVE_DESCRIPTION_NO_FRAME_REACH = (
+    "Also reports iframes present, including same-origin and large ones (host + captcha signature); their "
+    "contents cannot be observed or reached. Call once per page, then act by ref."
+)
+_OBSERVE_DESCRIPTION_FRAME_REACH = (
+    "Elements inside the page's child frames are included in the same list and are acted on by ref "
+    "exactly like the page's own — you never need to switch frames or mention one. The iframes line "
+    "reports the frames present and names any whose contents could NOT be read, so a frame missing from "
+    "the element list is stated rather than silent. Call once per page, then act by ref."
+)
 
 # Cap on what get_html returns, for markup and for rendered text alike.
 HTML_MAX_CHARS = 20000
@@ -289,6 +315,40 @@ def _classify_commit(
     return CommitStatus.OK if post_matches == 1 else CommitStatus.UNVERIFIED
 
 
+_SURFACE_PUNCT_RE = re.compile(r"[()\[\]{},;\"'\u2018\u2019]")
+
+
+def _surface_tokens(text: str) -> list[str]:
+    # "United States (+1)" must read as holding "+1": brackets, commas and quotes wrap tokens, "+" does not.
+    return _SURFACE_PUNCT_RE.sub(" ", text).lower().split()
+
+
+def _short_surface_verdict(
+    pre: str | None, post: str | None, chosen: str, visible_rows: list[str] | None
+) -> CommitStatus | None:
+    """Judge a field's own committed surface that renders only part of the clicked label ("+1").
+
+    OK only when this click changed the surface and exactly one row visible at the click is consistent
+    with it -- the chosen one. With the chosen row consistent, several consistent rows, an unread (None)
+    pre-click surface, or an unread (None) row set make the commit UNVERIFIED. None: no opinion.
+    """
+    shown = _surface_tokens(post or "")
+    if not shown or (pre is not None and _surface_tokens(pre) == shown):
+        return None
+    width = len(shown)
+
+    def consistent(row: list[str]) -> bool:
+        return any(row[i : i + width] == shown for i in range(len(row) - width + 1))
+
+    if visible_rows is None:
+        return CommitStatus.UNVERIFIED if consistent(_surface_tokens(chosen)) else None
+    # Every consistent ROW counts: two distinct rows that normalize alike both explain the surface.
+    hits = [" ".join(row) for row in (_surface_tokens(r) for r in visible_rows) if consistent(row)]
+    if " ".join(_surface_tokens(chosen)) not in hits:
+        return None
+    return CommitStatus.OK if len(hits) == 1 and pre is not None else CommitStatus.UNVERIFIED
+
+
 _ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
 
 
@@ -318,6 +378,9 @@ class _TypeaheadPick(NamedTuple):
     # Whether the commit surface already vouched for the chosen label BEFORE the pick click — such a
     # surface proves nothing about the commit and must not vouch for it downstream either.
     pre_surface_hit: bool = False
+    # The field's own committed surface when a short-form render (e.g. a dial code) matched more than
+    # one row visible at the click — set only when that ambiguity is why nothing was reported committed.
+    shared_surface: str | None = None
 
 
 # The smallest query many closed-vocabulary pickers need before they render candidates. Read by the
@@ -502,7 +565,8 @@ def _ambiguous_rows_error(
     )
     tail = f" ({note})" if note else ""
     return ToolResult.error(
-        f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+        f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled",
+        data={"release_own_list": True},
     )
 
 
@@ -579,7 +643,8 @@ def _identical_text_rows_error(
     return ToolResult.error(
         f"{value!r} matches {len(rows)} rows in {selector} whose labels the exact matcher cannot tell "
         f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
-        "is NOT filled"
+        "is NOT filled",
+        data=None if tags_live else {"release_own_list": True},
     )
 
 
@@ -1076,6 +1141,22 @@ _FIND_SUGGESTION_JS = (
   // sits under the field is not its menu.
   const ownPopup = fieldOwnPopup(field, true);
   const rowSel = rowSelFor(field);
+  // What the field itself now holds: an echo mirrors the FIELD, so a widget that clamped or reformatted
+  // the keystrokes shows its value, not the query that was typed.
+  let fieldVal = '';
+  try {
+    fieldVal = String(field.isContentEditable ? field.textContent : (field.value || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+  } catch (e) { fieldVal = ''; }
+  const ariaHiddenRow = (n) => { try { return !!n.closest('[aria-hidden="true"]'); } catch (e) { return false; } };
+  // Fail toward pickable: a node we cannot read stays a candidate, which can only cost a refusal.
+  const pickableRow = (n) => {
+    try {
+      if (n.matches('a,button,li,[role=option],[role=menuitem],[role=treeitem],[role=row],[onclick],[tabindex]')) return true;
+      if (n.closest('[role=listbox],[role=menu],[role=tree],[role=grid],ul,ol')) return true;
+      const cs = n.ownerDocument.defaultView.getComputedStyle(n);
+      return !!(cs && (cs.cursor === 'pointer' || cs.userSelect === 'none'));
+    } catch (e) { return true; }
+  };
   // A list this field already had open when the call arrived (see _FOCUS_SNAPSHOT_JS) reacts by
   // NARROWING rather than by appearing: once it has, the rows it kept are the ones typing selected.
   let openNarrowed = false;
@@ -1094,7 +1175,9 @@ _FIND_SUGGESTION_JS = (
     if (el.children.length > 8) continue;                             // a suggestion row, not a big container
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0 || r.height > 120) continue;  // visible, row-sized (allows a 2-line row)
-    if (fr) {                                                          // in the dropdown region: below, or above if it flipped up
+    // anyRegion is for a caller that only asks whether rows reacted and never clicks one: a field kept
+    // off-screen has no dropdown region its visible list could fall in.
+    if (fr && !args.anyRegion) {                                       // in the dropdown region: below, or above if it flipped up
       if (r.right < fr.left || r.left > fr.right) continue;
       if (!(ownPopup && pContains(ownPopup, el)) && (r.top < fr.top - 400 || r.top > fr.bottom + 500)) continue;
     }
@@ -1105,6 +1188,12 @@ _FIND_SUGGESTION_JS = (
     if (isNavRow(el)) continue;
     let score = 0;
     const norm = txt.replace(/\s+/g, ' ').trim().toLowerCase();
+    // Without the dropdown region to lean on, what is left to separate a suggestion from a segmented
+    // control's own echo -- which is a node the widget REPLACES on input, so it reads as new -- is
+    // whether a person could point at it. A row stays pickable with no ARIA at all; an echo is inert
+    // display: hidden from the a11y tree, or showing the field's own value back. An unreadable field
+    // value excludes nothing, so what the rule cannot judge it refuses rather than fills.
+    if (args.anyRegion && !pickableRow(el) && (ariaHiddenRow(el) || (fieldVal && norm === fieldVal))) continue;
     // A row whose whole text IS the value outranks a partial match ("New York" over "New York City";
     // "No" over "No, I have not ..."). This is only the CANDIDATE gate, not a cross-row ranking: every
     // row that clears score > 0 is tagged below and handed to the caller's own precision matcher.
@@ -1476,6 +1565,199 @@ _SEMANTIC_COMMIT_STATE_JS = (
 }"""
 )
 
+# A field's own committed-value surface: React-Select / styled combobox widgets move a commit OUT of
+# the filter input into a single-value node or chip beside it (clearing the input), so reading el.value
+# misses it. Reads only once the widget reports closed (aria-expanded=false) — a still-open list
+# reflecting the typed filter must never read as a commitment — and scoped to the nearest ancestor
+# (<=4 hops) holding exactly this one combobox trigger, so a sibling field showing the same label can't
+# vouch for this one.
+# `ownCommittedSurfaces` returns each SURFACE node's OWN {text, aria} untouched — the exact-match
+# verifier judges each node on its own text/aria, exactly as before this was extracted, so one chip's
+# internal comma ("Korea, Republic of") is never confused with the separator joining SEVERAL chips.
+# `ownCommittedSurface` is the display form (D1's short-surface read, observe/D3): one node's text or
+# aria, joined across several surfaces (multi-value chips) with ", ".
+_OWN_COMMITTED_SURFACE_FN_JS = r"""
+  const ownWidgetClosed = (el) => {
+    const expandedEl = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
+    return (expandedEl ? expandedEl.getAttribute('aria-expanded') : null) === 'false';
+  };
+  const ownCommittedSurfaces = (el) => {
+    if (!ownWidgetClosed(el)) return [];
+    const TRIGGER = "[role=combobox],[aria-haspopup=listbox],[aria-haspopup=menu],button[aria-expanded],input[role=combobox],select";
+    const SURFACE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label'],[role=option][aria-selected=true],.chip,.pill,[class*='token']";
+    const VALUE_NODE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label']";
+    let scope = null;
+    for (let anc = el.parentElement, hops = 1; anc && hops <= 4; hops++, anc = anc.parentElement) {
+      const trig = anc.querySelectorAll(TRIGGER);
+      if (anc.querySelector(SURFACE) && trig.length === 1 && (trig[0] === el || el.contains(trig[0]))) {
+        scope = anc;
+        break;
+      }
+    }
+    if (!scope) return [];
+    const out = [];
+    for (const s of scope.querySelectorAll(SURFACE)) {
+      const text = (s.textContent || '').trim();
+      const aria = (s.getAttribute('aria-label') || '').trim();
+      // Affirmative: a displayed value comes only from a dedicated single/multi-value node the platform
+      // says is painted; options, chips, pills and tokens are never read as the field's value.
+      const isValueNode = s.matches(VALUE_NODE);
+      let painted = false;
+      try {
+        painted = s.checkVisibility({ opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true });
+      } catch (e) {
+        painted = false;
+      }
+      if (text || aria) out.push({ text: text, aria: aria, displayed: painted && isValueNode });
+    }
+    return out;
+  };
+  const ownCommittedSurface = (el) => ownCommittedSurfaces(el).filter((s) => s.displayed).map((s) => s.text || s.aria).join(', ');
+"""
+
+# `ownCommittedSurface` for one selector, read the same way every other probe reads its target. null
+# when it cannot be read (no element, or the widget does not report closed) -- never '' for "unknown".
+_OWN_SURFACE_TEXT_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + r"""
+  const el = pQS(arg.sel) || arg.el;
+  if (!el || !ownWidgetClosed(el)) return null;
+  return ownCommittedSurface(el);
+}"""
+)
+
+# Whether a field shows ANY surface node of its own, painted or not -- a chip or token counts here even
+# though it is never read as the value. null when it cannot be read. For the Escape guard, where reading
+# too much only skips a cleanup.
+_OWN_SURFACE_PRESENT_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + r"""
+  const el = pQS(arg.sel) || arg.el;
+  if (!el || !ownWidgetClosed(el)) return null;
+  return ownCommittedSurfaces(el).length > 0;
+}"""
+)
+
+# Every option row CURRENTLY RENDERED in the field's own open list (fieldOwnPopup), independent of the
+# suggestion finder's relevance filter: _FIND_SUGGESTION_JS scores a row by word-overlap with the TYPED
+# query before it ever reaches its declared/undeclared split, so a widget-rendered sibling that shares
+# no >=3-char word with the query (a loosely-filtered "Canada +1" beside a typed "United States +1")
+# never becomes a candidate at all -- the resolved `rows` a pick used can be narrower than what the
+# widget actually showed. The short-surface verdict's uniqueness check needs the true complete set.
+# The set must be the one on screen when the press lands, not an earlier read: an async list can append a
+# row in between. A one-shot window capture listener takes it at pointerdown, before any page handler
+# runs, and page handlers later in the same press can still change the rows before the one that commits.
+# From the snapshot to the end of the press task it is void on any row added, node gaining a row role,
+# row text changed, row selector changed (a grid declared), or field re-pointed at another list. A row
+# holding DOM text it does not render also counts under that full text, so nothing CSS reveals can be
+# missing from it. `window.__tv3_rows_at_press` is null when no press reached it or the rows changed;
+# `window.__tv3_press.end()` stops the watch.
+_ARM_ROWS_AT_PRESS_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const prev = window.__tv3_press;
+  if (prev) prev.end();
+  window.__tv3_rows_at_press = null;
+  const field = () => pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  // DOM text cannot change without a mutation the watch sees; rendered text can, through CSS alone.
+  const domText = (row) => {
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) parts.push(n.data);
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  };
+  // A row is read as it renders; one whose DOM text holds more than that (a visibility-hidden badge, an
+  // unrendered row) also counts under its full DOM text -- a spare explaining row can only cost an OK.
+  const rowForms = (row) => {
+    const shown = row.getClientRects().length ? (row.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    const full = domText(row);
+    const squash = (t) => t.replace(/\s+/g, '');
+    const forms = shown ? [shown] : [];
+    if (full && squash(full) !== squash(shown)) forms.push(full);
+    return forms.map((t) => t.slice(0, 200));
+  };
+  const read = (popup) => {
+    if (!popup) return [];
+    // Uniqueness is only sound over the COMPLETE rendered set, so a list past the bound reads as no rows
+    // (the verdict then has no opinion) rather than as its first N.
+    const texts = [];
+    for (const row of popup.querySelectorAll(rowSel)) {
+      texts.push(...rowForms(row));
+      if (texts.length > 500) return [];
+    }
+    return texts;
+  };
+  let observer = null;
+  let el = null;
+  let popup0 = null;
+  let rowSel = null;
+  let known = new Map();
+  const changesRows = (records) => records.some((r) => {
+    if (r.type === 'attributes') {
+      if (r.attributeName === 'role' && r.target.matches(rowSel) && !known.has(r.target)) return true;
+      if (rowSelFor(el) !== rowSel) return true;
+      if (r.attributeName !== 'aria-controls' && r.attributeName !== 'aria-owns') return false;
+      const now = r.target.getAttribute(r.attributeName) ? fieldOwnPopup(el, true) : null;
+      return !!now && now !== popup0;
+    }
+    const host = r.target.nodeType === 1 ? r.target : r.target.parentElement;
+    const row = host && host.closest(rowSel);
+    // A node added inside a row changes it only if its text changed: a checkmark icon is not a new label.
+    if (row && (!known.has(row) || known.get(row) !== domText(row))) return true;
+    if (r.type !== 'childList') return false;
+    return [...r.addedNodes].some((n) => n.nodeType === 1 && (n.matches(rowSel) || n.querySelector(rowSel)));
+  });
+  const end = () => {
+    window.removeEventListener('pointerdown', snap, true);
+    window.removeEventListener('mousedown', snap, true);
+    window.removeEventListener('mouseup', finish, true);
+    if (observer) {
+      try { if (changesRows(observer.takeRecords())) window.__tv3_rows_at_press = null; } catch (e) { window.__tv3_rows_at_press = null; }
+      observer.disconnect();
+      observer = null;
+    }
+    if (window.__tv3_press === press) window.__tv3_press = null;
+  };
+  const finish = (e) => { if (e.isTrusted) setTimeout(end, 0); };
+  // Only a trusted press is ours: a page-dispatched pointerdown before the click must not spend the snapshot.
+  const snap = (e) => {
+    if (!e.isTrusted) return;
+    window.removeEventListener('pointerdown', snap, true);
+    window.removeEventListener('mousedown', snap, true);
+    try {
+      el = field();
+      if (!el) { window.__tv3_rows_at_press = []; return; }
+      rowSel = rowSelFor(el);
+      const popup = fieldOwnPopup(el, true);
+      popup0 = popup;
+      known = new Map([...(popup ? popup.querySelectorAll(rowSel) : [])].map((row) => [row, domText(row)]));
+      window.__tv3_rows_at_press = read(popup);
+      observer = new MutationObserver((records) => { if (changesRows(records)) window.__tv3_rows_at_press = null; });
+      const roots = new Set([document, el.getRootNode()]);
+      if (popup) roots.add(popup.getRootNode());
+      // Only these attributes decide which nodes are this field's rows; class/aria churn (a hover highlight) does not.
+      const attributeFilter = ['role', 'aria-haspopup', 'aria-controls', 'aria-owns'];
+      const watch = { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter };
+      for (const root of roots) observer.observe(root, watch);
+      window.addEventListener('mouseup', finish, true);
+    } catch (err) {
+      window.__tv3_rows_at_press = null;
+    }
+  };
+  const press = { end };
+  window.__tv3_press = press;
+  window.addEventListener('pointerdown', snap, true);
+  window.addEventListener('mousedown', snap, true);
+  return true;
+}"""
+)
+
 # Read back whether the field committed a real selection CAUSED BY the suggestion click — not just that
 # the field holds text (the caller typed into it before clicking, so a bare value check would call any
 # no-op click a success). Committed iff the visible value (a) reflects the row we clicked (shares a word
@@ -1485,6 +1767,7 @@ _SEMANTIC_COMMIT_STATE_JS = (
 _VERIFY_COMMIT_JS = (
     r"""(args) => {"""
     + _PIERCED_QUERY_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
     + r"""
   const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3));
   const overlaps = (a, b) => { const B = toks(b); for (const w of toks(a)) if (B.has(w)) return true; return false; };
@@ -1552,44 +1835,28 @@ _VERIFY_COMMIT_JS = (
     }
   }
   // React-Select / styled combobox: on commit the value moves OUT of the filter input into a
-  // single-value node or token beside it and the input is cleared, so the reads above miss it. Read
-  // that committed surface — but only once the widget reports closed (aria-expanded=false), so a
-  // still-open list reflecting the typed filter can't read as a commitment, and scoped to the nearest
-  // ancestor holding exactly this one combobox trigger, so a sibling field showing the same label
-  // can't pre-confirm this one. Mirrors v1's _CUSTOM_SELECT_COMMITTED_STATE_JS.
+  // single-value node or token beside it and the input is cleared, so the reads above miss it.
+  // ownCommittedSurfaces already gates this to the closed state and the field's own scope. Mirrors
+  // v1's _CUSTOM_SELECT_COMMITTED_STATE_JS.
   const expandedEl = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   const expanded = expandedEl ? expandedEl.getAttribute('aria-expanded') : null;
-  if (expanded === 'false') {
-    const TRIGGER = "[role=combobox],[aria-haspopup=listbox],[aria-haspopup=menu],button[aria-expanded],input[role=combobox],select";
-    const SURFACE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label'],[role=option][aria-selected=true],.chip,.pill,[class*='token']";
-    let scope = null;
-    for (let anc = el.parentElement, hops = 1; anc && hops <= 4; hops++, anc = anc.parentElement) {
-      const trig = anc.querySelectorAll(TRIGGER);
-      if (anc.querySelector(SURFACE) && trig.length === 1 && (trig[0] === el || el.contains(trig[0]))) {
-        scope = anc;
-        break;
-      }
-    }
-    if (scope) {
-      // EXACT normalized match, not token overlap (mirrors v1's matchesExpected): a stale single-value
-      // or a leftover multi-select token that merely SHARES a word with the chosen label would read as a
-      // false commit when the real selection silently failed. A committed surface normally holds exactly
-      // the chosen label (or, for a multi-value chip, it among comma-separated parts).
-      const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
-      const want = norm(chosen) || norm(typed);
-      const surfaceMatches = (raw) => {
-        const n = norm(raw);
-        if (!n || !want) return false;
-        return n === want || n.split(',').map((p) => p.trim()).includes(want);
-      };
-      for (const s of scope.querySelectorAll(SURFACE)) {
-        // textContent OR the accessible name (aria-label): a chip/single-value can carry the committed
-        // label only in aria-label with no text node — v1 reads both, so this must too.
-        const t = (s.textContent || '').trim();
-        if (surfaceMatches(t)) return t;
-        const al = (s.getAttribute('aria-label') || '').trim();
-        if (surfaceMatches(al)) return al;
-      }
+  const surfaces = ownCommittedSurfaces(el);
+  if (surfaces.length) {
+    // EXACT normalized match, not token overlap (mirrors v1's matchesExpected): a stale single-value
+    // or a leftover multi-select token that merely SHARES a word with the chosen label would read as a
+    // false commit when the real selection silently failed. A committed surface normally holds exactly
+    // the chosen label (or, for a multi-value chip, it among comma-separated parts within that SAME
+    // node's own text — never across several chips, which a join would falsely conflate).
+    const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+    const want = norm(chosen) || norm(typed);
+    const surfaceMatches = (raw) => {
+      const n = norm(raw);
+      if (!n || !want) return false;
+      return n === want || n.split(',').map((p) => p.trim()).includes(want);
+    };
+    for (const s of surfaces) {
+      if (surfaceMatches(s.text)) return s.text;
+      if (surfaceMatches(s.aria)) return s.aria;
     }
   }
   // A button/div trigger with no input and no chip shows its committed label on ITSELF (aria-label
@@ -2012,6 +2279,12 @@ PENDING_MARKER_JS = (
 )
 
 
+# What the probe reports when a child frame could not be read in time. A non-empty string is what the
+# finish gate treats as "still in flight", so this is the fail-closed answer expressed in the contract
+# the caller already has, rather than a third return type every caller would have to learn.
+PENDING_MARKER_UNKNOWN_FRAME = "a frame of this page did not respond in time to confirm it is not still submitting"
+
+
 async def pending_marker(page: Any, selector: str) -> str | None:
     """The text the page still shows `selector`'s control as in flight with, or None.
 
@@ -2019,12 +2292,44 @@ async def pending_marker(page: Any, selector: str) -> str | None:
     judges the element the run acted on. A second, hand-rolled resolver would be a second source of
     truth: shadow-piercing CSS, host-anchored selectors straddling a shadow boundary, and the
     text=/xpath forms all resolve here and none of them resolve through an in-page querySelector walk.
-    Fails open: an unresolvable control reports nothing, and nothing is not evidence of pending."""
+    Fails open: an unresolvable control reports nothing, and nothing is not evidence of pending.
+
+    The child frames are searched too when frame perception is on, and that is a correctness
+    requirement rather than completeness: `query_selector_all` on the page does not cross a frame
+    boundary, so a submit control the run clicked INSIDE a frame resolves to nothing here, and nothing
+    is read as "not pending". The completion gate would then accept `finish(completed)` while that
+    frame's submission was still in flight -- a false success, which is the one outcome worse than a
+    truthful failure. The control could not be clicked at all before frame perception, so this probe was
+    complete; it stopped being complete the moment the space widened."""
     try:
-        handles = await page.query_selector_all(selector)
+        handles = list(await page.query_selector_all(selector))
     except Exception:
         LOG.warning("taskv3 pending-marker probe could not resolve the control", selector=selector, exc_info=True)
         return None
+    # Frames are searched WHETHER OR NOT the page matched. Gating this on "the page found nothing"
+    # loses the case that matters: a durable selector like `#submit` or `button[type=submit]` commonly
+    # matches in both documents, and the parent's unrelated control then answers "not pending" for a
+    # frame control still showing "Processing" -- accepting finish(completed) on a live submission.
+    if settings.TASK_V3_FRAME_PERCEPTION:
+        # ONE realm -- the one the submit was recorded in -- not a walk of every frame. A walk cannot be
+        # bounded (a wedged renderer blocks the protocol queue), and the caller's single global deadline
+        # cancelling a walk is what let a cancellation read as "nothing pending": a completion accepted
+        # because we ran out of time to check. The ledger already knows where the click landed, so there
+        # is nothing to search for.
+        recorded = _frame_work(page)["submitted"].get(selector)
+        if recorded is not None:
+            try:
+                # Inside the fail-closed handler, not before it: this read can fail or stall exactly as
+                # the query below can, and outside it the failure escapes to the caller's bounded probe
+                # and is converted into "no pending marker" -- the fail-open this branch exists to avoid.
+                current = {recorded: await _realm_document_id(recorded)}
+                if recorded in _live_frame_work(page, current)["submitted"].values():
+                    handles.extend(await recorded.query_selector_all(selector))
+            except Exception:
+                # The realm the submit went to will not answer, so whether it is still in flight is
+                # UNKNOWN -- and unknown has to block, or a completion is accepted on silence.
+                LOG.info("taskv3 pending-marker probe could not read the submitted realm")
+                return PENDING_MARKER_UNKNOWN_FRAME
     if not handles:
         # Not an error: the control being gone is the ordinary shape of a submission that landed.
         return None
@@ -2511,6 +2816,182 @@ _NATIVE_PROXY_JS = r"""
     return named && vis(named) ? named : null;
   };
 """
+
+
+# The label is a timeline nicety on the critical path of every click/type/hover, so the probe gets a
+# hard budget the ACTION never pays for: the isolated world shares the page's JS thread, and a
+# busy-looping page would otherwise stall the action behind a read nothing depends on.
+_TARGET_NAME_TIMEOUT_SECONDS = 2.0
+
+# The page-visible name of the element an action is about to touch, computed the way observe already
+# names controls (aria-label, then the native <label>, then aria-labelledby, then contents) so the
+# label a reader sees is the one the model was shown. Read through this realm's prototypes, since a
+# page can shadow `labels`/`getAttribute` to hand back a decoy name.
+#
+# `el.value` is deliberately absent from every branch: on a text field it holds whatever the run just
+# entered, and unlike observe's transient payload this name is persisted on the action row and shown
+# in the run timeline -- a password or a verification code must not be able to arrive there. The
+# `value` ATTRIBUTE of a push button is its page-authored caption, not user input, so that one branch
+# is allowed and is gated on the button types.
+#
+# `kind` is a SEPARATE, bounded signal: a token from `TARGET_KIND_TOKENS` (target_label.py), never
+# free page text, so it can drive the floor phrase in a persisted row without a shape or secret check
+# of its own. For an INPUT it comes only from the `type` attribute; for everything else, an explicit
+# `role` attribute (if its first token is in the allowlist) or, failing that, the tag -- never both,
+# so a page cannot layer a role onto an input to pick a different floor than its type implies.
+_TARGET_NAME_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const _labelText = """
+    + _LABEL_TEXT_JS
+    + r""";
+"""
+    + _NATIVE_LABEL_JS
+    + r"""
+  // No executor handoff (the `arg.el` other probes accept): this one runs only in the isolated realm,
+  // which resolves the selector itself. A composed selector no single root can match simply has no
+  // name here -- and where its two halves are ambiguous, naming one of them would be a guess anyway.
+  const el = _q.find(arg.sel);
+  if (!el) return null;
+  const CAP = """
+    + str(TARGET_NAME_CAP)
+    + r""";
+  const KIND_TOKENS = new Set("""
+    + json.dumps(sorted(TARGET_KIND_TOKENS))
+    + r""");
+  // Sliced one past the bound so an over-length surface is DETECTABLE rather than silently shortened.
+  const nrm = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, CAP + 1);
+  const tag = _tag(el);
+  const type = String(_attr(el, 'type') || '').toLowerCase();
+  // Table cells, headers, tree items and options are left out even though accname lets them name
+  // themselves from their contents: their text is the page's data, such as a result row's or a
+  // typeahead suggestion's name or address. Menu items and tabs stay because their text is a caption.
+  const _NAME_FROM_CONTENT = 'button,a[href],summary,label,legend,h1,h2,h3,h4,h5,h6,'
+    + '[role=button],[role=link],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],'
+    + '[role=checkbox],[role=radio],[role=switch],[role=tab],[role=heading],[role=tooltip]';
+  // A node a reader cannot see names nothing, and innerText on an unrendered one falls back to
+  // textContent, which includes <script> bodies. checkVisibility covers display, visibility and
+  // opacity up the ancestor chain in one browser-defined check rather than an enumerated list.
+  const rendered = (n) => {
+    try {
+      if (typeof Element.prototype.checkVisibility === 'function') {
+        return Element.prototype.checkVisibility.call(n, { checkOpacity: true, checkVisibilityCSS: true });
+      }
+      return Element.prototype.getClientRects.call(n).length > 0;
+    } catch (e) {
+      return false;
+    }
+  };
+  // Every associated label, in tree order, as accname joins them; bounded like the referents below.
+  const labelled = () => {
+    const parts = [];
+    for (const l of nativeLabelsOf(el)) {
+      if (parts.length >= 8) break;
+      if (!rendered(l)) continue;
+      const t = nrm(_labelText(l));
+      if (t) parts.push(t);
+    }
+    return nrm(parts.join(' '));
+  };
+  const labelledBy = () => {
+    const idref = _attr(el, 'aria-labelledby');
+    if (!idref) return '';
+    let root = null;
+    try { root = Node.prototype.getRootNode.call(el); } catch (e) { return ''; }
+    if (!root) return '';
+    // Every referent, in order, as accname joins them; bounded so a page cannot make this unbounded.
+    const parts = [];
+    for (const id of String(idref).trim().split(/\s+/).slice(0, 8)) {
+      const target = _firstById(root, id);
+      if (!target || !rendered(target)) continue;
+      // A referent that takes input holds what was typed, so the whole name is refused.
+      if (['INPUT', 'TEXTAREA', 'SELECT'].indexOf(_tag(target)) !== -1) return '';
+      try {
+        if (Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable').get.call(target) === true) return '';
+      } catch (e) {
+        // not an HTMLElement, so not editable either
+      }
+      const t = nrm(_labelText(target));
+      if (t) parts.push(t);
+    }
+    return nrm(parts.join(' '));
+  };
+  // Name-from-contents applies only to the roles that support it (accname 2F), plus <label>, whose
+  // text IS what a reader sees over the control it names. On anything else the "name" would be
+  // whatever the page happens to render inside -- a result row's PII, a rich-text box's current
+  // contents -- which is the same user data the `el.value` exclusion exists to keep out, reached
+  // through a different accessor. Deliberately narrower than observe's own label, which is transient.
+  let contents = '';
+  let editable = true;
+  try {
+    editable = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable').get.call(el) === true;
+  } catch (e) {
+    editable = false;  // not an HTMLElement (an SVG target); it has no editable content either
+  }
+  if (!editable && _matches(el, _NAME_FROM_CONTENT)) {
+    try {
+      contents = nrm(Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'innerText').get.call(el));
+    } catch (e) {
+      contents = '';
+    }
+  }
+  const caption = tag === 'INPUT' && ['button', 'submit', 'reset'].indexOf(type) !== -1
+    ? nrm(_attr(el, 'value'))
+    : '';
+  // A page can mirror what was typed into a field's `title`, so a text-entry field never takes its name
+  // from one.
+  const textEntry = editable || tag === 'TEXTAREA' || _matches(el, '[role=textbox],[role=searchbox]')
+    || (tag === 'INPUT' && ['button', 'submit', 'reset', 'image', 'checkbox', 'radio', 'file', 'range'].indexOf(type) === -1);
+  const name = nrm(_attr(el, 'aria-label')) || labelled() || labelledBy() || contents || caption
+    || nrm(_attr(el, 'alt')) || nrm(_attr(el, 'placeholder')) || (textEntry ? '' : nrm(_attr(el, 'title')));
+  // Refused here rather than truncated, and this is the only place that can be exact: `length` is
+  // UTF-16 code units while Python counts code points, so a name whose bound falls on an astral
+  // character (an emoji is one code point, two units) would arrive UNDER the Python cap and be
+  // accepted -- as a truncated value the secret check can no longer recognize as the credential it
+  // was cut from. A name at the bound is page text anyway, so nothing readable is lost.
+  const finalName = (!name || name.length >= CAP) ? null : name;
+  let kind = '';
+  if (tag === 'INPUT') {
+    const INPUT_KIND = {
+      email: 'email', password: 'password', search: 'search', tel: 'tel', url: 'url', number: 'number',
+      date: 'date', 'datetime-local': 'date', month: 'date', week: 'date', time: 'date',
+      file: 'file', checkbox: 'checkbox', radio: 'radio', range: 'slider',
+      button: 'button', submit: 'button', reset: 'button', image: 'button',
+    };
+    kind = INPUT_KIND[type] || 'textbox';
+  } else {
+    const roleToken = String(_attr(el, 'role') || '').trim().split(/\s+/)[0].toLowerCase();
+    if (roleToken && KIND_TOKENS.has(roleToken)) {
+      kind = roleToken;
+    } else if (tag === 'BUTTON' || tag === 'SUMMARY') {
+      kind = 'button';
+    } else if (tag === 'A' && _attr(el, 'href') !== null) {
+      kind = 'link';
+    } else if (tag === 'SELECT') {
+      kind = 'combobox';
+    } else if (tag === 'TEXTAREA') {
+      kind = 'textarea';
+    } else if (tag === 'OPTION') {
+      kind = 'option';
+    } else if (tag === 'IMG') {
+      kind = 'image';
+    } else if (/^H[1-6]$/.test(tag)) {
+      kind = 'heading';
+    } else if (tag === 'TD' || tag === 'TH') {
+      kind = 'cell';
+    } else if (editable) {
+      kind = 'textbox';
+    }
+  }
+  return { name: finalName, kind: kind };
+}"""
+)
+
+# Actions whose target has a name worth reading back. press_key and navigate are excluded: neither is
+# about an element a reader would recognize by name.
+_TARGET_LABEL_TOOL_NAMES = frozenset({"click", "hover", "type", "select_option", "select_combobox", "file_upload"})
 
 
 _REACH_PROBE_NEEDED_JS = (
@@ -3380,6 +3861,23 @@ class _FieldNotEditable(Exception):
         super().__init__(selector)
         self.selector = selector
         self.read_only = read_only
+
+
+_OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable", "not enabled", "not attached")
+
+
+def _click_blocked_only_by_viewport(exc: BaseException) -> bool:
+    # Playwright's call log names why each retry failed. Only a click that never got past the viewport
+    # check is one focus() may stand in for; a field something covered on any retry keeps its error.
+    message = str(exc)
+    return "outside of the viewport" in message and not any(b in message for b in _OTHER_CLICK_BLOCKERS)
+
+
+def _typed_text_landed(read: str | None, typed: str) -> bool:
+    # Exact, whitespace included: a field that reformatted or trimmed the text ("3" -> "03", "abc " ->
+    # "abc") is refused rather than judged equivalent; a refusal costs one retry, a wrong equivalence is
+    # a false success.
+    return read is not None and read == typed
 
 
 # Design-system forms render a <select> at zero size behind a styled listbox proxy. Playwright's
@@ -4463,6 +4961,9 @@ async () => {
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
     + r""";
+"""
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + r"""
   const _visibleProxy = """
     + _VISIBLE_PROXY_JS
     + r""";
@@ -5394,6 +5895,12 @@ async () => {
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
     if (secretValue) { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    // React-Select-style commit: the widget clears el.value and moves the label into its own surface
+    // (D3). Only when el.value is empty, so a field still holding its own text is never overridden.
+    else if (_isAutocomplete(el)) {
+      const sv = ownCommittedSurface(el);
+      if (sv) rec.value = String(sv).slice(0, _RETAIN_WIDTH);
+    }
     // ARIA defines switch as a checkbox variant carrying the same aria-checked, so it belongs here.
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
     else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
@@ -5785,16 +6292,32 @@ async () => {
       }
     }
   } catch (e) { texts.length = 0; textDropped = 0; }
-  // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
-  // perception can never list its contents — record host + signature so the model can see the gate
-  // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
-  // and rejected: presence is the contract here, not cross-frame reach). Same visibility rule as
-  // elements, so hidden tracking pixels stay out. Isolated like the digest above.
+  // Iframe PRESENCE: an anti-bot/captcha widget can live in a child frame — same- or cross-origin —
+  // and main-frame element perception can never list its contents, so this records host + signature
+  // (plus origin and viewport-fill) instead. What it REPORTS is attributes only, never the frame's
+  // document (page.frames-based traversal was considered and rejected: presence is the contract
+  // here, not cross-frame reach). The census below is the one exception and is not part of this
+  // contract: it reads same-origin frames, but only to count, and never reports what it saw.
+  // Same visibility rule as elements, so hidden tracking pixels stay out.
   // `failed` and `unread` are this channel's own bookkeeping, not a question put to the page: on the
   // section that reports gates, "found none" and "could not look" must not render as one sentence.
   const iframeInfo = { total: 0, inComponents: 0, entries: [], failed: false, unread: 0 };
+  // TELEMETRY ONLY (SKY-15590), never rendered to the model: `iframeInfo` counts frames worth
+  // REPORTING, which is the wrong denominator for how often a page carries a frame v3 cannot see
+  // into. Counted above those presentation filters but below the zero-size skip, which excludes
+  // beacons rather than frames.
+  const frameCensus = { sameOrigin: 0, crossOrigin: 0, sameOriginInteractive: 0, peeked: 0, peekFailed: 0 };
+  // Bounds the expensive query; not reported, because `peeked` and `peekFailed` already describe
+  // the outcomes and this only describes the budget.
+  let censusAttempts = 0;
+  // Covers at least the scanner's own `q` set, since an undercount reads as "decorative" and
+  // argues against the fix this justifies. Hidden and disabled controls are excluded: a CSRF
+  // input is not actionable.
+  const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,[role=button],[role=option],[role=combobox],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
   try {
     const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
     // A design system packages the widget inside its own shadow root, where a document query cannot
     // reach it. Walked like the ARIA, message and heading channels above, so this asks the page no
     // new question, only the same one of more roots.
@@ -5810,31 +6333,87 @@ async () => {
           try {
             const r = f.getBoundingClientRect();
             if (r.width === 0 || r.height === 0) continue;
+            // Census first: a srcdoc frame IS same-origin and a sub-viewport one is still a frame the
+            // tools cannot reach into, so both must be counted before the reporting filters drop them.
+            try {
+              // Reachability is the LIVE document, not the declared `src`: a frame can navigate
+              // itself after load, so `src` says where it started, not where it is.
+              let censusDoc = null;
+              try { censusDoc = f.contentDocument; } catch (e2) { censusDoc = null; }
+              let censusSame = censusDoc !== null;
+              if (!censusSame) {
+                // Unreadable now, so `src` only decides WHICH kind. `about:` inherits the embedder's
+                // origin and `srcdoc` is inline, but URL serializes both as "null"; `data:` is
+                // opaque for real and stays cross-origin.
+                censusSame = f.hasAttribute('srcdoc');
+                if (!censusSame) {
+                  try {
+                    const cu = new URL(f.getAttribute('src') || '', location.href);
+                    censusSame = cu.protocol === 'about:' || cu.origin === location.origin;
+                  } catch (e3) { censusSame = false; }
+                }
+                // Same-origin by src but unreadable: sandboxed, tampered, or navigated away. That is
+                // a disclosed gap, never a frame scored as holding nothing.
+                if (censusSame) frameCensus.peekFailed++;
+              }
+              if (censusSame) {
+                frameCensus.sameOrigin++;
+                // Every same-origin frame lands in exactly ONE of peeked / peekFailed / neither, so
+                // `sameOrigin - peeked - peekFailed` is the count the cap discarded. Bounded by
+                // attempts, never by `peeked`: a page of throwing frames would never spend the cap.
+                if (censusDoc && censusAttempts < 12) {
+                  censusAttempts++;
+                  // A page can tamper with querySelector; scoring that throw as "decorative" is the
+                  // silent zero this census exists to prevent.
+                  try {
+                    if (censusDoc.querySelector(INTERACTIVE_SEL)) frameCensus.sameOriginInteractive++;
+                    frameCensus.peeked++;
+                  } catch (e4) { frameCensus.peekFailed++; }
+                }
+              } else {
+                frameCensus.crossOrigin++;
+              }
+            } catch (e5) { /* census must never cost the reporting scan a frame */ }
             // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
             if (f.hasAttribute('srcdoc')) continue;
             const src = f.getAttribute('src') || '';
             let u;
             try { u = new URL(src, location.href); } catch (e) { continue; }
-            if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
             const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
             const isCaptcha = sig.test(src + ' ' + ttl);
+            const sameOrigin = u.origin === location.origin;
+            // A measurement of the on-screen share, never a verdict on what the frame is; kept in tens so
+            // layout jitter cannot change the digest of an unchanged page.
+            const onW = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+            const onH = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+            const viewportPct = vw * vh > 0 ? Math.min(100, Math.round((onW * onH) / (vw * vh) * 10) * 10) : 0;
+            // Same-origin helper frames (tiny or off-screen) are common on ordinary pages; only one the user
+            // can see at a meaningful size, or one carrying a challenge signature, is worth a digest entry.
+            if (sameOrigin && !isCaptcha && onW * onH < 0.05 * vw * vh) continue;
             // Counted once every throwable read has succeeded: incrementing earlier put a frame in
             // `total` and in `unread` at once, so the two summed past the page's real count.
             iframeInfo.total++;
             if (root !== document) iframeInfo.inComponents++;
+            const entry = { host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha, sameOrigin: sameOrigin, viewportPct: viewportPct };
             if (iframeInfo.entries.length < 8) {
-              iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha });
-            } else if (isCaptcha) {
-              // Spending all 8 slots on ad embeds and dropping the one frame this channel exists to
-              // report defeats the channel, so a gate displaces an embed; the cap and total hold.
-              const at = iframeInfo.entries.findIndex((e) => !e.captcha);
-              if (at !== -1) iframeInfo.entries[at] = { host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha };
+              iframeInfo.entries.push(entry);
+            } else {
+              // Spending all 8 slots on lower-signal frames and dropping the one this channel exists to
+              // report defeats the channel, so a frame evicts the lowest-ranked entry only when it outranks it.
+              // Additive, so a viewport-filling challenge still outranks a row of small challenge widgets.
+              const rank = (e) => (e.captcha ? 4 : 0) + (e.viewportPct >= 80 ? 2 : 0) + (e.sameOrigin ? 1 : 0);
+              let lo = 0;
+              for (let k = 1; k < iframeInfo.entries.length; k++) {
+                if (rank(iframeInfo.entries[k]) < rank(iframeInfo.entries[lo])) lo = k;
+              }
+              if (rank(entry) > rank(iframeInfo.entries[lo])) iframeInfo.entries[lo] = entry;
             }
           } catch (e) { iframeInfo.unread++; continue; }
         }
       } catch (e) { iframeInfo.unread++; continue; }
     }
-  } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; frameCensus.sameOrigin = 0; frameCensus.crossOrigin = 0; frameCensus.sameOriginInteractive = 0; frameCensus.peeked = 0; frameCensus.peekFailed = 0; }
 
   // Ref identity. The same NODE keeps the same ref across observe() calls, so a frozen page renders an
   // identical digest and a ref read earlier still names the element it described. Held in a WeakMap,
@@ -5872,7 +6451,7 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -6139,13 +6718,39 @@ _FILLED_STATE_JS = (
 
 
 async def _count_filled_fields(page: Any) -> int:
-    """How many fields hold state a reload would wipe (incl. an attached file). Fail-open to 0: a probe
-    failure must never let this guard block a navigation."""
+    """How many fields hold state a reload would wipe (incl. an attached file). Fail-open to 0.
+
+    The main document is COUNTED, every field of it, including ones the page pre-filled. Child frames are
+    not counted but READ FROM A LEDGER of what the model itself filled, because a frame document cannot
+    be scanned under any bound. The asymmetry that follows: a page-prefilled field inside a frame is not
+    protected, where the same field in the main document is. Forced by the platform rather than chosen,
+    and still strictly better than the status quo, where nothing in a frame was protected at all.
+
+    The frames are counted because the guard's subject is the work a reload discards, and in-frame
+    work is discardable the moment v3 can fill it."""
+    total = 0
     try:
-        return int(await page.evaluate(_FILLED_STATE_JS))
+        total = int(await page.evaluate(_FILLED_STATE_JS))
     except Exception:
         LOG.info("taskv3 filled-state probe failed, treating page as empty", exc_info=True)
-        return 0
+    if not settings.TASK_V3_FRAME_PERCEPTION:
+        return total
+    # The main-frame count above is UNCHANGED, deliberately: it counts every field in that document
+    # including ones the PAGE pre-filled, and refusing a reload over those is what the guard is for, not
+    # a defect in it. Routing the main frame through the ledger would have quietly stopped protecting
+    # autofilled forms on flag-off traffic.
+    #
+    # Frame work comes from the ledger instead of a scan. Not a cheaper approximation -- a scan of frame
+    # documents cannot be bounded at all (a wedged renderer blocks the protocol queue and a same-origin
+    # child shares its parent's thread, so there is no per-frame liveness to time out against), and what
+    # the ledger records is the model's own work, which is the guard's actual subject.
+    #
+    # The asymmetry is stated in the docstring rather than hidden: a field the PAGE pre-filled inside a
+    # frame is not protected, where the same field in the main document is.
+    current = {realm: await _realm_document_id(realm) for realm in _frame_work(page)["documents"]}
+    for selectors in _live_frame_work(page, current)["filled"].values():
+        total += len(selectors)
+    return total
 
 
 # A probe that reads the DOM from the page's own JS realm can be answered by the page: prototype
@@ -6153,6 +6758,97 @@ async def _count_filled_fields(page: Any) -> int:
 # through a real cover. These probes run in a per-page isolated world instead, a realm the page has
 # no handle on, rebuilt whenever the document it was created against is gone.
 _ISOLATED_WORLDS: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+# One CDP session per PAGE, shared by every realm probed on it. Keyed per realm instead, a run that
+# probes many child frames -- an SPA or an ad-heavy page that churns iframes -- opens a session per
+# frame and never detaches any: the frame goes away, its worlds entry is collected, and the session is
+# left orphaned but still attached. A page is long-lived and bounded; the set of frames on it is not.
+_PAGE_CDP_SESSIONS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+
+async def _page_cdp_session(page: Any) -> Any:
+    session = _PAGE_CDP_SESSIONS.get(page)
+    if session is None:
+        session = await page.context.new_cdp_session(page)
+        _PAGE_CDP_SESSIONS[page] = session
+    return session
+
+
+def _realm_page(target: Any) -> Any:
+    """The page behind a realm: the target itself, or the page a Frame belongs to."""
+    try:
+        target.context
+    except AttributeError:
+        return target.page
+    return target
+
+
+def _frame_ids_for_url(tree: dict[str, Any], url: str) -> list[dict[str, Any]]:
+    """The browser's own record for every frame in `tree` showing `url`, flattened depth-first.
+
+    The whole record rather than just the id, because `loaderId` and the tree's `url` are both needed and
+    both have to come from the same browser-held read -- re-asking for either is what made the previous
+    version compare a value against itself.
+    """
+    found: list[dict[str, Any]] = []
+    stack = [tree.get("frameTree") or {}]
+    while stack:
+        node = stack.pop()
+        frame = node.get("frame") or {}
+        # CDP's Page.Frame.url is the document url WITHOUT its fragment, with the fragment carried
+        # separately in urlFragment; Playwright's Frame.url is the two concatenated (crPage.js). Comparing
+        # the two directly never matches for a frame whose url has a `#` -- and the failure is silent, because
+        # "no id matched" is indistinguishable here from "this page embeds itself", so isolation would be
+        # refused forever on any fragment-routed widget and every probe on it would answer from a realm the
+        # page can patch.
+        if frame.get("id") and str(frame.get("url") or "") + str(frame.get("urlFragment") or "") == url:
+            found.append(frame)
+        stack.extend(node.get("childFrames") or [])
+    return found
+
+
+async def _realm_frame_record(target: Any, session: Any) -> dict[str, Any] | None:
+    """The CDP frameId of the document `target` is showing, or None when it cannot be named uniquely.
+
+    A child frame shares its parent's CDP session unless the browser put it out of process, so
+    `new_cdp_session(frame)` raises "this frame does not have a separate CDP session" for an ordinary
+    same-origin child -- and, measured on this Chromium, for a cross-origin one too. The session is
+    therefore always the PAGE's, and the frame is named by its id within that session's frame tree.
+
+    Matched by url, with ambiguity refused rather than guessed: a page that embeds ITSELF has a parent
+    and child on one url, and picking either would be the coin-flip that puts a probe in the wrong
+    document. Refusing costs isolation for that page and nothing else -- the caller falls back to the
+    realm's own world, which is the right document either way.
+    """
+    page = _realm_page(target)
+    if target is page:
+        return None  # the main frame: the session's own root, which needs no lookup
+    try:
+        url = target.url
+        tree = await session.send("Page.getFrameTree")
+        moved = target.url != url
+    except Exception:
+        # RAISED, not turned into None. None here means "this frame cannot be named uniquely", which is
+        # the deliberate refuse-isolation branch -- so swallowing a DEAD SESSION reclassified it as an
+        # ambiguous frame, and the caller then stopped retrying and fell back to the page's own realm for
+        # the rest of the run instead of evicting the session and reopening one. The two failures need
+        # opposite responses, so they cannot share a return value.
+        LOG.info("taskv3 probe isolation could not read the frame tree", exc_info=True)
+        raise
+    if moved:
+        # The url was sampled before the tree read and the frame navigated during it. The ambiguity
+        # refusal below would then be DEFEATED by the race rather than triggered by it: a sibling still
+        # showing the old url becomes the sole match precisely because the target no longer holds it, so
+        # two frames on one url -- the case that refusal exists for -- reads as unambiguous. Playwright
+        # exposes no frameId to bind against, so the identity is refused when it moved under the read.
+        LOG.info("taskv3 probe isolation saw the frame navigate during the tree read")
+        return None
+    records = _frame_ids_for_url(tree, url)
+    if len(records) != 1:
+        # INFO because this is the counter the self-embedding decision is meant to be revisited on:
+        # `frames_matching_url` >= 2 is a page embedding itself, 0 is a url that matched nothing.
+        LOG.info("taskv3 probe isolation could not name the frame uniquely", frames_matching_url=len(records))
+        return None
+    return records[0]
 
 
 async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] | None:
@@ -6163,32 +6859,63 @@ async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] 
         state = {"session": None, "context_id": None}
         _ISOLATED_WORLDS[page] = state
         try:
-            state["session"] = await page.context.new_cdp_session(page)
+            # Always the PAGE's session, never the realm's. `new_cdp_session` accepts a Frame per its
+            # signature, but it RAISES for a frame that shares its parent's renderer -- "this frame does
+            # not have a separate CDP session" -- which is the ordinary same-origin child and, measured,
+            # the cross-origin one here too. The frame is addressed by its id inside this session
+            # instead, which is what keeps a framed probe ISOLATED rather than dropping it into a realm
+            # the page can patch.
+            state["session"] = await _page_cdp_session(_realm_page(page))
         except Exception:
-            LOG.debug("taskv3 probe isolation unavailable, falling back to the page realm", exc_info=True)
+            LOG.debug("taskv3 probe isolation unavailable, falling back to the realm's own", exc_info=True)
     if state["session"] is None:
         return None
     if fresh:
         state["context_id"] = None
     if state["context_id"] is None:
         try:
-            state["context_id"] = await _create_isolated_world(state["session"])
+            record = await _realm_frame_record(page, state["session"])
+            if record is None and page is not _realm_page(page):
+                # A child frame whose id could not be named uniquely (a self-embedding page). Refuse
+                # isolation rather than create a world in whichever document won the coin flip.
+                state["context_id"] = None
+                return None
+            # No post-check on the world. `Page.createIsolatedWorld` is given a frameId the BROWSER
+            # supplied, so the world is in that frame by construction -- measured: it resolves a
+            # frame-only selector and cannot see a parent-only one. A check comparing the world's
+            # `document.URL` to the tree's url could therefore only ever produce FALSE NEGATIVES, and a
+            # false negative here is the bug it would be trying to prevent: rejecting a valid world drops
+            # every probe into the realm the page controls. The one real hazard, a frame navigating out
+            # from under the world, does not answer wrongly -- the context is destroyed and the evaluate
+            # raises, which the retry above already rebuilds from.
+            frame_id = str(record["id"]) if record else None
+            state["context_id"] = await _create_isolated_world(state["session"], frame_id)
         except Exception:
             # A session detached by a renderer swap (cross-process navigation) answers nothing ever
             # again; evict it (not the cached-miss `None`) so the next probe opens a new one.
             LOG.debug("taskv3 probe isolation session lost, dropping it", exc_info=True)
+            dead = state["session"]
             try:
-                await state["session"].detach()
+                await dead.detach()
             except Exception:
                 pass
-            _ISOLATED_WORLDS.pop(page, None)
+            # EVERY realm holding this session, not just the one that noticed. The session is shared per
+            # page while the worlds are keyed per realm, so evicting only the observing realm left every
+            # sibling frame holding a detached session and a context id that looks usable -- and their
+            # next probe answered from the realm the page can patch, permanently.
+            for realm, other in list(_ISOLATED_WORLDS.items()):
+                if other.get("session") is dead:
+                    _ISOLATED_WORLDS.pop(realm, None)
+            _PAGE_CDP_SESSIONS.pop(_realm_page(page), None)
             raise
     return state["session"], int(state["context_id"])
 
 
-async def _create_isolated_world(session: Any) -> int:
-    tree = await session.send("Page.getFrameTree")
-    frame_id = tree["frameTree"]["frame"]["id"]
+async def _create_isolated_world(session: Any, frame_id: str | None = None) -> int:
+    """A pristine realm in `frame_id`'s document, or in the session's root frame when None."""
+    if frame_id is None:
+        tree = await session.send("Page.getFrameTree")
+        frame_id = tree["frameTree"]["frame"]["id"]
     # The protocol spells it "Univeral"; the typo is the wire name.
     world = await session.send(
         "Page.createIsolatedWorld",
@@ -6276,13 +7003,390 @@ async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> 
     return True
 
 
-async def _probe_evaluate(page: Any, js: str, selector: str, arg: dict[str, Any]) -> Any:
-    """Isolated-world probe, falling back to the page's own realm with own-label granting disabled --
-    a realm the page can patch must not be able to hand a label a hit-test bypass."""
-    isolated = await _evaluate_isolated(page, js, selector)
+# Child frames observe reads per call, and how deep it descends. These bound the WALK; the OUTPUT is
+# bounded separately by OBSERVE_MERGED_ELEMENT_MAX and OBSERVE_MERGED_TEXT_MAX, because _OBSERVE_JS's
+# own 250-element budget is PER REALM and so caps nothing page-wide once several realms are merged.
+# A page can nest frames without limit, and observe runs on nearly every turn, so an unbounded descent
+# is a latency bill charged to every run for the pathological case.
+OBSERVE_FRAME_MAX = 8
+OBSERVE_FRAME_DEPTH_MAX = 3
+
+
+def _frame_depth(frame: Any, main_frame: Any) -> int:
+    """How many frame boundaries sit between `frame` and the main frame; 0 for the main frame itself."""
+    depth = 0
+    node = frame
+    while node is not None and node is not main_frame and depth <= OBSERVE_FRAME_DEPTH_MAX + 1:
+        try:
+            node = node.parent_frame
+        except Exception:
+            return OBSERVE_FRAME_DEPTH_MAX + 1
+        depth += 1
+    return depth
+
+
+# Realm-attributed work the MODEL did, recorded at the moment of the action and read by the guards.
+#
+# The guards used to answer their questions by walking every child frame, which cannot be bounded: a
+# frame that wedges its renderer blocks every protocol request queued behind it, and a same-origin child
+# shares its parent's renderer thread, so there is no per-frame liveness to time out against. Recording
+# at the action removes the walk entirely -- and it is more accurate as well as bounded, because the
+# guards care about the model's own unsubmitted work rather than about every field on every document.
+#
+# Page-keyed and weak, like _ISOLATED_WORLDS: a closure writes it and module-level `pending_marker`
+# reads it. Entries are per realm, and a realm whose document identity has changed has had its work
+# discarded WITH that document, so its entries are dropped on read rather than trusted.
+_FRAME_WORK: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+
+
+def _frame_work(page: Any) -> dict[str, Any]:
+    state = _FRAME_WORK.get(page)
+    if state is None:
+        state = {"filled": {}, "submitted": {}, "documents": {}}
+        _FRAME_WORK[page] = state
+    return state
+
+
+async def _record_frame_work(page: Any, realm: Any, selector: str, kind: str, document_id: str) -> None:
+    """Note that the model did `kind` to `selector` inside `realm`. No-op for the main frame, whose work
+    the existing main-document probes already see."""
+    if realm is None or realm is page:
+        return
+    state = _frame_work(page)
+    state["documents"][realm] = document_id
+    if kind == "filled":
+        state["filled"].setdefault(realm, set()).add(selector)
+    else:
+        state["submitted"][selector] = realm
+
+
+def _live_frame_work(page: Any, current: dict[Any, str]) -> dict[str, Any]:
+    """The ledger with every entry whose realm shows a DIFFERENT document dropped.
+
+    A `loaderId` change means that document is gone and so is the work in it, so the entry is not merely
+    stale -- keeping it would have the guard refuse a reload to protect a form that no longer exists.
+    """
+    state = _frame_work(page)
+    live_realms = {realm for realm, doc in state["documents"].items() if current.get(realm) == doc}
+    return {
+        "filled": {realm: sel for realm, sel in state["filled"].items() if realm in live_realms},
+        "submitted": {sel: realm for sel, realm in state["submitted"].items() if realm in live_realms},
+    }
+
+
+def _recorded_work_frames(page: Any) -> list[Any]:
+    """Every child realm this run has ACTED in, whether or not it is still observable.
+
+    A gate cannot judge a frame it stopped being able to see. `_observable_child_frames` drops a hidden
+    host and caps the list, so an app that hides the frame it is submitting -- or a page that grows past
+    the cap -- takes that realm out of the completion fingerprint while its work is still in flight, and
+    the sample it leaves behind is STABLE, which reads as settled. Bounded by the actions the model took
+    rather than by the page's frame count, which is why this is a ledger read and not another walk.
+    """
+    state = _FRAME_WORK.get(page)
+    if state is None:
+        return []
+    return list(state["documents"])
+
+
+def _safe_url(target: Any) -> str:
+    try:
+        return str(target.url)
+    except Exception:
+        return ""
+
+
+# A document that cannot be named uniquely in the frame tree -- two children on one url, which
+# `about:blank` and `srcdoc` make ordinary. STABLE, not randomized: reads are bracketed by two identity
+# samples, so a fresh random value per call made `after != before` for such a realm ALWAYS, and the
+# reading was discarded every time. Sibling frames sharing a url were permanently unreadable -- one of
+# the shapes frame perception exists to reach. Refs from such a realm are refused EXPLICITLY in
+# `_resolve_ref` instead, which is what the randomized value was really doing, by accident and at the
+# cost of the content.
+_UNIDENTIFIABLE_DOCUMENT = "unidentifiable"
+
+
+def _document_unidentifiable(document_id: str) -> bool:
+    return document_id.endswith(f"|{_UNIDENTIFIABLE_DOCUMENT}")
+
+
+async def _realm_document_id(target: Any) -> str:
+    """A realm's document identity: its canonical url plus the browser's `loaderId` for that document.
+
+    `loaderId` is what distinguishes a REPLACED document from the same one, which a url cannot -- a
+    frame reloading itself at one url is ordinary. It is held by the browser and changes on every
+    document load, so unlike a value read out of the page it cannot be pre-seeded or forged by
+    patching `Math.random`. Degrades to the url alone where no CDP session exists (a non-Chromium
+    engine), which is what this was before either mechanism.
+    """
+    url = canonical_url(_safe_url(target))
+    if not settings.TASK_V3_FRAME_PERCEPTION:
+        # The flag-off path gets the url alone, which is the identity it always had. Ungated, this
+        # helper opens a CDP session and issues Page.getFrameTree on EVERY observe and every ref
+        # action -- on all production traffic, for a loaderId only frame refs need, against CDP
+        # behaviour that is separately disclosed as unverified on the prod default engine. It also
+        # silently tightened ref staleness on the default path. "Behind the flag, default off" has to
+        # mean this too.
+        return url
+    page = _realm_page(target)
+    try:
+        session = await _page_cdp_session(page)
+    except Exception:
+        # NO CDP session at all -- a non-Chromium engine. The documented degradation: the url alone,
+        # which is the identity this had before loaderId existed.
+        LOG.debug("taskv3 has no CDP session for this page; using the url alone", exc_info=True)
+        return url
+    try:
+        record = await _realm_frame_record(target, session)
+        if record is None and target is page:
+            tree = await session.send("Page.getFrameTree")
+            record = tree["frameTree"]["frame"]
+    except Exception:
+        # A session that EXISTED and then failed -- a renderer swap detached it. Kept distinct from
+        # having none, because degrading a CHILD FRAME to the url alone here is FAIL-OPEN: both of a
+        # read's identity samples then compare equal, refs are minted, and a detached one is re-resolved
+        # into whatever the remembered selector now names in a document that may have been replaced. The
+        # main frame keeps the url, which is the only identity it has ever had.
+        LOG.info("taskv3 lost the CDP session while identifying a document", exc_info=True)
+        return url if target is page else f"{url}|{_UNIDENTIFIABLE_DOCUMENT}"
+    loader = str((record or {}).get("loaderId") or "")
+    if not loader:
+        # No loaderId means the frame could not be named uniquely -- two child frames on one url,
+        # which `about:blank` and `srcdoc` make ordinary rather than exotic. Falling back to the url
+        # alone would be FAIL-OPEN in a design that fails closed everywhere else: a reload at that url
+        # would compare equal and a detached ref would re-resolve into the replacement. A marked
+        # identity is returned instead -- stable, so the realm can still be READ, with re-resolution
+        # of its refs refused by name in `_resolve_ref`.
+        LOG.info("taskv3 could not identify a realm's document; refusing its refs")
+        return f"{url}|{_UNIDENTIFIABLE_DOCUMENT}"
+    return f"{url}|{loader}"
+
+
+async def _observable_child_frames(page: Any) -> tuple[list[Any], int, int]:
+    """The child frames observe reads, in Playwright frame order, plus how many the caps left out and
+    how many could not be judged.
+
+    Read through `page.frames` rather than the parent's `contentDocument`, which is what reaches a
+    cross-origin frame at all: a frame's own realm is addressed over CDP and never consults the
+    parent's origin. A frame whose host is invisible is skipped for v1's reason -- `frame.evaluate`
+    on one can hang (scraper.py says so) -- which also excludes tracking pixels."""
+    try:
+        main_frame = page.main_frame
+        candidates = [frame for frame in page.frames if frame is not main_frame]
+    except Exception:
+        LOG.debug("taskv3 observe could not enumerate child frames", exc_info=True)
+        return [], 0, 1
+    kept: list[Any] = []
+    keptset: set[Any] = set()
+    # Excluded parents, split by reason, so a child under one is counted the way its ancestor was.
+    cappedset: set[Any] = set()
+    unjudgedset: set[Any] = set()
+    skipped = 0
+    unjudged = 0
+    # `page.frames` is parent-before-child, so a frame's ancestors are decided before it is.
+    for frame in candidates:
+        # A frame whose own host is visible can still sit inside a HIDDEN ancestor frame, and none of
+        # its document is then visible to the user. v1 avoids this by recursing only into visible
+        # parents; since `page.frames` is parent-before-child, an excluded parent is already decided.
+        try:
+            parent = frame.parent_frame
+        except Exception:
+            unjudged += 1
+            continue
+        if parent is not None and parent is not main_frame and parent not in keptset:
+            # WHY the parent was excluded decides how this child is counted. A hidden parent means the
+            # child is genuinely invisible and is no more unread than any other hidden region. A parent
+            # dropped by the caps or unjudged means this child was readable and we simply did not get
+            # to it, so it belongs in that count -- otherwise the digest's "N could not be read"
+            # understates a deep subtree by every frame under the one that hit the cap.
+            if parent in cappedset:
+                cappedset.add(frame)
+                skipped += 1
+            elif parent in unjudgedset:
+                unjudgedset.add(frame)
+                unjudged += 1
+            continue
+        try:
+            if frame.is_detached():
+                # Its document is gone, so an element read from it could never be acted on.
+                continue
+        except Exception:
+            unjudgedset.add(frame)
+            unjudged += 1
+            continue
+        if _frame_depth(frame, main_frame) > OBSERVE_FRAME_DEPTH_MAX:
+            cappedset.add(frame)
+            skipped += 1
+            continue
+        host = None
+        try:
+            host = await frame.frame_element()
+            # Invisible hosts are filtered BEFORE the count cap, not after. Tested after it, every
+            # tracking pixel and hidden helper beyond the cap counts as a region that "could not be
+            # read" -- and the digest then tells the model that N regions went unread on a page whose
+            # readable content it in fact covered entirely. That is the disclosure channel misinforming
+            # about coverage, which costs turns the same way a silent omission does.
+            if not await host.is_visible():
+                continue
+        except Exception:
+            # A frame whose host cannot be read is not silently dropped: it is a region of the page
+            # this reading did not cover, which the digest has to be able to say.
+            unjudgedset.add(frame)
+            unjudged += 1
+            continue
+        finally:
+            if host is not None:
+                try:
+                    await host.dispose()
+                except Exception:
+                    pass
+        if len(kept) >= OBSERVE_FRAME_MAX:
+            cappedset.add(frame)
+            skipped += 1
+            continue
+        kept.append(frame)
+        keptset.add(frame)
+    return kept, skipped, unjudged
+
+
+# Stands in for "which document this element came from is no longer known", which is not the same as
+# "the main frame" and must not decay into it: the main frame is a real document a selector will happily
+# resolve in.
+_UNKNOWN_REALM = object()
+
+
+class _RealmChangedDuringRead(Exception):
+    """A realm's document was replaced between the two identity samples bracketing its read."""
+
+
+class _Observation(NamedTuple):
+    """One reading of the page, spanning its main frame and the child frames observe could read."""
+
+    data: dict[str, Any]
+    handles: list[Any]
+    # Per element, the frame it was read from -- None for the main frame. Parallel to `handles` and to
+    # `data["elements"]`; server-side only, so no frame identity ever reaches the model.
+    owners: list[Any]
+    # Per realm, whether its page-side ref numbering restarted. Per realm and not page-wide because
+    # the ids come from a WeakMap in each realm and two realms hand back overlapping ones, so a single
+    # flag would either strand a live realm's refs or let one realm's id inherit another's element.
+    refs_fresh: dict[Any, bool]
+    # Per realm, the document url captured WITH that realm's read. Recorded here rather than sampled
+    # after the reads complete: a frame navigating in between would leave the digest describing the old
+    # document and the url naming the new one, and the staleness check would then agree.
+    documents: dict[Any, str]
+    # Regions this reading did not cover: a frame that would not answer, or one it could not judge.
+    unreadable_frames: int = 0
+    # Frames left out by the walk's own caps (count or depth), which is a different fact from a frame
+    # that refused to be read and is disclosed separately.
+    capped_frames: int = 0
+
+
+# Summed across realms: each is a count of something the reading gave up, and the model needs the
+# page-wide total. `url`/`title` stay the main frame's (they are the page's identity), and `iframes`
+# stays the main frame's untouched -- the presence channel reports the page's frames, and folding a
+# frame's own scan into it would change a channel whose contract is presence, not reach.
+_OBSERVE_SUMMED_KEYS = (
+    "textDropped",
+    "dropped",
+    "truncated",
+    "truncatedInComponents",
+    "unnamedAnonymous",
+    "unnamedBudget",
+    "unnamedDuplicated",
+    "unnamedUnverifiable",
+    "unnamedUnsafe",
+    "undiscoveredRoots",
+    "rootCount",
+    "hiddenListed",
+    "hiddenDropped",
+    "phantomDropped",
+    "markersMinted",
+    "markersReused",
+)
+# `textTruncated` joins these rather than the summed set: it is a boolean the payload emits to say the
+# text digest hit its budget, so a frame that hit ITS budget has to be able to raise the page's flag.
+_OBSERVE_ANY_KEYS = ("unreadableRoot", "pageMutated", "textTruncated")
+# Text lines the merged digest keeps. Each realm bounds its own list, so without a merged cap a page
+# of frames multiplies the text section by its frame count -- and the digest rides in the persistent
+# conversation prefix, where every line is paid for on every later turn.
+OBSERVE_MERGED_TEXT_MAX = 12
+
+# Elements the MERGED reading may carry, page-wide. The 250-element budget inside _OBSERVE_JS is per
+# realm, so without this a page of frames multiplies the element list by its frame count -- and the
+# digest rides in the persistent conversation prefix, which is where v3's cost lives. Set to the
+# per-realm budget deliberately: frame perception must not raise the worst-case prefix above what a
+# frameless page already costs. Main frame first, so what a busy page starves is a frame's rows and
+# never the page's own submit button, and the shortfall is disclosed like every other cap here.
+OBSERVE_MERGED_ELEMENT_MAX = 250
+
+
+def _iframe_reach_clause(observation: _Observation) -> str:
+    """What the tools can do with this page's frames, as of this reading.
+
+    Three states, not two. With frame perception off the contents are genuinely unreachable and saying
+    so is what stops the model writing selectors that cannot resolve. With it on they are listed and
+    actionable by ref -- except for frames this reading could not read or that its own caps left out,
+    which have to stay VISIBLE as unread rather than vanish, because a silent omission is what turns
+    "I could not see it" into a confident "the form never rendered".
+    """
+    if not settings.TASK_V3_FRAME_PERCEPTION:
+        return "(contents NOT listed here and NOT reachable by selector)"
+    unread = observation.unreadable_frames + observation.capped_frames
+    if unread:
+        return (
+            f"(contents of the frames listed below are among the elements above and actionable by ref; "
+            f"{unread} frame(s) could not be read and their contents are NOT listed)"
+        )
+    return "(contents are among the elements above and actionable by ref, same as the page's own)"
+
+
+def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> int:
+    """Fold a child frame's reading into the page's, in place. Returns how many of the frame's elements
+    were taken, which the caller uses to keep its handle and owner lists in step -- a length split
+    between them makes observe refuse every ref in the reading."""
+    elements = into.setdefault("elements", [])
+    incoming = other.get("elements") or []
+    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - len(elements))
+    taken = incoming[:room]
+    elements.extend(taken)
+    over_page_cap = len(incoming) - len(taken)
+    into["dropped"] = int(into.get("dropped") or 0) + over_page_cap
+    # Also counted here, never instead of `dropped` above -- the digest's note reads `dropped` and its
+    # text must not change. `dropped` means two unrelated things once a frame is merged (this cap, and
+    # elements no realm could describe), and nothing downstream can separate them without this key.
+    into["mergeCapDropped"] = int(into.get("mergeCapDropped") or 0) + over_page_cap
+    texts = into.setdefault("text", [])
+    fulls = into.setdefault("textFull", [])
+    # textFull is positional against text, so they are extended together and padded to stay aligned;
+    # a length split would print one line's full text against another line.
+    other_texts = list(other.get("text") or [])
+    other_fulls = list(other.get("textFull") or [])
+    other_fulls += [None] * (len(other_texts) - len(other_fulls))
+    room = max(0, OBSERVE_MERGED_TEXT_MAX - len(texts))
+    texts.extend(other_texts[:room])
+    fulls.extend(other_fulls[:room])
+    dropped_by_cap = max(0, len(other_texts) - room)
+    for key in _OBSERVE_SUMMED_KEYS:
+        into[key] = int(into.get(key) or 0) + int(other.get(key) or 0)
+    into["textDropped"] = int(into.get("textDropped") or 0) + dropped_by_cap
+    for key in _OBSERVE_ANY_KEYS:
+        into[key] = bool(into.get(key)) or bool(other.get(key))
+    return len(taken)
+
+
+async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, Any]) -> Any:
+    """Isolated-world probe, falling back to the realm's OWN world with own-label granting disabled --
+    a realm the page can patch must not be able to hand a label a hit-test bypass.
+
+    `target` is the realm the element lives in. The fallback deliberately stays in THAT realm rather
+    than dropping to the page's: losing isolation is the trade this fallback has always made, but
+    answering about the wrong document is not a trade, it is a wrong answer wearing a verdict's clothes.
+    """
+    isolated = await _evaluate_isolated(target, js, selector)
     if isolated is not None:
         return isolated
-    return await page.evaluate(js, {**arg, "allowOwnLabel": False})
+    return await target.evaluate(js, {**arg, "allowOwnLabel": False})
 
 
 def build_browser_tools(
@@ -6350,7 +7454,9 @@ def build_browser_tools(
     # The page-side WeakMap id -> (public ref, tag) it was issued for. The map lives in the page's
     # realm, so it is not trusted for identity: an id that comes back describing a different tag is a
     # different element and gets a NEW public ref rather than inheriting the old one's.
-    _public_ref_for_js: dict[int, tuple[int, str]] = {}
+    # Keyed by (realm, page-side id): each realm has its own WeakMap, so the same id from the page and
+    # from a child frame denotes two different elements.
+    _public_ref_for_js: dict[tuple[Any, int], tuple[int, str]] = {}
     # The document the current manifest was read from. A reading describes ONE document; after a
     # navigation every handle in it is dead, and re-querying a remembered selector would resolve it
     # against a page the model never saw.
@@ -6378,6 +7484,15 @@ def build_browser_tools(
     # diagnosis asks about a visible host while the hidden inner control is what timed out. Cleared in
     # _resolve_page, so it never outlives the call that recorded it.
     _acted_selector: dict[str, str] = {}
+    # The child frame the current call's selector belongs to, or empty for the main frame. Written by
+    # the selector-routing wrapper immediately before its handler runs and cleared in its finally, the
+    # same single-slot handoff `_prefetched_page` uses and with the same prerequisite: the loop
+    # dispatches one tool call at a time. A concurrent dispatcher must replace this, not reuse it.
+    #
+    # One slot rather than a parameter on every handler because frame routing is ONE cross-cutting
+    # concern. Threading a realm through forty call sites is how a concern gets scattered into the
+    # tools, and each site becomes a place to forget it.
+    _acted_realm: list[Any] = []
 
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
@@ -6390,7 +7505,28 @@ def build_browser_tools(
         # a rewrite succeeds leaves the previous call's mapping in place for one that does not. A later
         # hover on the same `#id` would then be diagnosed against an inner control it never touched.
         _acted_selector.clear()
-        return page, None
+        # Handlers get the realm their selector lives in, which for every main-frame element -- the
+        # overwhelming majority -- is the page itself and therefore unchanged. Returning the realm
+        # rather than the page is what makes the element-scoped calls AND the element probes resolve in
+        # the element's own document; the handful of genuinely page-level operations (keyboard, mouse,
+        # screenshot, the upload request listener) reach it through `_current_page()` instead, because a
+        # Frame has no such surface and because they are page-level facts rather than element-level ones.
+        # `_acted_page` is written just above, so `_current_page()` is non-None for the whole handler.
+        return (_acted_realm[0] if _acted_realm else page), None
+
+    def _current_page() -> Any:
+        """The page behind the current call, whatever realm its selector resolves in."""
+        return _acted_page[0] if _acted_page else None
+
+    def _navigated_phrase() -> str:
+        """How to tell the model that the document it was acting in moved.
+
+        Scoped to the realm because the sentence is read as an instruction: told "the page navigated"
+        when only an embedded widget's document did, the model re-orients the whole page and can
+        conclude it left the form it was filling. The page itself is unchanged in that case, and the
+        rest of it is still addressable.
+        """
+        return "the embedded frame navigated" if _acted_realm else "the page navigated"
 
     async def _url(page: Any) -> str:
         try:
@@ -6398,14 +7534,21 @@ def build_browser_tools(
         except Exception:
             return ""
 
+    async def _realm_url(page: Any, realm: Any) -> str:
+        """The URL of the document a realm is currently showing; `None` means the page's main frame."""
+        return await _url(page if realm is None else realm)
+
     def _is_context_teardown(exc: BaseException) -> bool:
         # Playwright's wording when a navigation destroys the context an evaluate was running in.
         # Matched by message because the driver raises a generic Error for it. Last resort only:
         # the driver also rewrites some unrelated protocol errors into this message.
         return "execution context was destroyed" in str(exc).lower()
 
-    async def _read_observation(page: Any) -> tuple[dict[str, Any], list[Any]]:
-        payload = await page.evaluate_handle(_observe_handles_js())
+    async def _read_one_realm(target: Any) -> tuple[dict[str, Any], list[Any], str]:
+        """One realm's reading. `target` is the page (its main frame) or a child frame; the payload and
+        the handles come from the SAME evaluate in that realm, which is what pairs them by index."""
+        before = await _realm_document_id(target)
+        payload = await target.evaluate_handle(_observe_handles_js())
         # Each get_property is its own remote-object reference, and observe runs on nearly every turn:
         # dropping them on the floor accumulates two orphans per call for the life of the document.
         holders: list[Any] = [payload]
@@ -6432,7 +7575,92 @@ def build_browser_tools(
                 except Exception:
                     pass
             handles.append(element)
-        return (json.loads(raw) if isinstance(raw, str) else raw), handles
+        # A per-DOCUMENT identity, read with the payload rather than sampled later. The url alone cannot
+        # see a document REPLACED at the same url -- a frame reloading itself, which a widget on a timer
+        # does routinely -- and a detached handle would then re-resolve the remembered selector against
+        # the replacement. The nonce lives on the document, so a reload wipes it.
+        # Identity on BOTH sides of the read. Sampled only afterwards, a reload landing between the
+        # payload extraction and the sample records the REPLACEMENT's identity against a digest and
+        # handles describing the document before it -- and the staleness check then agrees. Differing
+        # ends mean the realm changed mid-read, so the reading is discarded rather than recorded with an
+        # identity that belongs to neither document.
+        after = await _realm_document_id(target)
+        if after != before:
+            raise _RealmChangedDuringRead(f"realm changed during the read: {before!r} -> {after!r}")
+        return (json.loads(raw) if isinstance(raw, str) else raw), handles, after
+
+    async def _read_observation(page: Any) -> _Observation:
+        """One reading, retried once if a document was replaced while it was being assembled.
+
+        A page or frame navigating across a read is ordinary; navigating across two consecutive reads is
+        a page the model needs told about rather than handed a reading stitched from two documents.
+        """
+        try:
+            return await _read_observation_once(page)
+        except _RealmChangedDuringRead as exc:
+            LOG.info("taskv3 observe re-reading: a document changed while the reading was assembled", reason=str(exc))
+        return await _read_observation_once(page)
+
+    async def _read_observation_once(page: Any) -> _Observation:  # noqa: C901
+        """The page's reading, plus each readable child frame's, merged into one.
+
+        Merged rather than frame-switched: v1 hands its model a single tree and routes actions
+        internally, and the model never plans a frame hop. Every element carries its owning frame
+        server-side, in the manifest -- never in the selector, the digest, or anything the model types.
+
+        Main frame FIRST and frames appended after it, which is the same ordering rule the shadow-root
+        walk already applies to component roots: the element budget spends itself on the page's own
+        controls before a nested document's, so the submit button survives a frame full of rows.
+        """
+        main_data, main_handles, main_document = await _read_one_realm(page)
+        documents: dict[Any, str] = {None: main_document}
+        owners: list[Any] = [None] * len(main_handles)
+        if not settings.TASK_V3_FRAME_PERCEPTION:
+            return _Observation(main_data, main_handles, owners, {None: bool(main_data.get("refsFresh"))}, documents, 0)
+        frames, skipped, unjudged = await _observable_child_frames(page)
+        if not frames:
+            # `skipped` travels this path too. Dropped, a page whose every frame was capped out reports
+            # full reach and silently omits them -- the confident "the form never rendered" this
+            # disclosure exists to prevent.
+            return _Observation(
+                main_data, main_handles, owners, {None: bool(main_data.get("refsFresh"))}, documents, unjudged, skipped
+            )
+        # Concurrently under one deadline, for the reason captcha_solver.py:153-170 gives for its own
+        # frame scan: a sequential walk lets an early wedged frame spend the whole budget before the
+        # frame that matters is ever reached.
+        results = await asyncio.gather(*(_read_one_realm(frame) for frame in frames), return_exceptions=True)
+        fresh: dict[Any, bool] = {None: bool(main_data.get("refsFresh"))}
+        unreadable = unjudged
+        for frame, result in zip(frames, results):
+            if isinstance(result, BaseException):
+                # One frame that will not answer costs its own contents and nothing else, and is
+                # counted so the digest can say a region went unread rather than imply it was empty.
+                LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
+                unreadable += 1
+                continue
+            frame_data, frame_handles, frame_document = result
+            documents[frame] = frame_document
+            taken = _merge_realm(main_data, frame_data)
+            # Truncated in step with the element list: the three are paired by index, and a length
+            # split is exactly what makes observe refuse every ref it just minted.
+            for spare in frame_handles[taken:]:
+                if spare is None:
+                    continue
+                try:
+                    await spare.dispose()
+                except Exception:
+                    pass
+            main_handles.extend(frame_handles[:taken])
+            owners.extend([frame] * taken)
+            fresh[frame] = bool(frame_data.get("refsFresh"))
+        # The page's identity re-checked AFTER the frames were read. The main frame navigating in between
+        # would otherwise assemble one reading out of two documents -- the old page's url, text and
+        # controls beside child frames belonging to its replacement -- and while the old main handles go
+        # stale on their own, refs into a newly loaded child would stay valid and be acted on as though
+        # the model had seen them in this page.
+        if await _realm_document_id(page) != main_document:
+            raise _RealmChangedDuringRead("the page navigated while its frames were being read")
+        return _Observation(main_data, main_handles, owners, fresh, documents, unreadable, skipped)
 
     async def observe(_args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -6440,7 +7668,8 @@ def build_browser_tools(
             return error
         # Bound the whole acquisition -- the digest AND the handles behind it -- so a wedged page
         # can't hang the turn indefinitely on a later round trip the first bound never covered.
-        data, handles = await asyncio.wait_for(_read_observation(page), timeout=30)
+        observation = await asyncio.wait_for(_read_observation(page), timeout=30)
+        data, handles, owners = observation.data, observation.handles, observation.owners
         elements = data.get("elements", [])
         if len(handles) != len(elements):
             # Both come from the same array in the same evaluate, so a length split means the page's
@@ -6459,10 +7688,21 @@ def build_browser_tools(
                 except Exception:
                     pass
             handles = [None] * len(elements)
-        if data.get("refsFresh"):
-            # A fresh document restarted the page-side numbering, so no id it hands back can be one an
-            # earlier document was issued.
-            _public_ref_for_js.clear()
+            # Unconditionally, not only when the owner list ALSO split. The owner list is built from
+            # per-realm element counts, so it can still be the right length while the reading it
+            # describes is not trustworthy -- and a trusted owner plus a dead handle sends the ref to
+            # re-resolve its remembered selector in that frame, which stays actionable. "Pair nothing"
+            # has to mean every ref in the reading refuses.
+            owners = [_UNKNOWN_REALM] * len(elements)
+        for _realm, _was_fresh in observation.refs_fresh.items():
+            if not _was_fresh:
+                continue
+            # A fresh document restarted that realm's numbering, so no id it hands back can be one an
+            # earlier document was issued. Scoped to the realm that restarted: a child frame
+            # navigating does not renumber the page's ids, and clearing page-wide on its behalf would
+            # strand every still-live ref the main document holds.
+            for _key in [_k for _k in _public_ref_for_js if _k[0] is _realm]:
+                del _public_ref_for_js[_key]
         # Carried over only for the elements THIS reading still lists. The manifest is replaced
         # wholesale below, so an entry for an element the reading dropped names a ref no longer
         # resolvable anyway -- keeping it would grow this map for the life of a page that never
@@ -6480,28 +7720,48 @@ def build_browser_tools(
                 pass
         _observe_manifest.clear()
         _observe_document[:] = [canonical_url(await _url(page))]
-        _seen_js: set[int] = set()
+        # Per realm, the document each reading came from. A CHILD FRAME can navigate while the parent
+        # does not, and a page-wide URL check cannot see that: every ref minted into the old frame
+        # document would stay "valid" and re-resolve against a document the model never saw. A ref that
+        # errors costs a re-observe; a ref that silently resolves to a look-alike in a new document is
+        # the wrong-element commit the whole ref mechanism exists to prevent.
+        _realm_documents = observation.documents
+        _seen_js: set[tuple[Any, int]] = set()
         for _idx, e in enumerate(elements):
             _tag = str(e.get("tag") or "")
+            _owner = owners[_idx] if _idx < len(owners) else None
             _js_ref = e.get("ref")
             _js_ref = _js_ref if isinstance(_js_ref, int) and not isinstance(_js_ref, bool) else None
-            _prior = _carried.get(_js_ref) if _js_ref is not None else None
+            # Keyed by (realm, id): the id comes from a WeakMap in the realm that produced it, so the
+            # same number from two realms describes two different elements. Keyed by id alone, a frame's
+            # element would inherit the public ref issued for the page's.
+            _realm_key = (_owner, _js_ref) if _js_ref is not None else None
+            _prior = _carried.get(_realm_key) if _realm_key is not None else None
             # A repeated id within one reading, or one that now describes a different tag, is not the
             # element it was issued for: mint a new public ref rather than let two digest lines share
             # one, or let a remembered ref inherit a replacement.
-            if _prior is None or _prior[1] != _tag or _js_ref in _seen_js:
+            if _prior is None or _prior[1] != _tag or _realm_key in _seen_js:
                 _ref_seq[0] += 1
                 _public = _ref_seq[0]
             else:
                 _public = _prior[0]
-            if _js_ref is not None:
-                _public_ref_for_js[_js_ref] = (_public, _tag)
-                _seen_js.add(_js_ref)
+            if _realm_key is not None:
+                _public_ref_for_js[_realm_key] = (_public, _tag)
+                _seen_js.add(_realm_key)
             e["ref"] = _public
             # The selector rides along as the RE-RESOLVE path, not as an address: a framework that
             # replaces its nodes on every render detaches the handle, where the selector observe
             # computed for that element still names it. See _resolve_ref.
-            _observe_manifest[_public] = {"handle": handles[_idx], "tag": _tag, "selector": e.get("selector") or ""}
+            _observe_manifest[_public] = {
+                "handle": handles[_idx],
+                "tag": _tag,
+                "selector": e.get("selector") or "",
+                # The frame this element was read from, and the document that frame was showing. Both
+                # server-held: nothing frame-shaped is ever put in a selector, so the model has nothing
+                # frame-shaped to mistranscribe.
+                "owner": _owner,
+                "document": _realm_documents.get(_owner, ""),
+            }
         omitted_anonymous = data.get("unnamedAnonymous") or 0
         omitted_duplicated = data.get("unnamedDuplicated") or 0
         omitted_unverifiable = data.get("unnamedUnverifiable") or 0
@@ -6603,18 +7863,45 @@ def build_browser_tools(
             total = iframe_info.get("total", len(iframe_entries))
             parts = []
             for f in iframe_entries:
-                flag = "[captcha] " if f.get("captcha") else ""
+                tags = []
+                if f.get("captcha"):
+                    tags.append("[captcha]")
+                if f.get("sameOrigin"):
+                    tags.append("[same-origin]")
+                viewport_pct = f.get("viewportPct") or 0
+                # Shown from half the viewport, a lower bar than the 80% that ranks a frame for a capped slot:
+                # the fact is worth reading well before it is worth evicting another frame for.
+                if viewport_pct >= 50:
+                    tags.append(f"[fills {viewport_pct}% of viewport]")
+                flag = f"{' '.join(tags)} " if tags else ""
                 title = f" {f['title']!r}" if f.get("title") else ""
                 parts.append(f"{flag}{_digest_token(f.get('host') or '?', 80)}{title}")
             overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
             # `total` counts what was readable, so without this the sentence is an absolute claim
             # about a page some of which was never read.
+            #
+            # This clause states the TOOLS' REACH, not the DOM's accessibility, and those are different
+            # claims: a parent document cannot read a cross-origin child's DOM at all, yet the tools
+            # reach both over CDP. So it is keyed off what perception actually did on this call, and it
+            # changes in the same commit as the capability -- a message that runs ahead of the behaviour
+            # it describes would have the model emit selectors for elements no tool can reach.
             lines.append(
-                f"iframes: {total} cross-origin in the page and its open component roots "
-                "(contents NOT listed here and NOT reachable by selector): "
+                f"iframes: {total} in the page and its open component roots "
+                + _iframe_reach_clause(observation)
+                + ": "
                 + "; ".join(parts)
                 + overflow
                 + (f"; {iframe_hedge}" if iframe_hedge else "")
+            )
+        elif observation.unreadable_frames or observation.capped_frames:
+            # The presence channel does not list every frame -- it skips `srcdoc` outright and skips a
+            # small same-origin one -- so a frame perception failed to read can be absent from BOTH the
+            # element list and the entries above. Without this line the model is told nothing at all
+            # about a region of the page, which is the silent omission this whole change exists to end.
+            unread = observation.unreadable_frames + observation.capped_frames
+            lines.append(
+                f"iframes: {unread} frame(s) on this page could not be read, so their contents are "
+                "not listed" + (f"; {iframe_hedge}" if iframe_hedge else "")
             )
         elif iframe_hedge:
             lines.append(f"iframes: none found; {iframe_hedge}")
@@ -6742,6 +8029,7 @@ def build_browser_tools(
             lines.append(f"ref={e['ref']} {body}")
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
+        frame_census = data.get("frameCensus") or {}
         summary = {
             "text_dropped": text_dropped,
             "hidden_listed": hidden_kept,
@@ -6756,6 +8044,34 @@ def build_browser_tools(
             "group_texts_found": sum(1 for e in elements if e.get("group")),
             "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
             "duplicate_digest_lines": duplicate_digest_lines,
+            # SKY-15590. These ride the per-call record so EVERY observe is counted, frame-free
+            # ones included: a channel that speaks only when frames exist cannot state a rate.
+            # Deliberately not `iframes.total`, which is filtered for the model.
+            "frames_same_origin": int(frame_census.get("sameOrigin") or 0),
+            "frames_cross_origin": int(frame_census.get("crossOrigin") or 0),
+            "frames_same_origin_interactive": int(frame_census.get("sameOriginInteractive") or 0),
+            # Capped peek, and a peek that threw: without both, a capped or tampered page is
+            # indistinguishable from a sparse one.
+            "frames_peeked": int(frame_census.get("peeked") or 0),
+            "frames_peek_failed": int(frame_census.get("peekFailed") or 0),
+            # 0/1 int, not a bool: the loop's record filter keeps ints and drops bools.
+            "frame_scan_failed": 1 if iframe_info.get("failed") else 0,
+            # The REPORTING scan's gap counter, not the census's; they fail independently.
+            # The census's gap signal is `frames_peek_failed`.
+            "frame_unreadable_regions": int(iframe_unread or 0),
+            # SKY-16136. The element budget is the one cap here with no counter, and observe cannot
+            # report being truncated: a truncated digest is a SUCCESS. `elements_listed` is the
+            # denominator the cap-hit rate needs, so it rides every observe, truncating or not.
+            "elements_listed": len(elements),
+            "elements_truncated": truncated,
+            # Re-read rather than reusing the `in_components` local above: that one is bound inside
+            # `if truncated:`, so reusing it here would NameError on every observe that truncated nothing.
+            "elements_truncated_in_components": int(data.get("truncatedInComponents") or 0),
+            "elements_dropped": dropped,
+            # A DIFFERENT budget from `elements_truncated`: that one is _OBSERVE_JS's per-realm cap,
+            # this one is OBSERVE_MERGED_ELEMENT_MAX, applied when frames are folded in. Its share is
+            # inside `elements_dropped` too, so describe-failures alone are the difference of the two.
+            "elements_truncated_by_page_cap": int(data.get("mergeCapDropped") or 0),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
         # text or a field value the model previously typed (a token resolved back to its URL), and
@@ -6774,10 +8090,59 @@ def build_browser_tools(
         text = await _page_rendered_text(target)
         if text is None:
             return ToolResult.error("the rendered text could not be read")
+        if not selector:
+            # Whole-page read only. A SCOPED read is about one element in one document, and appending
+            # another document's text to it would answer a different question than the one asked.
+            text += await _child_frame_text(page)
         body = _escape_tags_in_text(_mask_refs(text))
         if len(body) > HTML_MAX_CHARS:
             body = body[:HTML_MAX_CHARS] + _RENDERED_TEXT_CUT
         return ToolResult.ok(body, data={"rendered_text": True})
+
+    async def _child_frame_text(page: Any) -> str:
+        """Each readable child frame's rendered text, labelled, appended to the page's own.
+
+        Text and not markup, which is v1's answer too (`get_frame_text` concatenates innerText across
+        frames and merges no frame markup): the measured failure is an extraction that could not see a
+        rendered table, and innerText renders a table with its header and its row/column association
+        intact. Merging nested documents' MARKUP would spend the whole markup budget on frame chrome
+        for no capability the text read does not already give.
+
+        UNBOUNDED, knowingly, and it is not the same case as the guards. A guard asks a yes/no question
+        and can be answered from a ledger of what the model did; this tool needs the frames' CONTENT, so
+        there is nothing to record instead of reading. A per-frame timeout does not help either: it
+        abandons the await without cancelling the request, and the connection is serialised, so a stalled
+        frame blocks everything after it regardless. Adding one would look like a fix and be theatre.
+        Disclosed and tracked rather than papered over -- v1 has the same exposure in `get_frame_text`.
+        """
+        if not settings.TASK_V3_FRAME_PERCEPTION:
+            return ""
+        frames, skipped, unjudged = await _observable_child_frames(page)
+        parts: list[str] = []
+        for frame in frames:
+            try:
+                text = await _page_rendered_text(frame)
+            except Exception:
+                text = None
+            if not text or not text.strip():
+                continue
+            # Named by its ordinal, never by its url or title: both are page-authored, and this text is
+            # about to be handed to the model as a section heading it will read as ours.
+            parts.append(f"\n\n--- frame {len(parts) + 1} of {len(frames)} ---\n{text}")
+        if skipped or unjudged:
+            # Said out loud, because omitting it silently is how a model concludes a table "never
+            # rendered" from text that was merely capped. The perception digest discloses the same fact
+            # through the reach clause, and this tool is reached without an observe in between.
+            parts.append(f"\n\n--- {skipped + unjudged} more frame(s) of this page were not read ---\n")
+        return "".join(parts)
+
+    async def _whole_page_text(page: Any) -> str | None:
+        """The rendered text of the page AND its readable child frames, or None when the page itself
+        could not be read. For checks whose evidence may be rendered in either document."""
+        own = await _page_rendered_text(page)
+        if own is None:
+            return None
+        return own + await _child_frame_text(page)
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -6912,6 +8277,72 @@ def build_browser_tools(
             element = None
         return {"sel": selector, "el": element}
 
+    def _with_target_label(handler: ToolHandler) -> ToolHandler:
+        """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
+        the result.
+
+        Pre-action because the action routinely destroys what it acted on -- a click that navigates,
+        a select that closes its menu -- so a post-hoc read would name whatever replaced it. Applied
+        inside the selector guard and the mark/ref resolvers, so the probe sees the same normalized
+        selector the action will land on. Never touches `content`: the model is not shown this."""
+
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            selector = args.get("selector")
+            name: str | None = None
+            kind: str | None = None
+            # The page comes from the preflight handoff, read and not popped -- the handler's own
+            # _resolve_page consumes it. Never page_provider(): a second must_get_working_page can
+            # recover or relaunch a page, and a label is not worth a side effect. Every labelled tool
+            # is in PREFLIGHT_TOOL_NAMES, so the handoff is there; one that is not gets no label.
+            if isinstance(selector, str) and selector and _prefetched_page:
+                # The REALM the action will land in, not the page. This wrapper runs inside the ref
+                # resolver, so `selector` is already the act-token selector and `_acted_realm` already
+                # names the frame that owns it -- asking the main document about that token finds
+                # nothing, and every framed action would be persisted with no name and no kind.
+                page = _acted_realm[0] if _acted_realm else _prefetched_page[0]
+                raw: Any = None
+                # _evaluate_isolated directly, NOT _probe_evaluate: that helper reads a None answer as
+                # "no isolated world" and re-runs the probe in the page's OWN realm -- and None is
+                # exactly what this probe returns for an unnamed element, the ordinary case. The page
+                # would then author a name that gets persisted and displayed, which is the whole thing
+                # the pristine realm is here to prevent (_target_is_inert refuses the fallback for the
+                # same reason). No isolated world means no name.
+                #
+                # Best-effort, end to end: a throw, a timeout or an answer of the wrong shape all mean
+                # "no name", never a failed action. The budget covers every leg, because a leg outside
+                # it is a leg the ACTION pays for on a page whose main thread is wedged. CancelledError
+                # is not an Exception and still propagates, so a cancelled run is not swallowed here.
+                try:
+                    raw = await asyncio.wait_for(
+                        _evaluate_isolated(page, _TARGET_NAME_JS, selector), _TARGET_NAME_TIMEOUT_SECONDS
+                    )
+                except Exception:
+                    raw = None
+                # Answer shape validated in Python, not trusted from the probe: the RAW name travels,
+                # not a cleaned one. The secret check downstream has to run upstream of every transform
+                # this side applies -- a cap or a collapse can put a credential in a shape the check no
+                # longer recognizes -- so the consumer detects first and cleans for display second.
+                if isinstance(raw, dict):
+                    raw_name = raw.get("name")
+                    name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
+                    raw_kind = raw.get("kind")
+                    kind = raw_kind if isinstance(raw_kind, str) and raw_kind else None
+            result = await handler(args)
+            # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
+            # so on a refusal the two can disagree about which element the selector meant -- a cloned
+            # marker matching twice resolves here to the clone and is then refused for exactly that
+            # ambiguity, and naming the twin nobody touched is worse than naming nothing.
+            if (name is None and kind is None) or result.status != "ok":
+                return result
+            data = {**(result.data or {})}
+            if name is not None:
+                data[TARGET_LABEL_DATA_KEY] = name
+            if kind is not None:
+                data[TARGET_KIND_DATA_KEY] = kind
+            return ToolResult(result.status, result.content, data, result.screenshots)
+
+        return wrapped
+
     async def _target_is_inert(selector: str) -> bool:
         # _evaluate_isolated directly, NOT _probe_evaluate: that helper falls back to the page's own
         # realm when no isolated world exists, and there a page replacing getComputedStyle could report
@@ -6919,8 +8350,12 @@ def build_browser_tools(
         # blocker. No isolated answer is unknown, and unknown makes no claim.
         if not _acted_page:
             return False
+        # The element's own realm: a framed control that timed out because it is display:none resolves
+        # nowhere in the main document, so it would get the generic timeout instead of the diagnosis
+        # that names what is actually wrong with it.
+        realm = _acted_realm[0] if _acted_realm else _acted_page[0]
         try:
-            return await _evaluate_isolated(_acted_page[0], _INERT_TARGET_PROBE_JS, selector) is True
+            return await _evaluate_isolated(realm, _INERT_TARGET_PROBE_JS, selector) is True
         except Exception:
             return False
 
@@ -7154,10 +8589,10 @@ def build_browser_tools(
             if url_before and url_now and url_now != url_before and await _same_document() is not True:
                 # A moved URL is a navigation unless the page says it is the same document --
                 # a menu that syncs its selection into the query string never left.
-                return f"Selected option {opt!r} — the page navigated.", None
+                return f"Selected option {opt!r} — {_navigated_phrase()}.", None
             after, navigated = await _after_read()
             if after is None and navigated:
-                return f"Selected option {opt!r} — the page navigated.", None
+                return f"Selected option {opt!r} — {_navigated_phrase()}.", None
             if after is not None and not after.get("stillOpen"):
                 child = await _cascade_child_note()
                 if child:
@@ -7166,7 +8601,7 @@ def build_browser_tools(
             if after is not None and _committed_state(after):
                 held, failure = await _state_holds(after.get("optState") or "")
                 if failure == "navigated":
-                    return f"Selected option {opt!r} — the page navigated.", None
+                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
@@ -7178,7 +8613,7 @@ def build_browser_tools(
             settled, navigated = await _after_read()
             if settled is None:
                 if navigated:
-                    return f"Selected option {opt!r} — the page navigated.", None
+                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
                 return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
                 child = await _cascade_child_note()
@@ -7188,7 +8623,7 @@ def build_browser_tools(
             if _committed_state(settled):
                 held, failure = await _state_holds(settled.get("optState") or "")
                 if failure == "navigated":
-                    return f"Selected option {opt!r} — the page navigated.", None
+                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
@@ -7290,6 +8725,12 @@ def build_browser_tools(
             except Exception:
                 pass
         url_before = await _url(page)
+        # The TAB's url, captured alongside the realm's. The two are the same for a main-frame click and
+        # diverge for a frame-owned one, and they answer different questions: the realm's url tells the
+        # reaction check whether the document it is about to read back is still there, while the tab's is
+        # the page-transition signal. Conflating them reports a widget navigating inside its own frame as
+        # the page having moved.
+        page_url_before = await _url(_current_page())
         doc_planted = False
         if pre is not None and pre.get("isOption"):
             try:
@@ -7387,8 +8828,21 @@ def build_browser_tools(
                 checked_before = None
 
         if skinned and label_click:
+            if _acted_realm:
+                # The coordinates come from a getBoundingClientRect inside the element's own realm, so
+                # in a child frame they are FRAME-relative while page.mouse takes viewport coordinates.
+                # Clicking them anyway would land wherever that offset happens to point -- a click on
+                # something else, reported as a click on this. Refused instead, because nothing here can
+                # be verified afterwards: the wrong element may well have accepted the click.
+                # Translating them by the frame's own offset (and by each ancestor frame's) is the
+                # follow-up; it is not free and it is not this change.
+                return ToolResult.error(
+                    f"{selector} is a styled control whose only clickable surface is its label, and it "
+                    "sits inside a frame where that label cannot be aimed at reliably — act on a "
+                    "different control, or use the native control directly if the page exposes one"
+                )
             try:
-                await page.mouse.click(float(label_click["x"]), float(label_click["y"]))
+                await _current_page().mouse.click(float(label_click["x"]), float(label_click["y"]))
             except Exception as e:
                 return ToolResult.error(
                     f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
@@ -7506,15 +8960,24 @@ def build_browser_tools(
         # reads (loop.py _ProgressLedger). Surfaced, not newly computed: _url is the page.url property,
         # not a probe, so this adds no evaluate. history.pushState can move the URL without leaving the
         # document, so this is a hint the ledger treats as re-baseline evidence, not a hard assertion.
-        url_after = await _url(page)
+        #
+        # Read off the TAB, never the acted realm. The ledger's question is whether the RUN moved, and a
+        # frame-scoped answer corrupts it in both directions: an embedded widget navigating inside its own
+        # frame would report hard progress the run never made -- manufacturing exactly the false progress
+        # the stall and revisit guards exist to refuse -- while a real page navigation that detaches the
+        # acted frame leaves _url(frame) throwing, which _url turns into "", reporting no transition for
+        # the clearest transition there is.
+        page_url_after = await _url(_current_page())
         transition_data: dict[str, Any] = {
-            "page_transitioned": bool(url_before and url_after and url_after != url_before)
+            "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before)
         }
-        if url_before and url_after and url_after != url_before:
+        if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
             # navigate back to a click-reached page is classified as a revisit, not fresh territory.
-            _recent_nav_canonicals.append(canonical_url(url_before))
-            _recent_nav_canonicals.append(canonical_url(url_after))
+            # The ring is page-level, so a frame's own url must never enter it: navigate() would then
+            # classify a genuinely fresh page as a revisit, or miss a real one.
+            _recent_nav_canonicals.append(canonical_url(page_url_before))
+            _recent_nav_canonicals.append(canonical_url(page_url_after))
 
         # An already-checked radio legitimately doesn't change on re-click, so the readback is
         # skipped for it -- same as the skinned path's short-circuit above.
@@ -7651,13 +9114,34 @@ def build_browser_tools(
         # field raise a false "covered by <the field's own list>" message on a field that was reachable.
         return True, occluded, None
 
-    async def _focus_for_typing(page: Any, selector: str) -> tuple[bool, dict[str, Any] | None]:
+    async def _declares_a_list(page: Any, selector: str) -> bool:
+        # Fail-closed toward "declares": on the focus-only path a wrong "no" would let the raw query in
+        # a suggestion field read back as a fill.
+        try:
+            arg = await _probe_arg(page, selector)
+            for js in (
+                _FIELD_DECLARES_LIST_JS,
+                _DECLARES_SEARCH_AUTOCOMPLETE_JS,
+                _TYPEAHEAD_LIST_OPEN_JS,
+                _ANCHOR_LIST_SEMANTICS_JS,
+            ):
+                if await page.evaluate(js, arg):
+                    return True
+        except Exception:
+            return True
+        return False
+
+    async def _focus_for_typing(
+        page: Any, selector: str, *, focus_fallback: bool = False
+    ) -> tuple[bool, dict[str, Any] | None, bool]:
         """Put the caret in `selector`. A False first element means the field is genuinely covered and
         must not be typed into. A click is how a widget learns to open its suggestion list, so it stays
-        the first move."""
+        the first move. The third element is True when the caret got there by focus() alone, after the
+        click could not reach the field -- nothing the page did in response to a click has been seen."""
         reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
-            return False, occluder
+            return False, occluder, False
+        focused_without_click = False
         if occluded:
             # Forcing skips the hit-target check but still dispatches at coordinates, so the wrapper
             # can take the event; the focus check below is what makes the outcome deterministic.
@@ -7681,16 +9165,37 @@ def build_browser_tools(
                 # The wrapper was a link and the click followed it. The selector may well match
                 # something on the destination, so typing now would put the text somewhere nobody
                 # asked for.
-                return False, occluder
+                return False, occluder, False
             try:
                 # The click may have remounted or hidden the field -- a wrapper that swaps its input
                 # on click is an ordinary SPA shape. fill() would wait its own full timeout for a
                 # node that is gone or invisible, which is the cost this whole path exists to avoid.
                 await page.wait_for_selector(selector, state="visible", timeout=1200)
             except Exception:
-                return False, occluder
+                return False, occluder, False
         else:
-            await page.click(selector, timeout=15000)
+            try:
+                await page.click(selector, timeout=15000)
+            except Exception as exc:
+                # A segmented control can keep its real input off-viewport with tabindex=-1 under an
+                # aria-hidden display layer: the probe finds nothing on top of it, but the click's
+                # hit-test has no point to land on. focus() needs no hit target. A widget that hands the
+                # caret to another segment would take the keys there, so a caret that does not stay put
+                # keeps today's error; the caller must still prove the keystrokes landed.
+                if not focus_fallback or not _click_blocked_only_by_viewport(exc):
+                    raise
+                # A field that commits a picked suggestion holds the raw query until blur, so a read-back
+                # could not tell a fill from a query; with no click to reach its rows, keep the error.
+                if await _declares_a_list(page, selector):
+                    raise
+                try:
+                    await page.focus(selector, timeout=15000)
+                    held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
+                except Exception:
+                    held = None
+                if held is not True:
+                    raise
+                focused_without_click = True
         try:
             focused = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
@@ -7701,7 +9206,7 @@ def build_browser_tools(
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
             await page.focus(selector, timeout=15000)
-        return True, None
+        return True, None, focused_without_click
 
     def _occluder_labels_hold(occluder: dict[str, Any] | None, value: str) -> bool:
         # The covering layer IS the committed-selection surface only when its own accessible naming
@@ -7752,6 +9257,38 @@ def build_browser_tools(
             )
         except Exception:
             return False
+
+    async def _own_surface_text(page: Any, selector: str) -> str | None:
+        # None: the surface could not be read, which is not the same as reading it empty.
+        try:
+            surface = await page.evaluate(_OWN_SURFACE_TEXT_JS, await _probe_arg(page, selector))
+        except Exception:
+            return None
+        return None if surface is None else str(surface)
+
+    async def _holds_own_surface(page: Any, selector: str) -> bool:
+        # Fail-closed toward "holds something": an unreadable field must never license a cleanup Escape.
+        try:
+            present = await page.evaluate(_OWN_SURFACE_PRESENT_JS, await _probe_arg(page, selector))
+        except Exception:
+            return True
+        return present is not False
+
+    async def _arm_rows_at_press(page: Any, selector: str) -> bool:
+        try:
+            return bool(await page.evaluate(_ARM_ROWS_AT_PRESS_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return False
+
+    async def _rows_at_press(page: Any) -> list[str] | None:
+        # None: no row set was taken at the press, which is not the same as the list showing no rows.
+        try:
+            raw = await page.evaluate(
+                "() => { if (window.__tv3_press) window.__tv3_press.end(); return window.__tv3_rows_at_press; }"
+            )
+        except Exception:
+            return None
+        return [str(t) for t in raw if isinstance(t, str)] if isinstance(raw, list) else None
 
     async def _semantic_commit_read(
         page: Any, selector: str, intended: str, typed: str, *, typed_trusted: bool
@@ -7850,8 +9387,59 @@ def build_browser_tools(
                 return chosen, True
         return committed, readable
 
+    async def _find_suggestion_rows(
+        page: Any, selector: str, query: str, *, any_region: bool = False
+    ) -> dict[str, Any] | None:
+        try:
+            found = await page.evaluate(
+                _FIND_SUGGESTION_JS,
+                {
+                    "value": query,
+                    "field": selector,
+                    "el": (await _probe_arg(page, selector))["el"],
+                    "anyRegion": any_region,
+                },
+            )
+        except Exception as e:
+            LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
+            return None
+        return found if isinstance(found, dict) and found.get("count") else None
+
+    async def _await_suggestion_rows(
+        page: Any, selector: str, query: str, rounds: int, *, any_region: bool = False
+    ) -> dict[str, Any] | None:
+        # The base poll extends while the widget shows a visible in-flight indicator — the same
+        # bounded busy extension the open->observe path applies: production pods run at a fraction
+        # of a vCPU, so a fetch that renders instantly on a laptop lands seconds later there.
+        found: dict[str, Any] | None = None
+        soft_deadline = time.monotonic() + 0.4 * rounds
+        hard_deadline = time.monotonic() + 8.0
+        while True:
+            await asyncio.sleep(0.4)
+            found = await _find_suggestion_rows(page, selector, query, any_region=any_region)
+            if found is not None:
+                break
+            now = time.monotonic()
+            if now >= hard_deadline:
+                break
+            if now >= soft_deadline:
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if not busy:
+                    break
+        return found
+
     async def _commit_typeahead(
-        page: Any, selector: str, value: str, rounds: int, *, exact_only: bool = False, probe: str | None = None
+        page: Any,
+        selector: str,
+        value: str,
+        rounds: int,
+        *,
+        exact_only: bool = False,
+        probe: str | None = None,
+        pre_own: str | None = None,
     ) -> _TypeaheadPick:
         # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
         # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
@@ -7867,17 +9455,11 @@ def build_browser_tools(
         # whole label IS `value` may be committed. `probe` is then what the field actually holds, which
         # is what the finder's reaction/overlap gate has to be given: rows answering "Il" need not share
         # a word with "Illinois".
+        # `pre_own` is the field's own committed surface read by the CALLER before it typed anything —
+        # reading it here would always see the list its own typing just opened.
 
         async def _find() -> dict[str, Any] | None:
-            try:
-                found = await page.evaluate(
-                    _FIND_SUGGESTION_JS,
-                    {"value": probe or value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
-                )
-            except Exception as e:
-                LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
-                return None
-            return found if isinstance(found, dict) and found.get("count") else None
+            return await _find_suggestion_rows(page, selector, probe or value)
 
         async def _full_rows() -> list[dict[str, Any]]:
             # The tagger truncates each label to 60 chars for payload size; the match must see the whole
@@ -7934,27 +9516,7 @@ def build_browser_tools(
                 info = None
             return info if isinstance(info, dict) else {}
 
-        # The base poll extends while the widget shows a visible in-flight indicator — the same
-        # bounded busy extension the open->observe path applies: production pods run at a fraction
-        # of a vCPU, so a fetch that renders instantly on a laptop lands seconds later there.
-        found: dict[str, Any] | None = None
-        soft_deadline = time.monotonic() + 0.4 * rounds
-        hard_deadline = time.monotonic() + 8.0
-        while True:
-            await asyncio.sleep(0.4)
-            found = await _find()
-            if found is not None:
-                break
-            now = time.monotonic()
-            if now >= hard_deadline:
-                break
-            if now >= soft_deadline:
-                try:
-                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
-                except Exception:
-                    busy = False
-                if not busy:
-                    break
+        found = await _await_suggestion_rows(page, selector, probe or value, rounds)
         if found is None:
             return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
         declared_rows, rows, idx, overflow = await _resolve(found)
@@ -8005,6 +9567,9 @@ def build_browser_tools(
             commit_evt_armed = bool(await page.evaluate(_ARM_COMMIT_EVENT_JS, await _probe_arg(page, selector)))
         except Exception:
             LOG.debug("taskv3 commit-event arm failed", selector=selector)
+        # The complete row set, taken at the press and independently of `rows` above: the finder's own
+        # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
+        rows_armed = await _arm_rows_at_press(page, selector)
         try:
             if not await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
@@ -8032,6 +9597,7 @@ def build_browser_tools(
                             )
                         except Exception:
                             LOG.debug("taskv3 commit-event arm failed", selector=selector)
+                        rows_armed = await _arm_rows_at_press(page, selector)
                         clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
             except Exception:
                 clicked = False
@@ -8063,6 +9629,18 @@ def build_browser_tools(
             best_txt,
             pre_surface_hit,
         )
+        shared_surface: str | None = None
+        if not committed:
+            # The exact-match verifier found nothing, but a widget that renders only a short form of
+            # the label (a dial code) still moved its own surface — judge THAT change against the rows
+            # visible when the click landed, the only ones it could have committed.
+            post_own = await _own_surface_text(page, selector)
+            press_rows = await _rows_at_press(page) if rows_armed else None
+            short_verdict = _short_surface_verdict(pre_own, post_own, best_txt, press_rows)
+            if short_verdict is CommitStatus.OK and post_own:
+                committed, readable = post_own, True
+            elif short_verdict is CommitStatus.UNVERIFIED:
+                shared_surface = post_own
         return _TypeaheadPick(
             committed or None,
             best_txt,
@@ -8071,6 +9649,7 @@ def build_browser_tools(
             clicked=True,
             declared=declared_rows,
             pre_surface_hit=pre_surface_hit,
+            shared_surface=shared_surface,
         )
 
     async def _read_field_value(page: Any, selector: str) -> str | None:
@@ -8114,7 +9693,9 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 pre-type value restore failed", selector=selector)
 
-    async def _type_and_commit(page: Any, selector: str, value: str, rounds: int) -> tuple[_TypeaheadPick, str | None]:
+    async def _type_and_commit(
+        page: Any, selector: str, value: str, rounds: int, *, focus_fallback: bool = False
+    ) -> tuple[_TypeaheadPick, str | None, str | None, bool]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
         # focus and then filters it in place keeps the same row nodes, so a snapshot taken after the click
@@ -8125,12 +9706,19 @@ def build_browser_tools(
         # Read the field BEFORE clearing it: a refusal further down owes this value back, and after the
         # fill() below no one can recover it.
         pre_value = await _read_field_value(page, selector)
+        # Same reason: fill()/type() below open the widget's own list (aria-expanded=true) for the rest
+        # of this attempt, and ownCommittedSurface reads nothing while it is open.
+        pre_own = await _own_surface_text(page, selector)
         try:
             await page.evaluate(_PRESNAPSHOT_JS)
         except Exception:
             presnapshot_ok = False
             LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
-        focused, occluder = await _focus_for_typing(page, selector)
+        # The focus-only path tells a typeahead from a plain field by rows reacting to the typing, which
+        # needs the pre-snapshot; without one it keeps today's error.
+        focused, occluder, focused_without_click = await _focus_for_typing(
+            page, selector, focus_fallback=focus_fallback and presnapshot_ok
+        )
         if not focused:
             raise _FieldCovered(selector, occluder)
         if presnapshot_ok:
@@ -8142,12 +9730,19 @@ def build_browser_tools(
                 pass
         await page.fill(selector, "", timeout=15000)
         await page.type(selector, value, delay=15, timeout=15000)
-        if not presnapshot_ok:
+        if not presnapshot_ok or focused_without_click:
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
-            # value and let the caller re-observe.
-            return _TypeaheadPick(None, None, False, None, clicked=False, declared=False), pre_value
-        return await _commit_typeahead(page, selector, value, rounds), pre_value
+            # value and let the caller re-observe. A field no click can reach gets no suggestion clicks
+            # either; the caller looks for reacting rows and reads its value back instead.
+            return (
+                _TypeaheadPick(None, None, False, None, clicked=False, declared=False),
+                pre_value,
+                pre_own,
+                focused_without_click,
+            )
+        pick = await _commit_typeahead(page, selector, value, rounds, pre_own=pre_own)
+        return pick, pre_value, pre_own, False
 
     async def _close_lingering_typeahead_list(
         page: Any, selector: str, committed: str | None, *, surface_vouched_pre_click: bool = False
@@ -8197,6 +9792,38 @@ def build_browser_tools(
         except Exception:
             pass
         return None
+
+    async def _list_opened_on_an_empty_field(page: Any, selector: str) -> bool:
+        # Escape can revert or clear a widget's text as it closes the list, so the cleanup may only run
+        # on a field that held nothing before this call; an unreadable field counts as holding something.
+        if await _own_list_open(page, selector):
+            return False
+        if await _read_field_value(page, selector) != "":
+            return False
+        return not await _holds_own_surface(page, selector)
+
+    async def _own_list_open(page: Any, selector: str) -> bool:
+        # Fail-closed toward "open": an unreadable state must never license closing a list afterwards.
+        try:
+            return bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return True
+
+    async def _close_own_list_on_exit(
+        page: Any, selector: str, result: ToolResult, *, opened_by_typing: bool
+    ) -> ToolResult:
+        # Opt-in: only a refusal that hands the choice back as "retype" and names nothing to click
+        # (release_own_list) closes the list its own typing opened; any other refusal leaves the page as is.
+        if not opened_by_typing or result.status == "ok" or not (result.data or {}).get("release_own_list"):
+            return result
+        dismissed = await _close_lingering_typeahead_list(page, selector, None)
+        if dismissed is None:
+            return result
+        return dataclasses.replace(
+            result,
+            content=f"{result.content} Closing its still-open list with Escape also dismissed the field's own "
+            "container — re-observe before continuing.",
+        )
 
     async def _typeahead_commit_verdict(
         page: Any, selector: str, committed: str | None, readable: bool
@@ -8286,97 +9913,9 @@ def build_browser_tools(
             # some other unhandled widget; leave it on today's path rather than guess.
             if not await _anchor_typeable(page, selector) and await _anchor_has_list_semantics(page, selector):
                 return await _open_observe_pick(page, selector, text)
-            # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
-            # not just on a single `input` from fill — still surfaces them, then commit the best match.
-            try:
-                pick, pre_value = await _type_and_commit(page, selector, text, rounds=3)
-            except _FieldCovered as exc:
-                return _covered_error(exc.selector, exc.occluder)
-            except _FieldNotEditable as exc:
-                return _not_editable_error(exc)
-            if pick.suggestion is None and pick.candidates:
-                # Several rows reacted and none was a unique precision match, so nothing was picked.
-                # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
-                # is a false success -- name the rows instead and hand the pick to the tool that makes
-                # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
-                # has to be true of the field as well as of the widget, so the query goes back out --
-                # unless the rows are text-indisambiguable (same candidate, or a value-only distinction:
-                # see _identical_text_rows_error), where retyping the same text can never pick a
-                # different row and the query stays so the list and the rows' tags stay live instead.
-                text_key = _exact_tier_key(text)
-                same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == text_key]
-                if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
-                    # Leave the query (keeping the list and tags live) only when there is nothing to
-                    # protect: a field that HELD a value must get it back, or the leftover query becomes
-                    # every later call's restore baseline and the true value is gone for the run.
-                    if not pre_value:
-                        return _identical_text_rows_error(selector, text, same_text, note=pick.note)
-                    await _restore_pre_type_value(page, selector, pre_value, [text])
-                    return _identical_text_rows_error(selector, text, same_text, tags_live=False, note=pick.note)
-                await _restore_pre_type_value(page, selector, pre_value, [text])
-                return _ambiguous_rows_error(
-                    selector,
-                    text,
-                    pick.candidates,
-                    next_step="call select_combobox with the option's full text",
-                    note=pick.note,
-                )
-            if pick.suggestion:
-                verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
-                if verdict is CommitStatus.OK:
-                    if pick.declared:
-                        closed = await _close_lingering_typeahead_list(
-                            page, selector, pick.committed, surface_vouched_pre_click=pick.pre_surface_hit
-                        )
-                        if closed is not None:
-                            return closed
-                    return ToolResult.ok(
-                        f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r} "
-                        f"(committed value: {pick.committed!r})"
-                    )
-                if verdict is CommitStatus.UNVERIFIED and matches != 1:
-                    # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
-                    # there is no stable element to read the commit off — soft, not a false did-not-commit.
-                    return ToolResult.ok(
-                        f"clicked suggestion {pick.suggestion!r} for {selector}, but it re-resolved to {matches} "
-                        "elements so the commit could not be verified — re-observe to confirm the value "
-                        "before relying on it"
-                    )
-                if verdict is CommitStatus.UNVERIFIED:
-                    # INV-2 (unreadable). The verifier pierces open roots and also reads the element the
-                    # executor resolved, so inside a component the failure is established rather than
-                    # guessed. A list portaled elsewhere, or a field in a closed root, is still beyond both
-                    # -- and that is exactly what the read reports by returning nothing, so the softening
-                    # follows the read.
-                    why = await _unverifiable_because(page, selector)
-                    if why:
-                        return ToolResult.ok(
-                            f"clicked suggestion {pick.suggestion!r} for {selector}; {why}, so the commit could not "
-                            "be verified — re-observe to confirm the value before relying on it"
-                        )
-                    return ToolResult.error(
-                        f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is "
-                        "NOT filled; re-observe and retry, do not proceed"
-                    )
-                # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
-                # in the same batch -- it may be an unvalidated submit, and no production submit guard
-                # exists yet.
-                return ToolResult.error(
-                    f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is NOT "
-                    "filled; re-observe and retry, do not proceed"
-                )
-            # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
-            # inside one -- but not one the widget portals elsewhere in the page or renders in a
-            # closed root, so inside a component this is still not evidence of absence. Saying
-            # "typed into X" there reads as a verified fill, and on a typeahead that silently rejects
-            # raw text it turns an honest failure into a confident wrong answer on a form we submit.
-            why = await _unverifiable_because(page, selector)
-            if why:
-                return ToolResult.ok(
-                    f"typed into {selector} — {why}, so the typeahead check could not see it and no "
-                    "commit was verified; re-observe to confirm the value before relying on it"
-                )
-            return ToolResult.ok(f"typed into {selector}")
+            opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
+            result = await _type_typeahead_commit(page, selector, text)
+            return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
         # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
         # the text simply lands in a field the person could not have reached.
@@ -8392,6 +9931,133 @@ def build_browser_tools(
             await page.type(selector, text, timeout=15000)
         if press_enter:
             await page.press(selector, "Enter")
+        return ToolResult.ok(f"typed into {selector}")
+
+    async def _type_typeahead_commit(page: Any, selector: str, text: str) -> ToolResult:
+        # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
+        # not just on a single `input` from fill — still surfaces them, then commit the best match.
+        try:
+            pick, pre_value, _pre_own, focused_without_click = await _type_and_commit(
+                page, selector, text, rounds=3, focus_fallback=True
+            )
+        except _FieldCovered as exc:
+            return _covered_error(exc.selector, exc.occluder)
+        except _FieldNotEditable as exc:
+            return _not_editable_error(exc)
+        if focused_without_click:
+            # focus() without a click cannot show the field took the keystrokes: a segmented control
+            # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
+            # the typed text counts as filled; anything else, including an unreadable field, is an
+            # error, never a success. Rows reacting to the typing mean the field commits a picked
+            # suggestion, which this path never clicks, so its raw text is no fill either. The poll's
+            # wait also lets a widget that clears a rejected entry on a timer do so before the read.
+            # The value is not echoed: typed text may be a resolved secret.
+            reacted = await _await_suggestion_rows(page, selector, text, rounds=8, any_region=True) is not None
+            if not reacted and _typed_text_landed(await _read_field_value(page, selector), text):
+                # The read-back costs a pause anyway, so spend it looking once more: a list slower than
+                # the poll would otherwise read as "no list" while its uncommitted query sits in the
+                # field. Slower than this is a bounded residual, not something a longer wait fixes.
+                await asyncio.sleep(0.3)
+                if await _find_suggestion_rows(page, selector, text, any_region=True) is None:
+                    return ToolResult.ok(f"typed into {selector}")
+            await _restore_pre_type_value(page, selector, pre_value, [text])
+            return ToolResult.error(
+                f"typed into {selector}, but it does not hold the typed text afterwards — the field is NOT "
+                "filled and may hold part of it. It sits outside the viewport and could only be focused, "
+                "not clicked; re-observe and fill it through the control the page shows instead",
+                data={"release_own_list": True},
+            )
+        if pick.suggestion is None and pick.candidates:
+            # Several rows reacted and none was a unique precision match, so nothing was picked.
+            # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
+            # is a false success -- name the rows instead and hand the pick to the tool that makes
+            # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
+            # has to be true of the field as well as of the widget, so the query goes back out --
+            # unless the rows are text-indisambiguable (same candidate, or a value-only distinction:
+            # see _identical_text_rows_error), where retyping the same text can never pick a
+            # different row and the query stays so the list and the rows' tags stay live instead.
+            text_key = _exact_tier_key(text)
+            same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == text_key]
+            if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
+                # Leave the query (keeping the list and tags live) only when there is nothing to
+                # protect: a field that HELD a value must get it back, or the leftover query becomes
+                # every later call's restore baseline and the true value is gone for the run.
+                if not pre_value:
+                    return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+                await _restore_pre_type_value(page, selector, pre_value, [text])
+                return _identical_text_rows_error(selector, text, same_text, tags_live=False, note=pick.note)
+            await _restore_pre_type_value(page, selector, pre_value, [text])
+            return _ambiguous_rows_error(
+                selector,
+                text,
+                pick.candidates,
+                next_step="call select_combobox with the option's full text",
+                note=pick.note,
+            )
+        if pick.suggestion:
+            verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
+            if verdict is CommitStatus.OK:
+                if pick.declared:
+                    closed = await _close_lingering_typeahead_list(
+                        page, selector, pick.committed, surface_vouched_pre_click=pick.pre_surface_hit
+                    )
+                    if closed is not None:
+                        return closed
+                return ToolResult.ok(
+                    f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r} "
+                    f"(committed value: {pick.committed!r})"
+                )
+            if not pick.committed and pick.shared_surface:
+                # The widget renders only a short form of the label ("+1"), and either another row visible
+                # at the click showed it too or the field was unreadable before the click.
+                return ToolResult.ok(
+                    f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r}, and the "
+                    f"field now shows {pick.shared_surface!r}, which cannot be tied to this pick alone, "
+                    "so the commit could not be verified — re-observe to confirm the value before "
+                    "relying on it"
+                )
+            if verdict is CommitStatus.UNVERIFIED and matches != 1:
+                # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
+                # there is no stable element to read the commit off — soft, not a false did-not-commit.
+                return ToolResult.ok(
+                    f"clicked suggestion {pick.suggestion!r} for {selector}, but it re-resolved to {matches} "
+                    "elements so the commit could not be verified — re-observe to confirm the value "
+                    "before relying on it"
+                )
+            if verdict is CommitStatus.UNVERIFIED:
+                # INV-2 (unreadable). The verifier pierces open roots and also reads the element the
+                # executor resolved, so inside a component the failure is established rather than
+                # guessed. A list portaled elsewhere, or a field in a closed root, is still beyond both
+                # -- and that is exactly what the read reports by returning nothing, so the softening
+                # follows the read.
+                why = await _unverifiable_because(page, selector)
+                if why:
+                    return ToolResult.ok(
+                        f"clicked suggestion {pick.suggestion!r} for {selector}; {why}, so the commit could not "
+                        "be verified — re-observe to confirm the value before relying on it"
+                    )
+                return ToolResult.error(
+                    f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is "
+                    "NOT filled; re-observe and retry, do not proceed"
+                )
+            # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
+            # in the same batch -- it may be an unvalidated submit, and no production submit guard
+            # exists yet.
+            return ToolResult.error(
+                f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is NOT "
+                "filled; re-observe and retry, do not proceed"
+            )
+        # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
+        # inside one -- but not one the widget portals elsewhere in the page or renders in a
+        # closed root, so inside a component this is still not evidence of absence. Saying
+        # "typed into X" there reads as a verified fill, and on a typeahead that silently rejects
+        # raw text it turns an honest failure into a confident wrong answer on a form we submit.
+        why = await _unverifiable_because(page, selector)
+        if why:
+            return ToolResult.ok(
+                f"typed into {selector} — {why}, so the typeahead check could not see it and no "
+                "commit was verified; re-observe to confirm the value before relying on it"
+            )
         return ToolResult.ok(f"typed into {selector}")
 
     async def _anchor_typeable(page: Any, selector: str) -> bool:
@@ -8430,7 +10096,7 @@ def build_browser_tools(
                 menu_open = False
             if menu_open:
                 try:
-                    await page.keyboard.press("Escape")
+                    await _current_page().keyboard.press("Escape")
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
@@ -8877,7 +10543,7 @@ def build_browser_tools(
             # itself.
             try:
                 if await page.evaluate(_MENU_OPEN_JS, probe):
-                    await page.keyboard.press("Escape")
+                    await _current_page().keyboard.press("Escape")
             except Exception:
                 pass
             return ToolResult.ok(f"{matched!r} was already selected for {selector}; left it as is")
@@ -8961,6 +10627,15 @@ def build_browser_tools(
         return any(holds(norm(part)) for part in surface.split("\u0001"))
 
     async def _commit_custom_combobox(page: Any, selector: str, value: str) -> ToolResult:
+        # Every non-ok exit below must close the field's OWN list if the attempt left it open (D2) —
+        # applied once here, at the exit, rather than at every refusal branch below.
+        opened_by_typing = await _anchor_typeable(page, selector) and await _list_opened_on_an_empty_field(
+            page, selector
+        )
+        result = await _commit_custom_combobox_attempt(page, selector, value)
+        return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
+
+    async def _commit_custom_combobox_attempt(page: Any, selector: str, value: str) -> ToolResult:
         # Shared custom-combobox commit — the ONE path select_combobox and select_option's non-native
         # branch both route through. Two mechanisms, one tool call: a TYPEAHEAD (searchable react-select /
         # spl-autocomplete) commits by keystroke-type -> WAIT for the reacting suggestion -> click ->
@@ -8977,6 +10652,7 @@ def build_browser_tools(
             *,
             declared: bool,
             surface_vouched_pre_click: bool = False,
+            shared_surface: str | None = None,
         ) -> ToolResult:
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
             if verdict is CommitStatus.OK:
@@ -8987,6 +10663,14 @@ def build_browser_tools(
                     if closed is not None:
                         return closed
                 return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
+            if not committed and shared_surface:
+                # The widget renders only a short form of the label ("+1"), and either another row visible
+                # at the click showed it too or the field was unreadable before the click.
+                return ToolResult.ok(
+                    f"selected {opt_txt!r} for {selector}; the field now shows {shared_surface!r}, which "
+                    "cannot be tied to this pick alone, so the commit could not be verified — re-observe "
+                    "to confirm the value before relying on it"
+                )
             if verdict is CommitStatus.UNVERIFIED and matches != 1:
                 # INV-1: re-resolved to n≠1 after the click — no stable element to read the commit off.
                 return ToolResult.ok(
@@ -9031,6 +10715,9 @@ def build_browser_tools(
             # the field's own vocabulary, which is what a caller needs to name the right label.
             for rung in _reduced_queries():
                 typed_queries.append(rung)
+                # `pre_own` is the ONE call-level snapshot the primary attempt took before it typed
+                # anything (closed over from _commit_custom_combobox_attempt) — re-reading it here
+                # would see the list THIS rung's own typing just opened and always read as changed.
                 try:
                     await page.fill(selector, "", timeout=15000)
                     await asyncio.sleep(0.2)
@@ -9042,7 +10729,9 @@ def build_browser_tools(
                     await page.type(selector, rung, delay=15, timeout=15000)
                 except Exception:
                     return []
-                rung_pick = await _commit_typeahead(page, selector, value, rounds=4, exact_only=True, probe=rung)
+                rung_pick = await _commit_typeahead(
+                    page, selector, value, rounds=4, exact_only=True, probe=rung, pre_own=pre_own
+                )
                 if rung_pick.suggestion is not None:
                     return await _typeahead_verdict_result(
                         rung_pick.suggestion,
@@ -9050,6 +10739,7 @@ def build_browser_tools(
                         rung_pick.readable,
                         declared=rung_pick.declared,
                         surface_vouched_pre_click=rung_pick.pre_surface_hit,
+                        shared_surface=rung_pick.shared_surface,
                     )
                 if rung_pick.candidates:
                     return rung_pick.candidates
@@ -9085,7 +10775,7 @@ def build_browser_tools(
         typed_queries: list[str] = [value]
         if await _anchor_typeable(page, selector):
             try:
-                pick, pre_value = await _type_and_commit(page, selector, value, rounds=8)
+                pick, pre_value, pre_own, _ = await _type_and_commit(page, selector, value, rounds=8)
             except _FieldCovered as exc:
                 # A widget that renders its committed selection as a pill list OVER its own input is
                 # not blocked — it is DONE when a pill in its own container already carries the
@@ -9211,7 +10901,8 @@ def build_browser_tools(
                         offered_note = ""
                     return ToolResult.error(
                         f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
-                        f"— do not assume success or move on as if it were{offered_note}"
+                        f"— do not assume success or move on as if it were{offered_note}",
+                        data={"release_own_list": True},
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
                 opened = await _open_observe_pick(page, selector, value, close_open_menu=True)
@@ -9232,6 +10923,7 @@ def build_browser_tools(
                 pick.readable,
                 declared=pick.declared,
                 surface_vouched_pre_click=pick.pre_surface_hit,
+                shared_surface=pick.shared_surface,
             )
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
         return await _open_observe_pick(page, selector, value)
@@ -9321,7 +11013,11 @@ def build_browser_tools(
                 return ambiguous
             await page.press(selector, key)
         else:
-            await page.keyboard.press(key)
+            # Page-level, not realm-level: a Frame has no `keyboard`, and an unaddressed keypress goes
+            # to whatever holds focus regardless of which document that is. Reached only with no
+            # selector, so the realm is the page today -- written through _current_page() so it stays
+            # correct if that ever stops being true.
+            await _current_page().keyboard.press(key)
         return ToolResult.ok(f"pressed {key}")
 
     async def scroll(args: dict[str, Any]) -> ToolResult:
@@ -9340,7 +11036,10 @@ def build_browser_tools(
         amount = int(args.get("amount", 800))
         if args.get("direction") == "up":
             amount = -amount
-        await page.mouse.wheel(0, amount)
+        # Reachable WITH a selector -- a ref that resolved to a selector now matching nothing falls
+        # through to here -- so `page` can be a child frame, and a Frame has no `mouse`. The wheel is a
+        # viewport gesture either way, so it belongs to the page.
+        await _current_page().mouse.wheel(0, amount)
         return ToolResult.ok(f"scrolled {amount}px")
 
     async def wait(args: dict[str, Any]) -> ToolResult:
@@ -9473,17 +11172,29 @@ def build_browser_tools(
         # Verify the upload took EFFECT, not just that set_input_files did not raise. Watch upload-like
         # network dispatches across the set_input_files + settle window (the window we already dwell in,
         # so this adds no latency); a genuine upload dispatches at least one, a silent no-op none.
-        probe = _UploadActivityProbe(page)
+        # The PAGE, not the realm the input lives in: a Frame has no `on`, and network dispatch is a
+        # page-level fact anyway -- a request a child frame issues is still the page's request, so
+        # watching it here is what makes the upload-activity signal correct for a framed field rather
+        # than merely non-crashing.
+        probe = _UploadActivityProbe(_current_page())
         # Read before the attach on every call: the consume-and-clear check needs the pre-attach text,
         # and whether it will be needed is only known afterwards. One local evaluate, no wait.
-        text_before = await _page_rendered_text(page)
+        # Whole page, not the input's realm. A framed upload widget very often has its "attached" /
+        # "rejected" banner rendered by the PARENT document, so a realm-scoped read cannot see the
+        # evidence this check is looking for -- and it fails in both directions: a successful upload
+        # reports "the file did not attach", and a rejection banner outside the frame goes unseen so a
+        # REJECTED upload is reported as uploaded. The filename can legitimately be echoed in either
+        # document, so the answer has to be the union.
+        text_before = await _whole_page_text(_current_page())
         probe.start()
         try:
             await el.set_input_files([local_path])
             populated = await _input_holds_file(el)
             # Settle + a small randomized delay so the upload and a following submit are not dispatched
             # in the same instant, matching v1's upload cadence (the engine that clears this step reliably).
-            await _settle_after_upload(page)
+            # Page-level too: it reuses v1's network-idle/DOM-stability wait, which describes the whole
+            # page settling and not one frame's.
+            await _settle_after_upload(_current_page())
             await _upload_submit_delay()
         finally:
             probe.stop()
@@ -9493,7 +11204,7 @@ def build_browser_tools(
             # a silent no-op cannot fake at once: the file's own name newly rendered on the page AND an
             # upload dispatched (a client-side rejection names the file but sends nothing; ambient
             # traffic sends but never names it), and no rejection wording anywhere the site newly rendered.
-            text_after = await _page_rendered_text(page)
+            text_after = await _whole_page_text(_current_page())
             shown_newly = (
                 text_before is not None
                 and text_after is not None
@@ -9552,6 +11263,16 @@ def build_browser_tools(
         value = _resolve_text(args["value"])
         return await _commit_custom_combobox(page, selector, value)
 
+    def _look_nothing_marked_message() -> str:
+        base = "look: no interactive controls are visible in the viewport."
+        if settings.TASK_V3_FRAME_PERCEPTION:
+            return (
+                base + " Note that look marks only the page's own frame, so controls inside an embedded"
+                " frame are not numbered here even though observe lists them and they are actionable by"
+                " ref. Scroll, or use observe and act by ref."
+            )
+        return base + " Scroll or re-observe."
+
     async def _clear_look_tags(page: Any) -> None:
         try:
             await page.evaluate(
@@ -9574,7 +11295,11 @@ def build_browser_tools(
         # Passive read + server-side render. The screenshot is a viewport frame (device px); the marks
         # are enumerated separately so the boxes are drawn in PIL, never injected into the DOM.
         try:
-            png = await page.screenshot()
+            # Through _current_page() like every other page-level surface. look() is not selector-routed
+            # today so `page` is already the page here, but writing it this way is what keeps the rule
+            # "a page-only API is reached through _current_page()" true without exception -- and the
+            # exception is what a later edit would copy.
+            png = await _current_page().screenshot()
         except Exception as exc:
             LOG.warning("taskv3 look screenshot failed", exc_info=True)
             return ToolResult.error(f"look failed to capture the page: {type(exc).__name__}: {exc}")
@@ -9620,8 +11345,11 @@ def build_browser_tools(
             LOG.warning("taskv3 look annotation failed", exc_info=True)
             return ToolResult.error(f"look failed to render marks: {type(exc).__name__}: {exc}", data=renumbered)
         if not kept:
+            # look marks the main frame only: its marks are viewport coordinates and a frame's rects are
+            # frame-relative (the label-click refusal, SKY-16109). A bare "nothing is visible" would
+            # contradict a screenshot showing a framed form, so name the surface that was marked.
             return ToolResult.ok(
-                "look: no interactive controls are visible in the viewport. Scroll or re-observe.",
+                _look_nothing_marked_message(),
                 data=renumbered,
                 screenshots=[annotated],
             )
@@ -9647,15 +11375,22 @@ def build_browser_tools(
         legend = header + "\n" + "\n".join(lines)
         return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
 
-    async def _holders(page: Any, selector: str) -> int:
-        """How many elements the engine sees for `selector`, without leaking the handles it made.
+    async def _holders(target: Any, selector: str) -> int:
+        """How many elements the engine sees for `selector` IN `target`'s document, without leaking the
+        handles it made. `target` is the page (its main frame) or the child frame owning the element.
 
         Every identity judgement on the act path is a COUNT, and these run on every act rather than
         once per document, so the probes cannot be left to the document's lifetime to clean up.
+
+        The target matters and is not a convenience: Playwright's page-level engine pierces open shadow
+        roots but never a frame boundary, so counting a frame element's selector against the PAGE
+        returns 0 -- and 0 is the answer that reads as "this selector names nothing", which every caller
+        here treats as a stale-but-harmless selector rather than as a question asked of the wrong
+        document.
         """
         found: list[Any] = []
         try:
-            found = list(await page.query_selector_all(selector))
+            found = list(await target.query_selector_all(selector))
             return len(found)
         finally:
             for probe in found:
@@ -9664,10 +11399,15 @@ def build_browser_tools(
                 except Exception:
                     pass
 
-    async def _resolve_handle_selector(page: Any, handle: Any) -> str | None:
+    async def _resolve_handle_selector(target: Any, handle: Any) -> str | None:
         """A live element handle -> a selector this run's tools act through, or None when the
         element no longer holds one alone. Shared by mark=N and ref=N so both inherit the same
-        server-side identity checks."""
+        server-side identity checks.
+
+        `target` is the realm the selector will be RESOLVED in -- the page, or the child frame the
+        element was read from. Uniqueness is a property of a document, so it is checked in the document
+        the element lives in; asking the page about a frame element's token counts 0 and refuses every
+        frame ref as stale."""
         # Every judgement below is made HERE, not in the page's realm. The read goes through
         # Playwright's accessor, the format is matched against this run's own pattern, and the
         # holder count comes from Playwright's engine -- so a page that patches its own RegExp,
@@ -9683,7 +11423,7 @@ def build_browser_tools(
                 # duplicated control arrives already wearing one. Keep it only while its holder is
                 # alone -- counted by the engine that pierces open shadow roots, which is the domain
                 # the click gate and the in-flight probe both resolve in.
-                if await _holders(page, f'{_ACT_SELECTOR_PREFIX}{existing}"]') == 1:
+                if await _holders(target, f'{_ACT_SELECTOR_PREFIX}{existing}"]') == 1:
                     token = existing
             except Exception:
                 token = ""
@@ -9703,7 +11443,7 @@ def build_browser_tools(
                 # never hand back an ambiguous selector, whatever the callers downstream check.
                 if await handle.get_attribute("data-tv3-act") != minted:
                     return None
-                if await _holders(page, f'{_ACT_SELECTOR_PREFIX}{minted}"]') != 1:
+                if await _holders(target, f'{_ACT_SELECTOR_PREFIX}{minted}"]') != 1:
                     return None
             except Exception:
                 return None
@@ -9760,7 +11500,14 @@ def build_browser_tools(
             # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
             # nudge's target -- and a copy leaves every one of them seeing only `mark`.
             args["selector"] = selector
-            return await handler(args)
+            # The THIRD caller with this shape, found by checking rather than by being told about it: the
+            # mark was resolved against THIS page, so letting preflight resolve again lets a popup that
+            # became the working page in between be the one acted on.
+            _prefetched_page.append(page)
+            try:
+                return await handler(args)
+            finally:
+                _prefetched_page.clear()
 
         return wrapped
 
@@ -9804,6 +11551,21 @@ def build_browser_tools(
         )
         expected = str(entry.get("tag") or "").lower()
         remembered = str(entry.get("selector") or "")
+        # The realm this ref was read from. Every identity question below is asked of THIS document,
+        # not of the page's: a frame element's token has no holders in the main document, and "no
+        # holders" is indistinguishable from "the selector went stale" to every check here.
+        owner = entry.get("owner")
+        if owner is not None and owner is not _UNKNOWN_REALM and _realm_page(owner) is not page:
+            # The provider can switch to a newly opened popup between observe and the act. The frame
+            # this ref names then belongs to the PREVIOUS tab, so acting on it would run the element
+            # action in a background page while every page-level probe -- transition, upload, settle --
+            # describes the popup. A ref is scoped to the page it was read from.
+            return None, stale
+        if owner is _UNKNOWN_REALM:
+            # This reading could not pair its elements with live handles, so which document this ref
+            # came from is unknown. Resolving it anywhere would be a guess between documents.
+            return None, stale
+        realm = page if owner is None else owner
 
         async def _tagged_right(candidate: Any) -> bool:
             # The digest line the model read named a tag; an element answering to a different one is
@@ -9835,19 +11597,19 @@ def build_browser_tools(
             if not remembered:
                 return True
             try:
-                if await _holders(page, f"{remembered}{act_selector}") == 1:
+                if await _holders(realm, f"{remembered}{act_selector}") == 1:
                     return True
                 # A remembered selector that names NOTHING is simply stale -- a marker the page moved
                 # or rolled back, an id it dropped. It is not evidence about the handle, which is live
                 # and alone, so the handle stands. Only a selector naming something that is NOT this
                 # handle is evidence of a swap.
-                return await _holders(page, remembered) == 0
+                return await _holders(realm, remembered) == 0
             except Exception:
                 return False
 
         handle = entry.get("handle")
         if handle is not None:
-            live = await _resolve_handle_selector(page, handle)
+            live = await _resolve_handle_selector(realm, handle)
             if live is not None:
                 # The handle is still on the page and alone, so it IS the identity. A mismatch here is
                 # refused rather than re-resolved: the remembered selector can drift off a live element
@@ -9862,7 +11624,37 @@ def build_browser_tools(
         # re-observed after leaves every handle dead and sends the fallback below to re-query the
         # remembered selector in the NEW document, where a unique same-tag look-alike would be adopted
         # as the element the model chose on the old page.
-        if _observe_document and _observe_document[0] != canonical_url(await _url(page)):
+        #
+        # Asked of the REF'S OWN realm, which is the part a page-wide check cannot do: a child frame can
+        # navigate while the parent's URL never changes, so a page-level comparison agrees and the
+        # re-resolve below runs against a document the model never saw. That failure is silent -- it
+        # returns an element rather than an error -- which makes it strictly worse than the blindness
+        # this whole change is fixing. `document` is recorded per ref at observe time; an entry from
+        # before this existed carries "" and falls back to the page-level check it used to get.
+        recorded_document = str(entry.get("document") or "")
+        if recorded_document:
+            if _document_unidentifiable(recorded_document):
+                # Refused on its own terms rather than by an identity mismatch. This realm cannot be named
+                # in the frame tree, so a document REPLACED at the same url is undetectable here and the
+                # remembered SELECTOR could be re-resolved into the replacement. Only re-resolution is
+                # refused: a re-observe hands back a LIVE handle, which is its own proof of the element and
+                # never reaches this check, so the frame stays actionable. A typed selector is deliberately
+                # NOT offered as the way out -- it is resolved against whatever document is there now, which
+                # is the wrong-document commit this refuses, it matches in every twin of the frame so that
+                # path refuses it anyway, and refs are the addressing contract.
+                #
+                # No `page_state_changed`: this realm is unnameable for as long as its twin exists, and that
+                # flag is absorbed as progress even from a call that errored -- it clears the retry ledger,
+                # stamps the change evidence that keeps a budget extension alive and re-baselines the
+                # loop-detection ring. A repeated refusal would then buy budget on a page standing still.
+                return None, ToolResult.error(
+                    f"ref={ref} was read from an embedded frame that shares a url with another frame on "
+                    "this page, so it cannot be confirmed to still be the same document — call observe() "
+                    "again and act on a ref from the new reading."
+                )
+            if recorded_document != await _realm_document_id(page if owner is None else owner):
+                return None, stale
+        elif _observe_document and _observe_document[0] != canonical_url(await _url(page)):
             return None, stale
         # Only now, with NO usable handle -- detached, or no longer alone on the page -- re-resolve.
         # Never with a live one: that is what would let a drifted selector displace a correct element.
@@ -9874,12 +11666,12 @@ def build_browser_tools(
         if not remembered:
             return None, stale
         try:
-            matches = await page.query_selector_all(remembered)
+            matches = await realm.query_selector_all(remembered)
         except Exception:
             return None, stale
         selector = None
         if len(matches) == 1 and await _tagged_right(matches[0]):
-            selector = await _resolve_handle_selector(page, matches[0])
+            selector = await _resolve_handle_selector(realm, matches[0])
         if selector is None:
             for spare in matches:
                 try:
@@ -9895,12 +11687,131 @@ def build_browser_tools(
         entry["handle"] = matches[0]
         return selector, None
 
-    def _with_ref_resolution(handler: ToolHandler) -> ToolHandler:
+    async def _realm_for_typed_selector(page: Any, selector: str) -> tuple[Any, ToolResult | None]:
+        """Which realm a selector the MODEL typed resolves in: the page, or one child frame.
+
+        The page is tried first and answers for every main-frame element, so the common path is
+        unchanged and pays one query it already paid. Only a selector the page cannot see reaches the
+        frames -- and a selector matching in more than one frame is an ERROR, never a pick: choosing
+        between two documents on the model's behalf is the wrong-element commit in a new costume.
+        """
+        if not settings.TASK_V3_FRAME_PERCEPTION:
+            return page, None
+        found: list[Any] = []
+        try:
+            if await _holders(page, selector) > 0:
+                found.append(page)
+        except Exception:
+            return page, None
+        # The frames are checked even when the page matched. Returning early on a page hit reads as
+        # "prefer the main frame", which is a silent pick between documents -- and it is most reachable
+        # for the selectors the tools themselves mint, since `[data-tv3-menu="1"]` and friends are
+        # numbered independently in every realm. A menu selector produced by an in-frame action would
+        # then click an unrelated option in the parent.
+        frames, skipped, unjudged = await _observable_child_frames(page)
+        unreadable = 0
+        for frame in frames:
+            try:
+                if await _holders(frame, selector) > 0:
+                    found.append(frame)
+            except Exception:
+                # The page's own query already answered, so the selector is well formed and it is this
+                # FRAME that failed -- navigating mid-scan, or detached. Counted as un-inspected rather
+                # than as no-match: a query that could not run and a query that found nothing return the
+                # same zero, and only one of them is evidence.
+                LOG.debug("taskv3 could not query a child frame for a typed selector", exc_info=True)
+                unreadable += 1
+        uninspected = skipped + unjudged + unreadable
+        if uninspected:
+            # Refused even when the page matched. Gating this on "nothing matched" made a page hit
+            # ANSWER for the realms that were never looked at: a tool-minted selector like
+            # `[data-tv3-menu="1"]` is numbered independently in every realm, so the identical selector
+            # can name a different element in the frame that was capped, hidden-judged or navigating, and
+            # the main-frame hit is then a wrong-document commit rather than a resolution. Costs a
+            # re-observe on a page with more frames than the cap; the alternative costs the wrong click.
+            return None, ToolResult.error(
+                f"{selector} could not be confirmed to name one element: {uninspected} frame(s) of this "
+                "page were not readable, and a selector like this is numbered separately in every "
+                "document — re-observe and act on a ref, which names exactly one."
+            )
+        if len(found) > 1:
+            return None, ToolResult.error(
+                f"{selector} matches elements in {len(found)} different documents of this page, so it "
+                "does not name one element — re-observe and act on a ref, which names exactly one."
+            )
+        return (found[0] if found else page), None
+
+    # Which tools leave work a reload would discard, and which leave something that may still be in
+    # flight. The loop decides what counts as a submit; this only records WHERE the click landed.
+    _LEDGER_FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
+    _LEDGER_SUBMIT_TOOLS = frozenset({"click", "press_key"})
+
+    async def _note_frame_work(tool_name: str, realm: Any, selector: Any, result: ToolResult) -> None:
+        """Record realm-attributed work an action left in a child frame.
+
+        One site rather than each tool's success return: the wrapper already holds the realm and the
+        normalized selector, and a per-return version would be a new place to forget.
+        """
+        if realm is None or not isinstance(selector, str) or not selector:
+            return
+        kind = "filled" if tool_name in _LEDGER_FILL_TOOLS else "submitted" if tool_name in _LEDGER_SUBMIT_TOOLS else ""
+        if not kind:
+            return
+        # A FILL is recorded whether or not the VERDICT was ok, because mutating the control and
+        # returning an error are independent outcomes. `file_upload` reports an error with the file
+        # ALREADY on the input when it sees no upload activity -- the ordinary submit-time-upload form --
+        # and a typeahead commit can fail with the text typed. Gated on the verdict, that work is
+        # invisible to the reload guard and a same-url `navigate()` discards it, the file included.
+        #
+        # Recording an attempt that changed nothing is the benign direction: it costs one recoverable
+        # reload refusal, which is already this guard's disclosed false-refusal mode, where the other
+        # direction costs the user's file. A per-handler "did I mutate" flag was rejected for the
+        # opposite reason -- it is a list of call sites to keep in sync, and the one that gets missed
+        # fails silently in the direction that loses data.
+        #
+        # A SUBMIT still requires the ok: the completion gate reads it, and recording one that never
+        # happened holds a finished run instead of protecting anything.
+        if kind == "submitted" and result.status != "ok":
+            return
+        page = _current_page()
+        if page is None:
+            return
+        try:
+            await _record_frame_work(page, realm, selector, kind, await _realm_document_id(realm))
+        except Exception:
+            # A ledger write that fails must not fail the action the model just took successfully; the
+            # guards then see less than they could, which is the pre-existing behaviour.
+            LOG.info("taskv3 could not record frame work", exc_info=True)
+
+    def _with_ref_resolution(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
             selector = args.get("selector")
             match = _REF_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
             if match is None:
-                return await handler(args)
+                # Inert with the flag off: no realm to route to, so not even a page resolution.
+                if not settings.TASK_V3_FRAME_PERCEPTION or not isinstance(selector, str) or not selector:
+                    return await handler(args)
+                page, error = await _resolve_page()
+                if error is not None:
+                    return error
+                realm, realm_error = await _realm_for_typed_selector(page, selector)
+                if realm_error is not None:
+                    return realm_error
+                # The routed page is handed on, because the realm decision was made ABOUT it: the
+                # provider is must_get_working_page and can switch to a newer tab, so letting preflight
+                # resolve again would run the selector on a popup that became valid during the frame
+                # queries while the routing belongs to the page before it. Cleared in the finally, which
+                # is what keeps this writer from leaving a page for the next call to pop.
+                _prefetched_page.append(page)
+                if realm is not page:
+                    _acted_realm[:] = [realm]
+                try:
+                    result = await handler(args)
+                    await _note_frame_work(tool_name, realm, args.get("selector"), result)
+                    return result
+                finally:
+                    _acted_realm.clear()
+                    _prefetched_page.clear()
             page, error = await _resolve_page()
             if error is not None:
                 return error
@@ -9908,13 +11819,30 @@ def build_browser_tools(
             resolved, ref_error = await _resolve_ref(page, ref)
             if ref_error is not None:
                 return ref_error
+            _owner = (_observe_manifest.get(ref) or {}).get("owner")
             # In place, for the same reason act-by-mark does it: the persisted action's element_id,
             # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
             args["selector"] = resolved
             durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
+            # Handed on for the same reason the typed-selector branch does it: the ref was validated
+            # against THIS page, and letting preflight resolve again lets a popup that became the working
+            # page in between become the one acted on. Cleared in the finally, so it cannot outlive the
+            # call. This was fixed in the sibling branch and missed here.
+            _prefetched_page.append(page)
+            if _owner is not None:
+                _acted_realm[:] = [_owner]
             try:
-                return await handler(args)
+                result = await handler(args)
+                # The DURABLE selector, not `args["selector"]`, which is still the transient
+                # data-tv3-act token here and is restored to `durable` by the finally below. The submit
+                # watch records that durable form, so `pending_marker` is later called with it -- keyed
+                # by the token, the ledger lookup never matches and the gate accepts a completion over an
+                # in-flight submit. The ledger would not have worked for framed submits at all.
+                await _note_frame_work(tool_name, _owner, durable or args.get("selector"), result)
+                return result
             finally:
+                _acted_realm.clear()
+                _prefetched_page.clear()
                 # ...but those readers run turns LATER, and the act token is a stamp on one node: a
                 # control the page REPLACES after the act -- a submit button swapped for its
                 # "Submitting" version -- carries it away, and the in-flight probe fails open on a
@@ -9927,7 +11855,12 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. ref=12, no brackets) as the selector argument of click/hover/type/select_option/etc to act on it. A ref names the element this reading described and keeps working while that element is on the page, including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors instead of acting on something else — re-observe and use a ref from the new reading. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached. Call once per page, then act by ref.",
+            _OBSERVE_DESCRIPTION_BASE
+            + (
+                _OBSERVE_DESCRIPTION_FRAME_REACH
+                if settings.TASK_V3_FRAME_PERCEPTION
+                else _OBSERVE_DESCRIPTION_NO_FRAME_REACH
+            ),
             _obj({}),
             observe,
         ),
@@ -10081,13 +12014,19 @@ def build_browser_tools(
             # ones from the re-sent transcript (bounds context on perception-heavy pages). look's legend
             # (not its ephemeral image, which never enters the transcript) rides the same rule.
             _tool_spec.compactable = True
+        if _tool_spec.name in _TARGET_LABEL_TOOL_NAMES:
+            # Innermost of the selector wrappers: outside it the selector may still be a mark=N/ref=N
+            # handle or an unnormalized `#id`, neither of which the probe can resolve.
+            _tool_spec.handler = _with_target_label(_tool_spec.handler)
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
         if _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES:
             # Outside preflight (it builds its action from the normalized selector), inside act_by_mark
             # (mark=N resolves to a selector first), so every selector tool inherits the guard.
             diagnose = _diagnose_inert_target if _tool_spec.name in _INERT_DIAGNOSIS_TOOL_NAMES else None
-            _tool_spec.handler = _with_ref_resolution(_with_selector_guard(_tool_spec.handler, diagnose))
+            _tool_spec.handler = _with_ref_resolution(
+                _tool_spec.name, _with_selector_guard(_tool_spec.handler, diagnose)
+            )
         if _tool_spec.name in ("click", "type"):
             # OUTERMOST wrapper: resolve mark=N to a selector before preflight builds its action from
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
@@ -10250,10 +12189,15 @@ def _with_preflight(
     prefetched_page: list[Any] | None = None,
 ) -> Callable[[dict[str, Any]], Awaitable[ToolResult]]:
     async def wrapped(args: dict[str, Any]) -> ToolResult:
-        page = await page_provider()
+        # An already-prefetched page is CONSUMED rather than re-resolved. The selector router resolves a
+        # page to decide which realm a selector lives in, and resolving again here would defeat that
+        # handoff: page_provider is must_get_working_page, so a popup that became valid during the
+        # router's frame queries would become the page this call acts on while the routing decision
+        # belongs to the one before it.
+        page = prefetched_page[0] if prefetched_page else await page_provider()
         if page is not None:
             preflight_tool_action(name, args, page)
-            if prefetched_page is not None:
+            if prefetched_page is not None and not prefetched_page:
                 prefetched_page.append(page)
         try:
             return await handler(args)

@@ -6,6 +6,7 @@ import {
   RUN_TOOLS,
   TurnNarrativeState,
   condenseActivityEntries,
+  hasObservedBlockEvidence,
   hasPendingToolCall,
   isBlockOk,
   parseUtcIsoMs,
@@ -420,7 +421,7 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
   // Block rows are appended below, so the indices held in labelsByRow stay valid.
   const runRows = rows.filter((r) => r.kind === "run");
   const runStartedMs = runStartLookup(turn.designActivity);
-  for (const block of turn.blocks) {
+  for (const block of turn.blocks.filter(hasObservedBlockEvidence)) {
     const anchor = anchorRunRow(block, runRows, runStartedMs);
     if (anchor) {
       anchor.blocks.push(condensedBlock(block));

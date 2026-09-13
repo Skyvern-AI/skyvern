@@ -709,6 +709,7 @@ sender: <email_address>                         # Required: Sender email address
 recipients: [<email_address>]                   # Required: Recipient list
 subject: <subject_line>                         # Required: Email subject
 body: <email_body>                              # Required: Email body
+body_format: <text|html>                        # Optional: "text" (default) sends the body as plain text; "html" sends it as a formatted HTML email with a generated plain-text fallback
 file_attachments: [<file_path>]                 # Optional: Local file paths to attach
 custom_smtp_host: <hostname>                    # Optional: Send through this SMTP server instead of the platform default (public hostnames only; private/internal addresses are blocked)
 custom_smtp_port: <port_number>                 # Optional: Custom SMTP port (defaults to 587; port 465 uses implicit TLS, other ports use STARTTLS)
@@ -749,6 +750,7 @@ timeout_seconds: <number>                       # Optional: How long to wait for
 sender: <email_address>                         # Optional: A copy is BCC'd here as the record of the send (default: "hello@skyvern.com")
 subject: <subject_line>                         # Optional: Notification subject (default: "Human interaction required for workflow run")
 body: <email_body>                              # Optional: Notification body (default: "Your interaction is required for a workflow run!")
+body_format: <text|html>                        # Optional: "text" (default) or "html"; in html mode the run link and instructions are appended as an HTML footer
 instructions: <text>                            # Optional: What the person should do, shown beside the approve/reject controls (default: "Please review and approve or reject to continue the workflow.")
 positive_descriptor: <text>                     # Optional: Label on the approve control (default: "Approve")
 negative_descriptor: <text>                     # Optional: Label on the reject control (default: "Reject")

@@ -757,6 +757,9 @@ class BrowserContextFactory:
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+        reconcile_persistent_init_scripts = bool(kwargs.pop("_reconcile_persistent_init_scripts", False))
+        sessionless_init_script_registrations = tuple(kwargs.pop("_sessionless_init_script_registrations", ()))
+        route_policy_url = cast(str | None, kwargs.pop("_browser_context_route_policy_url", None))
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
@@ -805,11 +808,20 @@ class BrowserContextFactory:
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
             route_handlers_allowed = None
-            if scoped_headers:
-                route_handlers_allowed = await app.AGENT_FUNCTION.browser_context_route_handlers_allowed(**kwargs)
+            if scoped_headers or route_policy_url is not None:
+                route_policy_kwargs = {
+                    **kwargs,
+                    "url": route_policy_url or kwargs.get("url"),
+                    "_fail_on_error": reconcile_persistent_init_scripts,
+                }
+                route_handlers_allowed = await app.AGENT_FUNCTION.browser_context_route_handlers_allowed(
+                    **route_policy_kwargs
+                )
             extension_kwargs = {
                 **kwargs,
                 "_browser_context_route_handlers_allowed": route_handlers_allowed,
+                "_reconcile_persistent_init_scripts": reconcile_persistent_init_scripts,
+                "_sessionless_init_script_registrations": sessionless_init_script_registrations,
             }
             await app.AGENT_FUNCTION.setup_browser_context_extensions(
                 browser_context=browser_context,

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
@@ -1191,6 +1192,7 @@ class SendEmailBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] | None = None
 
 
@@ -1328,6 +1330,7 @@ class HumanInteractionBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
 
 
 class DataExportBlockYAML(BlockYAML):
@@ -1630,6 +1633,10 @@ class WorkflowDefinitionYAML(BaseModel):
 
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
+    recording_id: str | None = Field(
+        default=None,
+        description="Durable browser recording to attach to the workflow version created by this save.",
+    )
     description: str | None = None
     proxy_location: ProxyLocation | GeoTarget | dict | None = None
     webhook_callback_url: str | None = None

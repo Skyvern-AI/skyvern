@@ -192,6 +192,7 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
             "page_state": {
                 "observed_after_workflow_run": True,
                 "form_summaries": ["form " + "x" * 500 for _ in range(10)],
+                "value_bindings": [f"label_{index}=" + "x" * 500 for index in range(10)],
                 "result_summaries": [],
                 "action_summaries": [],
                 "challenge_summaries": [],
@@ -220,6 +221,7 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
     assert len(projected["failure"]["action_trace"]) == 6
     assert len(projected["action_observations"]) == 6
     assert len(projected["failure"]["page_state"]["form_summaries"]) == 8
+    assert len(projected["failure"]["page_state"]["value_bindings"]) == 8
     assert len(projected["registered_outputs"]) == 12
     assert projected["registered_outputs"][0]["value_complete"] is False
     assert len(projected["downloads"]) == 12
@@ -385,6 +387,7 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
                 "evidence_source": long_identifier,
                 "observed_after_workflow_run": True,
                 "form_summaries": [long_summary for _ in range(10)],
+                "value_bindings": [long_summary for _ in range(10)],
                 "result_summaries": [long_summary for _ in range(10)],
                 "action_summaries": [long_summary for _ in range(10)],
                 "challenge_summaries": [long_summary for _ in range(10)],
@@ -427,6 +430,7 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
     assert len(projected["failure"]["action_trace"]) == 2
     assert len(projected["action_observations"]) == 2
     assert len(projected["failure"]["page_state"]["form_summaries"]) == 2
+    assert len(projected["failure"]["page_state"]["value_bindings"]) == 2
     assert len(projected["failure"]["locator_observations"]) == 2
     assert projected["failure"]["locator_observations"][0]["observed_candidates"] == ["button#item-0"]
     assert any(

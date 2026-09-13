@@ -538,6 +538,35 @@ class FakeSearchBrowserContext:
         return self.page
 
 
+class FakeCdpSession:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict | None]] = []
+        self.detached = False
+
+    async def send(self, method: str, params: dict | None = None) -> dict:
+        self.sent.append((method, params))
+        return {}
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class FakeClearingBrowserContext:
+    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out."""
+
+    def __init__(self) -> None:
+        self.clear_cookies_calls = 0
+        self.cdp_sessions: list[tuple[object, FakeCdpSession]] = []
+
+    async def clear_cookies(self) -> None:
+        self.clear_cookies_calls += 1
+
+    async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        session = FakeCdpSession()
+        self.cdp_sessions.append((page, session))
+        return session
+
+
 def read_unit_data_fixture(name: str) -> str:
     return (Path(__file__).parent / "data" / name).read_text()
 

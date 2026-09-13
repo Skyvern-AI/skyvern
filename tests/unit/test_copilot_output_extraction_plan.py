@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     _table_shape_bindings,
     array_parent_path,
     bindable_candidate_headings,
+    candidate_relations_from_packet,
     derivation_bail_reason,
     derive_requested_output_extraction_plan,
     plan_from_designations,
@@ -919,6 +920,59 @@ def test_an_unreadable_relation_is_not_offered_as_a_candidate() -> None:
     hidden = dict(_counted_relation("logs found", "1.22K", ".count", 1), visible=False)
 
     assert unbound_candidate_relations([_truncated_entry([hidden])]) == []
+
+
+def test_a_pair_that_only_reads_as_a_credential_once_joined_is_not_offered() -> None:
+    packet = _truncated_entry(
+        [
+            _counted_relation("Password", "hunter2", ".creds", 1),
+            _counted_relation("API key", "9f3c2201aa", ".creds", 1),
+            _counted_relation("Password (required)", "hunter2", ".creds", 2),
+            _counted_relation("API key (production)", "9f3c2201aa", ".creds", 2),
+            _counted_relation("Tokens used", "1.9M", ".usage", 1),
+            _counted_relation("logs found", "1.22K", ".count", 1),
+        ]
+    )
+
+    assert unbound_candidate_relations([packet]) == [("Tokens used", "1.9M"), ("logs found", "1.22K")]
+
+
+def test_a_credential_keyword_past_the_label_cap_still_drops_the_pair() -> None:
+    long_label = "Account recovery settings for the primary workspace administrator sign-in Password"
+    assert len(long_label) > 80
+    packet = _truncated_entry(
+        [
+            _counted_relation(long_label, "hunter2", ".creds", 1),
+            _counted_relation("logs found", "1.22K", ".count", 1),
+        ]
+    )["evidence"]
+
+    offered = candidate_relations_from_packet(packet, dismiss_texts=set(), max_chars=80)
+
+    assert offered == [("logs found", "1.22K")]
+
+
+def test_an_email_label_beside_a_password_value_is_not_offered_whatever_the_delimiter() -> None:
+    packet = _truncated_entry(
+        [
+            _counted_relation("user@example.com", "hunter2", ".account", 1),
+            _counted_relation("admin@example.com", "Ab/cd123?x#1", ".account", 2),
+            _counted_relation("Billing contact", "ops@example.com", ".contact", 1),
+            _counted_relation("logs found", "1.22K", ".count", 1),
+        ]
+    )["evidence"]
+
+    offered = candidate_relations_from_packet(packet, dismiss_texts=set())
+
+    assert offered == [("Billing contact", "ops@example.com"), ("logs found", "1.22K")]
+
+
+def test_a_designation_candidate_keeps_the_value_the_page_rendered_in_full() -> None:
+    value = "Request " + "9" * 200
+
+    offered = unbound_candidate_relations([_truncated_entry([_counted_relation("Trace", value, ".trace", 1)])])
+
+    assert offered == [("Trace", value)]
 
 
 def test_a_dialog_only_capture_does_not_outrank_the_page_it_covered() -> None:

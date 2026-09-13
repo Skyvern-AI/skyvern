@@ -136,6 +136,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         # First read is the block's own baseline capture (only a.zip exists yet); the
         # second is the post-run read (a.zip from before + b.zip downloaded this block).
         STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[a_zip], [a_zip, b_zip]])),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(has_workflow_run_context=lambda _run_id: False),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
 
