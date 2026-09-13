@@ -308,7 +308,7 @@ The response from polling (`get_run`) and webhooks have slightly different struc
 |-------|------|-------------|
 | `run_id` | string | Unique identifier for this run |
 | `status` | string | Current status: `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, `canceled` |
-| `output` | object \| null | Extracted data from the task |
+| `output` | object \| null | Extracted data from the task. Runs that end in `failed` or `terminated` can include data extracted before the run stopped |
 | `downloaded_files` | array | Files downloaded during execution |
 | `recording_url` | string \| null | Video recording of the browser session |
 | `screenshot_urls` | array \| null | Screenshots captured (latest first) |

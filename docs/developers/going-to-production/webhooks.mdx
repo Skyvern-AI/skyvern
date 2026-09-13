@@ -232,7 +232,7 @@ User-Agent: python-httpx/0.28.1
 | `run_id` | string | Unique identifier for this run |
 | `task_id` | string | Same as `run_id` |
 | `status` | string | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
-| `output` | object \| null | Extracted data from the task. If you configured [`error_code_mapping`](/developers/going-to-production/error-handling#step-3-use-error_code_mapping), failed runs include `output.error` with your custom error code. |
+| `output` | object \| null | Extracted data from the task. Runs that end in `failed` or `terminated` can include data extracted before the run stopped. If you configured [`error_code_mapping`](/developers/going-to-production/error-handling#step-3-use-error_code_mapping), failed runs include `output.error` with your custom error code. |
 | `summary` | string | AI-generated description of what was done |
 | `prompt` | string | The prompt from the original request |
 | `url` | string | The URL from the original request |
