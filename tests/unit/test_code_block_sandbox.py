@@ -20,7 +20,12 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
-from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    ALWAYS_DENIED_BUILTINS,
+    SANDBOX_ONLY_BUILTINS,
+    is_safe_script_code,
+    safe_builtins,
+)
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
@@ -454,15 +459,16 @@ class TestIsSafeCodeAcceptsLegitimateCode:
 
     def test_exposes_safe_iteration_and_regex_aliases(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
+        sandbox_builtins = safe_vars["__builtins__"]
 
-        assert safe_vars["enumerate"] is enumerate
-        assert safe_vars["isinstance"] is isinstance
-        assert safe_vars["any"] is any
-        assert safe_vars["all"] is all
-        assert safe_vars["max"] is max
-        assert safe_vars["min"] is min
-        assert safe_vars["sum"] is sum
-        assert safe_vars["sorted"] is sorted
+        assert sandbox_builtins["enumerate"] is enumerate
+        assert sandbox_builtins["isinstance"] is isinstance
+        assert sandbox_builtins["any"] is any
+        assert sandbox_builtins["all"] is all
+        assert sandbox_builtins["max"] is max
+        assert sandbox_builtins["min"] is min
+        assert sandbox_builtins["sum"] is sum
+        assert sandbox_builtins["sorted"] is sorted
         assert safe_vars["re"].I == safe_vars["re"].IGNORECASE
 
     def test_try_except(self) -> None:
@@ -508,15 +514,17 @@ class TestBuildSafeVars:
 
     def test_float_in_safe_vars(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        assert "float" in safe_vars
-        assert safe_vars["float"] is float
+        assert "float" not in safe_vars
+        assert safe_vars["__builtins__"]["float"] is float
 
-    def test_builtins_mapping_is_minimal(self) -> None:
-        safe_vars = CodeBlock.build_safe_vars()
-        assert set(safe_vars["__builtins__"]) == {"__build_class__", "__name__"}
+    def test_builtins_mapping_is_the_declared_policy(self) -> None:
+        sandbox_builtins = set(CodeBlock.build_safe_vars()["__builtins__"])
+        assert sandbox_builtins == set(safe_builtins()) | {"__build_class__", "__name__"}
+        assert sandbox_builtins.isdisjoint(ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS)
+        assert "__import__" not in sandbox_builtins
 
     def test_expected_builtins_present(self) -> None:
-        safe_vars = CodeBlock.build_safe_vars()
+        sandbox_builtins = CodeBlock.build_safe_vars()["__builtins__"]
         expected = {
             "len",
             "range",
@@ -535,9 +543,14 @@ class TestBuildSafeVars:
             "min",
             "sum",
             "sorted",
+            "zip",
+            "map",
+            "filter",
+            "ValueError",
+            "KeyError",
         }
         for name in expected:
-            assert name in safe_vars, f"{name} missing from safe_vars"
+            assert name in sandbox_builtins, f"{name} missing from __builtins__"
 
     def test_json_is_restricted_namespace(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
@@ -570,7 +583,13 @@ class TestBuildSafeVars:
 
     def test_exception_available(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        assert safe_vars["Exception"] is Exception
+        assert safe_vars["__builtins__"]["Exception"] is Exception
+
+    def test_datetime_is_restricted_namespace(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+        assert safe_vars["datetime"].date(2026, 9, 13).isoformat() == "2026-09-13"
+        assert safe_vars["datetime"].UTC is UTC
+        assert not hasattr(safe_vars["datetime"], "now")
 
     def test_no_safe_var_exposes_dangerous_module(self) -> None:
         """No value in safe_vars should be a module that has subprocess/OS capabilities."""
@@ -1243,6 +1262,52 @@ async def wrapper({default_args}):
         fn = self._exec_user_code("x = open('/etc/passwd')")
         with pytest.raises(NameError, match="open"):
             await fn()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", sorted(ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS))
+    async def test_denied_builtins_raise_name_error(self, name: str) -> None:
+        fn = self._exec_user_code(f"x = {name}")
+        with pytest.raises(NameError, match=name):
+            await fn()
+
+    @pytest.mark.asyncio
+    async def test_common_builtins_execute(self) -> None:
+        fn = self._exec_user_code(
+            "paired = dict(zip(labels, values))\n"
+            "try:\n"
+            "    raise ValueError('x')\n"
+            "except ValueError:\n"
+            "    caught = 'value'\n"
+            "day = datetime.date(2026, 9, 13).isoformat()\n",
+            parameters={"labels": ["a", "b"], "values": [1, 2]},
+        )
+        result = await fn()
+        assert result["paired"] == {"a": 1, "b": 2}
+        assert result["caught"] == "value"
+        assert result["day"] == "2026-09-13"
+
+    @pytest.mark.asyncio
+    async def test_parameters_shadow_builtin_names(self) -> None:
+        now = datetime.now(UTC)
+        block = CodeBlock(
+            label="shadow_block",
+            code="return {'zip_value': zip, 'len_value': len}",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="shadow_output",
+                description="test output",
+                output_parameter_id="op_shadow",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code, MagicMock(), parameters={"zip": "94105", "len": "persisted-len"}
+        )
+
+        assert await user_function() == {"zip_value": "94105", "len_value": "persisted-len"}
 
     @pytest.mark.asyncio
     async def test_parameters_cannot_override_sandbox_internals(self) -> None:

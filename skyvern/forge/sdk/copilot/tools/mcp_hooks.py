@@ -1858,7 +1858,8 @@ _WORKFLOW_KNOWLEDGE_DESCRIPTION = (
     "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
     "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
     "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
-    "choosing_a_block, common_patterns, and best_practices; omit topics to list every available ID. "
+    "choosing_a_block, common_patterns, best_practices, and code_block_runtime (the builtins, module "
+    "shims, and helpers a code block's Python may use); omit topics to list every available ID. "
     "Request only the relevant sections. For exact fields of a specific block type, use "
     "get_block_schema instead."
 )

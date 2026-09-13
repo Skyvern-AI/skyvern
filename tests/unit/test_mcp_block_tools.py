@@ -9,11 +9,13 @@ from pathlib import Path
 import pytest
 
 from skyvern.cli.mcp_tools.blocks import (
+    CODE_BLOCK_RUNTIME_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     skyvern_block_schema,
     skyvern_block_validate,
     skyvern_workflow_knowledge,
 )
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 
 @pytest.mark.asyncio
@@ -21,9 +23,26 @@ async def test_workflow_knowledge_lists_available_topics_without_returning_the_d
     result = await skyvern_workflow_knowledge()
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == list(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
+    assert result["data"]["topics"] == [*WORKFLOW_KNOWLEDGE_TOPIC_HEADERS, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_executor() -> None:
+    result = await skyvern_workflow_knowledge(topics=[CODE_BLOCK_RUNTIME_TOPIC])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"][CODE_BLOCK_RUNTIME_TOPIC]["content"]
+    safe_vars = CodeBlock.build_safe_vars()
+    for name in ("zip", "ValueError", "sorted"):
+        assert name in safe_vars["__builtins__"]
+        assert name in content
+    assert "open" not in safe_vars["__builtins__"]
+    assert "- datetime: UTC, date, datetime, timedelta, timezone" in content
+    assert "- html: escape" in content
+    assert "{{current_date}}" in content
+    assert "solve_captcha" in content
 
 
 @pytest.mark.asyncio
