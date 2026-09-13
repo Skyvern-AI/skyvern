@@ -12,7 +12,10 @@ class Constants:
 def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     """Replaces jinja-style references in a string.
 
-    Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}}
+    Handles references anywhere inside Jinja delimiters: {{oldKey}},
+    {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}}, mid-expression uses
+    like {{ other < oldKey }}, and statement blocks like {% if oldKey %}.
+    Quoted string literals inside an expression are left alone.
 
     Args:
         text: The text to search in
@@ -22,13 +25,20 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     Returns:
         The text with references replaced
     """
-    # Match {{oldKey}} or {{oldKey.something}} or {{oldKey | filter}} or {{oldKey[0]}} etc.
-    # Use negative lookahead to ensure key is not followed by identifier characters,
-    # which prevents matching {{keyOther}} when searching for {{key}}
-    # Capture whitespace after {{ to preserve formatting (e.g., "{{ key }}" stays "{{ newKey }}")
     escaped_old_key = re.escape(old_key)
-    pattern = rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])"
-    return re.sub(pattern, rf"{{{{\1{new_key}", text)
+    # Match the whole identifier on both sides so {{keyOther}} and {{my_key}}
+    # stay untouched when searching for {{key}}.
+    word = rf"(?<![a-zA-Z0-9_]){escaped_old_key}(?![a-zA-Z0-9_])"
+    # Only rewrite inside Jinja delimiters; the rest of the text is literal.
+    segment_pattern = re.compile(r"\{\{.*?\}\}|{%.*?%}", re.DOTALL)
+    quoted_pattern = re.compile(r"('[^']*'|\"[^\"]*\")")
+
+    def _rewrite_segment(segment_match: re.Match[str]) -> str:
+        segment = segment_match.group(0)
+        parts = quoted_pattern.split(segment)
+        return "".join(part if index % 2 == 1 else re.sub(word, new_key, part) for index, part in enumerate(parts))
+
+    return segment_pattern.sub(_rewrite_segment, text)
 
 
 def get_missing_variables(template_source: str, template_data: dict) -> set[str]:
