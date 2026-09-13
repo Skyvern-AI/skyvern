@@ -3,12 +3,14 @@ import {
   CodeBlockStep,
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
+  EmailBodyFormat,
   WorkflowBlockType,
   WorkflowModel,
 } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
+  recording_id?: string | null;
   description?: string | null;
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
@@ -236,6 +238,7 @@ export type HumanInteractionBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
 };
 
 export type DataExportBlockYAML = BlockYAMLBase & {
@@ -431,6 +434,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments?: Array<string> | null;
 };
 

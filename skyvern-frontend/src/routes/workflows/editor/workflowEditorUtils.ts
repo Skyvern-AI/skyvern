@@ -845,6 +845,7 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           sender: block.sender,
         },
       };
@@ -985,6 +986,7 @@ function convertToNode(
         data: {
           ...commonData,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           fileAttachments: block.file_attachments.join(", "),
           recipients: block.recipients.join(", "),
           subject: block.subject,
@@ -3091,6 +3093,7 @@ function getWorkflowBlock(
           .map((recipient) => recipient.trim()),
         subject: node.data.subject,
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
       };
     }
@@ -3287,6 +3290,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "send_email",
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         file_attachments: node.data.fileAttachments
           .split(",")
           .map((attachment) => attachment.trim()),
@@ -4637,6 +4641,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
         };
         return blockYaml;
       }
@@ -4928,6 +4933,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
           file_attachments: block.file_attachments,
         };
         return blockYaml;

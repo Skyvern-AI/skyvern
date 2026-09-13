@@ -22,6 +22,7 @@ import {
   TurnNarrativeState,
   formatElapsed,
   humanizeJudgeText,
+  hasObservedBlockEvidence,
   isBlockOk,
   isInterimOutcome,
   notConfirmedOutcome,
@@ -1551,7 +1552,8 @@ function DetailView({
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
-  const hasBlocks = turn.blocks.length > 0;
+  const observedBlocks = turn.blocks.filter(hasObservedBlockEvidence);
+  const hasBlocks = observedBlocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
   // Hide the "Designed the workflow" cluster on terminal turns that produced
@@ -1590,7 +1592,7 @@ function DetailView({
 
         {!showChecklist && hasBlocks ? (
           <div className="flex flex-col gap-1">
-            {turn.blocks.map((b) => (
+            {observedBlocks.map((b) => (
               <FBlockRun
                 key={b.workflowRunBlockId || b.label}
                 block={b}

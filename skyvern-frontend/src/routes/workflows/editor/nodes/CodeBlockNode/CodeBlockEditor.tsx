@@ -13,6 +13,7 @@ import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
+import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -79,7 +80,7 @@ function CodeBlockEditorBody({
     activeStepIndex != null ? (steps[activeStepIndex] ?? null) : null;
   const codeExtensions = useMemo<Array<Extension>>(() => {
     if (activeStep?.line_start == null) {
-      return jinjaHighlight;
+      return [...jinjaHighlight, ...pythonSyntaxExtensions];
     }
     const activeLineExtensions = lineHighlight([
       {
@@ -90,6 +91,7 @@ function CodeBlockEditorBody({
     ]);
     return [
       ...jinjaHighlight,
+      ...pythonSyntaxExtensions,
       ...(Array.isArray(activeLineExtensions)
         ? activeLineExtensions
         : [activeLineExtensions]),

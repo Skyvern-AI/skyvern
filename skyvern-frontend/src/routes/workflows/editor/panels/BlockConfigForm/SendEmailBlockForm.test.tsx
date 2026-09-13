@@ -26,6 +26,7 @@ vi.mock("@xyflow/react", async () => {
       getNode: (id: string) => mockNodeFixtures.get(id),
       updateNodeData: updateNodeDataMock,
     }),
+    useNodesData: (id: string) => mockNodeFixtures.get(id),
     useNodes: () => Array.from(mockNodeFixtures.values()).filter(Boolean),
     useEdges: () => [],
   };
@@ -101,6 +102,7 @@ const baseSendEmailData = {
   recipients: "alice@example.com",
   subject: "hello",
   body: "world",
+  bodyFormat: "text",
   fileAttachments: "/downloads",
   sender: "noreply@skyvern.com",
   smtpHostSecretParameterKey: "SMTP_HOST",
@@ -167,6 +169,9 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     expect(
       screen.getByPlaceholderText("What would you like to say?"),
     ).toBeDefined();
+    expect(
+      screen.getByRole("combobox", { name: "Body format" }).textContent,
+    ).toBe("Text");
   });
 
   test("File Attachments input is disabled (beta parity)", () => {

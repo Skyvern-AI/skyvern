@@ -1,7 +1,15 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { EMPTY_NARRATIVE, type TurnNarrativeState } from "../narrativeState";
+import { DiffCard } from "./DiffCard";
 import { getDiffCardTitle } from "./diffCardTitle";
+
+afterEach(() => {
+  cleanup();
+});
 
 const turn = (
   overrides: Partial<TurnNarrativeState> = {},
@@ -101,5 +109,32 @@ describe("getDiffCardTitle", () => {
         { accepted: true },
       ),
     ).toBe("Added browser step");
+  });
+});
+
+describe("DiffCard", () => {
+  it("lists a removed block from the review projection, which carries the removals", () => {
+    render(
+      <DiffCard
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "block_1", blockType: "task", change: "added" },
+              { label: "old_cleanup", blockType: "task", change: "removed" },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Removed")).not.toBeNull();
+    expect(screen.getByText("- old_cleanup")).not.toBeNull();
+  });
+
+  it("shows no removed section when the projection reports no removals", () => {
+    render(<DiffCard turn={turn()} />);
+
+    expect(screen.queryByText("Removed")).toBeNull();
   });
 });

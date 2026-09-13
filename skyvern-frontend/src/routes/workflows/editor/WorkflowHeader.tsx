@@ -113,7 +113,7 @@ function SaveButton() {
             className="size-10 min-w-[2.5rem]"
             disabled={isGlobalWorkflow || isRecording}
             onClick={() => {
-              void onSave();
+              void onSave().catch(() => {});
             }}
           >
             {saving ? (

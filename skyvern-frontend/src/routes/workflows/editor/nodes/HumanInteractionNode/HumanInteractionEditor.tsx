@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/accordion";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { EmailBodyFormatSelect } from "../components/EmailBodyFormatSelect";
 import { Separator } from "@/components/ui/separator";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -54,6 +55,7 @@ function HumanInteractionEditorBody({
     recipients,
     subject,
     body,
+    bodyFormat,
     negativeDescriptor,
     positiveDescriptor,
   } = data;
@@ -131,7 +133,14 @@ function HumanInteractionEditorBody({
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Body</Label>
+          <div className="flex items-center justify-between">
+            <Label className="text-xs text-tertiary-foreground">Body</Label>
+            <EmailBodyFormatSelect
+              value={bodyFormat}
+              onChange={(next) => update({ bodyFormat: next })}
+              disabled={!editable}
+            />
+          </div>
           <WorkflowBlockInputTextarea
             aiImprove={AI_IMPROVE_CONFIGS.humanInteraction.body}
             nodeId={blockId}

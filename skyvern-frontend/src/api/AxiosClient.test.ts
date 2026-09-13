@@ -619,6 +619,42 @@ describe("request-scoped authentication", () => {
   });
 });
 
+describe("upload deletion on page exit", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    window.sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    window.sessionStorage.clear();
+  });
+
+  it("sends an authenticated keepalive delete the browser can finish after unload", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(new Response(null, { status: 204 })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { deleteUploadedFileOnPageExit, getClient, setApiKeyHeader } =
+      await import("./AxiosClient");
+    setApiKeyHeader("api-key-a");
+    await getClient(async () => "token-a", "sans-api-v1");
+
+    deleteUploadedFileOnPageExit("file_1");
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(url.endsWith("/files/file_1")).toBe(true);
+    expect(init).toMatchObject({ method: "DELETE", keepalive: true });
+    expect(init.headers).toMatchObject({
+      Authorization: "Bearer token-a",
+      "X-API-Key": "api-key-a",
+    });
+  });
+});
+
 describe("open-source application entrypoint", () => {
   beforeEach(() => {
     vi.resetModules();

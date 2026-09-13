@@ -496,6 +496,45 @@ describe("notConfirmedOutcome — recorded run facts", () => {
     });
   });
 
+  it("a reloaded turn shows the run's recorded failure even when no block carries a reason", () => {
+    // The original incident's shape: the failure was recorded, the deadline fired before the
+    // block's evidence finished, and the assistant shipped no reply. lastRunOutcome is live-only,
+    // so on reload the card has only turnFacts to read.
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: null,
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: "not_demonstrated",
+        runId: "wr_1",
+        runCompleted: false,
+        terminalCause: "browser_operation_failed",
+        blocksRunThisTurn: 1,
+        recordedFailure: "Browser operation timed out on line 18.",
+        ranCleanOnCurrentSource: false,
+      },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          state: "failed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Browser operation timed out on line 18.",
+    });
+  });
+
   it("a recorded demonstrated outcome suppresses the block-derived not-confirmed", () => {
     const outcome = notConfirmedOutcome({
       ...base,

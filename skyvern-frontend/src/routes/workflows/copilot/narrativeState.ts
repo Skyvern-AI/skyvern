@@ -221,7 +221,8 @@ type BuildTestConnectFailureState =
   | "already_closed"
   | "provisioning_unavailable"
   | "cdp_connect_failed"
-  | "occupied";
+  | "occupied"
+  | "billing_credit_admission_refusal";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -230,7 +231,8 @@ export function isBuildTestConnectFailureState(
     value === "already_closed" ||
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
-    value === "occupied"
+    value === "occupied" ||
+    value === "billing_credit_admission_refusal"
   );
 }
 
@@ -259,6 +261,10 @@ export interface TurnFacts {
   runCompleted: boolean | null;
   terminalCause: string | null;
   blocksRunThisTurn: number | null;
+  // The failed run's own recorded reason, scrubbed at source. Survives a reload
+  // even when no block carries an outcome reason of its own. Optional: turns
+  // persisted before it was published carry no such key.
+  recordedFailure?: string | null;
   ranCleanOnCurrentSource: boolean;
 }
 
@@ -305,6 +311,18 @@ export interface BlockState {
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
   recordedActionsAt?: number;
+}
+
+export function hasObservedBlockEvidence(block: BlockState): boolean {
+  return (
+    block.workflowRunBlockId.length > 0 ||
+    block.activity.length > 0 ||
+    (block.recordedActions?.length ?? 0) > 0 ||
+    block.recordedActionsAt !== undefined ||
+    block.startedAt !== null ||
+    block.endedAt !== null ||
+    block.outcome !== undefined
+  );
 }
 
 export interface ActivityEntry {
@@ -469,6 +487,9 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
 // the rendered card from becoming a wall of text).
 const MAX_ACTIVITY_ENTRIES = 30;
 const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
+// Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
+// run-block id every iteration, so the block list is unbounded without this.
+const MAX_BLOCK_ATTEMPTS = 200;
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -1105,29 +1126,9 @@ export function applyNarrativeEvent(
 
     case "workflow_draft": {
       // Bubble shows the summary fields; canvas mid-turn rendering of
-      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. Seed
-      // ``blocks`` from block_labels so each drafted block renders its own
-      // card even on draft-only turns (where no block_progress fires).
-      // Existing entries from prior block_progress events take precedence;
-      // new labels join as ``drafted`` until block_progress upgrades them.
-      const labelToExisting = new Map(prev.blocks.map((b) => [b.label, b]));
-      const nextBlocks: BlockState[] = event.block_labels.map((label) => {
-        const existing = labelToExisting.get(label);
-        if (existing) return existing;
-        return {
-          workflowRunBlockId: "",
-          label,
-          blockType: "task",
-          state: "drafted",
-          lastSeenIteration: 0,
-          activity: [],
-          startedAt: null,
-          endedAt: null,
-        };
-      });
-      // Preserve any prior block whose label was dropped from the draft (rare
-      // — happens if the agent renames a block mid-turn). Drop those that no
-      // longer exist; they no longer participate in the proposal.
+      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. A draft is a
+      // workflow snapshot, not evidence that any block was authored or run,
+      // so it never creates, reorders, or removes narrative block attempts.
       // The write's patch arrives here rather than on the tool_result, because a write and its
       // test share one tool call and that result lands only after the run. Attach it to the
       // call's own entry so the row shows the code as soon as it is written.
@@ -1136,9 +1137,9 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          ? { blocks: prev.blocks, designActivity: prev.designActivity }
           : attachCodeDiffsToActivity(
-              nextBlocks,
+              prev.blocks,
               prev.designActivity,
               diffTarget,
               draftDiffs,
@@ -1160,20 +1161,9 @@ export function applyNarrativeEvent(
       const incomingState = mapBlockStatus(event.status);
       // Key on workflow_run_block_id, not block_label, so loop iterations
       // (e.g. a for_loop body) render as distinct rows.
-      let existing = prev.blocks.findIndex(
+      const existing = prev.blocks.findIndex(
         (b) => b.workflowRunBlockId === event.workflow_run_block_id,
       );
-      // A drafted placeholder seeded by workflow_draft has no run-block id
-      // yet; upgrade it in place on its first block_progress rather than
-      // spawning a duplicate row.
-      if (existing < 0) {
-        existing = prev.blocks.findIndex(
-          (b) =>
-            b.workflowRunBlockId === "" &&
-            b.state === "drafted" &&
-            b.label === event.block_label,
-        );
-      }
       const eventTs = event.timestamp ?? null;
       const previousBlock = existing >= 0 ? prev.blocks[existing]! : null;
       const startedAt =
@@ -1212,7 +1202,10 @@ export function applyNarrativeEvent(
         nextBlocks[existing] = baseEntry;
         return { ...prev, blocks: nextBlocks };
       }
-      return { ...prev, blocks: [...prev.blocks, baseEntry] };
+      return {
+        ...prev,
+        blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
+      };
     }
 
     case "run_outcome": {
@@ -1534,6 +1527,7 @@ function parseTurnFacts(raw: unknown): TurnFacts | null {
       typeof value.runCompleted === "boolean" ? value.runCompleted : null,
     terminalCause: text("terminalCause"),
     blocksRunThisTurn: count("blocksRunThisTurn"),
+    recordedFailure: text("recordedFailure"),
     ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
   };
 }
@@ -1637,59 +1631,61 @@ export function hydrateNarrativeFromPayload(
       : null;
 
   const blocksRaw = Array.isArray(payload.blocks) ? payload.blocks : [];
-  const blocks: BlockState[] = blocksRaw.map((b) => {
-    const obj = b as Record<string, unknown>;
-    const outcome = ((): BlockOutcome | undefined => {
-      const o = obj.outcome;
-      if (
-        o === "evaluating" ||
-        o === "demonstrated" ||
-        o === "not_demonstrated" ||
-        o === "not_evaluated"
-      )
-        return o;
-      return undefined;
-    })();
-    const outcomeRole: RunOutcomeRole | undefined =
-      outcome === undefined
-        ? undefined
-        : obj.outcomeRole === "recorded" ||
-            obj.outcomeRole === "adjudicated" ||
-            obj.outcomeRole === "interim_build_test"
-          ? obj.outcomeRole
-          : "adjudicated";
-    return {
-      workflowRunBlockId:
-        typeof obj.workflowRunBlockId === "string"
-          ? obj.workflowRunBlockId
-          : "",
-      label: typeof obj.label === "string" ? obj.label : "",
-      blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
-      outcome,
-      outcomeRole,
-      outcomeReason:
-        typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
-      state: ((): BlockState["state"] => {
-        const s = obj.state;
+  const blocks: BlockState[] = blocksRaw
+    .map((b) => {
+      const obj = b as Record<string, unknown>;
+      const outcome = ((): BlockOutcome | undefined => {
+        const o = obj.outcome;
         if (
-          s === "queued" ||
-          s === "drafted" ||
-          s === "running" ||
-          s === "completed" ||
-          s === "failed" ||
-          s === "stopped" ||
-          s === "skipped"
+          o === "evaluating" ||
+          o === "demonstrated" ||
+          o === "not_demonstrated" ||
+          o === "not_evaluated"
         )
-          return s;
-        return "queued";
-      })(),
-      lastSeenIteration:
-        typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
-      activity: normalizeActivityEntries(obj.activity),
-      startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
-      endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
-    };
-  });
+          return o;
+        return undefined;
+      })();
+      const outcomeRole: RunOutcomeRole | undefined =
+        outcome === undefined
+          ? undefined
+          : obj.outcomeRole === "recorded" ||
+              obj.outcomeRole === "adjudicated" ||
+              obj.outcomeRole === "interim_build_test"
+            ? obj.outcomeRole
+            : "adjudicated";
+      return {
+        workflowRunBlockId:
+          typeof obj.workflowRunBlockId === "string"
+            ? obj.workflowRunBlockId
+            : "",
+        label: typeof obj.label === "string" ? obj.label : "",
+        blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
+        outcome,
+        outcomeRole,
+        outcomeReason:
+          typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        state: ((): BlockState["state"] => {
+          const s = obj.state;
+          if (
+            s === "queued" ||
+            s === "drafted" ||
+            s === "running" ||
+            s === "completed" ||
+            s === "failed" ||
+            s === "stopped" ||
+            s === "skipped"
+          )
+            return s;
+          return "queued";
+        })(),
+        lastSeenIteration:
+          typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
+        activity: normalizeActivityEntries(obj.activity),
+        startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
+        endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
+      };
+    })
+    .filter(hasObservedBlockEvidence);
 
   const terminal = ((): TurnNarrativeState["terminal"] => {
     const t = payload.terminal;
@@ -1881,7 +1877,10 @@ export function notConfirmedOutcome(
     if (evaluationState !== "not_demonstrated") return null;
     return {
       verdict: "not_demonstrated",
-      displayReason: notDemonstratedBlock(turn.blocks)?.outcomeReason ?? null,
+      displayReason:
+        turn.turnFacts?.recordedFailure ??
+        notDemonstratedBlock(turn.blocks)?.outcomeReason ??
+        null,
     };
   }
   const block = notDemonstratedBlock(turn.blocks);
