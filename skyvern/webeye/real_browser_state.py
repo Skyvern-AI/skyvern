@@ -53,6 +53,10 @@ SETTLE_JITTER_MS = 500
 RECOVERABLE_BLANK_PAGE_URLS = {":"}
 
 
+class _BrowserConnectionProbeFailed(str):
+    """Diagnostic reason whose stale driver may be stopped before replacement."""
+
+
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
@@ -758,7 +762,7 @@ class RealBrowserState(BrowserState):
         try:
             connected = bool(browser.is_connected())
         except Exception as exc:
-            return False, f"browser_connection_probe_failed:{type(exc).__name__}"
+            return False, _BrowserConnectionProbeFailed(f"browser_connection_probe_failed:{type(exc).__name__}")
         return connected, None if connected else "browser_context_disconnected"
 
     def is_connected(self) -> bool:
@@ -780,10 +784,23 @@ class RealBrowserState(BrowserState):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        stale_context_is_unusable: bool = False,
     ) -> None:
-        # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
-        # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
+        # Rebuild through a fresh Playwright driver only after the old connection is known dead or
+        # an explicitly unusable connection has completed bounded shutdown.
         stale_pw = self.pw
+        stale_context = self.browser_context
+        stale_page = self.__page
+        stale_active_page = self.__active_page
+        stale_active_page_known_pages = self.__active_page_known_pages.copy()
+        stale_browser_artifacts = self.browser_artifacts
+        stale_browser_cleanup = self.browser_cleanup
+        stale_route_policy_url = self.browser_context_route_policy_url
+        stale_sessionless_init_script_registrations = self._sessionless_init_script_registrations.copy()
+        stale_disconnect_listener_browser = self._disconnect_listener_browser
+        stale_diagnostic = self._browser_state_diagnostic
+        stale_ever_connected = self._ever_connected
+        stale_close_requested = self._close_requested
         # check_and_fix_state rebuilds through the factory; forward this session's download binding so the
         # creator seam preserves the provider-selected destination on reconnect. The binding is carried
         # forward, never overridden after the fact, so a genuine provider change is not mislabeled.
@@ -797,32 +814,93 @@ class RealBrowserState(BrowserState):
         display_recording_owner_id = recorder.owner_id if isinstance(recorder, DisplayRecorder) else None
         effective_route_policy_url = browser_context_route_policy_url or self.browser_context_route_policy_url
         _stale_driver_connected, stale_driver_disconnect_reason = self._connection_status()
+        stale_driver_connection_probe_failed = isinstance(stale_driver_disconnect_reason, _BrowserConnectionProbeFailed)
         stale_driver_is_known_disconnected = stale_driver_disconnect_reason in {
             "playwright_driver_connection_closed",
             "browser_context_disconnected",
         }
+        stale_context_is_known_unusable = (
+            stale_driver_disconnect_reason
+            in {
+                "browser_context_missing",
+                "browser_context_close_called",
+                "browser_context_closed",
+            }
+            or stale_driver_connection_probe_failed
+        )
+        stale_driver_may_be_live = not stale_driver_is_known_disconnected
+        if stale_driver_may_be_live and not (stale_context_is_unusable or stale_context_is_known_unusable):
+            raise RuntimeError("Cannot replace a Playwright driver while its connection may still be live")
+        retain_guard_until_replacement = (
+            stale_driver_may_be_live
+            and (stale_context_is_unusable or stale_driver_connection_probe_failed)
+            and await app.AGENT_FUNCTION.has_retained_browser_egress_guard(stale_context)
+        )
+        stop_stale_before_replacement = stale_driver_may_be_live and not retain_guard_until_replacement
+        retry_stale_shutdown_after_replacement = False
+        if stop_stale_before_replacement:
+            stale_driver_pre_shutdown_error: BaseException | None = None
+
+            async def stop_stale_driver_before_replacement() -> None:
+                nonlocal stale_driver_pre_shutdown_error
+                try:
+                    await stale_pw.stop()
+                except BaseException as exc:
+                    stale_driver_pre_shutdown_error = exc
+                    raise
+                finally:
+                    # A cancellation-resistant stop may deliver the close event after
+                    # reconnect has already propagated cancellation to its caller.
+                    self._sessionless_init_script_registrations = stale_sessionless_init_script_registrations.copy()
+
+            try:
+                stale_driver_stopped = await self._run_bounded_detachable(
+                    stop_stale_driver_before_replacement(),
+                    BROWSER_CLOSE_TIMEOUT,
+                    "unusable stale Playwright driver shutdown before reconnect",
+                    accept_failure_as_completion=True,
+                )
+            finally:
+                # The stop can synchronously deliver this context's close event before it
+                # times out, fails, or observes caller cancellation. Preserve the snapshot
+                # for this wrapper's next reconnect even when no replacement is started.
+                self._sessionless_init_script_registrations = stale_sessionless_init_script_registrations.copy()
+            if stale_driver_pre_shutdown_error is not None:
+                retry_stale_shutdown_after_replacement = True
+            elif not stale_driver_stopped:
+                raise RuntimeError("Failed to stop unusable stale Playwright driver before reconnect")
+
+        def restore_stale_state() -> None:
+            self.pw = stale_pw
+            self.browser_context = stale_context
+            self.__page = stale_page
+            self.__active_page = stale_active_page
+            self.__active_page_known_pages = stale_active_page_known_pages
+            self.browser_artifacts = stale_browser_artifacts
+            self.browser_cleanup = stale_browser_cleanup
+            self.browser_context_route_policy_url = stale_route_policy_url
+            self._sessionless_init_script_registrations = stale_sessionless_init_script_registrations
+            self._disconnect_listener_browser = stale_disconnect_listener_browser
+            self._browser_state_diagnostic = stale_diagnostic
+            self._ever_connected = stale_ever_connected
+            self._close_requested = stale_close_requested
+
+        try:
+            if self.engine_selection is not None:
+                fresh_pw = await self.engine_selection.start_driver()
+            else:
+                fresh_pw = await async_playwright().start()
+                close_driver_connection_on_transport_loss(fresh_pw)
+        except BaseException:
+            restore_stale_state()
+            raise
+
+        # Reconciliation installs the replacement guard before replaying idempotent registrations.
+        # A retained guard remains attached until its replacement is ready so an unusable context
+        # cannot expose scripts during recovery. Unguarded unusable drivers are stopped above.
+        self.pw = fresh_pw
         self.browser_context = None
         await self.set_working_page(None)
-        # Detach the stale driver before the replacement connects. Playwright can otherwise replay
-        # context init scripts through both CDP clients, duplicating effects such as keepalive timers.
-        # A timeout or unknown liveness aborts because overlap is not safe to guess through. When the
-        # transport is positively disconnected, a completed stop that raises keeps the legacy recovery
-        # behavior: start a fresh driver rather than converting the transport loss into MissingBrowserState.
-        stale_driver_stopped = await self._run_bounded_detachable(
-            stale_pw.stop(),
-            BROWSER_CLOSE_TIMEOUT,
-            "stale Playwright driver shutdown before reconnect",
-            accept_failure_as_completion=stale_driver_is_known_disconnected,
-        )
-        if not stale_driver_stopped:
-            raise RuntimeError("Failed to stop stale Playwright driver before reconnect")
-        # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
-        # engines underneath a live run. States built outside the per-run seam keep the stock driver.
-        if self.engine_selection is not None:
-            self.pw = await self.engine_selection.start_driver()
-        else:
-            self.pw = await async_playwright().start()
-            close_driver_connection_on_transport_loss(self.pw)
         try:
             await self.check_and_fix_state(
                 proxy_location=proxy_location,
@@ -839,14 +917,63 @@ class RealBrowserState(BrowserState):
                 download_binding=prior_download_binding,
                 display_recording_owner_id=display_recording_owner_id,
                 reconcile_persistent_init_scripts=True,
-                sessionless_init_script_registrations=self.sessionless_init_script_registrations,
+                sessionless_init_script_registrations=tuple(stale_sessionless_init_script_registrations),
             )
-        except Exception:
-            # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
+        except BaseException:
+            # Restore the old wrapper before any await so cancellation during replacement cleanup
+            # cannot leave the partially initialized replacement published on this state.
+            restore_stale_state()
             await self._run_bounded_detachable(
-                self.pw.stop(), BROWSER_CLOSE_TIMEOUT, "new Playwright driver shutdown after failed reconnect"
+                fresh_pw.stop(), BROWSER_CLOSE_TIMEOUT, "new Playwright driver shutdown after failed reconnect"
             )
             raise
+        # Pre-handoff shutdown can synchronously deliver the stale context's close event while it
+        # is still this state's current context, clearing the live list. The replacement replayed
+        # the snapshot above, so retain that same durable state for later reconnects.
+        self._sessionless_init_script_registrations = stale_sessionless_init_script_registrations.copy()
+        if stop_stale_before_replacement and not retry_stale_shutdown_after_replacement:
+            return
+
+        async def stop_stale_driver() -> None:
+            await stale_pw.stop()
+
+        stale_driver_shutdown_retry_scheduled = False
+
+        def schedule_stale_driver_shutdown_retry() -> None:
+            nonlocal stale_driver_shutdown_retry_scheduled
+            if stale_driver_shutdown_retry_scheduled:
+                return
+            stale_driver_shutdown_retry_scheduled = True
+            LOG.warning("Scheduling stale Playwright driver shutdown retry after reconnect")
+
+            async def retry_stale_driver_shutdown() -> None:
+                await self._run_bounded_detachable(
+                    stale_pw.stop(),
+                    BROWSER_CLOSE_TIMEOUT,
+                    "retry stale Playwright driver shutdown after reconnect",
+                    accept_failure_as_completion=True,
+                )
+
+            retry_task = asyncio.create_task(retry_stale_driver_shutdown())
+            self._own_detached_task(retry_task, "retry stale Playwright driver shutdown after reconnect")
+
+        def retry_failed_stale_driver_shutdown(finished: asyncio.Task[None]) -> None:
+            if finished.cancelled() or finished.exception() is not None:
+                # Scheduling from completion serializes the calls even when the first stop ignores
+                # cancellation, while a late successful completion needs no retry.
+                schedule_stale_driver_shutdown_retry()
+
+        stale_driver_shutdown_task = asyncio.create_task(stop_stale_driver())
+        stale_driver_shutdown_task.add_done_callback(retry_failed_stale_driver_shutdown)
+        await self._run_bounded_detachable(
+            stale_driver_shutdown_task,
+            BROWSER_CLOSE_TIMEOUT,
+            "stale Playwright driver shutdown after guarded reconnect",
+            # The replacement is already authoritative. The done callback owns any needed
+            # retry, so a stale-driver stop failure must not turn the successful handoff into
+            # a reconnect failure.
+            accept_failure_as_completion=True,
+        )
 
     async def close_current_open_page(self) -> bool:
         try:

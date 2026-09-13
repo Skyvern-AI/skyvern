@@ -18,6 +18,7 @@ from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
@@ -874,6 +875,27 @@ class LivePageResolutionRecord:
     page_url: str = ""
 
 
+@dataclass(frozen=True)
+class UserMessageSiteURLSource:
+    message_index: int
+    kind: Literal["user_message"] = field(default="user_message", init=False)
+
+
+@dataclass(frozen=True)
+class QuestionResponseSiteURLSource:
+    interaction_id: str
+    kind: Literal["question_response"] = field(default="question_response", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+
+
+@dataclass(frozen=True)
+class _SiteURLText:
+    text: str
+    source: SiteURLSource
+
+
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
@@ -936,8 +958,9 @@ class RequestPolicy:
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
     user_provided_site_urls: list[str] = field(default_factory=list)
-    # Which user message (1-based) each of those URLs came from, so a release records its provenance.
-    user_site_url_sources: dict[str, int] = field(default_factory=dict)
+    # The ordinary user message or accepted interactive response each URL came from, so a release
+    # records truthful provenance without retaining or logging the response text.
+    user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
@@ -963,6 +986,18 @@ class RequestPolicy:
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
+
+    def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
+        project_question_response_sites(self, interaction)
+
+    def apply_raw_secret_redacted_draft(self) -> None:
+        self.raw_secret_detected = True
+        self.raw_secret_handling = "redacted_draft"
+        self.raw_secret_safety_status = "detected"
+        self.testing_intent = "skip_test"
+        self.allow_run_blocks = False
+        self.allow_missing_credentials_in_draft = True
+        self.credential_draft_deferred_explicitly = True
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -4115,40 +4150,87 @@ def credential_candidate_label(credential: Credential) -> str:
     return f"{label} - {'; '.join(facts)}"
 
 
-def _ground_user_provided_sites(
-    policy: RequestPolicy,
-    user_message: str,
-    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
-) -> None:
-    """Record every site the user themselves gave this chat, so the fill seam can release a credential
-    onto one of them and never onto a site only a model produced.
+def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> list[_SiteURLText]:
+    response = interaction.response
+    if interaction.status != "resolved" or response is None or response.skipped or response.raw_secret_detected:
+        return []
+    source = QuestionResponseSiteURLSource(interaction_id=interaction.interaction_id)
+    texts = [response.text] if response.text else []
+    texts.extend(answer.text for answer in response.answers if answer.text)
+    return [_SiteURLText(text=text, source=source) for text in texts]
 
-    Linking a later "log into pathfold" back to a URL from an earlier turn is the agent's job, not
-    this function's: it reads the whole conversation. What is recorded here is only the deterministic
-    part — the origins the user actually wrote.
-    """
-    # USER only, never TURN_OPENER_SENDERS: this set releases credentials, so a site must have
-    # been written by the person, not by a row the product authored on their behalf.
-    user_texts = [
-        message.content
-        for message in full_chat_history
-        if message.sender == WorkflowCopilotChatSender.USER and message.content
-    ]
-    user_texts.append(user_message or "")
-    seen_origins: set[str] = set()
-    urls: list[str] = []
-    sources: dict[str, int] = {}
-    for index, text in enumerate(user_texts, start=1):
-        for candidate in URL_CANDIDATE_RE.findall(text):
+
+def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        interaction = QuestionInteraction.model_validate(raw_interaction)
+    except ValidationError:
+        return []
+    return _accepted_question_response_url_texts(interaction)
+
+
+def _project_user_provided_sites(
+    policy: RequestPolicy,
+    url_texts: Sequence[_SiteURLText],
+    *,
+    reset: bool,
+) -> None:
+    """Project literal user-authored URL facts while preserving first-origin provenance."""
+    if reset:
+        policy.user_provided_site_urls = []
+        policy.user_site_url_sources = {}
+    seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
+    for item in url_texts:
+        for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
             if parts is None or parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
-            urls.append(cleaned)
-            sources[cleaned] = index
-    policy.user_provided_site_urls = urls
-    policy.user_site_url_sources = sources
+            policy.user_provided_site_urls.append(cleaned)
+            policy.user_site_url_sources[cleaned] = item.source
+
+
+def project_question_response_sites(policy: RequestPolicy, interaction: QuestionInteraction) -> None:
+    if interaction.response is not None and interaction.response.raw_secret_detected:
+        policy.apply_raw_secret_redacted_draft()
+        return
+    _project_user_provided_sites(policy, _accepted_question_response_url_texts(interaction), reset=False)
+
+
+def _ground_user_provided_sites(
+    policy: RequestPolicy,
+    user_message: str,
+    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> None:
+    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+
+    Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
+    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    PRODUCT or AI prose never become credential-origin authority.
+    """
+    url_texts: list[_SiteURLText] = []
+    user_message_index = 0
+    for message in full_chat_history:
+        if message.sender == WorkflowCopilotChatSender.USER and message.content:
+            user_message_index += 1
+            url_texts.append(
+                _SiteURLText(
+                    text=message.content,
+                    source=UserMessageSiteURLSource(message_index=user_message_index),
+                )
+            )
+        if message.sender != WorkflowCopilotChatSender.AI or message.narrative_payload is None:
+            continue
+        for raw_interaction in message.narrative_payload.get("questionInteractions", []):
+            url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+    if user_message:
+        url_texts.append(
+            _SiteURLText(
+                text=user_message,
+                source=UserMessageSiteURLSource(message_index=user_message_index + 1),
+            )
+        )
+    _project_user_provided_sites(policy, url_texts, reset=True)
 
 
 def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:

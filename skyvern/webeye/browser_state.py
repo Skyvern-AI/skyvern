@@ -69,6 +69,7 @@ class BrowserState(Protocol):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        stale_context_is_unusable: bool = False,
     ) -> None: ...
 
     async def get_working_page(self) -> Page | None: ...

@@ -57,6 +57,10 @@ class QuestionResponse(BaseModel):
     answers: list[QuestionAnswer] = Field(default_factory=list)
     text: str | None = None
     skipped: bool = False
+    # Server-owned result of screening the free-text answer. It is persisted
+    # with the interaction so active and reconstructed policies enforce the
+    # same trust floor without retaining the detected literal.
+    raw_secret_detected: bool = Field(default=False, exclude_if=lambda detected: not detected)
 
 
 class QuestionInteraction(BaseModel):
@@ -194,6 +198,14 @@ async def ask_user(ctx: CopilotContext, arguments: AskUserArguments, tool_call_i
             while True:
                 recorded = await repo.poll_copilot_question(ctx.organization_id, chat_id, interaction.interaction_id)
                 if recorded.status == "resolved":
+                    if ctx.request_policy is not None:
+                        ctx.request_policy.project_question_response_sites(recorded)
+                        ctx.allow_untested_workflow_draft = (
+                            ctx.request_policy.raw_secret_detected
+                            and ctx.request_policy.raw_secret_handling == "redacted_draft"
+                        )
+                    if recorded.response is not None and not recorded.response.skipped:
+                        ctx.credential_recovery_armed = True
                     await ctx.stream.send(
                         {
                             "type": "question_resolved",

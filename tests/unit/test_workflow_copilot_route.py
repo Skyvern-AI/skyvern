@@ -25,6 +25,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -3490,6 +3491,77 @@ async def test_chat_history_marks_abandoned_turn_interrupted_not_cancelled(
     assert chat.pending_turns == {}
     assert response.chat_history[-1].turn_outcome is not None
     restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redis_failure_does_not_protect_an_unrelated_stale_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    monkeypatch.setattr(workflow_copilot_route, "credential_pause_is_active", AsyncMock(return_value=None))
+
+    await _load_history()
+
+    assert store.claim_calls == ["turn-a"]
+    assert chat.pending_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_redis_failure_briefly_protects_a_recent_question_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved_at = datetime.now(timezone.utc) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS + 60)
+    interaction = QuestionInteraction(
+        interaction_id="question-1",
+        turn_id="turn-a",
+        tool_call_id="call-1",
+        parts=[],
+        status="resolved",
+        response=QuestionResponse(text="https://portal.example.com/login"),
+        resolved_at=resolved_at,
+    )
+    entry = _make_pending_turn(
+        "turn-a",
+        RECONCILE_ABANDON_AFTER_SECONDS + 120,
+        question_interactions=[interaction],
+    )
+    chat = _make_persisted_chat([entry])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    monkeypatch.setattr(workflow_copilot_route, "credential_pause_is_active", AsyncMock(return_value=None))
+
+    await _load_history()
+
+    assert store.claim_calls == []
+    assert list(chat.pending_turns) == ["turn-a"]
+
+
+@pytest.mark.asyncio
+async def test_redis_failure_eventually_releases_an_old_question_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    age = RECONCILE_ABANDON_AFTER_SECONDS + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 60
+    interaction = QuestionInteraction(
+        interaction_id="question-1",
+        turn_id="turn-a",
+        tool_call_id="call-1",
+        parts=[],
+        status="resolved",
+        response=QuestionResponse(text="https://portal.example.com/login"),
+        resolved_at=datetime.now(timezone.utc) - timedelta(seconds=age),
+    )
+    entry = _make_pending_turn("turn-a", age + 60, question_interactions=[interaction])
+    chat = _make_persisted_chat([entry])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    monkeypatch.setattr(workflow_copilot_route, "credential_pause_is_active", AsyncMock(return_value=None))
+
+    await _load_history()
+
+    assert store.claim_calls == ["turn-a"]
+    assert chat.pending_turns == {}
 
 
 @pytest.mark.asyncio

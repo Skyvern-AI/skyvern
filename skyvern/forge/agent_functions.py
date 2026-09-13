@@ -1487,6 +1487,10 @@ class AgentFunction:
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
 
+    async def has_retained_browser_egress_guard(self, browser_context: Any) -> bool:
+        """Whether cloud-only retained init scripts still require this context's guard."""
+        return False
+
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 

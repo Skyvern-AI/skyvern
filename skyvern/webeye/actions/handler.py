@@ -2165,6 +2165,7 @@ async def _recover_download_page(
                     browser_address=browser_address,
                     browser_profile_id=browser_state.browser_artifacts.applied_browser_profile_id,
                     browser_session_id=task.browser_session_id,
+                    stale_context_is_unusable=True,
                 )
                 recovered_page = await browser_state.get_working_page()
                 if recovered_page is None:

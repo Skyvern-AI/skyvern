@@ -131,6 +131,8 @@ export interface WorkflowCopilotChatRequest {
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
+  credential_recovery_token?: string;
+  supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
 }
 
@@ -163,6 +165,7 @@ export interface WorkflowCopilotChatHistoryMessage {
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
+  pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;

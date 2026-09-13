@@ -10,11 +10,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
-import type { QuestionInteraction } from "./workflowCopilotTypes";
+import type {
+  QuestionInteraction,
+  WorkflowCopilotCredentialRequiredUpdate,
+} from "./workflowCopilotTypes";
 
 type HistoryData = {
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
+  pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   workflow_copilot_chat_id: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
@@ -710,6 +714,36 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     await advance(2_000);
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("claims ownership when recovery discovers a credential pause", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    await resolveNextHistory(
+      historyData({
+        pending_credential_requests: [
+          {
+            type: "credential_required",
+            turn_id: turnId,
+            workflow_copilot_chat_id: "chat-1",
+            resume_token: "resume-token",
+            reason: "workflow_credential_inputs_unbound",
+            message: "",
+            login_page_urls: ["https://example.com/login"],
+            credential_refs: [],
+            timeout_seconds: 300,
+            expires_at: new Date(Date.now() + 300_000).toISOString(),
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }),
+    );
+
+    await submit("another one");
+    await advance(10);
+
+    expect(streamCalls.length).toBe(1);
   });
 
   it("does not re-read history when the stream ends on a terminal frame", async () => {

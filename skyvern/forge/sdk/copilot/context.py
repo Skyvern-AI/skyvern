@@ -1145,6 +1145,9 @@ class CopilotContext(AgentContext):
     # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
+    client_supports_credential_pause_recovery: bool = False
+    credential_recovery_token_digest: str | None = field(default=None, repr=False)
+    credential_recovery_armed: bool = False
     credential_pause_used: bool = False
     # True only while a card is on screen. credential_pause_used stays true for the rest of the
     # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
