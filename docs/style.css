@@ -687,6 +687,8 @@ header[class*="header"] {
     top: 140px;
     left: max(20px, calc(50% - 430px - 200px));
     width: 180px;
+    max-height: calc(100vh - 180px);
+    overflow-y: auto;
 }
 
 .cl-sidebar-title {
