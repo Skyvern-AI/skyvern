@@ -16,6 +16,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     DISABLE_TASK_V3_FLAG,
@@ -53,7 +54,12 @@ from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockType
 from skyvern.services import script_service
 from tests.unit.helpers import make_organization
-from tests.unit.test_agent_task_v3 import _make_block, _make_output_parameter, _run_execute_step_gate
+from tests.unit.test_agent_task_v3 import (
+    _make_block,
+    _make_output_parameter,
+    _run_execute_step_gate,
+    stub_workflow_block_engine_app,
+)
 from tests.unit.test_block_description_caching import _block_result, _setup_mocks
 from tests.unit.test_missing_starter_url import _mock_block_execute_deps
 
@@ -101,6 +107,7 @@ async def _resolve(
 ) -> None:
     with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER = provider
+        stub_workflow_block_engine_app(mock_app)
         await resolve_workflow_block_engine_arm(
             context,
             workflow_run_id=workflow_run_id,
@@ -322,6 +329,7 @@ async def test_noop_provider_never_queried_and_leaves_engine_unchanged(scoped_co
     spy = AsyncMock(wraps=provider._is_feature_enabled)
     with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app, patch.object(provider, "_is_feature_enabled", spy):
         mock_app.EXPERIMENTATION_PROVIDER = provider
+        stub_workflow_block_engine_app(mock_app)
         await resolve_workflow_block_engine_arm(
             scoped_context,
             workflow_run_id="wr_noop",
@@ -648,6 +656,7 @@ async def test_resolver_logs_the_ineligibility_reason(scoped_context: SkyvernCon
         patch("skyvern.forge.sdk.experimentation.workflow_block_engine.LOG") as mock_log,
     ):
         mock_app.EXPERIMENTATION_PROVIDER = provider
+        stub_workflow_block_engine_app(mock_app)
         await resolve_workflow_block_engine_arm(
             scoped_context,
             workflow_run_id="wr_logged",
@@ -799,3 +808,80 @@ async def test_agent_create_site_leaves_the_script_run_marker_unset(scoped_conte
     create_kwargs = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs
     assert create_kwargs["engine"] == RunEngine.skyvern_v3
     assert create_kwargs.get("ai_fallback_triggered") is None
+
+
+@pytest.mark.asyncio
+async def test_arm_offers_the_billing_tier_to_the_ab_flag_but_not_the_kill_switch(
+    scoped_context: SkyvernContext,
+) -> None:
+    # The tier is what lets one release condition hold enterprise and self-serve at different
+    # percentages. It must stay off DISABLE_TASK_V3: this resolver and the dispatch gate both
+    # evaluate that flag through task_v3_disabled, and the provider caches on
+    # (flag, distinct_id, properties), so adding a property on one side only would let the kill
+    # switch answer differently for the same run.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER = provider
+        stub_workflow_block_engine_app(mock_app, billing_tier=BillingTier.SELF_SERVE)
+        await resolve_workflow_block_engine_arm(
+            scoped_context,
+            workflow_run_id="wr_tier",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_1",
+            ineligibility_reason=None,
+        )
+
+    by_flag = {flag: properties or {} for flag, _distinct_id, properties in provider.calls}
+    assert by_flag[WORKFLOW_TASK_V3_AB_FLAG][BILLING_TIER_PROPERTY] == "self_serve"
+    assert BILLING_TIER_PROPERTY not in by_flag[DISABLE_TASK_V3_FLAG]
+    assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_reaches_the_ab_pays_for_no_tier_lookup(scoped_context: SkyvernContext) -> None:
+    # An ineligible run reads no flag, so a tier read would be pure cost on a path that cannot use
+    # it, and a logged tier would claim the run was bucketed on one. The same holds for a run the
+    # kill switch stops: a Redis or pooler incident is exactly when that switch gets flipped, and
+    # this resolver holds a lock while it runs.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    for reason, run_id in ((V3AbIneligibleReason.script_run, "wr_inelig"), (None, "wr_killed")):
+        provider.flags[DISABLE_TASK_V3_FLAG] = reason is None
+        tier = AsyncMock(return_value=BillingTier.ENTERPRISE)
+        with (
+            patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app,
+            patch("skyvern.forge.sdk.experimentation.workflow_block_engine.LOG") as mock_log,
+        ):
+            mock_app.EXPERIMENTATION_PROVIDER = provider
+            mock_app.AGENT_FUNCTION.resolve_billing_tier = tier
+            await resolve_workflow_block_engine_arm(
+                scoped_context,
+                workflow_run_id=run_id,
+                organization_id="org_1",
+                workflow_permanent_id="wpid_1",
+                ineligibility_reason=reason,
+            )
+        tier.assert_not_awaited()
+        assert mock_log.info.call_args.kwargs["billing_tier"] is None
+        assert scoped_context.workflow_block_engine_override is None
+
+
+@pytest.mark.asyncio
+async def test_a_failing_billing_tier_lookup_cannot_decide_the_arm(scoped_context: SkyvernContext) -> None:
+    # The resolver's catch-all turns any exception inside it into control, so a tier read that
+    # escaped would let a billing-lookup outage move every run of the experiment onto v1 -- a
+    # dependency the arm never had. The treated run must still be treated.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER = provider
+        mock_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(side_effect=RuntimeError("billing down"))
+        await resolve_workflow_block_engine_arm(
+            scoped_context,
+            workflow_run_id="wr_tier_down",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_1",
+            ineligibility_reason=None,
+        )
+
+    assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
+    by_flag = {flag: properties or {} for flag, _distinct_id, properties in provider.calls}
+    assert by_flag[WORKFLOW_TASK_V3_AB_FLAG][BILLING_TIER_PROPERTY] == "unknown"
