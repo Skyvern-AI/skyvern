@@ -46,6 +46,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
@@ -430,12 +431,25 @@ def convert_to_workflow_copilot_chat_message(
     parsed_narrative = typing.cast(
         "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
     )
+    raw_attachments = message_model.attached_files
+    attached_files: list[CopilotAttachedFile] = []
+    if isinstance(raw_attachments, list):
+        for entry in raw_attachments:
+            try:
+                attached_files.append(CopilotAttachedFile.model_validate(entry))
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to parse an attached file from a chat row, dropping it",
+                    workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                    exc_info=exc,
+                )
     return WorkflowCopilotChatMessageSchema(
         workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
         content=message_model.content,
         audio_artifact_id=message_model.audio_artifact_id,
+        attached_files=attached_files,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,

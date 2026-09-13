@@ -260,7 +260,11 @@ def _recorded_action_fields(
         # so the typed action carries the required field without retaining the raw value.
         fields["text"] = ""
     elif action_type == ActionType.UPLOAD_FILE:
-        fields["file_url"] = _string_value(kwargs.get("file_url", _arg(args, value_index)))
+        file_value = kwargs.get("file_url", _arg(args, value_index))
+        if isinstance(file_value, dict):
+            # An in-memory payload ({name, mimeType, buffer}): record the name, never the bytes.
+            file_value = file_value.get("name")
+        fields["file_url"] = _string_value(file_value)
     elif action_type == ActionType.DOWNLOAD_FILE:
         fields["file_name"] = _string_value(kwargs.get("file_name", _arg(args, 0))) or "download_file"
         download_url = _string_value(kwargs.get("download_url", _arg(args, 1)))
@@ -745,6 +749,21 @@ class RecordingPage:
         behind the recording and credential guards; a caller reaches it only after ``isinstance``.
         """
         return self.__page
+
+    def _pinned_locator(self) -> Callable[[str], RecordingLocator] | None:
+        """Recorded locators from the raw page class's own `locator`, fixed now for trusted platform helpers: authored
+        code can reach the raw page through `locator(...).page` and shadow `locator` on that instance."""
+        locate = getattr(type(self.__page), "locator", None)
+        if locate is None:
+            return None
+        page, recorder = self.__page, self.__recorder
+        return lambda selector: RecordingLocator(locate(page, selector), recorder, selector)
+
+    @property
+    def _credential_release_guard(self) -> CredentialReleaseGuard | None:
+        """The armed guard for this block, for trusted platform consumers only; ``None`` when the
+        block declared no credential whose saved login site yields a release scope."""
+        return self.__recorder.credential_release_guard
 
     def recorded_actions(self) -> list[Action]:
         return sorted(self.__recorder.actions, key=lambda action: cast(int, action.action_order))

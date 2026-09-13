@@ -89,11 +89,14 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+    from skyvern.forge.sdk.workflow.code_block_authorized_files import AuthorizedFileMaterialization
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.forge.taskv3.loop import ToolSpec
+    from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
@@ -152,6 +155,7 @@ SVG_LOCAL_CACHE_MAX_ITEMS = 4096
 SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
 SVGLocalCacheValue = tuple[str, float | None]
 PageOperationContracts = dict[str, dict[str, str | list[str]]]
+CodeBlockExecutionLimits = dict[str, str | int]
 
 # TTLCache has one global TTL, so each value also carries an optional shorter
 # expiry timestamp for negative cache entries.
@@ -250,7 +254,7 @@ class CodeBlockEngineFailure:
 class CodeBlockDownloadOperationReceipt:
     """Structured proof that the secure runner invoked the brokered download operation."""
 
-    operation: Literal["click_and_claim_download"] = "click_and_claim_download"
+    operation: Literal["click_and_claim_download", "expect_download"] = "click_and_claim_download"
 
 
 @dataclass
@@ -925,6 +929,19 @@ class AgentFunction:
     async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
         return False
 
+    # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
+    # Returning None is the ONLY safe answer without one: there is deliberately no in-process
+    # execution path here to degrade to, so a deployment with no runner offers no code tool rather
+    # than a weaker version of it. OSS ships no runner and always returns None.
+    async def build_task_v3_code_tool(
+        self,
+        *,
+        page_provider: PageProvider,
+        organization_id: str | None,
+        execution_id: str,
+    ) -> ToolSpec | None:
+        return None
+
     # Recognition of submit controls whose submission is wired in JS (rendered type=button); base recognizes none.
     async def is_recognized_submit_control(self, element: SkyvernElement) -> bool:
         return False
@@ -1181,6 +1198,13 @@ class AgentFunction:
     def page_operation_contracts(self) -> PageOperationContracts | None:
         return None
 
+    async def codeblock_execution_limits(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CodeBlockExecutionLimits | None:
+        """Cloud reports the secure runner's limits when this session's test runs will execute
+        under them; OSS has no runner, so its budget is unknown rather than unlimited."""
+        return None
+
     def web_search_provider(self) -> WebSearchProvider | None:
         """No search engine is configured in OSS; reading a provider's result markup is
         deployment configuration. Cloud overrides this with its configured provider."""
@@ -1250,6 +1274,7 @@ class AgentFunction:
         workflow_run_context: WorkflowRunContext,
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
+        authorized_file_materializations: dict[str, AuthorizedFileMaterialization] | None = None,
         recording_page: RecordingPage | None = None,
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,

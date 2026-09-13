@@ -174,8 +174,9 @@ from skyvern.forge.sdk.workflow.models.block import (
     _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
-from skyvern.forge.taskv3.loop import LoopOutcome
+from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
+from skyvern.forge.taskv3.target_label import compose_target_intention
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
@@ -377,6 +378,30 @@ _TASKV3_TOOL_ACTION_TYPES = {
     "solve_captcha": ActionType.SOLVE_CAPTCHA,
     "reload_page": ActionType.RELOAD_PAGE,
 }
+
+
+def _taskv3_row_intention(task: Task, round_action: RoundAction, secret_values: set[str]) -> str | None:
+    """The persisted label for one v3 action. This is the only frame that holds the unfloored drop-check
+    secrets, and a failure here is logged without exc_info, so no traceback renderer can print them."""
+    try:
+        # Drop-only: this set decides whether to drop a page-supplied name and reaches no redaction path.
+        label_secret_values = (
+            secret_values
+            | app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+                task.workflow_run_id, respect_artifact_redaction_flag=False
+            )
+            | app.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check(task.workflow_run_id)
+        )
+        return compose_target_intention(
+            round_action.tool,
+            round_action.target_name,
+            round_action.target_kind,
+            label_secret_values,
+            succeeded=round_action.succeeded,
+        )
+    except Exception:
+        LOG.warning("task_v3 failed to compose action label", task_id=task.task_id)
+        return None
 
 
 def _redact_tool_args(args: dict[str, Any], secret_values: set[str]) -> dict[str, Any]:
@@ -1723,7 +1748,7 @@ class ForgeAgent:
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
-        from skyvern.forge.taskv3.tools import pending_marker
+        from skyvern.forge.taskv3.tools import _observable_child_frames, _recorded_work_frames, pending_marker
         from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, select_previous_block
         from skyvern.utils.token_counter import approx_count_tokens
 
@@ -2077,15 +2102,10 @@ class ForgeAgent:
         # action round, and we persist one DB row per action + one screenshot per round, so the Task
         # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
         # best-effort — billing still meters off outcome.billable_actions below.
-        _billable_tool_names = frozenset(
-            {"click", "hover", "type", "select_option", "select_combobox", "press_key", "file_upload"}
-        )
         v3_persisted_actions: list[Action] = []
         v3_round_index = 0
 
-        async def _on_action_round(
-            round_actions: list[tuple[str, dict[str, Any], bool]], turn_reasoning: str | None
-        ) -> None:
+        async def _on_action_round(round_actions: list[RoundAction], turn_reasoning: str | None) -> None:
             nonlocal v3_round_index
             screenshot_artifact_id: str | None = None
             try:
@@ -2108,7 +2128,8 @@ class ForgeAgent:
                     # can be glued to adjacent alphanumerics — boundary anchoring would let it through.
                     turn_reasoning = redact_secrets_from_text(turn_reasoning, secret_values)
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
-            for name, args, succeeded in round_actions:
+            for round_action in round_actions:
+                name, args, succeeded = round_action.tool, round_action.args, round_action.succeeded
                 try:
                     tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
                     selector = tool_args.get("selector", "")
@@ -2127,6 +2148,7 @@ class ForgeAgent:
                         description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
                         reasoning=turn_reasoning,
+                        intention=_taskv3_row_intention(task, round_action, secret_values),
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(
@@ -2134,7 +2156,7 @@ class ForgeAgent:
                     )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
-            if any(name in _billable_tool_names for name, _args, _ok in round_actions):
+            if any(entry.billable for entry in round_actions):
                 # Only billable rounds consume the budget unit; recordable-only rounds (navigate/
                 # scroll/wait) keep the current index so they never inflate the workflow-run count.
                 v3_round_index += 1
@@ -2190,7 +2212,30 @@ class ForgeAgent:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
-            return await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+            own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+            if not settings.TASK_V3_FRAME_PERCEPTION:
+                return own
+            # The completion-side settle deferral rides this, and it is a LIVE gate rather than only the
+            # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is
+            # still rendering as settled, so the deferral loses its subject on exactly the traffic frame
+            # perception opens up. Same rule as the other guards this flag moved -- when work can happen
+            # in a frame, whatever judges that work has to look there.
+            frames, _skipped, _unjudged = await _observable_child_frames(peek)
+            # Plus every realm the run already acted in, which the observable set does not contain:
+            # it drops a hidden host and caps at OBSERVE_FRAME_MAX, so a frame the app hides WHILE it
+            # submits leaves both samples equal and the deferral accepts a completed verdict over work
+            # still in flight. Sampling what was acted in is the same record-don't-scan rule the other
+            # frame guards use, and it cannot grow with the page's frame count.
+            frames = list(frames) + [realm for realm in _recorded_work_frames(peek) if realm not in frames]
+            parts = [own or ""]
+            for frame in frames:
+                try:
+                    parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS) or ""))
+                except Exception:
+                    # A frame that will not answer contributes nothing rather than costing the page's
+                    # own fingerprint -- the deferral still has the main document to judge.
+                    LOG.debug("taskv3 page fingerprint could not read a child frame", exc_info=True)
+            return "\n".join(parts)
 
         # Document identity, not content: a failed call's leftover text or open menu changes the DOM
         # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.

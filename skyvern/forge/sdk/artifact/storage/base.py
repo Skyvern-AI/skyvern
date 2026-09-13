@@ -415,9 +415,21 @@ class BaseStorage(ABC):
     ) -> bool:
         pass
 
+    def manages_local_file_uri(self, uri: str, organization_id: str) -> bool:
+        """Whether this backend stores the file:// ``uri`` for ``organization_id``.
+
+        Only a backend that writes file:// URIs can answer yes, so the default is no.
+        """
+        return False
+
     @abstractmethod
     def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
-        pass
+        """Raise unless this backend owns ``uri`` for ``organization_id``.
+
+        Callers read a clean return as proof of ownership, so the default has to refuse: a backend
+        that forgets to override this would otherwise claim every URI in the system.
+        """
+        raise PermissionError(f"No permission to access storage URI: {uri}")
 
     @abstractmethod
     async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:

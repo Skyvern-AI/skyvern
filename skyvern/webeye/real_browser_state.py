@@ -4,9 +4,9 @@ import asyncio
 import random
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import structlog
@@ -76,6 +76,7 @@ class RealBrowserState(BrowserState):
         browser_cleanup: BrowserCleanupFunc = None,
         release_driver_on_close: bool = False,
         engine_selection: BrowserEngineSelection | None = None,
+        browser_context_route_policy_url: str | None = None,
     ):
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
@@ -90,6 +91,13 @@ class RealBrowserState(BrowserState):
         self._disconnect_listener_browser: Browser | None = None
         self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        # Browsers without a persistent-session id cannot use the S3 registry. The state is still
+        # the exclusive owner across an in-process remote-driver reconnect, so it retains the
+        # trusted registration records until the state itself closes.
+        self._sessionless_init_script_registrations: list[Any] = []
+        # The URL participates in route-policy feature targeting. Keep the value that created the
+        # context so a later driver reconnect evaluates the replacement with the same inputs.
+        self.browser_context_route_policy_url = browser_context_route_policy_url
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
@@ -134,6 +142,13 @@ class RealBrowserState(BrowserState):
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
+
+    def add_sessionless_init_script_registration(self, registration: Any) -> None:
+        self._sessionless_init_script_registrations.append(registration)
+
+    @property
+    def sessionless_init_script_registrations(self) -> tuple[Any, ...]:
+        return tuple(self._sessionless_init_script_registrations)
 
     async def _run_on_close_callbacks(self) -> None:
         callbacks = self._on_close_callbacks
@@ -264,6 +279,7 @@ class RealBrowserState(BrowserState):
     async def check_and_fix_state(
         self,
         url: str | None = None,
+        browser_context_route_policy_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -274,12 +290,19 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         display_recording_owner_id: str | None = None,
+        reconcile_persistent_init_scripts: bool = False,
+        sessionless_init_script_registrations: Collection[Any] = (),
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
             context = skyvern_context.current()
+            effective_route_policy_url = (
+                browser_context_route_policy_url or self.browser_context_route_policy_url or url
+            )
+            reconcile_persistent_init_scripts = reconcile_persistent_init_scripts or browser_session_id is not None
             # When recreation omits a binding, preserve the prior artifacts' binding instead of
             # downgrading to RUN_DIR.
             effective_download_binding = download_binding
@@ -294,6 +317,7 @@ class RealBrowserState(BrowserState):
             ) = await BrowserContextFactory.create_browser_context(
                 self.pw,
                 url=url,
+                _browser_context_route_policy_url=effective_route_policy_url,
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
@@ -305,11 +329,15 @@ class RealBrowserState(BrowserState):
                 browser_address=browser_address,
                 browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
                 engine_selection=self.engine_selection,
                 download_binding=effective_download_binding,
                 display_recording_owner_id=display_recording_owner_id,
+                _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
+                _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
             )
             self.browser_context = browser_context
+            self.browser_context_route_policy_url = effective_route_policy_url
             self.browser_artifacts = browser_artifacts
             self.browser_cleanup = browser_cleanup
             self._browser_state_diagnostic = None
@@ -513,6 +541,7 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -531,6 +560,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
             )
         except Exception as e:
             error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
@@ -553,6 +583,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
             )
         page = await self.__assert_page()
 
@@ -572,6 +603,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
             )
             page = await self.__assert_page()
         return page
@@ -654,6 +686,7 @@ class RealBrowserState(BrowserState):
     def _on_browser_context_closed(self, context: BrowserContext) -> None:
         if context is not self.browser_context:
             return
+        self._sessionless_init_script_registrations = []
         self._record_disconnect(
             "browser_context_close_event",
             event="browser_context_close",
@@ -737,13 +770,16 @@ class RealBrowserState(BrowserState):
     async def reconnect(
         self,
         proxy_location: ProxyLocationInput = None,
+        task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
+        browser_context_route_policy_url: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> None:
         # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
         # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
@@ -759,8 +795,27 @@ class RealBrowserState(BrowserState):
         # instead of a fresh Playwright recording. A different run cannot inherit it (id is this run's own).
         recorder = self.browser_artifacts._display_recorder if self.browser_artifacts else None
         display_recording_owner_id = recorder.owner_id if isinstance(recorder, DisplayRecorder) else None
+        effective_route_policy_url = browser_context_route_policy_url or self.browser_context_route_policy_url
+        _stale_driver_connected, stale_driver_disconnect_reason = self._connection_status()
+        stale_driver_is_known_disconnected = stale_driver_disconnect_reason in {
+            "playwright_driver_connection_closed",
+            "browser_context_disconnected",
+        }
         self.browser_context = None
         await self.set_working_page(None)
+        # Detach the stale driver before the replacement connects. Playwright can otherwise replay
+        # context init scripts through both CDP clients, duplicating effects such as keepalive timers.
+        # A timeout or unknown liveness aborts because overlap is not safe to guess through. When the
+        # transport is positively disconnected, a completed stop that raises keeps the legacy recovery
+        # behavior: start a fresh driver rather than converting the transport loss into MissingBrowserState.
+        stale_driver_stopped = await self._run_bounded_detachable(
+            stale_pw.stop(),
+            BROWSER_CLOSE_TIMEOUT,
+            "stale Playwright driver shutdown before reconnect",
+            accept_failure_as_completion=stale_driver_is_known_disconnected,
+        )
+        if not stale_driver_stopped:
+            raise RuntimeError("Failed to stop stale Playwright driver before reconnect")
         # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
         # engines underneath a live run. States built outside the per-run seam keep the stock driver.
         if self.engine_selection is not None:
@@ -771,28 +826,27 @@ class RealBrowserState(BrowserState):
         try:
             await self.check_and_fix_state(
                 proxy_location=proxy_location,
+                task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
+                browser_context_route_policy_url=effective_route_policy_url,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
                 download_binding=prior_download_binding,
                 display_recording_owner_id=display_recording_owner_id,
+                reconcile_persistent_init_scripts=True,
+                sessionless_init_script_registrations=self.sessionless_init_script_registrations,
             )
         except Exception:
             # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
-            try:
-                await self.pw.stop()
-            except Exception:
-                LOG.debug("Failed to stop the new Playwright driver after a failed reconnect", exc_info=True)
+            await self._run_bounded_detachable(
+                self.pw.stop(), BROWSER_CLOSE_TIMEOUT, "new Playwright driver shutdown after failed reconnect"
+            )
             raise
-        finally:
-            try:
-                await stale_pw.stop()
-            except Exception:
-                LOG.debug("Failed to stop the stale Playwright driver during reconnect", exc_info=True)
 
     async def close_current_open_page(self) -> bool:
         try:
@@ -800,6 +854,7 @@ class RealBrowserState(BrowserState):
                 await self._close_all_other_pages()
                 if self.browser_context is not None:
                     await self.browser_context.close()
+                self._sessionless_init_script_registrations = []
                 self.browser_context = None
                 await self.set_working_page(None)
                 return True
@@ -995,7 +1050,14 @@ class RealBrowserState(BrowserState):
                 await self.pw.stop()
         self._remote_driver_detached = True
 
-    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> bool:
+    async def _run_bounded_detachable(
+        self,
+        coro: Awaitable[None],
+        timeout: float,
+        description: str,
+        *,
+        accept_failure_as_completion: bool = False,
+    ) -> bool:
         # Bound a teardown phase WITHOUT relying on cancellation: a stuck download drain or a real
         # Playwright ``context.close`` blocked by an unresolved paused request can ignore the cancel a
         # plain ``asyncio.timeout`` delivers. We race the phase against ``timeout`` and, if it does not
@@ -1023,7 +1085,7 @@ class RealBrowserState(BrowserState):
         error = task.exception()
         if error is not None:
             LOG.warning("Teardown phase failed", phase=description, error_type=type(error).__name__)
-            return False
+            return accept_failure_as_completion
         return True
 
     def _own_detached_task(self, task: asyncio.Task[None], description: str) -> None:
@@ -1063,6 +1125,7 @@ class RealBrowserState(BrowserState):
         except Exception:
             LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
         await self.browser_context.close()
+        self._sessionless_init_script_registrations = []
         LOG.info("Main browser context and all its pages are closed")
 
     async def _run_browser_cleanup_bounded(self) -> None:

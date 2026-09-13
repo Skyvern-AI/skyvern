@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import difflib
+import hmac
 import importlib.util
 import json
 import os
@@ -1451,6 +1452,22 @@ def _browser_lease_failure_category(exc: Exception) -> list[dict] | None:
             "reasoning": reasoning,
         }
     ]
+
+
+_WORKFLOW_SAVE_FINGERPRINT_DOMAIN = b"skyvern.workflow_save_fingerprint.v2\0"
+
+
+def _workflow_save_fingerprint(request: WorkflowCreateYAMLRequest) -> str:
+    payload = request.model_dump(mode="json")
+    payload.pop("recording_id", None)
+    payload["cdp_connect_headers"] = request.cdp_connect_headers
+    payload["explicit_fields"] = sorted(request.model_fields_set - {"recording_id"})
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hmac.new(
+        settings.SECRET_KEY.encode(),
+        _WORKFLOW_SAVE_FINGERPRINT_DOMAIN + serialized.encode(),
+        sha256,
+    ).hexdigest()
 
 
 class WorkflowService:
@@ -11094,6 +11111,7 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
         )
         child_workflow_run_ids = [cwr.workflow_run_id for cwr in child_workflow_runs]
+        await self._drain_failure_evidence_captures([workflow_run.workflow_run_id, *child_workflow_run_ids])
         if child_workflow_runs:
             LOG.info(
                 "Found child workflow runs for cleanup",
@@ -11123,6 +11141,12 @@ class WorkflowService:
             child_workflow_run_ids=child_workflow_run_ids,
             close_browser_on_completion=browser_cleanup_result.recording_finalized,
         )
+
+    async def _drain_failure_evidence_captures(self, workflow_run_ids: Iterable[str]) -> None:
+        for workflow_run_id in workflow_run_ids:
+            if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+                await workflow_run_context.drain_failure_evidence_capture()
 
     async def _persist_workflow_browser_session_if_needed(
         self,
@@ -11510,6 +11534,24 @@ class WorkflowService:
         if browser_cleanup_result is None:
             mark_stream_closing(workflow_run.workflow_run_id)
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        capture_workflow_run_ids = [workflow_run.workflow_run_id]
+        caller_cancelled = False
+        try:
+            if browser_cleanup_result is not None:
+                capture_workflow_run_ids.extend(browser_cleanup_result.child_workflow_run_ids)
+            else:
+                # _clean_up_workflow_browser discovers children too, but its drain runs outside
+                # this guard; settling every owned capture here keeps its drain a no-op.
+                child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
+                    parent_workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+                capture_workflow_run_ids.extend(cwr.workflow_run_id for cwr in child_workflow_runs)
+            await self._drain_failure_evidence_captures(capture_workflow_run_ids)
+        except asyncio.CancelledError:
+            # WorkflowRunContext has already cancelled and joined the owned capture. Finish
+            # browser/session teardown and context eviction before restoring caller cancellation.
+            caller_cancelled = True
         # Tear down passkey material in the worker, after the finally block, while the context is still alive.
         await app.AGENT_FUNCTION.on_workflow_run_terminal(
             workflow_run_id=workflow_run.workflow_run_id,
@@ -11624,6 +11666,8 @@ class WorkflowService:
             # suppress it because replaying the workflow cannot repair post-run cleanup.
             if schedule_credential_fallback_retry:
                 self._schedule_credential_fallback_retry(workflow_run)
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     async def prepare_workflow_webhook(
         self,
@@ -12413,11 +12457,37 @@ class WorkflowService:
                 edited_by=edited_by,
                 created_via=created_via,
             )
+
+        recording_id_to_attach = request.recording_id
+        workflow_save_fingerprint = _workflow_save_fingerprint(request) if request.recording_id is not None else None
+        if request.recording_id is not None:
+            recording = await app.DATABASE.browser_recordings.get_recording(
+                request.recording_id,
+                organization_id,
+            )
+            if (
+                recording is None
+                or workflow_permanent_id is None
+                or recording.workflow_permanent_id != workflow_permanent_id
+            ):
+                raise SkyvernHTTPException(
+                    f"Browser recording {request.recording_id} not found",
+                    status_code=HTTPStatus.NOT_FOUND,
+                )
+            if recording.workflow_id is not None:
+                if recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint:
+                    return await self.get_workflow(
+                        workflow_id=recording.workflow_id,
+                        organization_id=organization_id,
+                    )
+                recording_id_to_attach = None
+
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
             organization,
         )
         new_workflow_id: str | None = None
+        attached_recording_to_new_version = False
         refresh_schedule_runtime_limits = False
         effective_max_elapsed_time_minutes: int | None = None
 
@@ -12553,6 +12623,44 @@ class WorkflowService:
                 validate_code_block_templates=validate_code_block_templates,
             )
 
+            if recording_id_to_attach is not None:
+                try:
+                    attached_recording = await app.DATABASE.browser_recordings.attach_to_workflow_version(
+                        recording_id=recording_id_to_attach,
+                        workflow_id=updated_workflow.workflow_id,
+                        workflow_permanent_id=updated_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        workflow_save_fingerprint=workflow_save_fingerprint,
+                    )
+                except ValueError as exc:
+                    raise SkyvernHTTPException(
+                        f"Browser recording {request.recording_id} not found",
+                        status_code=HTTPStatus.NOT_FOUND,
+                    ) from exc
+                if attached_recording.workflow_id is None:
+                    raise SkyvernHTTPException(
+                        f"Browser recording {request.recording_id} not found",
+                        status_code=HTTPStatus.NOT_FOUND,
+                    )
+
+                attached_recording_to_new_version = attached_recording.workflow_id == updated_workflow.workflow_id
+
+                # A concurrent retry may have attached the idempotency key to
+                # the first version while this duplicate version was built.
+                if (
+                    attached_recording.workflow_id != updated_workflow.workflow_id
+                    and attached_recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint
+                ):
+                    original_workflow = await self.get_workflow(
+                        workflow_id=attached_recording.workflow_id,
+                        organization_id=organization_id,
+                    )
+                    await self.delete_workflow_by_id(
+                        workflow_id=updated_workflow.workflow_id,
+                        organization_id=organization_id,
+                    )
+                    return original_workflow
+
             await self.maybe_delete_cached_code(
                 updated_workflow,
                 workflow_definition=workflow_definition,
@@ -12571,10 +12679,22 @@ class WorkflowService:
         except SkyvernHTTPException:
             # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
             # so they are not wrapped in a 500 by the caller.
+            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
+                await app.DATABASE.browser_recordings.detach_from_workflow_version(
+                    recording_id=recording_id_to_attach,
+                    workflow_id=new_workflow_id,
+                    organization_id=organization_id,
+                )
             if new_workflow_id:
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             raise
         except Exception as e:
+            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
+                await app.DATABASE.browser_recordings.detach_from_workflow_version(
+                    recording_id=recording_id_to_attach,
+                    workflow_id=new_workflow_id,
+                    organization_id=organization_id,
+                )
             if new_workflow_id:
                 LOG.error(
                     f"Failed to create workflow from request, deleting workflow {new_workflow_id}",

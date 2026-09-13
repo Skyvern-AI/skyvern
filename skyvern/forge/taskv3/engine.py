@@ -29,9 +29,11 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.goal_composition import build_user_prompt
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
@@ -40,6 +42,7 @@ from skyvern.forge.taskv3.loop import (
     CompletionBlocker,
     CompletionProbe,
     LoopOutcome,
+    RoundAction,
     SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
@@ -181,7 +184,7 @@ async def run_task_v3_agent_loop(
     prompt_name: str = "taskv3-agent-loop",
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
@@ -265,6 +268,40 @@ async def run_task_v3_agent_loop(
             semantic_commit_stats=semantic_commit_stats,
         )
     )
+
+    # The code tool is built by the deployment, not here: executing model-authored Python needs a
+    # sandboxed runner, which `skyvern/` has no way to reach. A deployment without one returns None
+    # and the surface is left alone. Page-free runs have no page to broker and never ask.
+    code_surface = configured_surface()
+    code_tool: ToolSpec | None = None
+    if code_surface.offers_code_tool and not page_free:
+        execution_id = (_ctx.run_id or _ctx.workflow_run_id or _ctx.task_id or "") if _ctx else ""
+        if settings.TASK_V3_FRAME_PERCEPTION:
+            # The realm-attributed ledger behind the data-loss guard and the completion gate is
+            # written only by the native action tools' wrapper. Code driving the page directly
+            # bypasses it, so in-frame fills and submits would be invisible to both -- worst under
+            # `replace`, where no native action runs and the ledger is never written at all. Until
+            # the brokered path records that work, the two features do not run together.
+            LOG.info("taskv3 code tool withheld", reason="frame_perception_enabled", surface=str(code_surface))
+        elif not execution_id:
+            # The deployment keys a sandbox session on this. Two runs sharing an empty identity would
+            # share a session, so no identity means no code tool rather than a shared one.
+            LOG.info("taskv3 code tool withheld", reason="no_run_identity", surface=str(code_surface))
+        else:
+            try:
+                code_tool = await app.AGENT_FUNCTION.build_task_v3_code_tool(
+                    page_provider=page_provider,
+                    organization_id=organization_id,
+                    execution_id=execution_id,
+                )
+            except Exception:
+                # Withhold, never fail the run: `add` is meant to be purely additive, so a sandbox
+                # hiccup must cost the code tool and nothing else. The action tools still work.
+                LOG.warning("taskv3 code tool build failed; continuing without it", exc_info=True)
+                code_tool = None
+            if code_tool is None:
+                LOG.info("taskv3 code tool withheld", reason="no_sandboxed_runner", surface=str(code_surface))
+    browser_tools = apply_surface(browser_tools, code_surface, code_tool)
 
     # The fingerprint sampler is caller-built (browser semantics — e.g. peeking without page
     # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this

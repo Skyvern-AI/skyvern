@@ -486,6 +486,11 @@ def _safe_identity_list(values: list[str]) -> list[str]:
     return sorted(dict.fromkeys(item for value in values for item in [_safe_text(str(value), 80)] if item))
 
 
+def _page_value_binding_labels(bindings: list[str]) -> list[str]:
+    """The label half of each binding: a figure ticks between runs, so only the page's shape joins the signature."""
+    return [binding.split("=", 1)[0] for binding in bindings]
+
+
 def _identity_token(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_") or "unknown"
 
@@ -520,6 +525,9 @@ def _repair_context_root_cause_identity(
         payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
         payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
         payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
+        payload["page_value_bindings"] = _safe_identity_list(
+            _page_value_binding_labels(repair_context.page_value_bindings)
+        )
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)

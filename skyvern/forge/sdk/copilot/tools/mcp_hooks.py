@@ -12,6 +12,7 @@ from typing import Any
 import structlog
 from pydantic import JsonValue
 
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -65,8 +66,10 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.models.block import CLEAR_BROWSER_DATA_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
+from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -492,9 +495,17 @@ async def _get_block_schema_post_hook(
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
+            data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
+            data["dialog_policy_helper_contract"] = DIALOG_POLICY_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
                 data["page_operation_contracts"] = page_operation_contracts
+            execution_limits = await app.AGENT_FUNCTION.codeblock_execution_limits(
+                organization_id=ctx.organization_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+            )
+            if execution_limits is not None:
+                data["code_execution_limits"] = execution_limits
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
@@ -1864,6 +1875,12 @@ _EVALUATE_SCOUT_ACT_DESCRIPTION = (
 )
 
 
+# The evaluate tool bounds its own dispatch at the engine's action deadline and reports a factual
+# TIMEOUT; an equal ceiling here would cancel first and return the generic unknown-effect error
+# instead. Same headroom the navigate path uses.
+_EVALUATE_OVERLAY_TIMEOUT_SECONDS = DEFAULT_ACTION_TIMEOUT_MS // 1000 + 5
+
+
 def _evaluate_overlay_description(
     block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
 ) -> str:
@@ -1948,7 +1965,7 @@ def _build_skyvern_mcp_overlays(
             },
             requires_browser=True,
             redacts_sensitive_origin_structured_result=True,
-            timeout=30,
+            timeout=_EVALUATE_OVERLAY_TIMEOUT_SECONDS,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
         ),
@@ -1970,7 +1987,6 @@ def _build_skyvern_mcp_overlays(
             forced_args={"selector_mode": "direct"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_click_pre_hook,
             post_hook=_click_post_hook,
@@ -1993,7 +2009,6 @@ def _build_skyvern_mcp_overlays(
             arg_transforms={"clear_first": "clear"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
@@ -2034,7 +2049,6 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["value"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,

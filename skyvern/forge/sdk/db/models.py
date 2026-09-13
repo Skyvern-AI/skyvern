@@ -34,6 +34,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_browser_profile_id,
+    generate_browser_recording_id,
     generate_credential_folder_id,
     generate_credential_id,
     generate_credential_parameter_id,
@@ -639,6 +640,38 @@ class WorkflowModel(SoftDeleteMixin, Base):
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
     is_saved_task = Column(Boolean, default=False, nullable=False)
+
+
+class BrowserRecordingModel(SoftDeleteMixin, Base):
+    __tablename__ = "browser_recordings"
+    __table_args__ = (
+        Index(
+            "uq_browser_recordings_org_attempt_active",
+            "organization_id",
+            "recording_attempt_id",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+        UniqueConstraint("workflow_id", name="uc_browser_recordings_workflow_id"),
+        Index("ix_browser_recordings_org_wpid", "organization_id", "workflow_permanent_id"),
+    )
+
+    recording_id = Column(String, primary_key=True, default=generate_browser_recording_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    recording_attempt_id = Column(String, nullable=False)
+    browser_session_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id", ondelete="CASCADE"), nullable=True)
+    evidence = Column(JSON, nullable=False)
+    recording_metadata = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 # TODO: Apply SoftDeleteMixin to WorkflowScheduleModel (requires migration + query audit)
@@ -1815,6 +1848,7 @@ class WorkflowCopilotChatMessageModel(Base):
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
     audio_artifact_id = Column(String, nullable=True)
+    attached_files = Column(JSON, nullable=True)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)

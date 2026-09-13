@@ -17,6 +17,15 @@ def is_connection_failure(dbapi_error: BaseException) -> bool:
     return sqlstate is None or sqlstate.startswith(_CONNECTION_SQLSTATE_PREFIXES)
 
 
+class DatabaseConnectionUnavailableError(Exception):
+    """A read could not reach the database after bounded reconnection attempts."""
+
+    def __init__(self, operation: str, attempts: int) -> None:
+        super().__init__(f"{operation} could not reach the database after {attempts} connection attempts")
+        self.operation = operation
+        self.attempts = attempts
+
+
 class NotFoundError(Exception):
     pass
 

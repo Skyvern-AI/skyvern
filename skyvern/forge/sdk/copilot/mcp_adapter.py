@@ -1910,10 +1910,11 @@ class SkyvernOverlayMCPServer(MCPServer):
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "timeout")
             # The call is cancelled where it stands, so a tool that changes the page may already have
             # changed it. Reporting a plain failure invites a retry that acts on the page twice.
+            within = f" within {overlay.timeout}s" if overlay.timeout is not None else ""
             err = {
                 "ok": False,
                 "error": (
-                    f"{tool_name} did not answer within {overlay.timeout}s and was cancelled. "
+                    f"{tool_name} did not answer{within} and was cancelled. "
                     "Whether it took effect is unknown; read the page before trying it again."
                 ),
             }

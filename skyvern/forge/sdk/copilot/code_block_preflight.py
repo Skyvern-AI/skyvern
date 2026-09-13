@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import textwrap
+import unicodedata
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -1107,9 +1108,8 @@ def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
 
 
 def _build_typed_module(code: str, *, parameter_keys: Iterable[str]) -> str:
-    parameter_declarations = "\n".join(
-        f"{key}: Any" for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key)
-    )
+    normalized_keys = dict.fromkeys(unicodedata.normalize("NFKC", key) for key in parameter_keys)
+    parameter_declarations = "\n".join(f"{key}: Any" for key in normalized_keys if _valid_python_identifier(key))
     indented_code = textwrap.indent(textwrap.dedent(code).strip() or "pass", "    ")
     if parameter_declarations:
         parameter_declarations += "\n"

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from skyvern.webeye.skycdp.errors import CdpError, CdpTimeoutError
-from skyvern.webeye.skycdp.facade.elements import ElementHandle, wait_for
+from skyvern.webeye.skycdp.facade.elements import ElementHandle, InputFiles, wait_for
 from skyvern.webeye.skycdp.facade.timeouts import DEFAULT_ACTION_TIMEOUT_MS, seconds_from_ms
 
 if TYPE_CHECKING:
@@ -733,7 +733,7 @@ class Locator:
     ) -> list[str]:
         return await (await self._act("select_option", timeout)).select_option(value)
 
-    async def set_input_files(self, files: str | list[str], timeout: float | None = None) -> None:
+    async def set_input_files(self, files: InputFiles, timeout: float | None = None) -> None:
         await (await self._act("set_input_files", timeout)).set_input_files(files)
 
     async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:

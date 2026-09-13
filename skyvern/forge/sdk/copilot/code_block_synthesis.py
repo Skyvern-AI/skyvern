@@ -16,6 +16,7 @@ import keyword
 import re
 import textwrap
 import tokenize
+import unicodedata
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
@@ -318,8 +319,9 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
 _REQUIRED_STATE_TIMEOUT_MS = 120_000
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
-# plus the injected `page`). A parameter key colliding with one of these is silently dropped
-# at bind time, so the synthesized fill would stringify the builtin instead of the user value.
+# plus the injected `page`). A parameter key colliding with one of these is shadowed by the
+# builtin at bind time (block.py's late safe globals let a persisted parameter keep its value,
+# but a new block must not rely on that), so the synthesized fill would stringify the builtin.
 # "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
 # injects a bound credential's fields under those bare names, so a plain parameter named
 # `password` would resolve to the credential's secret value instead of the user input.
@@ -333,6 +335,9 @@ _RESERVED_PARAM_NAMES = frozenset(
         "otp",
         "solve_captcha",
         "search_web",
+        "clear_browser_data",
+        "attach_authorized_file",
+        "set_dialog_policy",
         DOWNLOAD_CLAIM_HELPER_NAME,
         "print",
         "len",
@@ -436,11 +441,13 @@ class SynthesizedCodeBlock:
 
 
 def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
+    normalized_key = unicodedata.normalize("NFKC", parameter_key)
     return (
         parameter_key.isidentifier()
-        and not keyword.iskeyword(parameter_key)
-        and not parameter_key.startswith("__")
-        and parameter_key not in _RESERVED_PARAM_NAMES
+        and normalized_key.isidentifier()
+        and not keyword.iskeyword(normalized_key)
+        and not normalized_key.startswith("__")
+        and normalized_key not in _RESERVED_PARAM_NAMES
     )
 
 
@@ -2763,8 +2770,8 @@ def synthesize_code_block(
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
-        # The worker-owned claim helper is the one terminal shape both engines execute: the sandboxed
-        # runner cannot broker page.expect_download. The helper clicks once and confirms the fired
+        # The worker-owned claim helper is the terminal shape both engines execute for one known
+        # affordance. The helper clicks once and confirms the fired
         # download; the bytes land wherever this run's download binding already sends them, and the
         # execution layer registers them from there.
         download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)

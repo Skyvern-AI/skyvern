@@ -744,6 +744,14 @@ def _bounded_packet_page_state(
             notices=notices,
             keep="first",
         ),
+        "value_bindings": _bounded_packet_strings(
+            page_state.value_bindings,
+            field_name=f"{field_prefix}.value_bindings",
+            max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
+            max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+            notices=notices,
+            keep="first",
+        ),
         "result_summaries": _bounded_packet_strings(
             page_state.result_summaries,
             field_name=f"{field_prefix}.result_summaries",
@@ -843,6 +851,7 @@ def _compact_packet_for_aggregate_limit(
         compacted = page_state.model_copy(
             update={
                 "form_summaries": compact_summaries(page_state.form_summaries, field_name="form_summaries"),
+                "value_bindings": compact_summaries(page_state.value_bindings, field_name="value_bindings"),
                 "result_summaries": compact_summaries(
                     page_state.result_summaries,
                     field_name="result_summaries",
@@ -1353,6 +1362,7 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
                         "evidence_source": None,
                         "rendered_value_excerpt": None,
                         "form_summaries": [],
+                        "value_bindings": [],
                         "result_summaries": [],
                         "action_summaries": [],
                         "challenge_summaries": [],

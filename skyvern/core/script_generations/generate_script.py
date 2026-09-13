@@ -13,6 +13,7 @@ import re
 import zlib
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import libcst as cst
@@ -762,6 +763,9 @@ def _per_action_reasoning(act: dict) -> str:
 
 def _value(value: Any) -> cst.BaseExpression:
     """Convert simple Python objects to CST expressions."""
+    if isinstance(value, Enum):
+        # model_dump() hands over enum members, whose repr is not a literal.
+        value = value.value
     if isinstance(value, str):
         if "\n" in value:
             # For multi-line strings, use repr() which handles all escaping properly
@@ -2016,14 +2020,21 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
         ),
     ]
 
-    for custom_smtp_field in ("custom_smtp_host", "custom_smtp_port", "custom_smtp_username", "custom_smtp_password"):
-        custom_smtp_value = block.get(custom_smtp_field)
-        if custom_smtp_value is None or custom_smtp_value == "":
+    body_format = block.get("body_format")
+    optional_fields: list[tuple[str, Any]] = [
+        ("custom_smtp_host", block.get("custom_smtp_host")),
+        ("custom_smtp_port", block.get("custom_smtp_port")),
+        ("custom_smtp_username", block.get("custom_smtp_username")),
+        ("custom_smtp_password", block.get("custom_smtp_password")),
+        ("body_format", None if body_format in (None, "", "text") else body_format),
+    ]
+    for field, value in optional_fields:
+        if value is None or value == "":
             continue
         args.append(
             cst.Arg(
-                keyword=cst.Name(custom_smtp_field),
-                value=_value(custom_smtp_value),
+                keyword=cst.Name(field),
+                value=_value(value),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

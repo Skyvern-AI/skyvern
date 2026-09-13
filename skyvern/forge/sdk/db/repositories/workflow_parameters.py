@@ -24,8 +24,13 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_js
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
+from skyvern.forge.sdk.db.base_alchemy_db import read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
+from skyvern.forge.sdk.db.exceptions import (
+    DatabaseConnectionUnavailableError,
+    DuplicateCopilotTurnError,
+    NotFoundError,
+)
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -60,6 +65,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotAttachedFile,
     CopilotPendingTurn,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
@@ -250,6 +256,13 @@ def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
             continue
         kept[turn_id] = entry
     return kept
+
+
+def _dump_attached_files(attached_files: list[CopilotAttachedFile] | None) -> list[dict[str, Any]] | None:
+    # ``available`` is resolved fresh on every read, so persisting it would age into a lie.
+    if not attached_files:
+        return None
+    return [attached.model_dump(mode="json", exclude={"available"}) for attached in attached_files]
 
 
 class WorkflowParametersRepository(BaseRepository):
@@ -730,6 +743,7 @@ class WorkflowParametersRepository(BaseRepository):
         sender: WorkflowCopilotChatSender,
         content: str,
         audio_artifact_id: str | None = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
@@ -741,6 +755,7 @@ class WorkflowParametersRepository(BaseRepository):
                 sender=sender,
                 content=content,
                 audio_artifact_id=audio_artifact_id,
+                attached_files=_dump_attached_files(attached_files),
                 global_llm_context=global_llm_context,
                 turn_outcome=turn_outcome.model_dump(mode="json") if turn_outcome is not None else None,
                 narrative_payload=narrative_payload,
@@ -758,6 +773,7 @@ class WorkflowParametersRepository(BaseRepository):
         pending_turn: CopilotPendingTurn,
         user_message: str,
         audio_artifact_id: str | None = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
         sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
     ) -> WorkflowCopilotChatMessage:
         """Write the turn's opening row and its pending marker in one transaction.
@@ -805,6 +821,7 @@ class WorkflowParametersRepository(BaseRepository):
                 sender=sender,
                 content=user_message,
                 audio_artifact_id=audio_artifact_id,
+                attached_files=_dump_attached_files(attached_files),
             )
             session.add(new_message)
             await session.flush()
@@ -1196,12 +1213,12 @@ class WorkflowParametersRepository(BaseRepository):
             await session.refresh(message)
             return WorkflowCopilotChatMessage.model_validate(message)
 
-    @db_operation("get_workflow_copilot_chat_messages")
+    @db_operation("get_workflow_copilot_chat_messages", expected_errors=(DatabaseConnectionUnavailableError,))
     async def get_workflow_copilot_chat_messages(
         self,
         workflow_copilot_chat_id: str,
     ) -> list[WorkflowCopilotChatMessage]:
-        async with self.Session() as session:
+        async def read(session: AsyncSession) -> list[WorkflowCopilotChatMessage]:
             query = (
                 select(WorkflowCopilotChatMessageModel)
                 .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
@@ -1209,6 +1226,13 @@ class WorkflowParametersRepository(BaseRepository):
             )
             messages = (await session.scalars(query)).all()
             return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
+
+        return await read_with_disconnect_recovery(
+            self.Session,
+            read,
+            operation="get_workflow_copilot_chat_messages",
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+        )
 
     @db_operation("get_workflow_copilot_chat_by_id")
     async def get_workflow_copilot_chat_by_id(

@@ -67,12 +67,28 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.js_dispatch import (
+    cancel_aware,
+    cancellation_pending,
+    deadline_ended_the_call,
+    deadline_reached,
+    raise_if_cancelled,
+    record_browser_timeout,
+    record_unreported_timeout,
+    unwrap_caller_js_error,
+    without_navigation_recovery,
+)
 from skyvern.cli.core.perception_telemetry import PerceptionSnapshotCategory, track_perception_snapshot
 from skyvern.cli.core.session_manager import ObserveV2State, get_observe_v2_state, is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException, StaleFrameSelectionError
+from skyvern.exceptions import (
+    BlockedHost,
+    SkyvernHTTPException,
+    SkyvernPageAnalysisTimeout,
+    StaleFrameSelectionError,
+)
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
@@ -80,6 +96,7 @@ from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -94,6 +111,7 @@ from ._common import (
 )
 from ._element_state import (
     ACTION_TIMEOUT_DESCRIPTION,
+    DEFAULT_ACTION_TIMEOUT_MS,
     MAX_ACTION_TIMEOUT_MS,
     MIN_ACTION_TIMEOUT_MS,
     classify_element_state,
@@ -2545,6 +2563,8 @@ async def skyvern_evaluate(
 
     For multi-line await, use an explicit return. Full responses are returned by default; use
     ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
+    On the page/CDP route an expression that never settles within the browser action deadline returns a
+    TIMEOUT result; the extension route reports ACTION_FAILED with a tab-selection hint.
     Security: executes in page context — use only with trusted expressions.
     """
     # Block JS that sets password field values
@@ -2606,17 +2626,44 @@ async def skyvern_evaluate(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            result = await page.locator_scope.evaluate(js)
+            result = await SkyvernFrame._evaluate_expression(
+                frame=page.locator_scope,
+                # Logged verbatim on timeout, and a caller's expression can carry data no log
+                # processor knows to redact; the evaluation itself runs the real expression below.
+                expression="skyvern_evaluate caller expression",
+                evaluate_expression=without_navigation_recovery(lambda: page.locator_scope.evaluate(js)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
             timer.mark("sdk")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            original = unwrap_caller_js_error(e)
+            if deadline_ended_the_call(original, deadline):
+                record_unreported_timeout(original)
+                return action_result(
+                    "skyvern_evaluate",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(original),
+                        "The expression never settled, so whether it already took effect is unknown — read the page before retrying, since a re-run would repeat anything it did",
+                        exc=original,
+                    ),
+                )
             return action_result(
                 "skyvern_evaluate",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check JavaScript syntax", exc=e),
+                error=make_error(ErrorCode.ACTION_FAILED, str(original), "Check JavaScript syntax", exc=original),
             )
 
     return action_result(
@@ -3583,11 +3630,17 @@ async def skyvern_find(
     )
 
 
-async def _ensure_clipboard_permissions(page: Any) -> None:
-    """Grant clipboard permissions on the browser context (lazy, idempotent)."""
+async def _ensure_clipboard_permissions(page: Any, deadline: float) -> None:
+    """Grant clipboard permissions on the browser context (lazy, idempotent).
+
+    Shares the caller's action deadline so a browser that stops answering the grant cannot outlast
+    the bound its tool promises; a grant that times out is skipped like any other failed grant."""
     try:
-        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-    except Exception:
+        async with asyncio.timeout_at(deadline):
+            await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    except Exception as exc:
+        if cancellation_pending():
+            raise asyncio.CancelledError from exc
         LOG.debug("clipboard_permission_grant_skipped", exc_info=True)
 
 
@@ -3599,7 +3652,7 @@ async def skyvern_clipboard_read(
 
     Returns the current clipboard text content. Requires secure context
     (HTTPS or localhost). Clipboard permissions are granted automatically
-    on first use.
+    on first use. A read that never settles within the browser action deadline returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3608,12 +3661,44 @@ async def skyvern_clipboard_read(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            text = await page.evaluate("() => navigator.clipboard.readText()")
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a call the expired deadline cancels mid-flight,
+                # leaving its effect unknown; nothing has been sent yet, so report that instead.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout()
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            read_js = "() => navigator.clipboard.readText()"
+            text = await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=read_js,
+                evaluate_expression=lambda: page.evaluate(read_js),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_read")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e)
+                return action_result(
+                    "skyvern_clipboard_read",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard read never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_read",
                 ok=False,
@@ -3640,8 +3725,9 @@ async def skyvern_clipboard_write(
     """Copy text to the browser clipboard (as if the user pressed Ctrl+C).
 
     The text can then be pasted into form fields or read back with
-    clipboard_read. Requires secure context (HTTPS or localhost).
-    Clipboard permissions are granted automatically on first use.
+    clipboard_read. Requires secure context (HTTPS or localhost). Clipboard permissions are
+    granted automatically on first use. A write that never settles within the browser action deadline
+    returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3650,12 +3736,44 @@ async def skyvern_clipboard_write(
 
     action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a write the expired deadline cancels mid-flight,
+                # leaving the clipboard in an unknown state; nothing has been sent yet.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout()
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            write_js = "(t) => navigator.clipboard.writeText(t)"
+            await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=write_js,
+                evaluate_expression=cancel_aware(lambda: page.evaluate(write_js, text)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_write")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e)
+                return action_result(
+                    "skyvern_clipboard_write",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard write never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_write",
                 ok=False,

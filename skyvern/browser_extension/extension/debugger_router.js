@@ -358,7 +358,11 @@ export class DebuggerRouter {
           error instanceof ProtocolError &&
           error.code === ERROR_CODES.COMMAND_TIMEOUT
         ) {
-          if (error.commandTimedOut === true && !childAutoAttach) {
+          // Child frames can legitimately never answer, e.g. while navigating away.
+          if (
+            error.commandTimedOut === true &&
+            values.sessionId === undefined
+          ) {
             await this.recoverTimedOutCommandLocked(tabId);
           }
           throw error;

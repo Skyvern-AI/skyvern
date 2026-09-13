@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    BrowserRecordingModel,
     CredentialParameterModel,
     FolderModel,
     OnePasswordCredentialParameterModel,
@@ -1451,6 +1452,15 @@ class WorkflowsRepository(BaseRepository):
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
             await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            recording_delete_query = update(BrowserRecordingModel).where(
+                BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
+                BrowserRecordingModel.deleted_at.is_(None),
+            )
+            if organization_id is not None:
+                recording_delete_query = recording_delete_query.where(
+                    BrowserRecordingModel.organization_id == organization_id
+                )
+            await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
             return schedule_ids
 

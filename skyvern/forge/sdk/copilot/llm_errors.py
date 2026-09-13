@@ -47,7 +47,9 @@ def _iter_classification_chain(exc: BaseException) -> Iterator[BaseException]:
             current = current.original_exception
             continue
         yield current
-        current = current.__cause__ or current.__context__
+        # ``__context__`` only records that another error was being handled when this one was
+        # raised, so a failure inherited from an earlier attempt is not evidence about this one.
+        current = current.__cause__
 
 
 _RETRIABLE_LLM_ERROR_NAMES = {
@@ -84,43 +86,46 @@ _PERMANENT_LLM_ERRORS = (
     OpenAIPermissionDeniedError,
     OpenAIUnprocessableEntityError,
 )
+_TRANSIENT_LLM_ERRORS = (
+    litellm.APIConnectionError,
+    litellm.Timeout,
+    litellm.RateLimitError,
+    litellm.ServiceUnavailableError,
+    litellm.InternalServerError,
+    openai.APIConnectionError,
+    openai.RateLimitError,
+    openai.InternalServerError,
+    anthropic.APIConnectionError,
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+)
+
+
+def _is_transient_provider_item(exc: BaseException) -> bool:
+    if isinstance(exc, _TRANSIENT_LLM_ERRORS):
+        return True
+    if not any(marker in type(exc).__module__.lower() for marker in _LLM_ERROR_MODULE_MARKERS):
+        return False
+    if type(exc).__name__ in _RETRIABLE_LLM_ERROR_NAMES:
+        return True
+    return any(phrase in str(exc).lower() for phrase in _RETRIABLE_LLM_ERROR_TEXT)
+
+
+def is_transient_provider_error(exc: BaseException) -> bool:
+    for item in _iter_classification_chain(exc):
+        if isinstance(item, _PERMANENT_LLM_ERRORS):
+            return False
+        if _is_transient_provider_item(item):
+            return True
+    return False
 
 
 def is_retriable_llm_error(exc: BaseException) -> bool:
-    chain = list(_iter_classification_chain(exc))
-    for item in chain:
+    for item in _iter_classification_chain(exc):
         if isinstance(item, CopilotEmptyCompletionError):
             return (
                 item.retry_allowed
                 and item.stop_metadata.refusal is not True
                 and item.stop_metadata.content_filter is not True
             )
-    for item in chain:
-        if isinstance(item, _PERMANENT_LLM_ERRORS):
-            return False
-        if isinstance(
-            item,
-            (
-                litellm.APIConnectionError,
-                litellm.Timeout,
-                litellm.RateLimitError,
-                litellm.ServiceUnavailableError,
-                litellm.InternalServerError,
-                openai.APIConnectionError,
-                openai.RateLimitError,
-                openai.InternalServerError,
-                anthropic.APIConnectionError,
-                anthropic.RateLimitError,
-                anthropic.InternalServerError,
-            ),
-        ):
-            return True
-        module = type(item).__module__.lower()
-        name = type(item).__name__
-        text = str(item).lower()
-        module_has_llm_marker = any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS)
-        if name in _RETRIABLE_LLM_ERROR_NAMES and module_has_llm_marker:
-            return True
-        if module_has_llm_marker and any(phrase in text for phrase in _RETRIABLE_LLM_ERROR_TEXT):
-            return True
-    return False
+    return is_transient_provider_error(exc)

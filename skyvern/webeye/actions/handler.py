@@ -227,10 +227,6 @@ from skyvern.webeye.scraper.scraper import (
     structural_identity,
     trim_element_tree,
 )
-from skyvern.webeye.transient_page_observer import (
-    TransientPageTextObserver,
-    match_user_defined_errors_from_transient_text,
-)
 from skyvern.webeye.utils.dom import (
     COMMON_INPUT_TAGS,
     DomUtil,
@@ -2159,13 +2155,16 @@ async def _recover_download_page(
                         raise RuntimeError("Persistent browser address is unavailable for download recovery")
                 await browser_state.reconnect(
                     proxy_location=task.proxy_location,
+                    task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                     workflow_permanent_id=task.workflow_permanent_id,
+                    browser_context_route_policy_url=task.url,
                     organization_id=task.organization_id,
                     extra_http_headers=task.extra_http_headers,
                     cdp_connect_headers=task.cdp_connect_headers,
                     browser_address=browser_address,
                     browser_profile_id=browser_state.browser_artifacts.applied_browser_profile_id,
+                    browser_session_id=task.browser_session_id,
                 )
                 recovered_page = await browser_state.get_working_page()
                 if recovered_page is None:
@@ -4787,12 +4786,6 @@ class ActionHandler:
         working_page_recovery_attempted = False
         working_page_replaced_after_close = False
         xhr_fallback_moved_paths: set[str] = set()
-        transient_text_observer = TransientPageTextObserver(
-            page,
-            task_id=task.task_id,
-            step_id=step.step_id,
-            workflow_run_id=task.workflow_run_id,
-        )
         page.on("download", _capture_download_event)
         # Identity-only recorder for the task-scoped late cleanup, armed for every download click.
         page.on("popup", _record_download_popup_claim)
@@ -4819,7 +4812,6 @@ class ActionHandler:
                         "Failed to install blob URL retention before download action",
                         workflow_run_id=task.workflow_run_id,
                     )
-            await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
             with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
@@ -4863,18 +4855,6 @@ class ActionHandler:
                         LOG.warning("Failed to remove download listener from closed page", exc_info=True)
                     page = recovered_page
                     page.on("download", _capture_download_event)
-                    recovered_text_observer = TransientPageTextObserver(
-                        page,
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        workflow_run_id=task.workflow_run_id,
-                    )
-                    recovered_text_observer.events.extend(transient_text_observer.events)
-                    await transient_text_observer.stop()
-                    transient_text_observer = recovered_text_observer
-            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial
-            # visible text.
-            await transient_text_observer.start(scan_initial_visible_state=True)
             if task.download_timeout is not None:
                 download_wait_hard_timeout_seconds = float(task.download_timeout)
                 no_signal_grace_seconds = min(download_wait_hard_timeout_seconds, BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
@@ -4908,7 +4888,6 @@ class ActionHandler:
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
                 download_signal_poll_iterations: int | None = None
-                download_wait_matched_errors: list[UserDefinedError] = []
                 download_wait_extended_for_in_flight_request = False
 
                 def _record_download_signal(source: str) -> None:
@@ -5107,24 +5086,6 @@ class ActionHandler:
                                 download_event_fallback_failed = True
                                 break
                             elapsed_since_action = time.monotonic() - download_wait_started_at
-                            if not download_signal_observed:
-                                download_wait_matched_errors = match_user_defined_errors_from_transient_text(
-                                    task,
-                                    step,
-                                    transient_text_observer.events,
-                                )
-                                if download_wait_matched_errors:
-                                    action.errors = (action.errors or []) + download_wait_matched_errors
-                                    action.terminal_user_errors = True
-                                    LOG.warning(
-                                        "Stopping download wait after transient user-defined error text",
-                                        task_id=task.task_id,
-                                        step_id=step.step_id,
-                                        workflow_run_id=task.workflow_run_id,
-                                        error_codes=[error.error_code for error in download_wait_matched_errors],
-                                    )
-                                    break
-
                             if elapsed_since_action >= download_wait_hard_timeout_seconds:
                                 raise asyncio.TimeoutError
 
@@ -5163,35 +5124,18 @@ class ActionHandler:
                     _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
                     _dl_wait_span.set_attribute("download_event_fallback_failed", download_event_fallback_failed)
                     _dl_wait_span.set_attribute(
-                        "download_wait_observed_text_count",
-                        len(transient_text_observer.events),
-                    )
-                    _dl_wait_span.set_attribute(
-                        "download_wait_user_error_detected",
-                        bool(download_wait_matched_errors),
-                    )
-                    _dl_wait_span.set_attribute(
                         "download_wait_extended_for_in_flight_request",
                         download_wait_extended_for_in_flight_request,
                     )
                     LOG.info(
-                        "Transient download observation completed",
+                        "Download wait completed",
                         workflow_run_id=task.workflow_run_id,
-                        observer_event_count=len(transient_text_observer.events),
-                        user_error_matched=bool(download_wait_matched_errors),
                         extended_for_in_flight_request=download_wait_extended_for_in_flight_request,
                         elapsed_seconds=time.monotonic() - download_wait_started_at,
                     )
-                    if download_wait_matched_errors:
-                        _dl_wait_span.set_attribute(
-                            "download_wait_user_error_codes",
-                            ",".join(error.error_code for error in download_wait_matched_errors),
-                        )
 
             if not download_triggered:
-                if download_wait_matched_errors:
-                    await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, 0)
-                elif await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, _remaining_download_wait_seconds()):
+                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, _remaining_download_wait_seconds()):
                     download_triggered = True
 
             if browser_state is not None and not working_page_recovery_attempted and page.is_closed():
@@ -5209,11 +5153,10 @@ class ActionHandler:
 
             # A download-intent click can render the target PDF inline in a frame the browser refuses
             # to display, so no download event ever fires. If the bytes are still same-origin
-            # retrievable, recover them and rejoin the normal finalize path. Skipped when the workflow
-            # matched a user-defined terminal error, so configured stop conditions stay authoritative.
-            # Also skipped after page replacement because the iframe baseline belongs to the destroyed
-            # document; candidates in the reloaded document are not attributable to this action.
-            if not download_triggered and not download_wait_matched_errors and not working_page_replaced_after_close:
+            # retrievable, recover them and rejoin the normal finalize path. Skipped after page
+            # replacement because the iframe baseline belongs to the destroyed document; candidates in
+            # the reloaded document are not attributable to this action.
+            if not download_triggered and not working_page_replaced_after_close:
                 recovered_path = None
                 try:
                     # One whole-operation budget over every candidate fetch: a hung same-origin
@@ -5383,16 +5326,13 @@ class ActionHandler:
                     _remove_popup_listener(page, _register_download_popup)
                 except Exception:
                     LOG.warning("Failed to remove download popup registrar", exc_info=True)
+            xhr_capture.disable()
             try:
-                await transient_text_observer.stop()
+                await xhr_capture.drain(timeout_seconds=0)
             finally:
-                xhr_capture.disable()
-                try:
-                    await xhr_capture.drain(timeout_seconds=0)
-                finally:
-                    if staging_dir.exists():
-                        shutil.rmtree(staging_dir, ignore_errors=True)
-            # Single authoritative stamp, taken only after the observer is detached and drained so a
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+            # Single authoritative stamp, taken only after the capture is detached and drained so a
             # request that resolved during the cleanup awaits before disable() is not missed. Gated on
             # final artifact truth: a saved file never carries a failure status. A StaleActionAbort is
             # excluded because that action never executed -- a passively observed 5xx belongs to unrelated

@@ -1,8 +1,9 @@
 import os
 import shutil
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import BinaryIO
+from urllib.parse import quote
 
 import aiofiles
 import structlog
@@ -45,6 +46,35 @@ def _windows_safe_filename(name: str) -> str:
     invalid = '<>:"/\\|?*'
     name = "".join("-" if ch in invalid else ch for ch in name)
     return name.rstrip(" .")
+
+
+_MAX_FILENAME_BYTES = 255
+
+
+def bounded_basename(name: str) -> str:
+    """Shorten ``name`` to the common per-component filesystem limit, keeping its start and extension.
+
+    Uploads are stored as ``<file_id>_<original name>``, so the id prefix survives and keeps the
+    shortened name unique. Truncation happens on whole characters so no multi-byte one is split.
+    """
+    if len(name.encode()) <= _MAX_FILENAME_BYTES:
+        return name
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode()) > 32:
+        stem, ext = name, ""
+    budget = _MAX_FILENAME_BYTES - len(ext.encode())
+    return stem.encode()[:budget].decode(errors="ignore") + ext
+
+
+def managed_file_uri(path: PurePath) -> str:
+    """Build a file URI that parse_uri_to_path decodes back to the same path on every platform.
+
+    Percent-encoding keeps a "#" or "?" in a filename from reading back as a fragment or query.
+    Path.as_uri is avoided because it emits file:///C:/... on Windows, which that parser turns
+    into /C:/... rather than a drive-qualified path. Forward slashes keep the filename as the
+    URI's last segment, which download_file uses as the temporary file's name.
+    """
+    return "file://" + quote(path.as_posix())
 
 
 class LocalStorage(BaseStorage):
@@ -511,9 +541,26 @@ class LocalStorage(BaseStorage):
     async def save_legacy_file(
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
     ) -> tuple[str, str] | None:
-        raise NotImplementedError(
-            "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
-        )
+        """Write an uploaded file under the same org-scoped layout the cloud backends use.
+
+        ``organization_id`` is auth-derived and ``filename`` is reduced to its basename, so the
+        destination cannot leave this organization's directory. The returned pair is
+        (download URL, storage URI); local has no presigned URL, so both are the same ``file://``
+        URI, which the read and delete paths re-check with ``assert_managed_file_access``. That URI
+        names a path on the server, so it is not something a browser can fetch: a client's handle on
+        the file is its id.
+        """
+        todays_date = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        # Resolved up front: as_uri rejects a relative path, and a relative ARTIFACT_STORAGE_PATH
+        # would otherwise fail only after the bytes were written.
+        directory = (Path(self.artifact_path) / settings.ENV / organization_id / todays_date).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / bounded_basename(_windows_safe_filename(os.path.basename(filename)))
+        fileObj.seek(0)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(fileObj.read())
+        uri = managed_file_uri(file_path)
+        return uri, uri
 
     async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
         self.assert_managed_file_access(uri, organization_id)
@@ -592,6 +639,13 @@ class LocalStorage(BaseStorage):
             organization_id, browser_session_id, artifact_type, remote_path, date
         )
         return target_path.exists()
+
+    def manages_local_file_uri(self, uri: str, organization_id: str) -> bool:
+        try:
+            self.assert_managed_file_access(uri, organization_id)
+        except PermissionError:
+            return False
+        return True
 
     def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
         if not uri.startswith("file://"):

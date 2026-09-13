@@ -103,6 +103,7 @@ TerminalCause = Literal[
     "provisioning_unavailable",
     "cdp_connect_failed",
     "occupied",
+    "billing_credit_admission_refusal",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -209,6 +210,7 @@ class BuildTestPacketPageState(BaseModel):
     observed_after_workflow_run: bool = False
     rendered_value_excerpt: str | None = None
     form_summaries: list[str] = Field(default_factory=list)
+    value_bindings: list[str] = Field(default_factory=list)
     result_summaries: list[str] = Field(default_factory=list)
     action_summaries: list[str] = Field(default_factory=list)
     challenge_summaries: list[str] = Field(default_factory=list)
@@ -1779,10 +1781,16 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_associations=executed_block_associations,
                 completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
+                # Only the excerpt: page_evidence_refs feed structural_key, which would mint
+                # authority on an outcome whose whole point is that nothing was evaluated.
+                observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
-                key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
+                key_provenance={
+                    "structural_failure_identity": "run outcome was not evaluated",
+                    "observed_page_value_excerpt": "bounded post-run page evidence",
+                },
             )
         if referenced_unbound_keys:
             return _required_input_unbound_outcome(

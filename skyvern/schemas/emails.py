@@ -1,4 +1,11 @@
+from enum import StrEnum
+
 from pydantic import BaseModel, Field
+
+
+class EmailBodyFormat(StrEnum):
+    TEXT = "text"
+    HTML = "html"
 
 
 class EmailAttachment(BaseModel):

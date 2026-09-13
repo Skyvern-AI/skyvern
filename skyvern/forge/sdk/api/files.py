@@ -60,7 +60,8 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]+$")
+# Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
+_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
 
 
 def is_uploaded_file_id(value: str) -> bool:
@@ -426,8 +427,10 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
             except (PermissionError, RuntimeError):
                 return False
 
-        # Allow file:// URLs only in local environment
         if scheme == "file":
+            # An uploaded file is named by its id, handled above. A raw path is a legacy local-only
+            # value: sharing the organization's storage prefix does not authorize reading it, since
+            # those prefixes also hold artifacts and browser-session files.
             if settings.ENV != "local":
                 return False
 
@@ -441,6 +444,20 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
         # Reject unsupported schemes
         return False
 
+    except Exception:
+        return False
+
+
+def _storage_manages_file(url: str, organization_id: str | None) -> bool:
+    """Whether the configured storage backend owns this file:// URI for this organization.
+
+    Ownership skips the legacy downloads-directory guard, so only an explicit True counts: a
+    backend, stub, or mock that merely fails to raise must never authorize an arbitrary path.
+    """
+    if organization_id is None:
+        return False
+    try:
+        return app.STORAGE.manages_local_file_uri(url, organization_id) is True
     except Exception:
         return False
 
@@ -460,7 +477,8 @@ async def download_file(
 
     # Resolved before the try below so a missing or cross-org file id fails loudly instead of
     # falling through to the HTTP fetch path with an id as the URL.
-    if is_uploaded_file_id(url):
+    names_uploaded_file = is_uploaded_file_id(url)
+    if names_uploaded_file:
         url = await resolve_uploaded_file_id(url, organization_id)
 
     requested_url = url
@@ -474,9 +492,13 @@ async def download_file(
                 LOG.info("Converting Google Drive link to direct download", url=url)
         is_google_drive_download = _is_google_drive_download_url(url)
 
-        # Check if URL is a cloud storage URI handled by the configured storage backend.
+        # Check if URL is a storage URI handled by the configured storage backend. A file:// URI
+        # reaches storage only when it came from an uploaded file's id: the org's storage prefixes
+        # also hold artifacts and browser-session files, so sharing a prefix authorizes nothing.
         parsed = urlparse(url)
-        if parsed.scheme in ("s3", "gs", "azure"):
+        if parsed.scheme in ("s3", "gs", "azure") or (
+            parsed.scheme == "file" and names_uploaded_file and _storage_manages_file(url, organization_id)
+        ):
             if organization_id is None:
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
@@ -491,7 +513,9 @@ async def download_file(
             data = await app.STORAGE.download_managed_file(url, organization_id)
             if data is None:
                 raise Exception(f"Failed to download managed storage file: {url}")
-            filename = url.split("/")[-1]
+            # A local upload's URI percent-encodes its name, which can triple a non-ASCII name's
+            # length past the filesystem limit; the decoded name is the one storage already wrote.
+            filename = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.scheme == "file" else url.split("/")[-1]
             temp_file = create_named_temporary_file(delete=False, file_name=filename)
             LOG.info(f"Downloaded file to {temp_file.name}")
             temp_file.write(data)

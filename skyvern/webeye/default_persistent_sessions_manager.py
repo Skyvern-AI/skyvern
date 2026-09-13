@@ -516,6 +516,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        url: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)

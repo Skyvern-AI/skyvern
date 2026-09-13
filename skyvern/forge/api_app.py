@@ -41,7 +41,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_config
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.exceptions import NotFoundError, is_connection_failure
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
@@ -72,10 +72,15 @@ LOG = structlog.get_logger()
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-async def db_unavailable_handler(request: Request, exc: OperationalError) -> JSONResponse:
-    if not is_connection_failure(exc.orig):
-        raise exc
-    LOG.warning("Database unavailable", error_type=type(exc.orig).__name__, sqlstate=exc.orig.sqlstate)
+async def db_unavailable_handler(
+    request: Request, exc: OperationalError | DatabaseConnectionUnavailableError
+) -> JSONResponse:
+    if isinstance(exc, OperationalError):
+        if not is_connection_failure(exc.orig):
+            raise exc
+        LOG.warning("Database unavailable", error_type=type(exc.orig).__name__, sqlstate=exc.orig.sqlstate)
+    else:
+        LOG.warning("Database unavailable", error_type=type(exc).__name__, operation=exc.operation)
     # A connection that drops while a commit is in flight may already have committed, so only a
     # safe method is told to retry; a write gets the 503 without the hint.
     headers = {"Retry-After": "1"} if request.method in SAFE_METHODS else None
@@ -84,6 +89,13 @@ async def db_unavailable_handler(request: Request, exc: OperationalError) -> JSO
         content={"error": "Database temporarily unavailable"},
         headers=headers,
     )
+
+
+def register_db_unavailable_handlers(fastapi_app: FastAPI) -> None:
+    """Both types mean the same outage: a read that exhausted its own reconnection attempts
+    must answer like the raw driver error it replaced, not fall through to a 500."""
+    for exc_type in (OperationalError, DatabaseConnectionUnavailableError):
+        fastapi_app.add_exception_handler(exc_type, db_unavailable_handler)
 
 
 SECURITY_HEADERS = {
@@ -486,7 +498,7 @@ def create_api_app() -> FastAPI:
     async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
-    fastapi_app.add_exception_handler(OperationalError, db_unavailable_handler)
+    register_db_unavailable_handlers(fastapi_app)
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
