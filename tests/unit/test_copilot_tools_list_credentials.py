@@ -147,6 +147,72 @@ async def test_the_user_naming_another_credential_settles_the_fill_on_that_one()
 
 
 @pytest.mark.asyncio
+async def test_citing_a_shorter_saved_name_inside_the_one_the_user_typed_is_not_naming_it() -> None:
+    # The user typed "portal login", so the grounded check drops "portal" as a substring of it. Citing
+    # the shorter credential must not claim the user settled it this turn, which would unpin its origin.
+    approved = _password_credential(credential_id="cred_portal", name="portal")
+    longer = _password_credential(credential_id="cred_portal_login", name="portal login")
+    policy = RequestPolicy(canonical_user_message="use portal login to finish the build")
+    policy.prior_approved_credential_ids = {approved.credential_id}
+    policy.resolved_credentials = [approved]
+    policy.seeded_proposal_credential_ids = {approved.credential_id}
+    policy.live_page_admitted_urls = {approved.credential_id: "https://a.example/login"}
+
+    data = await _resolve("portal", policy, [approved, longer])
+
+    assert data["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == set()
+    assert policy.live_page_admitted_urls == {approved.credential_id: "https://a.example/login"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference_is_approved", [True, False])
+async def test_an_approval_from_an_earlier_turn_resolves_without_the_user_naming_it_again(
+    reference_is_approved: bool,
+) -> None:
+    approved = _password_credential(credential_id="cred_approved", name="portal-login")
+    other = _password_credential(credential_id="cred_other", name="billing-login")
+    # What a turn looks like after _seed_prior_approved_credentials rehydrates an approval the user
+    # gave earlier in this chat, on a turn whose message names no credential.
+    policy = RequestPolicy(canonical_user_message="now finish the workflow and test it")
+    policy.prior_approved_credential_ids = {approved.credential_id}
+    policy.resolved_credentials = [approved]
+
+    reference = approved.credential_id if reference_is_approved else other.credential_id
+    data = await _resolve(reference, policy, [approved, other])
+
+    assert data["status"] == ("resolved" if reference_is_approved else "denied")
+    # The approval answers which credential; it never claims the user named one this turn.
+    assert policy.current_turn_named_credential_ids == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["user_named_this_turn", "server_auto_bound", "user_approved_earlier_turn"])
+async def test_no_resume_arm_transfers_authority_to_whichever_credential_now_carries_that_name(arm: str) -> None:
+    # Every arm's record is written against an id. If that credential is renamed and a different one
+    # takes the old name, the name on the stored record must not vouch for the new holder.
+    recorded = _password_credential(credential_id="cred_recorded", name="Portal login")
+    recorded_now = _password_credential(credential_id="cred_recorded", name="Old portal")
+    renamed_onto_the_old_name = _password_credential(credential_id="cred_other", name="Portal login")
+    policy = RequestPolicy(canonical_user_message="carry on and finish the build")
+    if arm == "user_named_this_turn":
+        policy.resolved_credentials = [recorded]
+        policy.current_turn_named_credential_ids = {recorded.credential_id}
+    elif arm == "server_auto_bound":
+        policy.auto_bound_credentials = [recorded]
+    else:
+        policy.prior_approved_credential_ids = {recorded.credential_id}
+        policy.resolved_credentials = [recorded]
+
+    data = await _resolve("Portal login", policy, [recorded_now, renamed_onto_the_old_name])
+
+    assert data["status"] == "denied"
+    assert renamed_onto_the_old_name.credential_id not in {
+        credential.credential_id for credential in policy.resolved_credentials
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("saved", [True, False])
 async def test_saved_workflow_selection_resolves_but_a_canvas_proposal_does_not(saved: bool) -> None:
     credential = _password_credential()
