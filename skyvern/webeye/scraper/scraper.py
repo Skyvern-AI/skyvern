@@ -975,7 +975,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
                 wait_until_finished=False
             )
 
-        # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
+        # we listen to the incremental elements separated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements

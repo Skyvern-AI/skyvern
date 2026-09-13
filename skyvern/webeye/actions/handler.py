@@ -7502,7 +7502,7 @@ async def _handle_input_text_action(
     # check if it's selectable
     if (
         input_or_select_context is not None
-        and not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        and not input_or_select_context.is_search_bar  # no need to trigger selection logic for search bar
         and not is_totp_value
         and not is_secret_value
         and skyvern_element.get_tag_name() == InteractiveElement.INPUT
