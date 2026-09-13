@@ -6,6 +6,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.schemas.run_enums import RunEngine
 
@@ -28,6 +29,20 @@ async def task_v3_disabled(distinct_id: str, organization_id: str | None) -> boo
     return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         DISABLE_TASK_V3_FLAG, distinct_id, properties={"organization_id": organization_id}
     )
+
+
+async def _billing_tier_for_arm(organization_id: str | None) -> BillingTier:
+    """Never raises: a targeting property must not be able to decide the arm.
+
+    The resolver's own catch-all turns any exception into control, so letting a tier read escape
+    would let a billing-lookup failure silently move every run of the experiment onto v1 -- an
+    outage in a system the arm never depended on before.
+    """
+    try:
+        return await app.AGENT_FUNCTION.resolve_billing_tier(organization_id)
+    except Exception:
+        LOG.warning("Failed to resolve the billing tier for the engine arm", exc_info=True)
+        return BillingTier.UNKNOWN
 
 
 async def resolve_workflow_block_engine_arm(
@@ -60,22 +75,31 @@ async def resolve_workflow_block_engine_arm(
             return
         override: RunEngine | None = None
         run_is_eligible = ineligibility_reason is None
+        billing_tier: BillingTier | None = None
         try:
             if run_is_eligible:
                 # The kill switch, shared with the dispatch gate via task_v3_disabled so both
                 # evaluations use the same cache key, wins over the experiment. A kill flipped
                 # mid-run still takes effect at dispatch while these rows already read v3:
-                # stopping the run wins over its attribution.
+                # stopping the run wins over its attribution. Read FIRST, and before the billing
+                # lookup below: a Redis or pooler incident is exactly when someone flips this, and
+                # this lock is held throughout, so the kill switch must not queue behind that call.
                 disabled = await task_v3_disabled(workflow_run_id, organization_id)
-                if not disabled and await provider.is_feature_enabled_cached(
-                    WORKFLOW_TASK_V3_AB_FLAG,
-                    workflow_run_id,
-                    properties={
-                        "organization_id": organization_id,
-                        "workflow_permanent_id": workflow_permanent_id or "not_workflow",
-                    },
-                ):
-                    override = RunEngine.skyvern_v3
+                # billing_tier rides along so a release condition can hold enterprise and self-serve
+                # at different percentages. Deliberately not passed to task_v3_disabled: that flag's
+                # two callers must build identical provider cache keys, see its docstring.
+                if not disabled:
+                    billing_tier = await _billing_tier_for_arm(organization_id)
+                    if await provider.is_feature_enabled_cached(
+                        WORKFLOW_TASK_V3_AB_FLAG,
+                        workflow_run_id,
+                        properties={
+                            "organization_id": organization_id,
+                            "workflow_permanent_id": workflow_permanent_id or "not_workflow",
+                            BILLING_TIER_PROPERTY: billing_tier.value,
+                        },
+                    ):
+                        override = RunEngine.skyvern_v3
         except Exception:
             LOG.warning(
                 "Failed to resolve the workflow-block engine arm; using control",
@@ -92,6 +116,10 @@ async def resolve_workflow_block_engine_arm(
             arm="treatment" if override else "control",
             run_is_eligible=run_is_eligible,
             ineligibility_reason=ineligibility_reason,
+            # None whenever the A/B was never consulted -- an ineligible run, or one the kill switch
+            # already stopped -- so the field means "the tier this run was bucketed on" and never
+            # doubles as "nobody looked".
+            billing_tier=billing_tier.value if billing_tier else None,
         )
 
 
