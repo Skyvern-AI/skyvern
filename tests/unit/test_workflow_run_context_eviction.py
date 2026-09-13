@@ -18,7 +18,11 @@ from skyvern.webeye.browser_manager import BrowserCleanupResult
 
 def _context_manager_with(run_ids: list[str]) -> WorkflowContextManager:
     manager = WorkflowContextManager.__new__(WorkflowContextManager)
-    manager.workflow_run_contexts = {run_id: MagicMock() for run_id in run_ids}
+    manager.workflow_run_contexts = {}
+    for run_id in run_ids:
+        context = MagicMock()
+        context.drain_failure_evidence_capture = AsyncMock()
+        manager.workflow_run_contexts[run_id] = context
     return manager
 
 

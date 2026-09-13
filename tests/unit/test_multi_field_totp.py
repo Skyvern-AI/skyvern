@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import re
-from ast import literal_eval
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+import structlog
 
 from skyvern.config import settings
 from skyvern.forge.agent import (
@@ -57,22 +55,6 @@ _skip_no_browser = pytest.mark.skipif(
     not _has_playwright_browser(),
     reason="Requires Playwright browsers installed (run: playwright install chromium)",
 )
-
-
-def _log_fields(record: logging.LogRecord) -> dict[str, object]:
-    if isinstance(record.msg, dict):
-        return record.msg
-    message = re.sub(r"\x1b\[[0-9;]*m", "", record.getMessage())
-    fields: dict[str, object] = {}
-    for key, value in re.findall(
-        r"""['"]?(\w+)['"]?\s*[:=]\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\[[^\]]*\]|[^\s,}]+)""",
-        message,
-    ):
-        try:
-            fields[key] = literal_eval(value)
-        except (ValueError, SyntaxError):
-            fields[key] = {"true": True, "false": False, "null": None}.get(value, value)
-    return fields
 
 
 def _input(element_id: str, *, input_type: str = "text", frame: str = "frame-a") -> dict:
@@ -1852,14 +1834,13 @@ async def test_group_fill_fallback_navigation_before_final_box_fails(monkeypatch
 )
 @pytest.mark.asyncio
 async def test_group_fill_same_page_detach_reresolves_once_then_falls_back(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, phase: str, remount_kind: str
+    monkeypatch: pytest.MonkeyPatch, phase: str, remount_kind: str
 ) -> None:
     from skyvern.webeye.actions import handler
     from skyvern.webeye.scraper.scraped_page import ScrapedPage
     from skyvern.webeye.scraper.scraper import build_element_dict
     from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_ATTRIBUTE, SECRET_VISUAL_MASK_SCRIPT
 
-    caplog.set_level("INFO")
     task = _fill_task()
     changed_ancestor = remount_kind in {"scope_ancestor_replacement", "scope_ancestor_gone", "scope_ancestor_omitted"}
     replacement_count = remount_kind in {
@@ -2169,7 +2150,7 @@ async def test_group_fill_same_page_detach_reresolves_once_then_falls_back(
     sleep = AsyncMock()
     monkeypatch.setattr(handler, "_apply_secret_visual_mask_if_needed", mask)
     monkeypatch.setattr(handler, "asyncio", ScopedAsyncio(sleep=sleep))
-    with skyvern_context.scoped(context):
+    with skyvern_context.scoped(context), structlog.testing.capture_logs() as captured_logs:
         result = await _fill_multi_field_totp_group(page, scraped_page, task, state, code)
 
     assert not any(selector.startswith("xpath=") for selector in locator_requests)
@@ -2258,12 +2239,10 @@ async def test_group_fill_same_page_detach_reresolves_once_then_falls_back(
             assert next_payload["verification_code"] == code
     assert all(entry == call(0.1) for entry in sleep.await_args_list)
     if not accepted:
-        rejection_logs = [
-            record for record in caplog.records if "Multi-field OTP binding rejected" in record.getMessage()
-        ]
+        rejection_logs = [entry for entry in captured_logs if entry.get("event") == "Multi-field OTP binding rejected"]
         assert len(rejection_logs) == 1
-        assert code not in rejection_logs[0].getMessage() and _SEED not in rejection_logs[0].getMessage()
-        fields = _log_fields(rejection_logs[0])
+        fields = rejection_logs[0]
+        assert code not in str(fields) and _SEED not in str(fields)
         expected_reason = (
             "recovery_budget_exhausted"
             if budget_exhausted

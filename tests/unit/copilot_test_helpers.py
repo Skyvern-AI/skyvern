@@ -143,6 +143,7 @@ def install_get_run_results_harness(
     workflow_parameters: list[dict[str, str]] | None = None,
     attach_action_traces: Callable[..., Awaitable[None]] | None = None,
     recent_actions: list[MagicMock] | None = None,
+    attach_failed_block_screenshots: Callable[..., Awaitable[None]] | None = None,
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with."""
     run = SimpleNamespace(
@@ -175,7 +176,13 @@ def install_get_run_results_harness(
     monkeypatch.setattr(run_execution_module, "app", _AppStub())
     if attach_action_traces is not None:
         monkeypatch.setattr(run_execution_module, "_attach_action_traces", attach_action_traces)
-    monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+    # Stubbed by default so most callers need no artifact store; pass the real function to assert
+    # that at-failure evidence actually reaches the packet rather than that the call was made.
+    monkeypatch.setattr(
+        run_execution_module,
+        "_attach_failed_block_screenshots",
+        attach_failed_block_screenshots or AsyncMock(),
+    )
     monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={}))
     monkeypatch.setattr(run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
     return SimpleNamespace(

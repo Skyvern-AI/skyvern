@@ -335,6 +335,33 @@ class TestTheModelsReplyIsDelivered:
         assert result.narrative_payload["turnFacts"]["terminalCause"] == "browser_operation_failed"
         assert result.narrative_payload["turnFacts"]["ranCleanOnCurrentSource"] is False
 
+    def test_billing_refusal_reports_no_run_or_blocks_and_keeps_the_draft_untested(self) -> None:
+        ctx = _ctx()
+        _record_connect_failure(
+            ctx,
+            BuildTestConnectFailure(
+                state="billing_credit_admission_refusal",
+                retry_action=None,
+            ),
+        )
+
+        result = _result(
+            ctx,
+            updated_workflow=SimpleNamespace(name="untested draft"),
+            workflow_yaml=two_page_login_yaml(),
+            proposal_disposition="auto_applicable",
+            turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
+            narrative_payload=_payload(),
+        )
+
+        facts = (result.narrative_payload or {})["turnFacts"]
+        assert facts["terminalCause"] == "billing_credit_admission_refusal"
+        assert facts["runId"] is None
+        assert facts["runCompleted"] is None
+        assert facts["blocksRunThisTurn"] == 0
+        assert facts["ranCleanOnCurrentSource"] is False
+        assert result.proposal_disposition == "review_untested"
+
     def test_an_empty_completion_reports_its_cause_and_never_claims_a_clean_run(self) -> None:
         ctx = _ctx()
         ctx.empty_completion = True

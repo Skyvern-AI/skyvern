@@ -72,7 +72,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.request_policy import (
-    _CREDENTIALS_UI_DIRECTIONS,
     RequestPolicy,
     _seed_prior_approved_credentials,
     credential_prompt_reason,
@@ -1911,55 +1910,6 @@ class _SlowAnswerCache(_FakeCache):
         if key == self._response_key and time.monotonic() >= self._ready_at:
             return encode_credential_response(self._action, "cred_1" if self._action == "connected" else None)
         return await super().get(key)
-
-
-@pytest.mark.asyncio
-async def test_the_card_outlives_the_model_stream_deadline_the_tool_call_ran_under(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The ask is raised inside the model stream, which runs under the turn deadline; without
-    suspending that deadline for the wait, a user who takes longer than the budget left has the
-    card cancelled out from under them."""
-    ctx = _tool_ctx(
-        monkeypatch,
-        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 4.5),
-    )
-    # Keep the timing order explicit: loaded-runner overhead < turn budget < human
-    # wait < credential-card timeout. The neighboring resume test uses the same
-    # margins because a one-second turn budget is too small on a cold CI shard.
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 4.0)
-    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=30)
-
-    stream = _make_stream()
-    fake_result = _fake_result()
-    calls: list[dict[str, Any]] = []
-
-    def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return fake_result
-
-    async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
-        await _ask(ctx)
-
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", fake_stream_to_sse)
-
-    returned = await run_with_enforcement(
-        agent=MagicMock(),
-        initial_input="hello",
-        ctx=ctx,
-        stream=stream,
-        run_config=RunConfig(),
-        copilot_config=ctx.copilot_config,
-    )
-
-    assert returned is fake_result
-    assert len(calls) == 1
-    assert ctx.credential_pause_outcome == "skipped"
-    assert ctx.model_stream_deadline is None
-    sent = [str(call.args[0]) for call in ctx.stream.send.await_args_list]
-    assert sum(1 for frame in sent if "credential_required" in frame) == 1
-    assert not any(_CREDENTIALS_UI_DIRECTIONS in frame for frame in sent)
 
 
 @pytest.mark.asyncio

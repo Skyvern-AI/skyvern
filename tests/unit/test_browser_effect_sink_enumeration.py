@@ -15,7 +15,7 @@ _CANDIDATE_METHODS = frozenset(
 )
 
 _DISCOVERED_BROWSER_API_CALLS = {
-    "skyvern/forge/agent.py": Counter({"close": 1, "evaluate": 2, "new_page": 1}),
+    "skyvern/forge/agent.py": Counter({"close": 1, "evaluate": 3, "new_page": 1}),
     "skyvern/forge/agent_functions.py": Counter({"close": 1, "scroll_into_view_if_needed": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
@@ -77,7 +77,11 @@ _DISCOVERED_BROWSER_API_CALLS = {
 _EVALUATE_CALLERS = {
     # Read-only DOM fingerprint sample for the v3 settle-before-complete check, and the per-document
     # nonce the v3 loop reads to tell whether a failed batched call navigated the page.
-    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 1, "_page_probe": 1}),
+    # _page_fingerprint samples TWICE: the page's own document, and — with TASK_V3_FRAME_PERCEPTION on
+    # — each readable child frame. Both are the same read-only probe; the second exists because the
+    # settle check is a live gate and a main-frame-only sample reads a page whose child frame is still
+    # rendering as settled (SKY-14657).
+    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 2, "_page_probe": 1}),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
@@ -221,21 +225,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 170
+    assert sum(sum(methods.values()) for methods in observed.values()) == 171
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 165
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 166
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 30
+    assert sum(sum(callers.values()) for callers in observed.values()) == 31
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

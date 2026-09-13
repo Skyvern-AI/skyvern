@@ -48,7 +48,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
-from skyvern.forge.taskv3.loop import LoopOutcome
+from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -69,7 +69,7 @@ async def _run_execute_task_v3(
     monkeypatch: pytest.MonkeyPatch,
     outcome: LoopOutcome,
     post_step_side_effect: BaseException | None = None,
-    action_rounds: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    action_rounds: list[list[RoundAction]] | None = None,
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
     task_block: BaseTaskBlock | None = None,
@@ -553,7 +553,7 @@ async def test_execute_task_v3_scrubs_registered_secret_from_persisted_action_re
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": "sk4829137765"}, True)]],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": "sk4829137765"}, True, billable=True)]],
         action_round_texts=["typing the keysk4829137765into the field"],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -781,8 +781,11 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
     rounds = [
-        [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)],
-        [("click", {"selector": "#submit"}, True)],
+        [
+            RoundAction("click", {"selector": "#a"}, True, billable=True),
+            RoundAction("type", {"selector": "#b", "text": "x"}, True, billable=True),
+        ],
+        [RoundAction("click", {"selector": "#submit"}, True, billable=True)],
     ]
     round_texts = ["clicking the field then typing into it", "submitting the form"]
     step, task, _loop, _post = await _run_execute_task_v3(
@@ -807,11 +810,263 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
     assert all(a.task_id == task.task_id and a.step_id == step.step_id for a in persisted)
     assert all(a.screenshot_artifact_id == "artifact-1" for a in persisted)
     assert [a.action_type for a in persisted] == [ActionType.CLICK, ActionType.INPUT_TEXT, ActionType.CLICK]
-    # Every action in a round carries that round's turn text as its reasoning -- neither
-    # intention nor response, which the turn has no per-action value for.
+    # Every action in a round carries that round's turn text as its reasoning -- never the response,
+    # which the turn has no per-action value for. intention is never None for a tool in TARGET_VERBS:
+    # with no captured name or kind, every row still gets the tool's own FLOOR label.
     assert [a.reasoning for a in persisted] == [round_texts[0], round_texts[0], round_texts[1]]
-    assert all(a.intention is None for a in persisted)
+    assert [a.intention for a in persisted] == ["Clicked an element", "Typed into a text field", "Clicked an element"]
     assert all(a.response is None for a in persisted)
+
+
+def test_every_tool_that_pays_for_a_name_has_something_to_say_about_it() -> None:
+    # The set that triggers the capture lives with the tools; the verbs that render it live in
+    # target_label.py. A tool added to one and not the other pays the probe on every call and throws
+    # the answer away, which nothing else in the build would notice.
+    from skyvern.forge.taskv3.target_label import TARGET_VERBS
+    from skyvern.forge.taskv3.tools import _TARGET_LABEL_TOOL_NAMES
+
+    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_the_captured_target_name_as_the_action_intention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The whole point of the capture: a turn that emitted only tool calls (no prose, so `reasoning`
+    # is None) still leaves every row with a readable label -- a named one where a name was
+    # captured, a floor one where it was not. Each name below differs from every other, so no
+    # assertion can pass on a field nobody wrote.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
+    rounds = [
+        [
+            RoundAction("click", {"selector": "#a"}, True, "Sign In"),
+            RoundAction("type", {"selector": "#b", "text": "x"}, True, "Email address"),
+            RoundAction("click", {"selector": "#c"}, True, None),
+        ]
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[:-1]]
+    # "type" enriches with its default kind's noun ("field") even though no page kind was captured;
+    # "click" has no default kind, so a name enriches bare and a missing one floors generic.
+    assert [a.intention for a in persisted] == [
+        'Clicked "Sign In"',
+        'Typed into the "Email address" field',
+        "Clicked an element",
+    ]
+    assert all(a.reasoning is None for a in persisted)
+
+
+# Every shape a registered secret has been shown to survive in on this path, kept together so the
+# next one is added here rather than in a new file. Each entry is (label_the_page_would_render,
+# registered_secret). Scrubbing lost to all of these because it has to match exactly and the page-side
+# probe had already reshaped the value; dropping does not care about the shape.
+_SECRET_BEARING_LABELS = [
+    pytest.param("Saved sk4829137765 to vault", "sk4829137765", id="plain"),
+    # A secret past the transport cap: the capture is truncated page-side, so an exact match against
+    # the registered whole value can never fire again.
+    pytest.param("Session expired: " + "j" * 900, "j" * 900, id="past-the-cap"),
+    # Whitespace-bearing: the probe collapses it before Python sees it.
+    pytest.param(
+        "Saved -----BEGIN KEY----- MIIBOgIBAAJBAK7 to vault", "-----BEGIN KEY-----\nMIIBOgIBAAJBAK7", id="newlines"
+    ),
+    # Long only because of a whitespace run: collapses UNDER the cap, so the label is accepted while
+    # the registered form still reads as over-cap.
+    pytest.param(
+        "Saved " + "A" * 100 + " " + "B" * 100 + " ok", "A" * 100 + " " * 400 + "B" * 100, id="whitespace-run"
+    ),
+    # Shorter than 8 characters and glued to letters: the shared prose scrub boundary-anchors these.
+    pytest.param("Code123456accepted", "123456", id="short-and-glued"),
+    # Zero-width and bidi marks injected INTO the credential, which is what breaks an exact match.
+    pytest.param("Saved sk48\u200b2913\u200d7765 ok", "sk4829137765", id="zero-width-inside"),
+    pytest.param("Saved sk4829\u202e137765 ok", "sk4829137765", id="bidi-inside"),
+    # Case-flipped, since the check casefolds both sides.
+    pytest.param("Token ABCdef123456 x", "abcDEF123456", id="case-flipped"),
+    # Fullwidth compatibility forms. NFKC folds these; a codepoint blocklist does not, and this is
+    # not purely hostile -- East-Asian pages render digits and letters fullwidth as ordinary styling.
+    pytest.param(
+        "Saved " + "".join(chr(ord(c) + 0xFEE0) for c in "sk4829137765") + " ok", "sk4829137765", id="fullwidth"
+    ),
+    # Combining marks interspersed through the credential. U+034F (combining grapheme joiner) and
+    # U+FE0F (variation selector-16) are category Mn, NOT Cf, so a format-only strip misses them --
+    # and they render invisibly, so the label would look exactly like the plaintext secret.
+    pytest.param(
+        "Saved " + "".join(c + "\u034f" for c in "sk4829137765") + " ok", "sk4829137765", id="combining-joiner"
+    ),
+    pytest.param(
+        "Saved " + "".join(c + "\ufe0f" for c in "sk4829137765") + " ok", "sk4829137765", id="variation-selector"
+    ),
+]
+
+
+@pytest.mark.parametrize(("rendered_label", "secret"), _SECRET_BEARING_LABELS)
+@pytest.mark.asyncio
+async def test_an_element_name_that_touches_a_secret_is_dropped_not_scrubbed(
+    monkeypatch: pytest.MonkeyPatch, rendered_label: str, secret: str
+) -> None:
+    # A page can render what was just typed into it as the field's own accessible name. The name is
+    # dropped whole and the row falls back to the kind's floor label, which holds no page text.
+    touched, untouched = await _persisted_click_intentions(monkeypatch, rendered_label, {secret})
+
+    assert touched == "Clicked a button"
+    assert secret not in touched
+    assert untouched == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_registered_secret_that_reads_like_a_label_is_still_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Words only, so the shape filter passes it: the registered-secret matcher is the only layer that
+    # can stop it on a masked run.
+    secret = "correct horse battery"
+    touched, untouched = await _persisted_click_intentions(monkeypatch, f"Saved {secret.upper()}", {secret})
+
+    assert touched == "Clicked a button"
+    assert untouched == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_configured_secret_is_dropped_from_the_label_even_when_masking_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The label check only decides whether to drop a page-supplied name, so it consults every
+    # configured secret; the run's masking opt-out still leaves its reasoning unredacted.
+    from skyvern.forge import agent as agent_mod
+
+    secret = "correct horse battery"
+
+    def _configured_secrets(*_a: object, respect_artifact_redaction_flag: bool = True, **_k: object) -> set[str]:
+        return set() if respect_artifact_redaction_flag else {secret}
+
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.artifact_redaction_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(f"{manager}.get_secret_values_for_run", _configured_secrets)
+    monkeypatch.setattr(f"{manager}.runtime_secret_values_for_artifacts", lambda *_a, **_k: set())
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, f"Saved {secret}", "button"),
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        action_round_texts=[f"typing {secret} into the box"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+    touched, untouched = calls[0].kwargs["action"], calls[1].kwargs["action"]
+
+    assert touched.intention == "Clicked a button"
+    assert untouched.intention == 'Clicked the "Continue to review" button'
+    assert secret in (touched.reasoning or "")
+
+
+@pytest.mark.asyncio
+async def test_a_short_configured_secret_below_the_redaction_floor_is_still_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A three-digit CVV never reaches the redaction set (numeric floor of six), and the shape filter
+    # accepts "CVV 123", so only the unfloored drop-check set can catch it.
+    from skyvern.forge import agent as agent_mod
+
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.artifact_redaction_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(f"{manager}.get_secret_values_for_run", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.runtime_secret_values_for_artifacts", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.secret_values_for_drop_check", lambda *_a, **_k: {"123"})
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, "CVV 123", "button"),
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+
+    assert calls[0].kwargs["action"].intention == "Clicked a button"
+    assert calls[1].kwargs["action"].intention == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_label_failure_never_logs_a_traceback_that_could_hold_the_drop_check_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The label helper is the only frame holding the unfloored configured secrets; its own failure is
+    # logged without exc_info, so no traceback renderer that prints frame locals can reach them.
+    from structlog.testing import capture_logs
+
+    from skyvern.forge import agent as agent_mod
+
+    secret = "correct horse battery"
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.secret_values_for_drop_check", lambda *_a, **_k: {secret})
+
+    def _boom(*_a: object, **_k: object) -> str:
+        raise RuntimeError("label composition failed")
+
+    monkeypatch.setattr(agent_mod, "compose_target_intention", _boom)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            action_rounds=[[RoundAction("click", {"selector": "#a"}, True, f"Saved {secret}", "button")]],
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    label_failures = [entry for entry in logs if entry.get("event") == "task_v3 failed to compose action label"]
+
+    # The row still persists, just without a label.
+    assert persisted.intention is None
+    assert label_failures
+    assert all("exc_info" not in entry for entry in label_failures)
+    assert secret not in repr(logs)
+
+
+async def _persisted_click_intentions(
+    monkeypatch: pytest.MonkeyPatch, rendered_label: str, secret_values: set[str]
+) -> tuple[str | None, str | None]:
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: secret_values
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, rendered_label, "button"),
+                # Positive control under the same secret set: without it, a build that dropped every
+                # name unconditionally would pass.
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+    return calls[0].kwargs["action"].intention, calls[1].kwargs["action"].intention
 
 
 @pytest.mark.asyncio
@@ -823,7 +1078,7 @@ async def test_execute_task_v3_persists_action_row_when_screenshot_fails(monkeyp
     step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("click", {"selector": "#a"}, True)]],
+        action_rounds=[[RoundAction("click", {"selector": "#a"}, True, billable=True)]],
         screenshot_raises=True,
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -2388,8 +2643,11 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
     # counts v3 rounds exactly (distinct (task, order) pairs across steps and actions).
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type", "type", "click"])
     rounds = [
-        [("type", {"selector": "#a"}, True), ("type", {"selector": "#b"}, True)],
-        [("click", {"selector": "#go"}, True)],
+        [
+            RoundAction("type", {"selector": "#a"}, True, billable=True),
+            RoundAction("type", {"selector": "#b"}, True, billable=True),
+        ],
+        [RoundAction("click", {"selector": "#go"}, True, billable=True)],
     ]
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
@@ -3238,7 +3496,7 @@ async def test_execute_task_v3_failed_round_persists_failed_action_row(
     # A dispatched round that errored still consumed budget: its row persists with status=failed
     # and its round index, so later blocks count it against the workflow-run ceiling.
     outcome = LoopOutcome(status="budget_exhausted", reason="cap", billable_actions=[])
-    rounds = [[("click", {"selector": "#x"}, False)]]
+    rounds = [[RoundAction("click", {"selector": "#x"}, False, billable=True)]]
     await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
     )
@@ -3246,6 +3504,8 @@ async def test_execute_task_v3_failed_round_persists_failed_action_row(
     action = create_action.await_args.kwargs["action"]
     assert action.status == ActionStatus.failed
     assert action.step_order == 0
+    clicked = create_action.await_args_list[0].kwargs["action"]
+    assert clicked.intention == "Tried to click an element"
 
 
 @pytest.mark.asyncio
@@ -3282,9 +3542,9 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
     # consume a workflow-run budget unit: their rows keep the current round index.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
     rounds = [
-        [("navigate", {"url": "https://a.test"}, True)],
-        [("click", {"selector": "#go"}, True)],
-        [("scroll", {"amount": 500}, True)],
+        [RoundAction("navigate", {"url": "https://a.test"}, True)],
+        [RoundAction("click", {"selector": "#go"}, True, billable=True)],
+        [RoundAction("scroll", {"amount": 500}, True)],
     ]
     await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
@@ -3644,14 +3904,16 @@ async def test_execute_task_v3_persists_typed_actions_that_hydrate_as_their_subc
 
     rounds = [
         [
-            ("click", {"selector": "#go"}, True),
-            ("hover", {"selector": "#menu"}, True),
-            ("type", {"selector": "#q", "text": "hello"}, True),
-            ("select_option", {"selector": "#plan", "label": "Pro"}, True),
-            ("select_combobox", {"selector": "#city", "value": "Lisbon"}, True),
-            ("press_key", {"key": "Enter"}, True),
-            ("file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True),
-            ("solve_captcha", {}, True),
+            RoundAction("click", {"selector": "#go"}, True, billable=True),
+            RoundAction("hover", {"selector": "#menu"}, True, billable=True),
+            RoundAction("type", {"selector": "#q", "text": "hello"}, True, billable=True),
+            RoundAction("select_option", {"selector": "#plan", "label": "Pro"}, True, billable=True),
+            RoundAction("select_combobox", {"selector": "#city", "value": "Lisbon"}, True, billable=True),
+            RoundAction("press_key", {"key": "Enter"}, True, billable=True),
+            RoundAction(
+                "file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True, billable=True
+            ),
+            RoundAction("solve_captcha", {}, True),
         ]
     ]
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
@@ -3708,7 +3970,7 @@ async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_
     await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": typed_code}, True)]],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": typed_code}, True, billable=True)]],
         workflow_run_id="wr_v3test",
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -4368,7 +4630,7 @@ async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": "73914268"}, True)]],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": "73914268"}, True, billable=True)]],
         action_round_texts=["typing the verification code 73914268 into the field"],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -4389,7 +4651,7 @@ async def test_execute_task_v3_caps_persisted_reasoning_length(monkeypatch: pyte
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("click", {"selector": "#a"}, True)]],
+        action_rounds=[[RoundAction("click", {"selector": "#a"}, True, billable=True)]],
         action_round_texts=["x" * 5000],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -4412,7 +4674,7 @@ async def test_execute_task_v3_persists_reload_row_with_its_own_reason(monkeypat
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("reload_page", {"reason": "a page-level handler requested a refresh"}, True)]],
+        action_rounds=[[RoundAction("reload_page", {"reason": "a page-level handler requested a refresh"}, True)]],
         action_round_texts=["retrying after the handler asked for a refresh"],
         data_extraction_goal=None,
         extracted_information_schema=None,

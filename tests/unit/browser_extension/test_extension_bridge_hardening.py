@@ -197,6 +197,46 @@ if (commandError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
 if (!detached.includes(21) || router.attachedTabs.has(21)) {{
   throw new Error("timed-out command did not execute bounded detach recovery");
 }}
+
+// A timed-out child-session command must preserve the tab and child tracking.
+router.attachedTabs.add(23);
+router.attachStates.set(23, {{ status: "attached" }});
+const childSessionId = "child-session-23";
+router.childTargets.set(childSessionId, {{ tabId: 23, type: "iframe" }});
+chrome.debugger.sendCommand = (target, method) =>
+  target.sessionId === childSessionId
+    ? new Promise(() => undefined)
+    : Promise.resolve({{ method }});
+let childCommandError;
+try {{
+  await router.send({{
+    tabId: 23,
+    sessionId: childSessionId,
+    method: "Page.createIsolatedWorld",
+    params: {{ frameId: 123, worldName: "test" }},
+  }});
+}} catch (error) {{
+  childCommandError = error;
+}}
+if (childCommandError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`child command timeout was not structured: ${{childCommandError?.code}}`);
+}}
+if (
+  detached.includes(23) ||
+  !router.attachedTabs.has(23) ||
+  router.attachStates.get(23)?.status !== "attached" ||
+  !router.childTargets.has(childSessionId)
+) {{
+  throw new Error("timed-out child command changed tab or child-session state");
+}}
+const rootAfterChildTimeout = await router.send({{
+  tabId: 23,
+  method: "Runtime.evaluate",
+  params: {{ expression: "2+2" }},
+}});
+if (rootAfterChildTimeout.result.method !== "Runtime.evaluate") {{
+  throw new Error("root command did not complete after child timeout");
+}}
 const healthy = await router.send({{ tabId: 22, method: "Runtime.evaluate", params: {{ expression: "2+2" }} }});
 if (healthy.result.method !== "Runtime.evaluate") {{
   throw new Error("healthy tab command was blocked by a wedged tab");

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
@@ -17,6 +18,7 @@ from skyvern.cli.core.page_read import (
     prune_html,
     read_page,
 )
+from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import inspection
 from skyvern.cli.mcp_tools.inspection import skyvern_page
 
@@ -293,6 +295,129 @@ async def test_cursor_uses_real_binding_across_replicas(monkeypatch: pytest.Monk
 
     assert second["data"]["content"] == "B" * 50_000
     assert second["data"]["total_size"] == len(document)
+
+
+class _HangingBindingScope(_ReplicaScope):
+    """Document-epoch reads never settle; the content read is unaffected."""
+
+    def __init__(self, content: str, document_epoch: float) -> None:
+        super().__init__(content, document_epoch)
+        self.awaits = 0
+        self.released = asyncio.Event()
+
+    async def evaluate(self, _expression: str) -> float:
+        self.awaits += 1
+        await self.released.wait()
+        return self.document_epoch
+
+
+class _SlowReadScope(_ReplicaScope):
+    """Both identity checks answer quickly; the content read between them is slow but healthy."""
+
+    def __init__(self, content: str, document_epoch: float, read_delay_s: float) -> None:
+        super().__init__(content, document_epoch)
+        self.read_delay_s = read_delay_s
+
+    async def content(self) -> str:
+        await asyncio.sleep(self.read_delay_s)
+        return self.content_value
+
+    async def evaluate(self, _expression: str) -> float:
+        await asyncio.sleep(0.001)
+        return self.document_epoch
+
+
+class _SlowThenHangingBindingScope(_ReplicaScope):
+    """The first identity check answers slowly; the second never settles."""
+
+    def __init__(self, content: str, document_epoch: float, first_delay_s: float) -> None:
+        super().__init__(content, document_epoch)
+        self.first_delay_s = first_delay_s
+        self.awaits = 0
+
+    async def evaluate(self, _expression: str) -> float:
+        self.awaits += 1
+        if self.awaits == 1:
+            await asyncio.sleep(self.first_delay_s)
+            return self.document_epoch
+        await asyncio.Event().wait()
+        return self.document_epoch
+
+
+def _patch_replica_get_page(monkeypatch: pytest.MonkeyPatch, page: _ReplicaPage) -> None:
+    async def fake_get_page(**_kwargs: object) -> tuple[_ReplicaPage, BrowserContext]:
+        return page, BrowserContext(mode="cloud_session", session_id="pbs_session")
+
+    monkeypatch.setattr(inspection, "get_page", fake_get_page)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_evaluate_action_lifecycle_bounds_a_cursor_binding_that_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = "A" * 150_000
+    page = _ReplicaPage(frame_chain=_STABLE_FRAME_CHAIN, content=document)
+    scope = _HangingBindingScope(document, 1234.5)
+    page.locator_scope = scope
+    _patch_replica_get_page(monkeypatch, page)
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 200)
+
+    result = await skyvern_page(mode="html", max_chars=50_000)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == inspection.ErrorCode.TIMEOUT
+    assert "cursor" not in result["error"]["hint"].lower()
+    assert scope.awaits == 1
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_evaluate_action_lifecycle_keeps_a_slow_healthy_read_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = "A" * 150_000
+    page = _ReplicaPage(frame_chain=_STABLE_FRAME_CHAIN, content=document)
+    page.locator_scope = _SlowReadScope(document, 1234.5, read_delay_s=0.2)
+    _patch_replica_get_page(monkeypatch, page)
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 600)
+
+    result = await skyvern_page(mode="html", max_chars=50_000)
+
+    assert result["ok"] is True
+    assert result["data"]["cursor_next"] is not None
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_evaluate_action_lifecycle_bounds_the_post_read_binding_that_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = "A" * 150_000
+    page = _ReplicaPage(frame_chain=_STABLE_FRAME_CHAIN, content=document)
+    scope = _SlowThenHangingBindingScope(document, 1234.5, first_delay_s=0.24)
+    page.locator_scope = scope
+    _patch_replica_get_page(monkeypatch, page)
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 400)
+
+    result = await skyvern_page(mode="html", max_chars=50_000)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == inspection.ErrorCode.TIMEOUT
+    assert scope.awaits == 2
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_evaluate_action_lifecycle_keeps_a_read_longer_than_the_budget_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = "A" * 150_000
+    page = _ReplicaPage(frame_chain=_STABLE_FRAME_CHAIN, content=document)
+    page.locator_scope = _SlowReadScope(document, 1234.5, read_delay_s=0.3)
+    _patch_replica_get_page(monkeypatch, page)
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 200)
+
+    result = await skyvern_page(mode="html", max_chars=50_000)
+
+    assert result["ok"] is True
+    assert result["data"]["cursor_next"] is not None
 
 
 @pytest.mark.asyncio
@@ -857,14 +982,127 @@ async def test_skyvern_page_keeps_terminal_cursor_key_in_concise_mode(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_page_cursor_binding_reflects_the_document_recovery_landed_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Navigation recovery retries the epoch read against a new document; the rest of the snapshot
+    must describe that document too, or a paginated read rejects its own initial binding."""
+    from playwright.async_api import Error as PlaywrightError
+
+    from skyvern.cli.core.result import BrowserContext
+    from skyvern.cli.mcp_tools import inspection
+
+    class NavigatingScope:
+        def __init__(self, page: object) -> None:
+            self.page = page
+            self.calls = 0
+
+        async def evaluate(self, expression: object = None, arg: object | None = None) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                self.page.url = "https://example.test/after"
+                raise PlaywrightError("Execution context was destroyed, most likely because of a navigation")
+            return 1234.0
+
+        async def wait_for_load_state(self, state: object = None, timeout: float | None = None) -> None:
+            return None
+
+    class NavigatingPage:
+        working_frame = None
+        url = "https://example.test/before"
+
+    page = NavigatingPage()
+    page.locator_scope = NavigatingScope(page)
+
+    binding = await inspection._page_cursor_binding(page, ctx=BrowserContext(mode="local"))
+
+    _identity, page_url, _frames, epoch = binding
+    assert epoch == 1234.0
+    assert page_url == "https://example.test/after", binding
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_reports_a_deadline_transport_error_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from playwright.async_api import Error as PlaywrightError
+
+    from skyvern.cli.core.result import BrowserContext
+    from skyvern.cli.mcp_tools import inspection
+
+    class StalledScope:
+        async def evaluate(self, _expression: str, _arg: object | None = None) -> object:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise PlaywrightError("Target page, context or browser has been closed") from None
+
+    class StalledPage:
+        working_frame = None
+        url = "https://example.test/"
+        locator_scope = StalledScope()
+
+    async def fake_get_page(**_kwargs: object) -> tuple[StalledPage, BrowserContext]:
+        return StalledPage(), BrowserContext(mode="local")
+
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    monkeypatch.setattr(inspection, "get_page", fake_get_page)
+
+    result = await inspection.skyvern_page()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "TIMEOUT", result
+
+
+@pytest.mark.asyncio
+async def test_skyvern_page_does_not_report_a_slow_content_read_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.cli.core.result import BrowserContext
+    from skyvern.cli.mcp_tools import inspection
+
+    class ReadyScope:
+        async def evaluate(self, _expression: str, _arg: object | None = None) -> object:
+            return 1.0
+
+    class ReadyPage:
+        working_frame = None
+        url = "https://example.test/"
+        locator_scope = ReadyScope()
+
+    async def fake_get_page(**_kwargs: object) -> tuple[ReadyPage, BrowserContext]:
+        return ReadyPage(), BrowserContext(mode="local")
+
+    async def slow_then_broken(*_args: object, **_kwargs: object) -> dict[str, object]:
+        # Outlasts the identity check's own bound, then fails for its own reason.
+        await asyncio.sleep(0.12)
+        raise RuntimeError("content read failed")
+
+    monkeypatch.setattr(inspection, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    monkeypatch.setattr(inspection, "get_page", fake_get_page)
+    monkeypatch.setattr(inspection, "read_page", slow_then_broken)
+
+    result = await inspection.skyvern_page()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "ACTION_FAILED", result
+    assert result["error"]["message"] == "content read failed"
+
+
+@pytest.mark.asyncio
 async def test_skyvern_page_returns_structured_error_when_cursor_binding_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from skyvern.cli.core.result import BrowserContext
     from skyvern.cli.mcp_tools import inspection
 
+    class HealthyScope:
+        async def evaluate(self, expression: object = None, arg: object | None = None) -> object:
+            return 1.0
+
     class BrokenPage:
         working_frame = None
+        locator_scope = HealthyScope()
 
         @property
         def url(self) -> str:

@@ -10,7 +10,10 @@ from fastapi import HTTPException
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_mod
 from skyvern.schemas.browser_session_timeouts import max_lifetime_exceeded_warning
-from skyvern.webeye.persistent_sessions_manager import BrowserSessionExtension
+from skyvern.webeye.persistent_sessions_manager import (
+    BrowserSessionCreditAdmissionRefusal,
+    BrowserSessionExtension,
+)
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 
@@ -145,6 +148,24 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
         )
 
     assert app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["needs_live_view"] is needs_live_view
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_preserves_typed_credit_refusal_http_contract() -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=BrowserSessionCreditAdmissionRefusal())
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.detail == "Credits exhausted. Upgrade your plan in Billing."
 
 
 def test_a_session_request_is_unwatched_unless_it_says_otherwise() -> None:

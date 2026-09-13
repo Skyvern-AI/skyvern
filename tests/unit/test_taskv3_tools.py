@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import itertools
 import json
 import re
 import time
@@ -27,7 +28,12 @@ from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
-from skyvern.forge.taskv3.loop import SemanticCommitStats
+from skyvern.forge.taskv3.code_surface import (
+    CodeToolSurface,
+    apply_surface,
+    configured_surface,
+)
+from skyvern.forge.taskv3.loop import CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
 from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
@@ -1768,6 +1774,18 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "group_texts_found",
         "a11y_removed_listed",
         "duplicate_digest_lines",
+        "frames_same_origin",
+        "frames_cross_origin",
+        "frames_same_origin_interactive",
+        "frames_peeked",
+        "frames_peek_failed",
+        "frame_scan_failed",
+        "frame_unreadable_regions",
+        "elements_listed",
+        "elements_truncated",
+        "elements_truncated_in_components",
+        "elements_dropped",
+        "elements_truncated_by_page_cap",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -1777,6 +1795,18 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
     assert summary["text_dropped"] > 0
     assert summary["omitted_unnameable"] == 1
     assert summary["markers_minted"] == 1 and summary["markers_reused"] == 0
+    # The census rides this same record, so it is pinned to values here rather than to key names:
+    # `set_content` leaves the page on about:blank, where `location.origin` is "null" and the
+    # component root's frame is cross-origin by construction. A census that silently stopped
+    # counting would keep every key and still read as a clean zero.
+    assert summary["frames_cross_origin"] == 1
+    assert summary["frames_same_origin"] == 0
+    assert summary["frames_same_origin_interactive"] == 0
+    assert summary["frames_peeked"] == 0 and summary["frames_peek_failed"] == 0
+    # The scan reached that frame (`iframes_in_component_roots` above), so neither channel may
+    # report a gap it did not have.
+    assert summary["frame_scan_failed"] == 0
+    assert summary["frame_unreadable_regions"] == 0
     # The second pass finds the markers the first one wrote, so minted and reused trade places.
     assert second.data is not None
     assert second.data["summary"]["markers_reused"] == 1 and second.data["summary"]["markers_minted"] == 0
@@ -3457,7 +3487,7 @@ async def test_observe_renders_cross_origin_iframe_presence_line() -> None:
     tools = build_browser_tools(_fixed_page_provider(_IframePage()))
     r = await _tool(tools, "observe").handler({})
     assert r.status == "ok"
-    assert "9 cross-origin" in r.content
+    assert "iframes: 9 in the page" in r.content
     assert "[captcha] challenges.antibot-vendor.test" in r.content
     assert "embed.media.test" in r.content
     assert "+7 more" in r.content
@@ -3495,8 +3525,427 @@ async def test_observe_iframe_scan_survives_poisoned_frame_and_renders_end_to_en
 
         r = await _tool(build_browser_tools(_provider), "observe").handler({})
         assert r.status == "ok"
-        assert "iframes: 1 cross-origin" in r.content
+        assert "iframes: 1 in the page" in r.content
         assert "[captcha] challenges.antibot-vendor.test" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_surfaces_a_same_origin_full_viewport_iframe() -> None:
+    # A same-origin iframe used to be skipped outright by the presence channel, so a challenge
+    # rendered from the page's own origin (still opaque to element perception, which is main-frame
+    # only) went completely unreported. `set_content` leaves the page on about:blank, where every
+    # frame is cross-origin by construction, so this needs a routed real origin.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                if route.request.url.endswith("/frame"):
+                    body = "<p>challenge content</p>"
+                else:
+                    body = (
+                        "<!doctype html><html><body>"
+                        '<iframe src="/frame" style="position:fixed;top:0;left:0;border:none" '
+                        'width="1024" height="900"></iframe>'
+                        '<iframe src="/helper" width="4" height="4"></iframe>'
+                        "</body></html>"
+                    )
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            data = await _observe_data(page)
+            entries = (data.get("iframes") or {}).get("entries") or []
+            assert len(entries) == 1, data.get("iframes")
+            assert entries[0]["sameOrigin"] is True, entries[0]
+            assert entries[0]["viewportPct"] >= 50, entries[0]
+
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+            assert line is not None, r.content
+            assert "[same-origin]" in line, line
+            assert "% of viewport]" in line, line
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_frame_census_counts_frames_the_reporting_scan_filters_out() -> None:
+    # SKY-15590. The census exists because `iframes.total` counts frames worth REPORTING to the model:
+    # it drops srcdoc frames (inherently same-origin) and same-origin frames under 5% of the viewport.
+    # Using it as prevalence would undercount exactly the same-origin frames the main-frame-only tool
+    # loop cannot see into. Both filtered shapes are present here and both must reach the census.
+    # `set_content` leaves the page on about:blank, where every frame is cross-origin by construction,
+    # so this needs a routed real origin or the census would read 0 and pass for the wrong reason.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                if route.request.url.endswith("/tiny"):
+                    body = "<button id='in-frame'>Act</button>"
+                elif route.request.url.endswith("/decor"):
+                    body = "<p>decorative</p>"
+                else:
+                    body = (
+                        "<!doctype html><html><body><input id='main-field'>"
+                        # under 5% of viewport and same-origin: dropped from entries/total, counted here
+                        '<iframe src="/tiny" width="80" height="40"></iframe>'
+                        # same-origin with nothing actionable: counted, but not as interactive
+                        '<iframe src="/decor" width="80" height="40"></iframe>'
+                        # srcdoc is same-origin and skipped outright by the reporting scan
+                        "<iframe srcdoc=\"<button>inline</button>\" width='80' height='40'></iframe>"
+                        "</body></html>"
+                    )
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            data = await _observe_data(page)
+            census = data.get("frameCensus") or {}
+            iframe_info = data.get("iframes") or {}
+
+            # The census sees all three; the reporting scan was built to ignore them.
+            assert census.get("sameOrigin") == 3, (census, iframe_info)
+            assert census.get("crossOrigin") == 0, census
+            assert iframe_info.get("total") == 0, iframe_info
+            # Two carry a control, one is decorative: the split that answers whether a fix would reach
+            # anything actionable or would only enumerate chrome.
+            assert census.get("sameOriginInteractive") == 2, census
+            # The peek is capped, so a page past the cap must be distinguishable from one with fewer.
+            assert census.get("peeked") == 3, census
+
+            # BEHAVIOUR NEUTRALITY: telemetry only. The model-facing reading must not gain a frame line.
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            assert r.status == "ok", r.content
+            assert not any(ln.startswith("iframes:") for ln in r.content.splitlines()), r.content
+            assert "main-field" in r.content or "ref=" in r.content, r.content
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_reports_frame_counts_on_every_call_including_frame_free_pages() -> None:
+    # SKY-15590's whole point is a RATE, and a rate needs a denominator. An earlier version logged
+    # only when frames were present, which makes "fraction of observes carrying a same-origin frame"
+    # compute to ~100% because the population is pre-filtered to the interesting cases. The counts
+    # therefore ride the per-call summary unconditionally: a frame-free page must report zeros, not
+    # silence. (They are ints because the loop's record filter keeps ints and drops bools.)
+    async with _content_page("<!doctype html><html><body><input id='only-field'></body></html>") as page:
+
+        async def _provider() -> Any:
+            return page
+
+        r = await _tool(build_browser_tools(_provider), "observe").handler({})
+        assert r.status == "ok", r.content
+        summary = (r.data or {}).get("summary") or {}
+        for field in (
+            "frames_same_origin",
+            "frames_cross_origin",
+            "frames_same_origin_interactive",
+            "frames_peeked",
+            "frames_peek_failed",
+            "frame_scan_failed",
+        ):
+            assert field in summary, (field, summary)
+            assert isinstance(summary[field], int) and not isinstance(summary[field], bool), (field, summary)
+        assert summary["frames_same_origin"] == 0, summary
+        assert summary["frames_cross_origin"] == 0, summary
+        assert summary["frame_scan_failed"] == 0, summary
+        # NOT MODEL-FACING, pinned rather than asserted in prose: only `content` is ever put in a
+        # message (the loop builds {"role": "tool", ..., "content": ...}), and every reader of
+        # `data` keys off named fields, so these counts cannot reach the model or change behaviour.
+        assert not any(field.startswith("frames_") for field in r.content.split()), r.content
+        assert "frame_scan_failed" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_frame_census_separates_cross_origin_and_survives_a_closed_frame() -> None:
+    # A cross-origin frame must land in its own bucket (the peek cannot read it, and must not throw),
+    # and a frame whose document is unreachable must cost the census that frame's interactivity only,
+    # never the surrounding scan.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                body = (
+                    "<!doctype html><html><body>"
+                    '<iframe src="/local" width="300" height="200"></iframe>'
+                    '<iframe src="http://other-origin.test/x" width="300" height="200"></iframe>'
+                    "</body></html>"
+                    if route.request.url.endswith("/start")
+                    else "<button>x</button>"
+                )
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            census = (await _observe_data(page)).get("frameCensus") or {}
+            assert census.get("sameOrigin") == 1, census
+            assert census.get("crossOrigin") == 1, census
+            # Exact, not a bound: `<= 1` was satisfied by an always-zero regression, so it verified
+            # "cross-origin is never interactive" while NOT verifying that detection works at all.
+            # The same-origin frame here serves a button, so exactly one must be interactive.
+            assert census.get("sameOriginInteractive") == 1, census
+            assert census.get("peekFailed") == 0, census
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_frame_census_banks_inherited_and_opaque_origins_on_the_right_sides() -> None:
+    # Two frames that a URL-origin comparison alone gets WRONG, in opposite directions.
+    # `about:blank` inherits the embedder's origin and its document is readable, but URL serializes
+    # that origin as "null" -- so a bare origin check banks a reachable frame as unreachable, which
+    # is the census undercounting the bucket a fix could actually reach.
+    # A sandboxed frame is the mirror image: its src IS same-origin, so the census rightly counts it
+    # there, but the sandbox forces an opaque origin. Note the mechanism, because it decides the
+    # code: `contentDocument` returns NULL for an opaque-origin frame rather than throwing, so a
+    # truthiness guard alone scores it "decorative" and the catch never runs. Unreadable is not
+    # empty, and it must be DISCLOSED. Nothing else in the suite makes `peekFailed` fire at all.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                body = (
+                    "<!doctype html><html><body>"
+                    '<iframe src="about:blank" width="300" height="200"></iframe>'
+                    '<iframe src="/boxed" sandbox="allow-scripts" width="300" height="200"></iframe>'
+                    "</body></html>"
+                    if route.request.url.endswith("/start")
+                    else "<button>x</button>"
+                )
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            census = (await _observe_data(page)).get("frameCensus") or {}
+            # Both land same-origin: one by inheritance, one by its src.
+            assert census.get("sameOrigin") == 2, census
+            assert census.get("crossOrigin") == 0, census
+            # `peeked` counts documents actually READ, and the sandboxed one never yields a
+            # document, so only about:blank is peeked.
+            assert census.get("peeked") == 1, census
+            # The sandboxed one is unreadable and says so, rather than reading as a frame with
+            # nothing in it -- the silent zero this census exists to prevent.
+            assert census.get("peekFailed") == 1, census
+            # about:blank is genuinely empty, and the sandboxed one could not be read, so neither
+            # may be claimed as interactive.
+            assert census.get("sameOriginInteractive") == 0, census
+        finally:
+            await browser.close()
+
+
+def test_the_frame_census_control_set_cannot_silently_fall_behind_the_scanners_own() -> None:
+    # `INTERACTIVE_SEL` is a third hand-maintained copy of a control list this script already
+    # defines as `q`, so a role added to `q` would leave the census quietly undercounting. This
+    # turns that drift into a red instead.
+    import re  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import _OBSERVE_JS  # noqa: PLC0415
+
+    def terms(raw: str) -> set[str]:
+        # Strip the :is()/:not() wrapper so the comparison is over the control terms themselves.
+        raw = re.sub(r"^:is\(|\):not\(.*$", "", raw)
+        return {t.strip().replace('"', "").replace("'", "").split(":not(")[0] for t in raw.split(",") if t.strip()}
+
+    census = terms(re.search(r"const INTERACTIVE_SEL = '([^']+)'", _OBSERVE_JS).group(1))
+    q = terms(re.search(r"  const q = '([^']+)'", _OBSERVE_JS).group(1))
+    missing = q - census
+    assert not missing, f"census control set fell behind `q`: {sorted(missing)}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_frame_census_leaves_the_capped_frames_countable() -> None:
+    # The peek is capped, so on a busy page some readable frames are never inspected. If a capped
+    # frame were indistinguishable from an inspected one, an INCOMPLETE interactivity census would
+    # read as complete -- so every same-origin frame must land in exactly one of peeked/peekFailed/
+    # neither, leaving `sameOrigin - peeked - peekFailed` as the number the cap discarded.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                body = (
+                    "<!doctype html><html><body>"
+                    + "".join(f'<iframe src="/f{i}" width="120" height="80"></iframe>' for i in range(14))
+                    + "</body></html>"
+                    if route.request.url.endswith("/start")
+                    else "<button>go</button>"
+                )
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            census = (await _observe_data(page)).get("frameCensus") or {}
+            assert census.get("sameOrigin") == 14, census
+            # Exactly the cap, not "at most": a regression that stopped peeking would also satisfy <=.
+            assert census.get("peeked") == 12, census
+            # Nothing failed here, so the whole remainder is attributable to the cap.
+            assert census.get("peekFailed") == 0, census
+            capped = census["sameOrigin"] - census["peeked"] - census["peekFailed"]
+            assert capped == 2, (capped, census)
+            # Only the inspected ones may be claimed, never all 14.
+            assert census.get("sameOriginInteractive") == 12, census
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_keeps_a_same_origin_interstitial_listed_behind_many_embeds() -> None:
+    # The entry cap is 8: embeds that fill every slot first must not push out a same-origin
+    # interstitial that has no challenge signature and covers less than the viewport-filling bar.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                if route.request.url.startswith("http://sameorigin.test/start"):
+                    embeds = "".join(
+                        f'<iframe src="http://embed{i}.test/ad" width="100" height="60"></iframe>' for i in range(9)
+                    )
+                    body = (
+                        "<!doctype html><html><body>"
+                        + embeds
+                        + '<iframe src="/gate" style="position:fixed;top:0;left:0;border:none" '
+                        'width="1024" height="540"></iframe></body></html>'
+                    )
+                else:
+                    body = "<p>frame</p>"
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            info = (await _observe_data(page)).get("iframes") or {}
+            entries = info.get("entries") or []
+            assert info.get("total") == 10, info
+            assert len(entries) == 8, info
+            assert any(e.get("sameOrigin") for e in entries), entries
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_a_late_captcha_frame_behind_many_same_origin_frames() -> None:
+    # Same-origin frames that clear the size bar outrank embeds, but they must not lock the capped
+    # slots against a later frame carrying a challenge signature.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                if route.request.url.startswith("http://sameorigin.test/start"):
+                    # Mixed ranks, with the lowest (a small cross-origin embed) mid-list, so only a true
+                    # lowest-rank search picks the entry the late challenge frame should replace.
+                    panes = [f'<iframe src="/pane{i}" width="300" height="300"></iframe>' for i in range(7)]
+                    panes.insert(3, '<iframe src="http://embed.test/ad" width="100" height="60"></iframe>')
+                    body = (
+                        "<!doctype html><html><body>"
+                        + "".join(panes)
+                        + '<iframe src="http://challenges.antibot-vendor.test/captcha" width="100" height="60"></iframe>'
+                        "</body></html>"
+                    )
+                else:
+                    body = "<p>frame</p>"
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            info = (await _observe_data(page)).get("iframes") or {}
+            entries = info.get("entries") or []
+            assert info.get("total") == 9, info
+            assert len(entries) == 8, info
+            assert any(e.get("captcha") for e in entries), entries
+            assert sum(1 for e in entries if e.get("sameOrigin")) == 7, entries
+            assert not any(e.get("host") == "embed.test" for e in entries), entries
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_a_viewport_filling_challenge_behind_many_small_ones() -> None:
+    # Eight small challenge widgets fill the cap first; a later challenge frame covering the viewport
+    # must still outrank them rather than tie and drop into the overflow count.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                if route.request.url.startswith("http://sameorigin.test/start"):
+                    widgets = "".join(
+                        f'<iframe src="http://widget{i}.test/captcha" width="100" height="60"></iframe>'
+                        for i in range(8)
+                    )
+                    body = (
+                        "<!doctype html><html><body>"
+                        + widgets
+                        + '<iframe src="http://gate.test/captcha" style="position:fixed;top:0;left:0;border:none" '
+                        'width="1024" height="900"></iframe></body></html>'
+                    )
+                else:
+                    body = "<p>frame</p>"
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://sameorigin.test/start")
+
+            info = (await _observe_data(page)).get("iframes") or {}
+            entries = info.get("entries") or []
+            assert info.get("total") == 9, info
+            assert len(entries) == 8, info
+            assert any(e.get("host") == "gate.test" for e in entries), entries
+        finally:
+            await browser.close()
 
 
 @pytest.mark.asyncio
@@ -3543,7 +3992,7 @@ async def test_observe_reports_a_captcha_iframe_packaged_inside_a_component() ->
         # Pinned whole: asserting a substring lets the scope clause silently revert to the old
         # "component roots not scanned", which is the false claim this change exists to retire.
         assert line == (
-            "iframes: 1 cross-origin in the page and its open component roots (contents NOT listed "
+            "iframes: 1 in the page and its open component roots (contents NOT listed "
             "here and NOT reachable by selector): [captcha] challenges.antibot-vendor.test 'Sign-in widget'"
         ), line
 
@@ -6969,6 +7418,236 @@ async def test_type_fails_loud_and_fast_when_an_unrelated_overlay_covers_the_fie
         assert elapsed < 10, elapsed
 
 
+# SKY-16067: a segmented date control. Each segment's real input is clipped off-viewport with
+# tabindex=-1, and an aria-hidden display layer is what the person sees. Nothing covers the input,
+# so the probe calls it reachable, but a click's hit-test has no point to land on. The display mirrors
+# the input on real input events, as the widget would.
+_SEGMENTED_DATE_HTML = """
+<div role="group" aria-label="Start date" style="position:relative;width:240px;height:30px;overflow:hidden">
+  <div id="year-display" aria-hidden="true" style="position:absolute;inset:0;background:#fff">YYYY</div>
+  <input id="year" type="text" tabindex="-1" aria-label="Year"
+         style="position:absolute;left:-500px;top:0;width:60px;height:30px">
+  <input id="month" type="text" tabindex="-1" aria-label="Month"
+         style="position:absolute;left:-400px;top:0;width:40px;height:30px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("input", () => {
+    document.getElementById("year-display").textContent = year.value || "YYYY";
+  });
+</script>
+"""
+
+
+# The same control rendering its echo the other common way: the widget REPLACES the display node on
+# input, so the node carrying the typed text is absent from the pre-snapshot and reads as new.
+_SEGMENTED_DATE_REPLACED_ECHO_HTML = """
+<div role="group" aria-label="Start date" style="position:relative;width:240px;height:30px;overflow:hidden">
+  <div id="year-display" aria-hidden="true" style="position:absolute;inset:0;background:#fff"><span>YYYY</span></div>
+  <input id="year" type="text" tabindex="-1" aria-label="Year"
+         style="position:absolute;left:-500px;top:0;width:60px;height:30px">
+  <input id="month" type="text" tabindex="-1" aria-label="Month"
+         style="position:absolute;left:-400px;top:0;width:40px;height:30px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("input", () => {
+    const slot = document.getElementById("year-display");
+    slot.innerHTML = "";
+    const echo = document.createElement("span");
+    echo.textContent = year.value || "YYYY";
+    slot.appendChild(echo);
+  });
+</script>
+"""
+
+
+# And the same replacement render with the echo left EXPOSED to the a11y tree, which is what a control
+# that shows the user its current value actually does. Nothing here is hidden, so only the echo's
+# relation to the field -- it shows the field's own value back -- can tell it from a suggestion.
+_SEGMENTED_DATE_EXPOSED_ECHO_HTML = """
+<div role="group" aria-label="Start date" style="position:relative;width:240px;height:30px;overflow:hidden">
+  <div id="year-display" style="position:absolute;inset:0;background:#fff"><span>YYYY</span></div>
+  <input id="year" type="text" tabindex="-1" aria-label="Year"
+         style="position:absolute;left:-500px;top:0;width:60px;height:30px">
+  <input id="month" type="text" tabindex="-1" aria-label="Month"
+         style="position:absolute;left:-400px;top:0;width:40px;height:30px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("input", () => {
+    const slot = document.getElementById("year-display");
+    slot.innerHTML = "";
+    const echo = document.createElement("span");
+    echo.textContent = year.value || "YYYY";
+    slot.appendChild(echo);
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("misroute", "text"),
+    [
+        # Focus lands, then the widget moves the caret to the next segment: keys fill the wrong field.
+        ("year.addEventListener('focus', () => document.getElementById('month').focus());", "2023"),
+        # Focus lands and stays, but the widget swallows every key.
+        (
+            "year.addEventListener('keydown', (e) => e.preventDefault());"
+            "year.addEventListener('beforeinput', (e) => e.preventDefault());",
+            "2023",
+        ),
+        # The keys land, then the widget rejects the entry and clears it a moment later.
+        ("year.addEventListener('input', () => setTimeout(() => { year.value = ''; }, 100));", "2023"),
+        # The widget trims what it was given, so the field no longer holds the requested text.
+        ("year.addEventListener('input', () => { year.value = year.value.trim(); });", "2023 "),
+    ],
+    ids=["keys-land-in-sibling-segment", "keys-dropped", "cleared-after-typing", "trimmed"],
+)
+async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(misroute: str, text: str) -> None:
+    # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would
+    # turn today's loud failure into a date that reads as filled and is not.
+    # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
+    html = _SEGMENTED_DATE_HTML + f"<script>{misroute}</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        try:
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": text})
+        except Exception as exc:
+            assert "outside of the viewport" in str(exc), exc
+        else:
+            assert r.status == "error", r.content
+            assert "NOT filled" in r.content, r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == ""
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+# The same unclickable shape on a field that only commits a picked suggestion: the raw query sits in
+# the input until blur, so reading it back proves nothing.
+_UNCLICKABLE_TYPEAHEAD_HTML = """
+<div style="position:relative;width:300px;height:30px;overflow:hidden">
+  <div aria-hidden="true" style="position:absolute;inset:0;background:#fff">City</div>
+  <input id="city" type="text" tabindex="-1" aria-label="City" {aria}
+         style="position:absolute;left:-500px;top:0;width:200px;height:30px">
+</div>
+<div id="city-echo" style="position:absolute;left:8px;top:34px"></div>
+<ul id="city-list" role="listbox" style="display:none;margin:0;padding:0;width:300px"></ul>
+<script>
+  const city = document.getElementById("city");
+  const list = document.getElementById("city-list");
+  city.addEventListener("input", () => setTimeout(() => {{
+    list.innerHTML = city.value ? '<li role="option">Springfield, IL</li>' : "";
+    list.style.display = city.value ? "block" : "none";
+  }}, {delay_ms}));
+  city.addEventListener("blur", () => {{ city.value = ""; }});
+  city.addEventListener("input", () => {{ window.__cityTyped = true; }});
+  city.addEventListener("focus", () => {{ window.__cityFocused = true; }});
+  {echo}
+</script>
+"""
+
+# The same shape with nothing to read off the rows: bare divs, no role, no cursor styling, only a click
+# listener -- and listeners are not enumerable from page script. This is where a pickability test has
+# the least to go on, so the detection claim has to hold here or not at all.
+_UNCLICKABLE_BARE_TYPEAHEAD_HTML = """
+<div style="position:relative;width:300px;height:30px;overflow:hidden">
+  <div aria-hidden="true" style="position:absolute;inset:0;background:#fff">City</div>
+  <input id="city" type="text" tabindex="-1" aria-label="City" {aria}
+         style="position:absolute;left:-500px;top:0;width:200px;height:30px">
+</div>
+<div id="city-echo" style="position:absolute;left:8px;top:34px"></div>
+<div id="city-list" style="display:none;width:300px"></div>
+<script>
+  const city = document.getElementById("city");
+  const list = document.getElementById("city-list");
+  city.addEventListener("input", () => setTimeout(() => {{
+    list.innerHTML = city.value ? "<div>Springfield, IL</div>" : "";
+    list.style.display = city.value ? "block" : "none";
+    const row = list.firstElementChild;
+    if (row) row.addEventListener("click", () => {{ city.value = "Springfield, IL"; }});
+  }}, {delay_ms}));
+  city.addEventListener("blur", () => {{ city.value = ""; }});
+  {echo}
+</script>
+"""
+
+# A widget that renders BOTH: an echo of the keystrokes and a real list. Excluding the echo must not
+# excuse the list.
+_ECHO_SCRIPT = (
+    'const slot = document.getElementById("city-echo");'
+    'city.addEventListener("input", () => {{ slot.innerHTML = "<span>" + city.value + "</span>"; }});'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("template", "aria", "delay_ms", "echo"),
+    [
+        # Declared, with a fetch slower than any poll: only the declaration can give it away.
+        (
+            _UNCLICKABLE_TYPEAHEAD_HTML,
+            'role="combobox" aria-autocomplete="list" aria-controls="city-list" aria-expanded="false"',
+            2500,
+            "",
+        ),
+        # Nothing declared: only the rows reacting to the typing give it away.
+        (_UNCLICKABLE_TYPEAHEAD_HTML, "", 0, ""),
+        # Nothing declared AND slower than the poll's first look.
+        (_UNCLICKABLE_TYPEAHEAD_HTML, "", 2500, ""),
+        # Nothing declared, and the widget also echoes the keystrokes: the echo is excused, the list is not.
+        (_UNCLICKABLE_TYPEAHEAD_HTML, "", 0, _ECHO_SCRIPT),
+        # Rows a pickability test can read nothing off, alone and beside an echo of the keystrokes.
+        (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, ""),
+        (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, _ECHO_SCRIPT),
+    ],
+    ids=[
+        "declared-slow-rows",
+        "undeclared-reacting-rows",
+        "undeclared-slow-rows",
+        "undeclared-rows-beside-an-echo",
+        "bare-div-rows",
+        "bare-div-rows-beside-an-echo",
+    ],
+)
+async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
+    template: str, aria: str, delay_ms: int, echo: str
+) -> None:
+    # A field that DECLARES a list is refused before it is focused, so the page must be untouched:
+    # asserting only the verdict cannot tell that guard from a later one reaching the same answer.
+    declares = bool(aria)
+    async with _content_page(template.format(aria=aria, delay_ms=delay_ms, echo=echo)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        try:
+            r = await _tool(tools, "type").handler({"selector": "#city", "text": "Springfield"})
+        except Exception as exc:
+            assert "outside of the viewport" in str(exc), exc
+        else:
+            assert r.status == "error", r.content
+            assert "NOT filled" in r.content, r.content
+        if declares:
+            assert await page.evaluate("() => !window.__cityFocused && !window.__cityTyped")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "html",
+    [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_REPLACED_ECHO_HTML, _SEGMENTED_DATE_EXPOSED_ECHO_HTML],
+    ids=["echo-mutated", "echo-replaced", "echo-exposed"],
+)
+async def test_type_fills_a_segment_input_the_click_cannot_reach(html: str) -> None:
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == "2023"
+        # Real key events reached the widget, not just a value write.
+        assert await page.eval_on_selector("#year-display", "el => el.textContent") == "2023"
+
+
 # The field hangs directly off <body>, so EVERY overlay on the page is "inside its parent". A purely
 # structural skin test reads a full-viewport modal as this field's own decoration.
 _COVERED_MODAL_SHARES_PARENT_HTML = """
@@ -9177,6 +9856,14 @@ async def test_observe_discloses_elements_dropped_by_the_budget() -> None:
         # just that it starved something. Without it, "N more elements" reads as more of the same.
         note = next(ln for ln in r.content.splitlines() if "element budget" in ln)
         assert "inside components" in note, note
+        # SKY-16136. Both counters pinned to the note they were computed beside, so neither can drift
+        # to a constant while the note keeps reading correctly.
+        assert r.data is not None
+        summary = r.data["summary"]
+        total, in_components = (int(n) for n in re.findall(r"(\d+) (?:more element|of them)", note))
+        assert summary["elements_truncated"] == total, (summary, note)
+        assert summary["elements_truncated_in_components"] == in_components, (summary, note)
+        assert in_components > 0, note
 
 
 @_skip_no_browser
@@ -9259,6 +9946,17 @@ async def test_budget_note_counts_only_what_it_actually_cost_and_offers_no_false
         # 260 visible, 251 listed, 40 hidden: the overflow is the 9 visible ones, not 49. Anchored at
         # the start of the count, because "49 more element(s)" CONTAINS "9 more element(s)".
         assert note.startswith("note: 9 more element(s)"), note
+        # SKY-16136. Pinned to the note's own number rather than to ">0": a counter that can disagree
+        # with what the model was told cannot be used to reason about what the model saw.
+        assert r.data is not None
+        summary = r.data["summary"]
+        assert summary["elements_truncated"] == 9, summary
+        assert summary["elements_listed"] == len([ln for ln in r.content.splitlines() if ln.startswith("ref=")])
+        assert summary["elements_truncated_in_components"] == 0, summary
+        # No frames here, so the page-wide merge cap never ran and must not claim it did.
+        assert summary["elements_truncated_by_page_cap"] == 0, summary
+        # `dropped` counts elements that could not be described; the budget overflow is not one.
+        assert summary["elements_dropped"] == 0, summary
 
 
 @_skip_no_browser
@@ -21941,3 +22639,507 @@ async def test_observe_says_nothing_past_the_last_heading_a_capped_scan_saw() ->
         inside, past = (line for line in _lines(r.content) if "'Continue'" in line)
         assert "section='Section 3'" in inside, r.content
         assert "section=" not in past, r.content
+
+
+def _surface_oracle(
+    pre: str | None, post: str, chosen: str, rows: list[str] | None
+) -> taskv3_tools.CommitStatus | None:
+    # Independent formulation of the short-surface invariant: padded substring search over
+    # whitespace-normalized text, not the token-list scan the implementation uses. An unread pre-click
+    # surface (None) can never show that this click changed anything, and an unread row set (None) can
+    # never show the chosen row was the only one, so neither ever confirms.
+    fold = str.maketrans({c: " " for c in "()[]{},;\"'\u2018\u2019"})
+
+    def norm(s: str) -> str:
+        return " ".join(s.translate(fold).lower().split())
+
+    def consistent(surface: str, row: str) -> bool:
+        return bool(surface) and f" {surface} " in f" {row} "
+
+    q = norm(post)
+    if not q or (pre is not None and norm(pre) == q):
+        return None
+    if rows is None:
+        return taskv3_tools.CommitStatus.UNVERIFIED if consistent(q, norm(chosen)) else None
+    hits = [norm(r) for r in rows if consistent(q, norm(r))]
+    if norm(chosen) not in hits:
+        return None
+    if pre is None or len(hits) > 1:
+        return taskv3_tools.CommitStatus.UNVERIFIED
+    return taskv3_tools.CommitStatus.OK
+
+
+def test_short_surface_verdict_holds_the_invariant_over_generated_forms() -> None:
+    labels = ["United States +1", "United States (+1)", "Canada (+1)", "United Kingdom +44", "Yes", "No"]
+    surfaces = ["", "+1", "+44", "United States", "States +1", "Yes", "full time", "Canada", "No", "Kingdom +1"]
+    checked = 0
+    for n in (1, 2, 3):
+        for rows in itertools.combinations(labels, n):
+            for chosen in rows:
+                for pre, post in itertools.product([None, *surfaces], surfaces):
+                    for seen in (list(rows), None):
+                        got = taskv3_tools._short_surface_verdict(pre, post, chosen, seen)
+                        assert got == _surface_oracle(pre, post, chosen, seen), (pre, post, chosen, seen)
+                        checked += 1
+    assert checked > 3000
+
+
+def test_short_surface_verdict_examples() -> None:
+    verdict = taskv3_tools._short_surface_verdict
+    assert verdict("", "+1", "United States +1", ["United States +1"]) == taskv3_tools.CommitStatus.OK
+    assert (
+        verdict("", "+1", "United States +1", ["United States +1", "Canada +1"]) == taskv3_tools.CommitStatus.UNVERIFIED
+    )
+    assert verdict("+1", "+1", "United States +1", ["United States +1"]) is None
+    assert verdict(None, "+1", "United States +1", ["United States +1"]) == taskv3_tools.CommitStatus.UNVERIFIED
+    assert verdict("", "+1", "United States +1", None) == taskv3_tools.CommitStatus.UNVERIFIED
+    assert verdict("", "+44", "United States +1", None) is None
+    assert verdict("", "+44", "United States +1", ["United States +1", "United Kingdom +44"]) is None
+    assert verdict("", "States +", "United States +1", ["United States +1"]) is None
+    assert (
+        verdict("", "+1", "United States (+1)", ["United States (+1)", "United Kingdom (+44)"])
+        == taskv3_tools.CommitStatus.OK
+    )
+    assert (
+        verdict("", "+1", "United States (+1)", ["United States (+1)", "Canada (+1)"])
+        == taskv3_tools.CommitStatus.UNVERIFIED
+    )
+    assert (
+        verdict("", "+1", "United States (+1)", ["United States (+1)", "United States +1"])
+        == taskv3_tools.CommitStatus.UNVERIFIED
+    )
+
+
+_DECLARED_DUPLICATE_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="addr" type="text" autocomplete="off" aria-controls="addr-list" aria-expanded="false"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="addr-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    window.__clicked_row_index = null;
+    var ROWS = [{"text":"123 Maple Court","value":"+9001"},{"text":"123 Maple Court","value":"+9002"}];
+    var input = document.getElementById('addr');
+    var list = document.getElementById('addr-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { input.setAttribute('aria-expanded', 'false'); return; }
+      ROWS.forEach(function (r, i) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.cssText = 'display:block;width:100%;height:24px';
+        row.textContent = r.text;
+        row.setAttribute('data-value', r.value);
+        row.addEventListener('click', function () {
+          window.__clicked_row_index = i;
+          input.value = r.text;
+          list.innerHTML = '';
+          input.setAttribute('aria-expanded', 'false');
+        });
+        list.appendChild(row);
+      });
+      input.setAttribute('aria-expanded', 'true');
+    });
+    input.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      list.innerHTML = '';
+      input.setAttribute('aria-expanded', 'false');
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_identical_text_refusal_keeps_a_declared_list_open_for_the_advertised_click() -> None:
+    # The identical-text refusal tells the caller to click a tagged row, so its list must survive the
+    # call even on a widget whose open state is declared (aria-expanded) and that closes on Escape.
+    async with _content_page(_DECLARED_DUPLICATE_ROWS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert "data-tv3-sugg" in r.content, r.content
+        assert await page.eval_on_selector("#addr", "el => el.getAttribute('aria-expanded')") == "true"
+        tagged = await page.query_selector_all("[data-tv3-sugg]")
+        assert len(tagged) >= 2, (len(tagged), r.content)
+        await tagged[1].click()
+        assert await page.evaluate("() => window.__clicked_row_index") == 1
+
+
+def test_merging_a_frames_reading_keeps_text_and_its_full_form_positionally_aligned() -> None:
+    # textFull is positional against text: the digest prints entry i's full form against entry i's
+    # line. A realm whose textFull is shorter than its text (only the truncated entries carry one) must
+    # be padded, or every later line is printed against another line's full text — wrong content under
+    # a correct-looking label, with nothing in the output to show it happened.
+    from skyvern.forge.taskv3.tools import _merge_realm
+
+    page = {"text": ["page one"], "textFull": ["page one in full"], "elements": [{"i": 0}]}
+    frame = {
+        "text": ["frame a", "frame b", "frame c"],
+        # Only the middle entry was truncated, so the realm returns a SHORTER textFull than text.
+        "textFull": [None, "frame b in full"],
+        "elements": [{"i": 1}, {"i": 2}],
+    }
+    _merge_realm(page, frame)
+
+    assert page["text"] == ["page one", "frame a", "frame b", "frame c"]
+    assert len(page["textFull"]) == len(page["text"])
+    assert page["textFull"] == ["page one in full", None, "frame b in full", None]
+    assert page["elements"] == [{"i": 0}, {"i": 1}, {"i": 2}]
+
+
+def test_merging_counts_text_the_merged_cap_dropped() -> None:
+    # The merged text cap is the one cap that is not the JS's own, so it is the one the payload would
+    # not otherwise disclose. A digest that silently shows the first N reads as "that is all".
+    from skyvern.forge.taskv3.tools import OBSERVE_MERGED_TEXT_MAX, _merge_realm
+
+    page = {"text": [f"page {i}" for i in range(OBSERVE_MERGED_TEXT_MAX)], "textFull": [], "textDropped": 2}
+    _merge_realm(page, {"text": ["frame a", "frame b"], "textFull": [], "textDropped": 1})
+
+    assert len(page["text"]) == OBSERVE_MERGED_TEXT_MAX  # no room, so neither frame line is kept
+    # 2 already dropped + 1 the frame itself dropped + 2 this cap dropped.
+    assert page["textDropped"] == 5
+
+
+def test_the_iframe_reach_clause_never_claims_reach_it_does_not_have(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Three states, not two. The failure that matters is the middle one: frames were read, but not all
+    # of them, and claiming blanket reachability there sends the model to write selectors for contents
+    # no tool can resolve.
+    from skyvern.forge.taskv3.tools import _iframe_reach_clause
+    from skyvern.forge.taskv3.tools import _Observation as Obs
+
+    read_all = Obs({}, [], [], {}, {}, 0, 0)
+    some_unread = Obs({}, [], [], {}, {}, 1, 0)
+    capped = Obs({}, [], [], {}, {}, 0, 2)
+
+    # Off: the contents genuinely are unreachable by selector, and saying so is what keeps the model
+    # from trying. This sentence must NOT soften while the capability is absent.
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+    assert "NOT reachable by selector" in _iframe_reach_clause(read_all)
+    assert "NOT reachable by selector" in _iframe_reach_clause(some_unread)
+
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    assert "actionable by ref" in _iframe_reach_clause(read_all)
+    assert "NOT" not in _iframe_reach_clause(read_all)
+    # Partial reach states BOTH halves: what is reachable, and that something was not read.
+    for partial in (some_unread, capped):
+        clause = _iframe_reach_clause(partial)
+        assert "could not be read" in clause, clause
+        assert "NOT listed" in clause, clause
+
+
+class _SplitPairingElement:
+    """An element a re-resolve would happily adopt: it answers the tag the digest line named, accepts an
+    act token, and reports itself as the token's only holder."""
+
+    def __init__(self, tag: str) -> None:
+        self._tag = tag
+        self._attrs: dict[str, str] = {}
+
+    async def evaluate(self, js: str, arg: Any = None) -> Any:
+        if "tagName" in js:
+            return self._tag.upper()
+        if "setAttribute" in js and isinstance(arg, str):
+            self._attrs["data-tv3-act"] = arg
+            return True
+        return None
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self._attrs.get(name)
+
+    async def dispose(self) -> None:
+        return None
+
+
+class _SplitPairingPage(_FakePage):
+    """A page whose observe payload hands back FEWER live handles than digest entries.
+
+    That is the shape a page gets by rewriting one of the two arrays mid-evaluate. Everything else here
+    exists to make the re-resolve fallback succeed if it is reached — a single matching element that
+    answers the right tag — so a test asserting refusal is asserting the refusal and not the absence of
+    anything to resolve to.
+    """
+
+    async def evaluate_handle(self, js: str) -> _FakeObservePayload:
+        raw = await self.evaluate(js)
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return _FakeObservePayload(data, [None] * (len(data.get("elements", [])) - 1))
+
+    async def query_selector_all(self, selector: str) -> list[Any]:
+        return [_SplitPairingElement("input")]
+
+
+@pytest.mark.asyncio
+async def test_a_ref_refuses_when_the_reading_could_not_say_which_document_it_came_from() -> None:
+    # With more than one document in play, "pair nothing" cannot mean "assume the main frame". A frame
+    # element's selector is often a plain `#id`, and a portal-style page carries the same id in the main
+    # document — so defaulting the realm would re-resolve the ref onto a look-alike in the wrong
+    # document and act on it. The refusal costs a re-observe; the alternative is a wrong-element commit.
+    page = _SplitPairingPage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    reading = await _tool(tools, "observe").handler({})
+    assert reading.status == "ok", reading.content
+
+    ref = _ref_line(reading.content, "First name")
+    result = await _tool(tools, "click").handler({"selector": ref})
+
+    assert result.status == "error", result.content
+    assert "re-observe" in result.content.lower() or "observe()" in result.content, result.content
+    # And it really did not act: no click reached the page for that ref.
+    assert not any(call[0] == "click" for call in page.calls), page.calls
+
+
+def test_no_page_only_playwright_api_is_called_on_a_realm_variable() -> None:
+    """`_resolve_page` hands a handler the realm its selector lives in — the page, or the child frame the
+    element was read from. A `Frame` implements the element-scoped surface but not the page-scoped one, so
+    reaching a page-only attribute through that variable is an AttributeError the moment a ref points
+    into a frame, and only then: every main-frame run passes.
+
+    This is the class, not an instance of it. Four such sites existed while the routing was being built
+    (`keyboard`, `mouse` twice, and a request listener), each reachable only through a framed element.
+    Page-level surfaces go through `_current_page()`; this fails if one stops doing so.
+    """
+    import re
+    from pathlib import Path
+
+    from playwright.async_api import Frame, Page
+
+    page_only = {name for name in dir(Page) if not name.startswith("_") and not hasattr(Frame, name)}
+    # Page inherits these from its event emitter; Frame has no event surface at all.
+    page_only |= {"on", "once", "remove_listener"}
+
+    source = Path(taskv3_tools.__file__).read_text().split("\n")
+    # Above this, `page` is a module-level parameter that is never a realm.
+    start = next(i for i, line in enumerate(source) if line.startswith("def build_browser_tools("))
+
+    offenders = [
+        f"{i + 1}: .{name} -> {source[i].strip()[:100]}"
+        for i in range(start, len(source))
+        if not source[i].lstrip().startswith("#")
+        for name in page_only
+        if re.search(r"\bpage\." + re.escape(name) + r"\b", source[i])
+    ]
+    assert not offenders, "page-only Playwright API reached through a realm variable:\n" + "\n".join(offenders)
+
+
+# Four unambiguous controls, measured on their own before being nested, so the count the page-wide
+# cap is expected to drop is established independently of the code under test.
+_PAGE_CAP_FRAME_HTML = (
+    "<button id='f0' style='display:block;height:12px'>Frame Zero</button>"
+    "<button id='f1' style='display:block;height:12px'>Frame One</button>"
+    "<button id='f2' style='display:block;height:12px'>Frame Two</button>"
+    "<button id='f3' style='display:block;height:12px'>Frame Three</button>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_page_wide_element_cap_is_counted_apart_from_undescribable_elements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The per-realm budget and the merged page-wide cap are both 250, so a dense main frame spends the
+    # whole budget and every frame's elements are then dropped wholesale. That loss lands in `dropped`
+    # beside elements that genuinely could not be described -- one integer, two meanings -- which is
+    # what makes the page-wide cap unreadable in telemetry without a counter of its own.
+    from skyvern.forge.taskv3.tools import OBSERVE_MERGED_ELEMENT_MAX  # noqa: PLC0415
+
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    async with _live_page(_PAGE_CAP_FRAME_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        alone = await _tool(tools, "observe").handler({})
+    assert alone.data is not None
+    offered = alone.data["summary"]["elements_listed"]
+    assert offered == 4, alone.content
+
+    dense = "".join(f"<button id='b{n}' style='display:block;height:2px'>B{n}</button>" for n in range(260))
+    # The page must also drop elements for a reason that is NOT a budget, or `elements_dropped` and the
+    # page-cap counter carry the same number here and the test passes just as happily against a counter
+    # wired to `dropped`. These controls have no id, so they need a minted marker, and the observer
+    # strips it back off -- the re-resolve then refuses them. FIRST in the document: the walk breaks at
+    # the element budget, so anything behind the dense block is never reached and never dropped at all.
+    undescribable = (
+        "<button style='display:block;height:12px'>No Hook One</button>"
+        "<button style='display:block;height:12px'>No Hook Two</button>"
+        "<button style='display:block;height:12px'>No Hook Three</button>"
+        "<script>new MutationObserver(function (recs) {"
+        "  for (var r of recs) { try { r.target.removeAttribute('data-tv3'); } catch (e) {} }"
+        "}).observe(document.documentElement,"
+        "  {attributes: true, subtree: true, attributeFilter: ['data-tv3']});</script>"
+    )
+    framed = undescribable + dense + f'<iframe srcdoc="{_PAGE_CAP_FRAME_HTML}" width="300" height="120"></iframe>'
+    async with _live_page(framed) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        merged = await _tool(tools, "observe").handler({})
+        # The same page read with frame enumeration off is the baseline: whatever it reports is the
+        # main frame's own contribution, so the difference below is attributable to the frame alone.
+        monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+        main_only = await _tool(tools, "observe").handler({})
+
+    assert merged.data is not None and main_only.data is not None
+    with_frames = merged.data["summary"]
+    without = main_only.data["summary"]
+    # Computed from three independently measured quantities -- the frame's own yield, the page-wide
+    # constant, and the main frame's contribution read with enumeration off -- rather than asserted
+    # non-zero. The main frame does not fill the budget exactly: the controls it drops are charged
+    # against the budget before they are dropped, so it leaves a little room the frame partly fills.
+    room = OBSERVE_MERGED_ELEMENT_MAX - without["elements_listed"]
+    expected_page_cap = offered - room
+    assert expected_page_cap > 0, (offered, room)
+    assert with_frames["elements_truncated_by_page_cap"] == expected_page_cap, (with_frames, without, offered)
+    assert with_frames["elements_listed"] == OBSERVE_MERGED_ELEMENT_MAX, with_frames
+    # Alongside, not instead of: `dropped` still carries the cap's share (the digest note reads it and
+    # must not change), on TOP of the marker-stripped controls above. The strict inequality is what a
+    # counter mistakenly reading `dropped` cannot satisfy at the same time as the equality above.
+    assert with_frames["elements_dropped"] == without["elements_dropped"] + expected_page_cap, (with_frames, without)
+    assert with_frames["elements_dropped"] > with_frames["elements_truncated_by_page_cap"], with_frames
+    # With frame enumeration off there is no merge, so the page-wide cap cannot have run -- while the
+    # same page still reports the describe-failures, which is what makes the two channels separable.
+    assert without["elements_truncated_by_page_cap"] == 0, without
+    assert without["elements_dropped"] > 0, without
+    # Two different budgets. The page-wide cap must not inflate the per-realm counter.
+    assert with_frames["elements_truncated"] == without["elements_truncated"], (with_frames, without)
+
+
+def test_merging_caps_elements_page_wide_and_counts_what_it_dropped() -> None:
+    # _OBSERVE_JS's 250-element budget is PER REALM, so merging N realms without a page-wide cap
+    # multiplies the digest by N -- and the digest rides in the persistent conversation prefix, paid for
+    # on every later turn. The cap equals the per-realm budget on purpose: frame perception must not
+    # raise the worst-case prefix above what a frameless page already costs.
+    from skyvern.forge.taskv3.tools import OBSERVE_MERGED_ELEMENT_MAX, _merge_realm
+
+    page = {"elements": [{"i": n} for n in range(OBSERVE_MERGED_ELEMENT_MAX - 2)], "text": [], "textFull": []}
+    taken = _merge_realm(page, {"elements": [{"f": 0}, {"f": 1}, {"f": 2}, {"f": 3}], "text": [], "textFull": []})
+
+    # Only what fit, and the main frame's own elements are never the ones displaced.
+    assert taken == 2
+    assert len(page["elements"]) == OBSERVE_MERGED_ELEMENT_MAX
+    assert page["elements"][-2:] == [{"f": 0}, {"f": 1}]
+    # A capped digest has to say it was capped, or showing the first N reads as "that is all".
+    assert page["dropped"] == 2
+    # The page-wide cap's share is ALSO kept on its own key. `dropped` carries two unrelated meanings
+    # -- this cap, and elements the reading could not describe at all -- and nothing downstream can
+    # tell them apart without it. Alongside, never instead of: the digest note reads `dropped`.
+    assert page["mergeCapDropped"] == 2
+
+    # A frame that BOTH overflows the cap and reports describe-failures of its own: `dropped` takes
+    # each of them (it is a summed key as well as the cap's sink), the page-cap key takes only the cap.
+    page = {"elements": [{"i": n} for n in range(OBSERVE_MERGED_ELEMENT_MAX - 1)], "text": [], "textFull": []}
+    _merge_realm(page, {"elements": [{"f": 0}, {"f": 1}, {"f": 2}], "text": [], "textFull": [], "dropped": 7})
+    assert page["dropped"] == 9
+    assert page["mergeCapDropped"] == 2
+
+
+# Today's surface, written out rather than derived. A witness that derives the expected set from the
+# same builder it checks cannot notice the set changing -- which is the whole thing these pin.
+_SURFACE_OFF_TOOL_NAMES = frozenset(
+    {
+        "observe",
+        "get_html",
+        "look",
+        "click",
+        "hover",
+        "type",
+        "select_option",
+        "select_combobox",
+        "press_key",
+        "scroll",
+        "wait",
+        "navigate",
+        "file_upload",
+    }
+)
+
+
+def _stub_code_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> Any:
+        return None
+
+    return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
+
+
+def test_code_tool_surface_off_is_todays_tool_set() -> None:
+    """The default state advertises exactly what the loop advertised before the setting existed."""
+
+    async def provider() -> Any:
+        return None
+
+    assert {t.name for t in build_browser_tools(provider)} == _SURFACE_OFF_TOOL_NAMES
+    assert settings.TASK_V3_CODE_TOOL_SURFACE == "off"
+    assert configured_surface() is CodeToolSurface.OFF
+    # OFF ignores a code tool even when the deployment could build one.
+    tools = build_browser_tools(provider)
+    assert {t.name for t in apply_surface(tools, CodeToolSurface.OFF, _stub_code_tool())} == _SURFACE_OFF_TOOL_NAMES
+
+
+def test_code_tool_surface_states_advertise_exact_sets() -> None:
+    """Each state's exact tool-name set, so an edit cannot silently change what a state offers."""
+
+    async def provider() -> Any:
+        return None
+
+    added = apply_surface(build_browser_tools(provider), CodeToolSurface.ADD, _stub_code_tool())
+    replaced = apply_surface(build_browser_tools(provider), CodeToolSurface.REPLACE, _stub_code_tool())
+
+    assert {t.name for t in added} == _SURFACE_OFF_TOOL_NAMES | {CODE_TOOL_NAME}
+    assert {t.name for t in replaced} == {"observe", "get_html", "look", "wait", CODE_TOOL_NAME}
+
+
+def test_code_tool_is_billable_however_the_deployment_built_it() -> None:
+    """A page-mutating tool the loop cannot see as billable is invisible to the stall detector, the
+    no-progress streak and the settle probe. The assembly point sets the flag rather than trusting
+    whoever built the tool to have set it."""
+    code_tool = _stub_code_tool()
+    assert code_tool.billable is False
+
+    async def provider() -> Any:
+        return None
+
+    apply_surface(build_browser_tools(provider), CodeToolSurface.ADD, code_tool)
+    assert code_tool.billable is True
+
+
+def test_withheld_code_tool_leaves_the_model_able_to_act() -> None:
+    """`replace` with no runner keeps the action tools rather than removing them.
+
+    Subtracting the action tools while the tool that was meant to subsume them is unavailable would
+    leave a surface that can perceive and wait but never act -- a guaranteed-failing run. Withholding
+    a capability must not also remove the one it would have replaced.
+    """
+
+    async def provider() -> Any:
+        return None
+
+    for surface in (CodeToolSurface.ADD, CodeToolSurface.REPLACE):
+        kept = apply_surface(build_browser_tools(provider), surface, None)
+        assert {t.name for t in kept} == _SURFACE_OFF_TOOL_NAMES
+
+
+def test_unrecognized_surface_value_reads_as_off(monkeypatch: Any) -> None:
+    """An unknown value must not fail a run; off is the state that changes nothing."""
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "replace_actions_network")
+    assert configured_surface() is CodeToolSurface.OFF
+
+
+def test_a_code_tool_the_submit_guard_cannot_recognise_is_refused() -> None:
+    """The submit guard keys off the tool's NAME, so a differently-named tool is one it cannot see.
+
+    `apply_surface` takes whatever ToolSpec the deployment hands it, and the guard that decides a
+    call may have submitted a form matches on the name alone. Those live in different modules with
+    different owners, so the agreement between them is a convention until something enforces it --
+    and a code tool the submit guard is blind to is exactly the tool that must not be advertised.
+    """
+
+    async def provider() -> Any:
+        return None
+
+    async def handler(args: dict[str, Any]) -> Any:
+        return None
+
+    misnamed = ToolSpec("run_python", "run python", {"type": "object", "properties": {}}, handler)
+    kept = apply_surface(build_browser_tools(provider), CodeToolSurface.REPLACE, misnamed)
+
+    # Withheld, and -- as when no runner exists at all -- the action tools stay rather than being
+    # stripped in favour of a tool that was refused.
+    assert {t.name for t in kept} == _SURFACE_OFF_TOOL_NAMES
+    assert misnamed.billable is False

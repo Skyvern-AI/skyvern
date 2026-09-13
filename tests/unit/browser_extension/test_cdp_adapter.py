@@ -1506,6 +1506,26 @@ async def test_navigation_event_buffer_overflow_flushes_and_warns(
     assert warning.call_args.kwargs["buffered_navigation_event_count"] == 0
 
 
+def test_navigation_sensitive_event_bound_keeps_execution_context_events() -> None:
+    adapter = ExtensionCdpAdapter(VirtualTargetRegistry(), StubRelay())
+    execution_context_event = {
+        "method": "Runtime.executionContextCreated",
+        "params": {"context": {"id": 1}},
+    }
+    other_events = [
+        {"method": "Page.frameAttached", "params": {"frameId": f"frame-{index}"}}
+        for index in range(cdp_adapter_module._NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT + 1)
+    ]
+
+    with patch.object(cdp_adapter_module.LOG, "warning") as warning:
+        retained_events = adapter._bound_navigation_sensitive_events(42, [execution_context_event, *other_events])
+
+    assert len(retained_events) == cdp_adapter_module._NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT
+    assert retained_events[0] == execution_context_event
+    assert retained_events[1:] == other_events[-(cdp_adapter_module._NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT - 1) :]
+    assert warning.call_args.kwargs["dropped_execution_context_event_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_navigation_event_overflow_keeps_sensitive_events_until_response(
     adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],

@@ -15,7 +15,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.agent import _taskv3_action_for_tool_call
-from skyvern.forge.taskv3.loop import SubmitWatch, make_finish_tool, run_agent_tool_loop
+from skyvern.forge.taskv3.loop import RoundAction, SubmitWatch, make_finish_tool, run_agent_tool_loop
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, PreSubmitFrame, is_run_sampled
 from skyvern.forge.taskv3.tools import build_browser_tools, pending_marker
 from tests.unit.test_taskv3_loop import _ScriptedCaller
@@ -811,9 +811,9 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
     # action builder reads args["selector"] off it, so a wrapper that resolved into a copy left the
     # persisted row naming no element at all. Asserted through to the Action the row is built from.
     pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
-    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+    rounds: list[list[RoundAction]] = []
 
-    async def _capture(actions: list[tuple[str, dict[str, Any], bool]], _text: str | None) -> None:
+    async def _capture(actions: list[RoundAction], _text: str | None) -> None:
         rounds.append(actions)
 
     try:
@@ -841,7 +841,7 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
         await browser.close()
         await pw.stop()
 
-    clicked = [(name, args) for round_ in rounds for name, args, ok in round_ if name == "click" and ok]
+    clicked = [entry for round_ in rounds for entry in round_ if entry.tool == "click" and entry.succeeded]
     assert len(clicked) == 1, rounds
-    action = _taskv3_action_for_tool_call("click", clicked[0][1], reasoning="r")
+    action = _taskv3_action_for_tool_call("click", clicked[0].args, reasoning="r")
     assert action.element_id, 'a mark-based click persisted element_id="" before the args carried it'

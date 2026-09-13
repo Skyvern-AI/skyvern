@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,7 +35,11 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
-from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
+from skyvern.webeye.persistent_sessions_manager import (
+    BrowserOperation,
+    BrowserRetirement,
+    BrowserSessionCreditAdmissionRefusal,
+)
 from tests.unit.test_copilot_secret_scrub import _make_server
 
 
@@ -230,6 +234,73 @@ async def test_ensure_browser_session_error_dict_omits_raw_exception(monkeypatch
     assert "persistent-sessions.internal.svc" not in error_text
     assert "http://" not in error_text
     assert "internal:" not in error_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "expected"),
+    [
+        (
+            runtime.ensure_browser_session,
+            {
+                "ok": False,
+                "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+                "data": {
+                    "browser_session_acquisition_failure": {
+                        "state": "billing_credit_admission_refusal",
+                        "retry_action": None,
+                    }
+                },
+            },
+        ),
+        (
+            runtime.ensure_build_test_browser_session,
+            {
+                "ok": False,
+                "error": (
+                    "Build test did not start because credits are exhausted. "
+                    "No browser or run started. Upgrade your plan in Billing."
+                ),
+                "data": {
+                    "overall_status": "setup_failed",
+                    "failure_reason": (
+                        "Build test did not start because credits are exhausted. "
+                        "No browser or run started. Upgrade your plan in Billing."
+                    ),
+                    "browser_session_id": None,
+                    "build_test_connect_failure": {
+                        "state": "billing_credit_admission_refusal",
+                        "workflow_run_id": None,
+                        "workflow_run_block_id": None,
+                        "task_id": None,
+                        "browser_session_id": None,
+                        "occupier_run_id": None,
+                        "diagnostic": None,
+                        "retry_action": None,
+                    },
+                    "blocks": [],
+                },
+            },
+        ),
+    ],
+)
+async def test_billing_credit_refusal_survives_both_acquisition_callers(
+    monkeypatch: pytest.MonkeyPatch,
+    caller: Callable[[AgentContext], Awaitable[object]],
+    expected: object,
+) -> None:
+    manager = MagicMock()
+    manager.create_session = AsyncMock(side_effect=BrowserSessionCreditAdmissionRefusal())
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    result = await caller(ctx)
+
+    assert result == expected
+    assert ctx.browser_session_id is None
+    manager.create_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1390,3 +1461,71 @@ async def test_a_suspended_turn_deadline_leaves_the_release_wait_unclamped(
         budget = runtime._supersede_release_budget_seconds(attached_build_test_ctx)
 
     assert budget == runtime._SUPERSEDE_RELEASE_WAIT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_restored_session_is_consumed_and_the_authored_navigation_survives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner hands back a session it proved answers, so the caller attaches to it rather than
+    minting a replacement, and the work already authored against the old one is still there."""
+    authored_yaml = "blocks:\n  - block_type: goto\n    url: https://example.com/search\n"
+    lookup = _SharedSessionLookup()
+    manager = _install_dispatch_stack(monkeypatch, lookup)
+    manager.get_session = AsyncMock(return_value=_session_row(runnable_id=None))
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_restored"
+    ctx.workflow_yaml = authored_yaml
+
+    assert await runtime.verify_build_test_browser_session_by_attaching(ctx) is None
+
+    result, _ = await _dispatch_browser_tool(ctx)
+
+    assert ctx.browser_session_id == "bs_restored"
+    assert ctx.workflow_yaml == authored_yaml
+    assert '"result": 7' in result.content[0].text
+    assert "browser session was lost" not in result.content[0].text
+    manager.create_session.assert_not_awaited()
+    assert lookup.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_owner_refusing_the_replacement_retires_the_session_and_leaves_a_route_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven-defunct upstream has to reach the user explicitly AND release the held id, or the
+    same authoring request re-attaches to the same corpse for the rest of the chat."""
+    authored_yaml = "blocks:\n  - block_type: goto\n    url: https://example.com/search\n"
+    manager = MagicMock()
+    manager.get_browser_state = AsyncMock(
+        side_effect=BrowserTargetClosedError("Replacement browser state did not answer a CDP roundtrip.")
+    )
+    _admit_mock_browser_operations(manager)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_unusable"
+    ctx.workflow_yaml = authored_yaml
+
+    result = await runtime.verify_build_test_browser_session_by_attaching(ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["data"]["build_test_connect_failure"] == {
+        "state": "already_closed",
+        "browser_session_id": "bs_unusable",
+        "retry_action": "test_end_to_end",
+    }
+    assert "extracted" not in result["data"]
+    assert result["data"].get("overall_status") != "completed"
+    assert ctx.workflow_yaml == authored_yaml
+    assert not ctx.browser_session_id
+
+    provision = AsyncMock(return_value=None)
+    monkeypatch.setattr(runtime, "ensure_build_test_browser_session", provision)
+    assert await runtime.verify_build_test_browser_session_by_attaching(ctx) is None
+    provision.assert_awaited_once()

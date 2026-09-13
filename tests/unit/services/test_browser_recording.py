@@ -5,6 +5,7 @@ Just an example unit test for now. Will expand later.
 import asyncio
 import base64
 import gzip
+import json
 import re
 import time
 import typing as t
@@ -31,6 +32,7 @@ from skyvern.services.browser_recording.service import (
     _is_duplicate_action,
     _recording_enrichment_llm_handler,
     _resolve_enrichment_handler,
+    build_durable_recording_evidence,
     deterministic_input_text_parameter_key,
     summarize_exfiltrated_recording_events,
 )
@@ -158,6 +160,69 @@ def test_click() -> None:
     assert len(actions) == 1
     assert actions[0].kind == "click"
     assert actions[0].target.sky_id == "sky-123"
+
+
+def test_durable_recording_evidence_is_chronological_and_never_stores_typed_values() -> None:
+    target = ActionTarget(
+        id="password",
+        tag_name="INPUT",
+        role="textbox",
+        input_type="password",
+        autocomplete="current-password",
+        accessible_name="Password",
+        mouse=Mouse(xp=0.5, yp=0.5),
+    )
+    page_controlled_target = ActionTarget(
+        tag_name="raw-secret-element",
+        role="raw-secret-role",
+        input_type="raw-secret-type",
+        autocomplete="raw-secret-autocomplete",
+        mouse=Mouse(xp=0.5, yp=0.5),
+    )
+    actions = [
+        ActionInputText(
+            kind=ActionKind.INPUT_TEXT,
+            target=target,
+            timestamp_start=2000,
+            timestamp_end=2001,
+            url="https://user:pass@example.com/account?token=raw-secret#section",
+            input_value="raw-secret",
+        ),
+        ActionClick(
+            kind=ActionKind.CLICK,
+            target=page_controlled_target,
+            timestamp_start=1000,
+            timestamp_end=1001,
+            url="https://example.com",
+        ),
+    ]
+
+    evidence = build_durable_recording_evidence(actions)
+    serialized = json.dumps(evidence)
+
+    assert [item["kind"] for item in evidence] == ["click", "input_text"]
+    assert evidence[1]["url"] == "https://example.com"
+    assert evidence[0]["target"] == {}
+    assert evidence[1]["target"] == {
+        "tag_name": "input",
+        "role": "textbox",
+        "input_type": "password",
+        "autocomplete": "current-password",
+    }
+    assert "input_value" not in evidence[1]
+    assert "selector" not in evidence[1]["target"]
+    assert "accessible_name" not in evidence[1]["target"]
+    assert "raw-secret" not in serialized
+    assert "user:pass" not in serialized
+
+
+def test_durable_recording_evidence_omits_url_with_invalid_port() -> None:
+    action = _click_action(timestamp=1000)
+    action.url = "https://example.com:not-a-port/path?token=raw-secret"
+
+    evidence = build_durable_recording_evidence([action])
+
+    assert evidence[0]["url"] == ""
 
 
 def test_identical_click_events_are_deduped() -> None:

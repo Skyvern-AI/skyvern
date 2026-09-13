@@ -56,7 +56,7 @@ _CODE_ONLY_UNAVAILABLE = tuple(
 )
 _CODE_ONLY_REQUIRED_TEXT = {
     "file_download": "download registration",
-    "file_upload": "file materialization",
+    "file_upload": "attach_authorized_file",
     "login": "credential-typed code",
     "task": "declared AI leaf",
     "task_v2": "declared AI leaf",
@@ -545,6 +545,21 @@ def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -
     assert "`evaluate`" not in prompt
     assert "locator" in prompt
     assert "MCP/scout evidence" in prompt
+
+
+def test_code_schema_guidance_advertises_only_the_authorized_file_attachment_helper() -> None:
+    guidance = " ".join(_code_only_browser_schema_guidance())
+
+    assert "attach_authorized_file(page, <file_parameter>, <observed_selector>)" in guidance
+    assert "set_input_files" not in guidance
+
+
+def test_code_schema_guidance_advertises_clear_browser_data_instead_of_browser_settings_pages() -> None:
+    guidance = " ".join(_code_only_browser_schema_guidance())
+
+    assert "await clear_browser_data(page)" in guidance
+    assert "chrome://" in guidance
+    assert "clear_cookies" not in guidance
 
 
 def test_code_only_authoring_prompt_defers_runtime_helpers_to_code_schema() -> None:

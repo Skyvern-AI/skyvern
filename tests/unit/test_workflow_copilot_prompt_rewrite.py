@@ -59,6 +59,8 @@ def _sentence_containing(prompt: str, needle: str) -> str:
 
 def _code_only_ctx() -> SimpleNamespace:
     return SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[],
@@ -121,6 +123,14 @@ async def test_code_schema_is_the_discoverable_home_for_runtime_helpers(monkeypa
     assert "await solve_captcha(page)" in guidance
     assert "<key>.username" in guidance
     assert "<key>.password" in guidance
+
+    model_result = _copilot_to_call_tool_result(rendered, "get_block_schema")
+    model_payload = json.loads(model_result.content[0].text)
+    model_guidance = "\n".join(model_payload["data"]["code_only_guidance"])
+    assert "await clear_browser_data(page)" in model_guidance
+    clear_helper = model_payload["data"]["clear_browser_data_helper_contract"]
+    assert clear_helper["shadowed_by_parameter"] == "clear_browser_data"
+    assert clear_helper["on_parameter_collision"]
 
 
 @pytest.mark.asyncio

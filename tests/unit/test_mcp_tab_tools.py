@@ -48,10 +48,16 @@ def _make_session_state(browser: MagicMock | None = None) -> SessionState:
 
 
 def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page: MagicMock, ctx: BrowserContext) -> AsyncMock:
-    """Patch get_page to return a SkyvernBrowserPage-like wrapper."""
+    """Patch page and browser resolution for tests that use a retained session."""
     skyvern_page = SimpleNamespace(page=page)
     mock = AsyncMock(return_value=(skyvern_page, ctx))
     monkeypatch.setattr(mcp_tabs, "get_page", mock)
+
+    async def _resolve_browser(**_kwargs: object) -> tuple[MagicMock, BrowserContext]:
+        state = mcp_tabs.get_current_session()
+        return state.browser or MagicMock(), ctx
+
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", _resolve_browser)
     return mock
 
 
@@ -81,10 +87,10 @@ async def test_tab_list_returns_all_tabs(monkeypatch: pytest.MonkeyPatch) -> Non
     browser = _make_mock_browser(page_a, page_b)
 
     ctx = BrowserContext(mode="local")
-    skyvern_page = SimpleNamespace(page=page_a)
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(skyvern_page, ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
+    state._active_page = page_a
     _patch_session(monkeypatch, state)
 
     result = await mcp_tabs.skyvern_tab_list()
@@ -101,6 +107,106 @@ async def test_tab_list_returns_all_tabs(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_tab_list_prefers_implicit_page_over_newer_popup(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "A")
+    popup_b = _make_mock_page("https://b.com", "B")
+    popup_c = _make_mock_page("https://c.com", "C")
+    browser = _make_mock_browser(page_a, popup_b, popup_c)
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, page_a, ctx)
+    state = _make_session_state(browser)
+    state._active_page = None
+    state._implicit_page = page_a
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_tab_list()
+
+    assert result["ok"] is True
+    assert result["data"]["active_tab_id"] == str(id(page_a))
+    assert [tab["is_active"] for tab in result["data"]["tabs"]] == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_tab_list_falls_back_when_implicit_page_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed_page = _make_mock_page("https://closed.example", "Closed", closed=True)
+    remaining_page = _make_mock_page("https://remaining.example", "Remaining")
+    browser = _make_mock_browser(closed_page, remaining_page)
+
+    ctx = BrowserContext(mode="local")
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(mcp_tabs, "ensure_browser_hooks", MagicMock())
+    state = _make_session_state(browser)
+    state._implicit_page = closed_page
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_tab_list()
+
+    assert result["ok"] is True
+    assert result["data"]["active_tab_id"] == str(id(remaining_page))
+    assert result["data"]["tabs"][0]["is_active"] is False
+    assert result["data"]["tabs"][1]["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_tab_list_pins_newest_page_when_no_selection_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "A")
+    page_b = _make_mock_page("https://b.com", "B")
+    popup_c = _make_mock_page("https://c.com", "C")
+    browser = _make_mock_browser(page_a, page_b)
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(mcp_tabs, "ensure_browser_hooks", MagicMock())
+
+    listed = await mcp_tabs.skyvern_tab_list()
+
+    assert listed["ok"] is True
+    assert listed["data"]["active_tab_id"] == str(id(page_b))
+    assert state._implicit_page is page_b
+
+    browser._browser_context.pages.append(popup_c)
+    page_b_wrapper = SimpleNamespace(page=page_b)
+    browser.get_page_for = AsyncMock(return_value=page_b_wrapper)
+    browser.get_working_page = AsyncMock(return_value=SimpleNamespace(page=popup_c))
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+    monkeypatch.setattr(session_manager, "ensure_browser_hooks", MagicMock())
+
+    page, _ = await session_manager.get_page()
+
+    assert page is page_b_wrapper
+    browser.get_page_for.assert_awaited_once_with(page_b)
+    browser.get_working_page.assert_not_awaited()
+
+    listed_again = await mcp_tabs.skyvern_tab_list()
+
+    assert listed_again["ok"] is True
+    assert listed_again["data"]["active_tab_id"] == str(id(page_b))
+
+
+@pytest.mark.asyncio
+async def test_tab_list_preserves_selection_lost_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "A")
+    page_b = _make_mock_page("https://b.com", "B")
+    browser = _make_mock_browser(page_a, page_b)
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state.selection_lost = True
+    _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(mcp_tabs, "ensure_browser_hooks", MagicMock())
+
+    result = await mcp_tabs.skyvern_tab_list()
+
+    assert result["ok"] is True
+    assert result["data"]["active_tab_id"] is None
+    assert state.selection_lost is True
+    assert state._implicit_page is None
+
+
+@pytest.mark.asyncio
 async def test_tab_list_answers_within_its_bound_when_a_page_title_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _never_returns() -> str:
         await asyncio.sleep(3600)
@@ -111,7 +217,7 @@ async def test_tab_list_answers_within_its_bound_when_a_page_title_hangs(monkeyp
     browser = _make_mock_browser(hanging)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=hanging), ctx)))
+    _patch_get_page(monkeypatch, hanging, ctx)
     _patch_session(monkeypatch, _make_session_state(browser))
     monkeypatch.setattr(mcp_tabs, "TAB_TITLE_TIMEOUT_SECONDS", 0.05)
 
@@ -128,7 +234,7 @@ async def test_tab_list_reports_debugger_attachment_only_in_extension_mode(monke
     page_b = _make_mock_page("https://b.com", "Page B")
     browser = _make_mock_browser(page_a, page_b)
     ctx = BrowserContext(mode="extension", can_access_localhost=True)
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
     _patch_session(monkeypatch, _make_session_state(browser))
 
     runtime = MagicMock()
@@ -145,12 +251,101 @@ async def test_tab_list_reports_debugger_attachment_only_in_extension_mode(monke
 
 @pytest.mark.asyncio
 async def test_tab_list_no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(side_effect=mcp_tabs.BrowserNotAvailableError()))
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(side_effect=mcp_tabs.BrowserNotAvailableError()))
 
     result = await mcp_tabs.skyvern_tab_list()
 
     assert result["ok"] is False
     assert result["error"]["code"] == "NO_ACTIVE_BROWSER"
+
+
+@pytest.mark.asyncio
+async def test_tab_management_recovers_from_stale_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected_page = _make_mock_page("https://selected.example", "Selected", closed=True)
+    remaining_page = _make_mock_page("https://remaining.example", "Remaining")
+    new_page = _make_mock_page("about:blank", "New tab")
+    browser = _make_mock_browser(remaining_page)
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state._active_page = selected_page
+    state.selection_lost = True
+    _patch_session(monkeypatch, state)
+
+    resolve = AsyncMock(return_value=(browser, ctx))
+    get_page = AsyncMock(side_effect=AssertionError("tab management must not resolve a page"))
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", resolve)
+    monkeypatch.setattr(mcp_tabs, "get_page", get_page)
+
+    listed = await mcp_tabs.skyvern_tab_list()
+
+    assert listed["ok"] is True
+    assert listed["data"]["active_tab_id"] is None
+    assert listed["data"]["tabs"][0]["is_active"] is False
+    assert state._active_page is selected_page
+
+    switched = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(remaining_page)))
+
+    assert switched["ok"] is True
+    assert state._active_page is remaining_page
+
+    state._active_page = selected_page
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+    browser._browser_context.pages = [remaining_page, new_page]
+    created = await mcp_tabs.skyvern_tab_new()
+
+    assert created["ok"] is True
+    assert state._active_page is new_page
+    assert resolve.await_count == 3
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tab_close_nonselected_tab_does_not_require_stale_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_page = _make_mock_page("https://selected.example", "Selected", closed=True)
+    target_page = _make_mock_page("https://target.example", "Target")
+    browser = _make_mock_browser(target_page)
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state._active_page = selected_page
+    state.selection_lost = True
+    _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    get_page = AsyncMock(side_effect=AssertionError("non-selected tab close must not resolve a page"))
+    monkeypatch.setattr(mcp_tabs, "get_page", get_page)
+
+    def _close_side_effect() -> None:
+        browser._browser_context.pages = []
+
+    target_page.close = AsyncMock(side_effect=_close_side_effect)
+    result = await mcp_tabs.skyvern_tab_close(tab_id=str(id(target_page)))
+
+    assert result["ok"] is True
+    assert result["data"]["closed_tab_id"] == str(id(target_page))
+    assert state._active_page is selected_page
+    assert state.selection_lost is True
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tab_tool_preserves_page_selection_lost_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    active_page = _make_mock_page(closed=True)
+    browser = _make_mock_browser(active_page)
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state.context = ctx
+    state._active_page = active_page
+    monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+
+    result = await mcp_tabs.skyvern_tab_close()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PAGE_SELECTION_LOST"
+    assert result["error"]["message"] == "The active page is closed or detached"
+    assert result["error"]["hint"] == "Call skyvern_tab_list, then skyvern_tab_switch or skyvern_tab_new"
 
 
 # ═══════════════════════════════════════════════════
@@ -166,10 +361,10 @@ async def test_tab_new_creates_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     browser._browser_context.new_page = AsyncMock(return_value=new_page)
 
     ctx = BrowserContext(mode="local")
-    skyvern_page = SimpleNamespace(page=existing_page)
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(skyvern_page, ctx)))
+    _patch_get_page(monkeypatch, existing_page, ctx)
 
     state = _make_session_state(browser)
+    state.selection_lost = True
     _patch_session(monkeypatch, state)
 
     # After new_page(), browser.pages should include both
@@ -180,7 +375,51 @@ async def test_tab_new_creates_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["ok"] is True
     assert result["data"]["is_active"] is True
     assert state._active_page is new_page
+    assert state.selection_lost is False
     browser._browser_context.new_page.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tab_new_initializes_popup_and_inspection_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing_page = _make_mock_page("https://old.com", "Old")
+    new_page = _make_mock_page("about:blank", "New Tab")
+    popup = _make_mock_page("https://popup.com", "Popup")
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state.context = ctx
+    session_manager.set_current_session(state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    browser.get_page_for = AsyncMock(return_value=SimpleNamespace(page=new_page))
+
+    result = await mcp_tabs.skyvern_tab_new()
+
+    assert result["ok"] is True
+    assert browser._browser_context.on.call_count == 1
+    page_event_handler = browser._browser_context.on.call_args.args[1]
+    handlers = {call.args[0]: call.args[1] for call in existing_page.on.call_args_list}
+    assert {"console", "response", "dialog", "pageerror"} <= handlers.keys()
+
+    handlers["console"](SimpleNamespace(type="warning", text="early console", location={}))
+    response = SimpleNamespace(
+        url="https://api.example.test/data",
+        request=SimpleNamespace(method="GET", timing={}, resource_type="fetch"),
+        status=200,
+        headers={},
+    )
+    handlers["response"](response)
+    assert any(entry["text"] == "early console" for entry in state.console_messages)
+    assert any(entry["url"] == "https://api.example.test/data" for entry in state.network_requests)
+
+    browser._browser_context.pages = [existing_page, new_page, popup]
+    page_event_handler(popup)
+
+    waited = await mcp_tabs.skyvern_tab_wait_for_new(timeout_ms=1000)
+
+    assert waited["ok"] is True
+    assert waited["data"]["tab_id"] == str(id(popup))
 
 
 @pytest.mark.asyncio
@@ -192,7 +431,7 @@ async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch, public_dns_reso
     browser._browser_context.pages = [existing_page, new_page]
 
     ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)))
+    _patch_get_page(monkeypatch, existing_page, ctx)
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
@@ -290,7 +529,7 @@ async def test_tab_new_navigation_failure_retains_new_active_tab(
     browser._browser_context.pages = [existing_page, new_page]
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)))
+    _patch_get_page(monkeypatch, existing_page, ctx)
 
     state = _make_session_state(browser)
     state._active_page = existing_page
@@ -400,18 +639,22 @@ async def test_tab_switch_by_tab_id(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _make_mock_browser(page_a, page_b)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
 
     target_id = str(id(page_b))
+    state._implicit_page = page_a
+    state.selection_lost = True
     result = await mcp_tabs.skyvern_tab_switch(tab_id=target_id)
 
     assert result["ok"] is True
     assert result["data"]["tab_id"] == target_id
     assert result["data"]["is_active"] is True
     assert state._active_page is page_b
+    assert state._implicit_page is None
+    assert state.selection_lost is False
 
 
 @pytest.mark.asyncio
@@ -421,7 +664,7 @@ async def test_tab_switch_by_index(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _make_mock_browser(page_a, page_b)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
@@ -451,7 +694,7 @@ async def test_tab_switch_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _make_mock_browser(page_a)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
@@ -476,7 +719,7 @@ async def test_tab_close_active_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _make_mock_browser(page_a, page_b)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
     state._active_page = page_a
@@ -498,16 +741,92 @@ async def test_tab_close_active_tab(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tab_close_non_active_popup_preserves_implicit_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "A")
+    popup_b = _make_mock_page("https://b.com", "B")
+    popup_c = _make_mock_page("https://c.com", "C")
+    browser = _make_mock_browser(page_a, popup_b, popup_c)
+
+    ctx = BrowserContext(mode="local")
+    state = _make_session_state(browser)
+    state._active_page = None
+    state._implicit_page = page_a
+    state._working_frame = MagicMock()
+    _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(mcp_tabs, "ensure_browser_hooks", MagicMock())
+    clear = MagicMock()
+    monkeypatch.setattr(mcp_tabs, "clear_session_ref_map", clear)
+
+    def _close_side_effect() -> None:
+        browser._browser_context.pages = [page_a, popup_b]
+
+    popup_c.close = AsyncMock(side_effect=_close_side_effect)
+
+    result = await mcp_tabs.skyvern_tab_close(tab_id=str(id(popup_c)))
+
+    assert result["ok"] is True
+    assert state._implicit_page is page_a
+    assert state._working_frame is not None
+    clear.assert_not_called()
+
+    page_a_wrapper = SimpleNamespace(page=page_a)
+    browser.get_page_for = AsyncMock(return_value=page_a_wrapper)
+    browser.get_working_page = AsyncMock(return_value=SimpleNamespace(page=popup_b))
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+    monkeypatch.setattr(session_manager, "ensure_browser_hooks", MagicMock())
+
+    page, _ = await session_manager.get_page()
+
+    assert page is page_a_wrapper
+    browser.get_page_for.assert_awaited_once_with(page_a)
+    browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tab_close_clears_implicit_page_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "A")
+    page_b = _make_mock_page("https://b.com", "B")
+    browser = _make_mock_browser(page_a, page_b)
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, page_a, ctx)
+
+    state = _make_session_state(browser)
+    state._implicit_page = page_a
+    state._working_frame = MagicMock()
+    _patch_session(monkeypatch, state)
+    clear = MagicMock()
+    monkeypatch.setattr(mcp_tabs, "clear_session_ref_map", clear)
+
+    def _close_side_effect() -> None:
+        browser._browser_context.pages = [page_b]
+
+    page_a.close = AsyncMock(side_effect=_close_side_effect)
+
+    result = await mcp_tabs.skyvern_tab_close(tab_id=str(id(page_a)))
+
+    assert result["ok"] is True
+    assert state._implicit_page is None
+    assert state._working_frame is None
+    clear.assert_called_once_with(session_id=None, cdp_url=None)
+
+
+@pytest.mark.asyncio
 async def test_tab_close_by_index(monkeypatch: pytest.MonkeyPatch) -> None:
     page_a = _make_mock_page("https://a.com", "A")
     page_b = _make_mock_page("https://b.com", "B")
     browser = _make_mock_browser(page_a, page_b)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
+    state._working_frame = MagicMock()
     _patch_session(monkeypatch, state)
+    clear = MagicMock()
+    monkeypatch.setattr(mcp_tabs, "clear_session_ref_map", clear)
 
     def _close_side_effect() -> None:
         browser._browser_context.pages = [page_a]
@@ -519,6 +838,13 @@ async def test_tab_close_by_index(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["ok"] is True
     assert result["data"]["closed_tab_id"] == str(id(page_b))
     assert result["data"]["remaining_tabs"] == 1
+    assert state._working_frame is None
+    clear.assert_called_once_with(session_id=None, cdp_url=None)
+
+    listed = await mcp_tabs.skyvern_tab_list()
+    assert listed["ok"] is True
+    assert listed["data"]["active_tab_id"] == str(id(page_a))
+    assert state._working_frame is None
 
 
 @pytest.mark.asyncio
@@ -527,7 +853,7 @@ async def test_tab_close_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _make_mock_browser(page_a)
 
     ctx = BrowserContext(mode="local")
-    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_get_page(monkeypatch, page_a, ctx)
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
@@ -762,6 +1088,7 @@ class TestTabStatePersistenceGuards:
     async def test_tab_close_rejects_per_request_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         session_manager.set_stateless_http_mode(True)
         _patch_get_page(monkeypatch, _make_mock_page(), BrowserContext(mode="cloud_session", session_id="pbs_req"))
+        session_manager.set_current_session(SessionState(browser=MagicMock()))
         result = await mcp_tabs.skyvern_tab_close()
         assert result["ok"] is False
         assert result["error"]["code"] == "ACTION_FAILED"
@@ -783,11 +1110,13 @@ class TestTabStatePersistenceGuards:
         session_manager.register_copilot_session("pbs_tabs", owned, organization_id="org_tabs")
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_tabs")
 
-        async def _get_page_installing_registered(**_kwargs: object) -> tuple[SimpleNamespace, BrowserContext]:
+        async def _resolve_browser_installing_registered(
+            **_kwargs: object,
+        ) -> tuple[MagicMock, BrowserContext]:
             session_manager.set_current_session(owned)
-            return SimpleNamespace(page=page_a), ctx
+            return owned.browser, ctx
 
-        monkeypatch.setattr(mcp_tabs, "get_page", _get_page_installing_registered)
+        monkeypatch.setattr(mcp_tabs, "resolve_browser", _resolve_browser_installing_registered)
         try:
             result = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(page_b)))
         finally:
@@ -911,6 +1240,7 @@ async def test_open_tabs_clears_the_ref_map_when_it_moves_the_active_tab(monkeyp
     # Parity with tab_new / tab_switch / tab_close: refs captured on the previous tab must not
     # resolve against the newly active one.
     state, clear = _patch_open_tabs(monkeypatch)
+    state.selection_lost = True
 
     result = await mcp_tabs.skyvern_open_tabs(
         urls=["https://a.com", "https://b.com"], screenshot=False, set_active_last=True
@@ -919,7 +1249,65 @@ async def test_open_tabs_clears_the_ref_map_when_it_moves_the_active_tab(monkeyp
     assert result["ok"] is True, result
     assert state._active_page is not None
     assert state._active_page.url == "https://b.com"
+    assert state.selection_lost is False
     clear.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_keeps_lost_selection_when_active_tab_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    state, _ = _patch_open_tabs(monkeypatch)
+    previous_active = state._active_page
+    implicit_page = _make_mock_page("https://implicit.example", "Implicit")
+    state._implicit_page = implicit_page
+    state.selection_lost = True
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://a.com"], screenshot=False)
+
+    assert result["ok"] is True
+    assert state.selection_lost is True
+    assert state._implicit_page is implicit_page
+    assert state._active_page is previous_active
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_clears_lost_selection_when_active_tab_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    state, _ = _patch_open_tabs(monkeypatch)
+    state.selection_lost = True
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://a.com"], screenshot=False, set_active_last=True)
+
+    assert result["ok"] is True
+    assert state.selection_lost is False
+    assert state._active_page.url == "https://a.com"
+    assert state._implicit_page is None
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_keeps_lost_selection_when_every_navigation_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    state, _ = _patch_open_tabs(monkeypatch)
+    for page in state.browser._browser_context.pages[1:]:
+        page.goto.side_effect = RuntimeError("navigation failed")
+    state.selection_lost = True
+
+    result = await mcp_tabs.skyvern_open_tabs(
+        urls=["https://a.com", "https://b.com"], screenshot=False, set_active_last=True
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["opened"] == 0
+    assert state.selection_lost is True
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_keeps_implicit_page_when_active_tab_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    state, _ = _patch_open_tabs(monkeypatch)
+    pinned_page = state._active_page
+    state._implicit_page = pinned_page
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://a.com"], screenshot=False)
+
+    assert result["ok"] is True
+    assert state._implicit_page is pinned_page
 
 
 @pytest.mark.asyncio

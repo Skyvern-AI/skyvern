@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import litellm
+import openai
 import pytest
 import yaml
 from agents import GuardrailFunctionOutput, InputGuardrail
@@ -26,7 +27,7 @@ from agents.run_context import RunContextWrapper
 from pydantic import BaseModel
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -106,6 +107,7 @@ from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, interim_run_start_outcome
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
@@ -139,6 +141,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
@@ -270,6 +273,39 @@ class TestFailedTestResponseNormalization:
             f"Failure: Verify you are human. {model_reply} Keep the draft to iterate on, or discard."
         )
         assert "proxy location?" not in rewritten
+
+    def test_credit_admission_refusal_reports_that_the_test_never_started(self) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_test_failure_reason=(
+                "Build test did not start because credits are exhausted. "
+                "No browser or run started. Upgrade your plan in Billing."
+            ),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=BuildTestConnectFailure(
+                    state="billing_credit_admission_refusal",
+                    retry_action=None,
+                ),
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I tested the workflow, but it failed.", ctx)
+
+        assert rewritten == (
+            "I created a draft workflow with 1 block, but I couldn't start a test. "
+            "Build test did not start because credits are exhausted. No browser or run started. "
+            "Upgrade your plan in Billing. The draft is untested. "
+            "Keep the draft to iterate on, or discard."
+        )
+        assert "tested it" not in rewritten
+        assert "test failed" not in rewritten
 
     def test_without_challenge_effects_the_base_follow_up_template_is_unchanged(self) -> None:
         no_contract_ctx = _challenge_failure_ctx()
@@ -706,8 +742,50 @@ workflow_definition:
         assert "button:nth-of-type" not in prompt
         assert "secret-token" not in prompt
 
+    @pytest.mark.parametrize(
+        ("failure_reason", "replacement"),
+        [
+            (
+                "CodeBlock failed because it requested an unsupported browser operation at line 2: blocked "
+                "navigation to non-web scheme: 'chrome://settings/clearBrowserData'; use "
+                "`await clear_browser_data(page)` to clear the run's cookies and site data.",
+                "await clear_browser_data(page)",
+            ),
+            (
+                "CodeBlock failed because it requested an unsupported browser operation at line 10: page.on is not "
+                "supported by the secure CodeBlock runner; a CodeBlock cannot register a browser event callback "
+                "that outlives it. Take the triggering action, then wait for its effect with a bounded call: "
+                "`await click_and_claim_download(page, selector)` for a download, "
+                "`await page.wait_for_url(url, timeout=...)` for navigation, or "
+                "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the "
+                "page. There is no brokered way to wait on a network response; wait on what the response "
+                "renders instead.",
+                "await page.wait_for_selector(selector, timeout=...)",
+            ),
+        ],
+        ids=["clear_browsing_data_navigation", "listener_denial"],
+    )
+    def test_runtime_repair_prompt_carries_the_denials_named_replacement(
+        self, failure_reason: str, replacement: str
+    ) -> None:
+        # A runner denial names the sanctioned replacement after the denied call, so a bound that
+        # keeps only the refusal hands the repair turn a dead end it will re-emit.
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="clear_session",
+                reason_code="runtime_block_failure",
+                runtime_failure_reason=failure_reason,
+                failed_block_status="failed",
+            ),
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert replacement in prompt
+
     def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
-        long_reason = "missing requested output child paths " + ("x" * 220)
+        long_reason = "missing requested output child paths " + ("x" * 700)
         repair_context = CodeAuthoringRepairContext(
             block_label="lookup_status",
             reason_code="metadata_reject",
@@ -737,7 +815,7 @@ workflow_definition:
         assert "reason_code: metadata_reject" in prompt
         assert "block_label: lookup_status" in prompt
         assert "runtime_failure_reason: missing requested output child paths " in prompt
-        assert "x" * 180 not in prompt
+        assert "x" * 640 not in prompt
         assert "runtime_failure_class: requested_output_contract_missing_output_coverage" in prompt
         assert "metadata_contract_source: requested_output_contract" in prompt
         assert "metadata_contract_reason_code: requested_output_contract_missing_output_coverage" in prompt
@@ -872,6 +950,36 @@ workflow_definition:
 
         assert "may already have changed" in scaffold
         assert "never carry an observed value into the code as a literal" in scaffold
+
+    def test_declared_goal_paths_bind_only_for_an_unevaluated_run(self) -> None:
+        """A failed operation must be repaired, not redirected into keyed extraction."""
+
+        def prompt_for(reason_code: str) -> str:
+            ctx = _ctx(
+                block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+                latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                    phase="persisted_block_run",
+                    attempted_tool="update_and_run_blocks",
+                    verdict="not_authoritative",
+                    reason_code=reason_code,
+                    block_labels=["read_failure_rate"],
+                    executed_block_labels=["read_failure_rate"],
+                    observed_page_value_excerpt="Service health Failure rate 26.05 %",
+                ),
+            )
+            ctx.code_artifact_metadata = {
+                "read_failure_rate": {"claimed_outcomes": [{"id": "metric", "goal_value_paths": ["$.failure_rate"]}]}
+            }
+            return agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        unevaluated = prompt_for("run_completed_unevaluated")
+        assert "OBSERVED PAGE VALUES CONTRACT:" in unevaluated
+        assert "- failure_rate: <observed value>" in unevaluated
+
+        runtime_failure = prompt_for("runtime_block_failure")
+        assert "OBSERVED PAGE VALUES CONTRACT:" not in runtime_failure
+        assert "bind_output_paths:" not in runtime_failure
+        assert "observed_page_values: Service health Failure rate 26.05 %" in runtime_failure
 
     def test_page_text_cannot_close_the_prompt_fence_it_is_rendered_into(self) -> None:
         ctx = _ctx(
@@ -1968,6 +2076,68 @@ workflow_definition:
         assert captured["run_called"] is True
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_persists_and_tests_noncanonical_identifiers(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: ﬁle
+      default_value: report.csv
+  blocks:
+    - block_type: code
+      label: ｓubmit
+      parameter_keys: [ﬁle]
+      code: |
+        return {"filename": ﬁle}
+"""
+        captured: dict[str, str | bool] = {}
+
+        async def fake_update_workflow(payload, ctx, **_kwargs):
+            captured["workflow_yaml"] = payload["workflow_yaml"]
+            ctx.workflow_yaml = payload["workflow_yaml"]
+            workflow = await _process_workflow_yaml(
+                settings_fallback_yaml="enable_self_healing: false",
+                workflow_id=ctx.workflow_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+                workflow_yaml=payload["workflow_yaml"],
+            )
+            return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
+
+        async def fake_run_blocks(params, ctx, **kwargs):
+            captured["run_called"] = True
+            return {
+                "ok": True,
+                "data": {"workflow_run_id": "wr-1", "overall_status": "completed", "blocks": []},
+            }
+
+        monkeypatch.setattr(
+            "skyvern.forge.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["ｓubmit"], {}, "ｓubmit", "initial"))
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["ｓubmit"], "parameters": {"ﬁle": "x"}}),
+        )
+
+        assert json.loads(result)["ok"] is True
+        assert captured["workflow_yaml"] == workflow_yaml
+        assert captured["run_called"] is True
+
 
 class TestEditBlockAndRun:
     @pytest.mark.asyncio
@@ -2957,7 +3127,6 @@ class TestTranslateToAgentResultGating:
             last_full_workflow_test_ok=True,
             last_run_blocks_workflow_run_id="wr_old",
             last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old"),
-            block_state_map={"old_block": "completed"},
             request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
         )
         result = _fake_run_result(
@@ -2977,7 +3146,6 @@ class TestTranslateToAgentResultGating:
         assert ctx.last_full_workflow_test_ok is False
         assert ctx.last_run_blocks_workflow_run_id is None
         assert ctx.last_run_outcome is None
-        assert ctx.block_state_map == {}
         assert ctx.run_outcome_trace == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
         assert ctx.last_workflow is new_wf
         # The REPLACE yaml itself (not the stale snapshot) must land on ctx;
@@ -3561,6 +3729,128 @@ workflow_definition:
             ).failure_kind
             == "external_dep"
         )
+
+    def test_recoverable_failure_labels_a_wrapped_transport_error_as_external_dep(self) -> None:
+        original = litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+        wrapped = litellm.exceptions.MidStreamFallbackError(
+            message="azure", llm_provider="azure", model="test", original_exception=original
+        )
+
+        failure = build_recoverable_failure(wrapped, workflow_modified=False, internal_error_id="cpe_transport")
+
+        assert failure.failure_kind == "external_dep"
+        assert failure.reason_summary == "A Copilot dependency stopped responding"
+
+    def test_recoverable_failure_ignores_a_transient_inherited_from_the_previous_attempt(self) -> None:
+        try:
+            raise litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+        except litellm.APIConnectionError:
+            try:
+                raise InvalidLLMConfigError("SECONDARY")
+            except InvalidLLMConfigError as config_error:
+                assert isinstance(config_error.__context__, litellm.APIConnectionError)
+
+                failure = build_recoverable_failure(
+                    config_error, workflow_modified=False, internal_error_id="cpe_config"
+                )
+
+                assert failure.failure_kind == "unknown"
+                assert not agent_module._is_retriable_llm_error(config_error)
+
+    @pytest.mark.parametrize(
+        ("error_factory", "expected_kind"),
+        [
+            pytest.param(CopilotTotalTimeoutError, "timeout", id="timeout"),
+            pytest.param(lambda: CopilotUnrecoverableToolError("click", "browser failed"), "tool_call", id="tool_call"),
+            pytest.param(lambda: yaml.YAMLError("bad yaml"), "validation", id="validation"),
+            pytest.param(lambda: LLMProviderError("PRIMARY"), "external_dep", id="external_dep"),
+        ],
+    )
+    def test_recoverable_failure_reads_an_explicit_cause_but_not_an_inherited_context(
+        self, error_factory: Callable[[], Exception], expected_kind: str
+    ) -> None:
+        explicitly_caused = InvalidLLMConfigError("SECONDARY")
+        explicitly_caused.__cause__ = error_factory()
+
+        assert (
+            build_recoverable_failure(
+                explicitly_caused, workflow_modified=False, internal_error_id="cpe_cause"
+            ).failure_kind
+            == expected_kind
+        )
+
+        try:
+            raise error_factory()
+        except Exception:
+            try:
+                raise InvalidLLMConfigError("SECONDARY")
+            except InvalidLLMConfigError as inherited:
+                assert inherited.__context__ is not None
+
+                assert (
+                    build_recoverable_failure(
+                        inherited, workflow_modified=False, internal_error_id="cpe_context"
+                    ).failure_kind
+                    == "unknown"
+                )
+
+    @pytest.mark.parametrize(
+        ("class_name", "message"),
+        [
+            pytest.param("RateLimitError", "slow down", id="known_name"),
+            pytest.param("AdapterStreamDropped", "upstream connection reset mid-stream", id="retriable_text"),
+        ],
+    )
+    def test_recoverable_failure_labels_a_provider_error_the_type_tuple_cannot_name(
+        self, class_name: str, message: str
+    ) -> None:
+        adapter_error = type(class_name, (Exception,), {"__module__": "openai"})(message)
+
+        failure = build_recoverable_failure(adapter_error, workflow_modified=False, internal_error_id="cpe_adapter")
+
+        assert agent_module._is_retriable_llm_error(adapter_error)
+        assert failure.failure_kind == "external_dep"
+
+    def test_recoverable_failure_keeps_unknown_for_a_permanent_provider_error(self) -> None:
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        error = openai.BadRequestError(
+            "the request was not accepted", response=httpx.Response(400, request=request), body=None
+        )
+
+        failure = build_recoverable_failure(error, workflow_modified=False, internal_error_id="cpe_permanent")
+
+        assert failure.failure_kind == "unknown"
+        assert "dependency stopped responding" not in failure.reason_summary
+
+    def test_recoverable_failure_label_agrees_with_retriability_on_a_permanent_over_transient_chain(self) -> None:
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        error = openai.BadRequestError(
+            "the request was not accepted", response=httpx.Response(400, request=request), body=None
+        )
+        error.__cause__ = litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+
+        failure = build_recoverable_failure(error, workflow_modified=False, internal_error_id="cpe_mixed")
+
+        assert not agent_module._is_retriable_llm_error(error)
+        assert failure.failure_kind == "unknown"
+
+    @pytest.mark.parametrize(
+        ("error_factory", "expected_kind"),
+        [
+            pytest.param(CopilotTotalTimeoutError, "timeout", id="timeout"),
+            pytest.param(lambda: CopilotUnrecoverableToolError("click", "browser failed"), "tool_call", id="tool_call"),
+            pytest.param(lambda: yaml.YAMLError("bad yaml"), "validation", id="validation"),
+        ],
+    )
+    def test_recoverable_failure_precedence_outranks_a_transport_link(
+        self, error_factory: Callable[[], Exception], expected_kind: str
+    ) -> None:
+        error = error_factory()
+        error.__cause__ = litellm.APIConnectionError(message="azure", llm_provider="azure", model="test")
+
+        failure = build_recoverable_failure(error, workflow_modified=False, internal_error_id="cpe_precedence")
+
+        assert failure.failure_kind == expected_kind
 
     def test_recoverable_failure_uses_chained_navigation_reason(self) -> None:
         nav_error = CopilotNonRetriableNavError("https://example.com", "net::ERR_NAME_NOT_RESOLVED")
@@ -5007,6 +5297,251 @@ class TestRunBlocksCredentialApproval:
         ]
         database.organizations.get_organization.assert_not_called()
 
+    @staticmethod
+    def _google_row(connection_id: str, *, state: str = "active") -> GoogleOAuthCredentialBase:
+        return GoogleOAuthCredentialBase(
+            id=connection_id,
+            organization_id="org-1",
+            credential_name=f"Connection {connection_id}",
+            email_address=None,
+            state=state,
+            scopes_requested=[GOOGLE_SHEETS_DATA_SCOPE],
+            scopes_granted=[GOOGLE_SHEETS_DATA_SCOPE],
+            created_at=datetime(2026, 9, 1),
+            modified_at=datetime(2026, 9, 1),
+        )
+
+    @staticmethod
+    def _listing_activity(*connection_ids: str) -> dict[str, object]:
+        return {
+            "tool": "list_integrations",
+            "integrations": [
+                {
+                    "provider": "google",
+                    "state": "active",
+                    "connection_id": connection_id,
+                    "scopes_granted": [GOOGLE_SHEETS_DATA_SCOPE],
+                }
+                for connection_id in connection_ids
+            ],
+        }
+
+    def _google_dispatch_stack(
+        self,
+        monkeypatch,
+        *,
+        workflow: _CredentialWorkflow,
+        visible: list[GoogleOAuthCredentialBase],
+        active_ids: list[str],
+    ) -> SimpleNamespace:
+        database = self._db(workflow=workflow, organization_lookup=None)
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_visible_credentials_for_org",
+            AsyncMock(return_value=visible),
+        )
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_credentials_for_org",
+            AsyncMock(return_value=[SimpleNamespace(id=connection_id) for connection_id in active_ids]),
+        )
+        return database
+
+    @pytest.mark.asyncio
+    async def test_same_turn_google_admission_retires_the_earlier_denial(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_sheet"}],
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_sheet")],
+            active_ids=["goac_sheet"],
+        )
+        policy = RequestPolicy(resolved_credentials=[])
+        ctx = _ctx(request_policy=policy)
+
+        denied = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert denied["ok"] is False
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.connected_account_recovery_choices
+
+        ctx.tool_activity.append(self._listing_activity("goac_sheet"))
+        admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert ctx.tool_blocker_signals == []
+        assert ctx.connected_account_recovery_choices == []
+        assert policy.run_approved_google_connection_ids == []
+
+    @pytest.mark.asyncio
+    async def test_replacing_the_denied_google_binding_with_an_admitted_one_retires_the_denial(
+        self, monkeypatch
+    ) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_denied"}],
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_denied"), self._google_row("goac_replacement")],
+            active_ids=["goac_replacement"],
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        denied = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert denied["ok"] is False
+        assert ctx.blocker_signal is not None
+
+        workflow.workflow_definition.blocks[0]["credential_id"] = "goac_replacement"
+        ctx.tool_activity.append(self._listing_activity("goac_replacement"))
+        admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert ctx.blocker_signal is None
+        assert ctx.connected_account_recovery_choices == []
+
+    @pytest.mark.asyncio
+    async def test_google_denial_stands_while_an_unexecuted_block_keeps_the_unapproved_connection(
+        self, monkeypatch
+    ) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[
+                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "goac_second"},
+            ],
+            output_labels={"first_write", "second_write"},
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_first"), self._google_row("goac_second")],
+            active_ids=["goac_first", "goac_second"],
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        denied = await _run_blocks_and_collect_debug(
+            {"block_labels": ["first_write", "second_write"], "parameters": {}}, ctx
+        )
+
+        assert denied["ok"] is False
+        assert ctx.blocker_signal is not None
+        assert set(ctx.blocker_signal.extra["unapproved_google_connection_ids"]) == {"goac_first", "goac_second"}
+
+        ctx.tool_activity.append(self._listing_activity("goac_first"))
+        admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
+
+        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.connected_account_recovery_choices
+
+    @pytest.mark.asyncio
+    async def test_revoked_google_connection_row_leaves_the_denial_standing(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_write", "credential_id": "goac_revoked"}],
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_revoked", state="revoked")],
+            active_ids=["goac_revoked"],
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        denied = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert denied["ok"] is False
+        assert ctx.blocker_signal is not None
+
+        ctx.tool_activity.append(self._listing_activity("goac_revoked"))
+        still_denied = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert still_denied["ok"] is False
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.connected_account_recovery_choices
+
+    @pytest.mark.asyncio
+    async def test_admitting_one_google_connection_leaves_a_second_denial_standing(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[
+                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "goac_second"},
+            ],
+            output_labels={"first_write", "second_write"},
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_first"), self._google_row("goac_second")],
+            active_ids=["goac_first", "goac_second"],
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        first = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
+        second = await _run_blocks_and_collect_debug({"block_labels": ["second_write"], "parameters": {}}, ctx)
+
+        assert first["ok"] is False
+        assert second["ok"] is False
+        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_first"]
+        assert len(ctx.tool_blocker_signals) == 2
+
+        ctx.tool_activity.append(self._listing_activity("goac_first"))
+        admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
+
+        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.tool_blocker_signals
+        assert ctx.connected_account_recovery_choices
+
+    @pytest.mark.asyncio
+    async def test_google_denial_stands_while_an_unexecuted_block_keeps_a_named_connection(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[
+                {"label": "first_write", "block_type": "google_sheets_write", "credential_id": "goac_first"},
+                {"label": "second_write", "block_type": "google_sheets_write", "credential_id": "Marketing Sheet"},
+            ],
+            output_labels={"first_write", "second_write"},
+        )
+        self._google_dispatch_stack(
+            monkeypatch,
+            workflow=workflow,
+            visible=[self._google_row("goac_first")],
+            active_ids=["goac_first"],
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        denied = await _run_blocks_and_collect_debug(
+            {"block_labels": ["first_write", "second_write"], "parameters": {}}, ctx
+        )
+
+        assert denied["ok"] is False
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_first"]
+        assert ctx.blocker_signal.extra["unapproved_google_reference_count"] == 2
+
+        ctx.tool_activity.append(self._listing_activity("goac_first"))
+        admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
+
+        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.connected_account_recovery_choices
+
     @pytest.mark.asyncio
     async def test_common_dispatch_gate_approves_only_selected_sheets_bindings(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
@@ -5093,7 +5628,8 @@ class TestRunBlocksCredentialApproval:
         approval = AsyncMock(return_value=["goac_shared"])
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
         monkeypatch.setattr(run_execution_module, "_approve_server_verified_google_sheet_bindings", approval)
-        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+        policy = RequestPolicy(resolved_credentials=[])
+        ctx = _ctx(request_policy=policy)
 
         result = await _run_blocks_and_collect_debug(
             {"block_labels": ["loop"], "parameters": {}},
@@ -5103,6 +5639,8 @@ class TestRunBlocksCredentialApproval:
         assert result["ok"] is False
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.blocker_signal.extra["unapproved_google_connection_ids"] == ["goac_shared"]
+        assert policy.run_approved_google_connection_ids == []
         database.organizations.get_organization.assert_not_called()
 
     @pytest.mark.asyncio

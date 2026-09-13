@@ -639,6 +639,7 @@ async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -
     expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
     assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_123"
     assert task.extra_http_headers == {"X-Test": "1"}
 
 
@@ -759,6 +760,7 @@ async def test_workflow_run_browser_inherits_session_proxy_pin_when_no_browser_s
     expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
     assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_456"
     assert workflow_run.extra_http_headers == {"X-Test": "1"}
 
 
@@ -1260,7 +1262,16 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
         during_attach.append(manager.live_session_runnable_ids())
         return pbs_state
 
-    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        skyvern_context.scoped(
+            SkyvernContext(
+                task_id="tsk_script_policy",
+                workflow_run_id="wfr_script_policy",
+                workflow_permanent_id="wpid_script_policy",
+            )
+        ),
+    ):
         configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(side_effect=_begin_session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=_get_browser_state)
@@ -1275,6 +1286,21 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
     # The lease takes over with no gap once the attach completes.
     assert manager._persistent_session_leases["s_attach"].runnable_id == "s_attach"
     assert manager.live_session_runnable_ids() == {"s_attach"}
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs == {
+        "organization_id": "org_test",
+        "expected_runnable_id": "s_attach",
+        "download_run_id": "wfr_script_policy",
+        "task_id": "tsk_script_policy",
+        "workflow_run_id": "wfr_script_policy",
+        "url": None,
+        "workflow_permanent_id": "wpid_script_policy",
+        "expected_runnable_generation_id": "gen_attach",
+    }
+    assert pbs_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_attach"
+    assert pbs_state.get_or_create_page.await_args.kwargs["organization_id"] == "org_test"
+    assert pbs_state.get_or_create_page.await_args.kwargs["task_id"] == "tsk_script_policy"
+    assert pbs_state.get_or_create_page.await_args.kwargs["workflow_run_id"] == "wfr_script_policy"
+    assert pbs_state.get_or_create_page.await_args.kwargs["workflow_permanent_id"] == "wpid_script_policy"
 
 
 @pytest.mark.asyncio
@@ -1539,6 +1565,7 @@ async def test_pbs_adoption_rebinds_download_dir_without_an_interceptor() -> Non
 async def test_public_workflow_adoption_keeps_lease_identity_separate_from_download_run_id() -> None:
     manager = RealBrowserManager()
     workflow_run = make_workflow_run("wr_owner")
+    workflow_run.workflow_permanent_id = "wpid_owner"
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
@@ -1571,6 +1598,10 @@ async def test_public_workflow_adoption_keeps_lease_identity_separate_from_downl
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="task_v2_run",
+        task_id=None,
+        workflow_run_id="wr_owner",
+        url=None,
+        workflow_permanent_id="wpid_owner",
     )
     mock_rebind.assert_awaited_once_with(adopted_browser, run_id="task_v2_run")
     assert manager._persistent_session_leases["wr_owner"].runnable_id == "wr_owner"
@@ -1584,6 +1615,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
     (get_download_dir(run_id)) never reads."""
     manager = RealBrowserManager()
     task = make_task("tsk_adopt")
+    task.workflow_permanent_id = "wpid_task"
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
@@ -1615,6 +1647,10 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
         organization_id="org_test",
         expected_runnable_id="tsk_adopt",
         download_run_id="tsk_adopt",
+        task_id="tsk_adopt",
+        workflow_run_id=None,
+        url="https://example.com",
+        workflow_permanent_id="wpid_task",
     )
 
 
@@ -1640,6 +1676,10 @@ async def test_workflow_task_inherits_workflow_session_lease_without_beginning_t
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="wr_owner",
+        task_id="tsk_child",
+        workflow_run_id=None,
+        url="https://example.com",
+        workflow_permanent_id=None,
     )
     lease = manager._persistent_session_leases["wr_owner"]
     assert lease.runnable_id == "wr_owner"
@@ -2086,12 +2126,18 @@ async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
             AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
         ) as create_browser_context,
     ):
-        state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
+        state = await manager._create_browser_state(
+            workflow_run_id="wr_engine_stamp",
+            organization_id="org_test",
+            browser_session_id="pbs_engine_stamp",
+        )
 
     assert state.engine_selection is selection
     assert state.pw is fake_pw
     selection.start_driver.assert_awaited_once()
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+    assert create_browser_context.await_args.kwargs["browser_session_id"] == "pbs_engine_stamp"
+    assert create_browser_context.await_args.kwargs["_reconcile_persistent_init_scripts"] is True
 
 
 @pytest.mark.asyncio

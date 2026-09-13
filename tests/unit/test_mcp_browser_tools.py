@@ -11,6 +11,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core import browser_ops
@@ -34,6 +35,8 @@ from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
+from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.main_world_eval import configure_main_world_prefix
 from tests.unit._mcp_browser_fakes import (
     StaleScopePage,
     make_mock_page,
@@ -1216,6 +1219,295 @@ async def test_evaluate_does_not_reclaim_tab_without_active_extension_session(
     assert result["error"]["code"] == mcp_browser.ErrorCode.NO_ACTIVE_BROWSER
     evaluate.assert_not_awaited()
     get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
+
+
+class _EvaluateScope:
+    """Locator scope whose evaluation only settles when the test releases it."""
+
+    def __init__(self, value: object = None, *, hangs: bool = True) -> None:
+        self.value = value
+        self.hangs = hangs
+        self.awaits = 0
+        self.released = asyncio.Event()
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        if self.hangs:
+            await self.released.wait()
+        return self.value
+
+
+def _evaluate_page(monkeypatch: pytest.MonkeyPatch, scope: _EvaluateScope) -> MagicMock:
+    page = make_skyvern_page(make_mock_page())
+    page.locator_scope = scope
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(context=None))
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="local"))),
+    )
+    return page
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_bounds_a_never_resolving_expression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope()
+    page = _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 150)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})")
+    elapsed = loop.time() - started
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    assert elapsed < 1.0
+    assert scope.awaits == 1
+    page.page.evaluate.assert_not_awaited()
+    close_session.assert_not_awaited()
+
+    scope.hangs = False
+    scope.value = "9.42K"
+    follow_up = await mcp_browser.skyvern_evaluate(expression="document.title")
+
+    assert follow_up["ok"] is True
+    assert follow_up["data"]["result"] == "9.42K"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_propagates_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope()
+    _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30000)
+
+    task = asyncio.create_task(mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})"))
+    while scope.awaits == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class _CancelTranslatingScope:
+    """Locator scope whose driver reports a torn-down target instead of honouring a cancellation, so
+    an external cancel reaches the tool as an ordinary exception."""
+
+    def __init__(self) -> None:
+        self.awaits = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_propagates_a_cancellation_the_driver_translated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _CancelTranslatingScope()
+    _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30000)
+
+    task = asyncio.create_task(mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})"))
+    while scope.awaits == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_returns_a_finite_value_from_the_active_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope(value={"visitors": "9.42K"}, hangs=False)
+    page = _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="({ visitors: '9.42K' })")
+
+    assert result["ok"] is True
+    assert result["data"]["result"] == {"visitors": "9.42K"}
+    assert scope.awaits == 1
+    page.page.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_keeps_caller_js_out_of_the_deadline_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope(value="ok", hangs=False)
+    _evaluate_page(monkeypatch, scope)
+    recorded: dict[str, Any] = {}
+
+    async def record(**kwargs: Any) -> Any:
+        recorded.update(kwargs)
+        return await kwargs["evaluate_expression"]()
+
+    monkeypatch.setattr(mcp_browser.SkyvernFrame, "_evaluate_expression", record)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/orders?token=tok-do-not-log')")
+
+    assert result["ok"] is True
+    assert "tok-do-not-log" not in recorded["expression"]
+
+
+class _DeadlineTransportScope:
+    """The real-browser shape: cancelling a large in-flight evaluate at the deadline surfaces the
+    driver's own transport error instead of the engine's timeout."""
+
+    def __init__(self) -> None:
+        self.awaits = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # The driver reports the torn-down target rather than honouring the cancellation, so
+            # asyncio surfaces this instead of converting the deadline into a TimeoutError.
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_reports_a_deadline_transport_error_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    scope = _DeadlineTransportScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/slow')")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert "Check JavaScript syntax" not in result["error"].get("hint", "")
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_records_a_browser_strike_for_a_translated_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine tallies the strike in its own timeout handler, which a driver error never reaches.
+
+    Without the tally, repeated hangs never accumulate toward BrowserHealth.is_degraded."""
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+    from skyvern.webeye.browser_health import BrowserOperation
+
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    context = SkyvernContext(request_id="test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    scope = _DeadlineTransportScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/slow')")
+
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert context.browser_health.consecutive_timeouts == 1
+    assert context.browser_health.stuck_operations == {BrowserOperation.EVALUATE}
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_does_not_double_count_an_engine_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    context = SkyvernContext(request_id="test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    scope = _EvaluateScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})")
+
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    # The engine's own handler already recorded this one.
+    assert context.browser_health.consecutive_timeouts == 1
+
+
+class _ContextDestroyedScope:
+    """Locator scope whose caller expression dies the one way the engine still recovers from. Any
+    second evaluate or settle is that recovery re-running JavaScript whose effects are unknown."""
+
+    def __init__(self, failing_expression: str) -> None:
+        self.failing_expression = failing_expression
+        self.expressions: list[str] = []
+        self.settles = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.expressions.append(expression)
+        if expression == self.failing_expression:
+            raise PlaywrightError("Execution context was destroyed, most likely because of a navigation")
+        return None
+
+    async def wait_for_load_state(self, state: str, timeout: float | None = None) -> None:
+        self.settles += 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_dispatches_caller_js_once_when_the_context_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _ContextDestroyedScope("postOrder()")
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="postOrder()")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert "Execution context was destroyed" in result["error"]["message"]
+    assert scope.expressions == ["postOrder()"]
+    assert scope.settles == 0
+
+
+class _PrefixedContext:
+    def __init__(self) -> None:
+        self.new_cdp_session = AsyncMock()
+
+
+class _PageLikeScope(_EvaluateScope):
+    """Structurally a top-level page, so a registered prefix would reroute a frame-agnostic
+    dispatch through the main-world CDP hook."""
+
+    def __init__(self, context: _PrefixedContext, value: object) -> None:
+        super().__init__(value, hangs=False)
+        self.context = context
+        self.main_frame = SimpleNamespace()
+
+    async def bring_to_front(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_keeps_the_original_dispatch_on_a_prefixed_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _PrefixedContext()
+    configure_main_world_prefix(context, "/* main world */\n")
+    scope = _PageLikeScope(context, value="9.42K")
+    assert is_page_like(scope)
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="document.title")
+
+    assert result["ok"] is True
+    assert result["data"]["result"] == "9.42K"
+    assert scope.awaits == 1
+    context.new_cdp_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,12 @@ from skyvern.webeye.real_browser_state import RealBrowserState
 INTERVAL_PATCH = "skyvern.forge.sdk.workflow.models.block.PERSIST_LOOP_OUTPUT_INTERVAL"
 
 
+def _mock_loop_context() -> MagicMock:
+    context = MagicMock()
+    context.cancel_failure_evidence_capture = AsyncMock()
+    return context
+
+
 def _make_output_param(label: str) -> OutputParameter:
     now = datetime.now(UTC)
     return OutputParameter(
@@ -62,7 +68,7 @@ class TestExecuteCallsRecordOnceAtEnd:
             last_block=inner_task,
         )
 
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         final_result = _make_block_result(loop_block.output_parameter)
 
         with (
@@ -106,7 +112,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -150,7 +156,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter, {"med": "data"})
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -198,7 +204,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -242,7 +248,7 @@ class TestIncrementalPersistFailureResilience:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -284,7 +290,7 @@ class TestIncrementalPersistFailureResilience:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -342,7 +348,7 @@ class TestPersistIntervalBatching:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -418,7 +424,7 @@ class TestResetBrowserTabsBetweenIterations:
     async def test_baseline_snapshot_once_and_reset_between_iterations(self) -> None:
         loop_block = self._loop_block()
         inner_result = _make_block_result(loop_block.loop_blocks[0].output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()

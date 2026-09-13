@@ -12,6 +12,7 @@ Viewport CDP recovery contracts live in ``webeye/test_screenshot_cdp_fallback.py
 
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -482,3 +483,41 @@ async def test_screenshot_timeout_warning_reads_an_undashed_single_entry_call_lo
 async def test_screenshot_timeout_warning_stage_is_unknown_without_a_call_log() -> None:
     kwargs = await _screenshot_timeout_warning_kwargs("Page.screenshot: Timeout 20000ms exceeded.")
     assert kwargs["screenshot_stage"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_hung_scroll_restoration_cannot_extend_the_screenshot_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outer finally restores the pre-screenshot scroll position as courtesy cleanup, and it
+    runs while the caller's screenshot budget is already unwinding. An unresponsive page there must
+    not extend that budget: a caller unwinding this call to publish an established failure would
+    otherwise wait for the hang."""
+
+    class _HangingFrame(_FakeSkyvernFrame):
+        async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+            self.scroll_restore_calls.append((x, y))
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(page_module.SettingsManager.get_settings(), "BROWSER_ACTION_TIMEOUT_MS", 50)
+    screenshots = [_png_bytes(120, 100, (10, 20, 30))]
+    positions = [0]
+    expected = _expected_merged_png(screenshots, positions)
+    fake_frame = _HangingFrame()
+
+    result = await asyncio.wait_for(
+        _invoke_take_scrolling_screenshot(
+            screenshots=screenshots,
+            positions=positions,
+            scrolling_number=1,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=MagicMock(),
+            bytesio_instances=[],
+            fake_frame=fake_frame,
+        ),
+        timeout=5,
+    )
+
+    # The screenshot still comes back, and the restoration was attempted and then abandoned.
+    assert result == expected
+    assert fake_frame.scroll_restore_calls == [(11, 22)]

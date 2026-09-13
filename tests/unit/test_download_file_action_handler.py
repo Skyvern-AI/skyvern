@@ -18,7 +18,6 @@ from pydantic import BaseModel, ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
-from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import BlockedHost
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1155,14 +1154,8 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
         now=now,
         organization=organization,
         page_url="https://example.com/downloads",
-        task_overrides={
-            "error_code_mapping": {
-                "download_failed": "The requested download could not be prepared",
-            },
-        },
     )
     task = task.model_copy(update={"download_timeout": 0.01})
-    transient_callbacks: dict[str, Callable] = {}
     unrelated_page = MagicMock()
     unrelated_page.url = "https://example.com/unrelated"
     recovered_page = MagicMock()
@@ -1171,12 +1164,7 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
     recovered_page.context = page.context
     page.context._skyvern_cdp_download_active = False
 
-    async def expose_original_binding(_name: str, callback: Callable) -> None:
-        transient_callbacks["original"] = callback
-
-    page.expose_binding = AsyncMock(side_effect=expose_original_binding)
     page.evaluate = AsyncMock(return_value=[])
-    recovered_page.expose_binding = AsyncMock()
     recovered_page.evaluate = AsyncMock(return_value=[])
     browser_state.list_valid_pages = AsyncMock(return_value=[page, unrelated_page])
     browser_state.new_page = AsyncMock(return_value=recovered_page)
@@ -1184,10 +1172,6 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
     browser_state.set_active_page = AsyncMock()
 
     async def close_page_during_click(*args: object, **kwargs: object) -> list[ActionSuccess]:
-        transient_callbacks["original"](
-            {},
-            {"text": "The requested download could not be prepared", "timestamp_ms": 1},
-        )
         page.is_closed.return_value = True
         return [ActionSuccess()]
 
@@ -1212,6 +1196,7 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
                 action=action,
             )
 
+    # Working-page recovery mechanics (observer-independent): the closed page is replaced.
     browser_state.new_page.assert_awaited_once_with()
     browser_state.navigate_to_url.assert_awaited_once_with(
         page=recovered_page,
@@ -1220,9 +1205,6 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
     browser_state.set_active_page.assert_awaited_once_with(recovered_page)
     assert unrelated_page is not recovered_page
     assert results[-1].download_triggered is False
-    assert results[-1].skip_remaining_actions is True
-    assert isinstance(results[-1], ActionFailure)
-    assert [error.error_code for error in action.errors or []] == ["download_failed"]
 
 
 @pytest.mark.asyncio
@@ -1411,6 +1393,7 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
         organization=organization,
         page_url="https://example.com/downloads",
     )
+    task = task.model_copy(update={"url": "https://initial.example.test/start"})
     page.expose_binding = AsyncMock()
     page.evaluate = AsyncMock(return_value=[])
     page.context._skyvern_cdp_download_active = False
@@ -1478,13 +1461,16 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
     browser_state.new_page.assert_awaited_once_with()
     browser_state.reconnect.assert_awaited_once_with(
         proxy_location=task.proxy_location,
+        task_id=task.task_id,
         workflow_run_id=task.workflow_run_id,
         workflow_permanent_id=task.workflow_permanent_id,
+        browser_context_route_policy_url=task.url,
         organization_id=task.organization_id,
         extra_http_headers=task.extra_http_headers,
         cdp_connect_headers=task.cdp_connect_headers,
         browser_address=task.browser_address,
         browser_profile_id=None,
+        browser_session_id=task.browser_session_id,
     )
     browser_state.navigate_to_url.assert_awaited_once_with(page=recovered_page, url=page.url)
     browser_state.set_active_page.assert_awaited_once_with(recovered_page)
@@ -1629,20 +1615,6 @@ async def test_handle_action_does_not_close_recovered_page_when_download_finishe
     browser_state.new_page = AsyncMock(return_value=recovered_page)
     browser_state.navigate_to_url = AsyncMock()
     browser_state.set_active_page = AsyncMock()
-    observer_lifecycle: list[str] = []
-    original_observer = MagicMock()
-    original_observer.events = [{"text": "The report download is ready", "timestamp_ms": 1}]
-    original_observer.start = AsyncMock(side_effect=lambda **_: observer_lifecycle.append("original:start"))
-
-    async def stop_original_observer() -> None:
-        observer_lifecycle.append("original:stop")
-        original_observer.events.clear()
-
-    original_observer.stop = AsyncMock(side_effect=stop_original_observer)
-    recovered_observer = MagicMock()
-    recovered_observer.events = []
-    recovered_observer.start = AsyncMock(side_effect=lambda **_: observer_lifecycle.append("recovered:start"))
-    recovered_observer.stop = AsyncMock(side_effect=lambda: observer_lifecycle.append("recovered:stop"))
 
     with tempfile.TemporaryDirectory() as temp_dir:
         downloaded_file = Path(temp_dir) / "report.pdf"
@@ -1668,10 +1640,6 @@ async def test_handle_action_does_not_close_recovered_page_when_download_finishe
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
             ),
-            patch(
-                "skyvern.webeye.actions.handler.TransientPageTextObserver",
-                side_effect=[original_observer, recovered_observer],
-            ),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
@@ -1685,8 +1653,6 @@ async def test_handle_action_does_not_close_recovered_page_when_download_finishe
 
     assert results[-1].download_triggered is True
     assert results[-1].skip_remaining_actions is True
-    assert recovered_observer.events == [{"text": "The report download is ready", "timestamp_ms": 1}]
-    assert observer_lifecycle == ["original:start", "original:stop", "recovered:start", "recovered:stop"]
     recovered_page.close.assert_not_awaited()
     download_popup.close.assert_awaited_once_with()
 
@@ -2297,15 +2263,32 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
                 file.write(b"ready")
             return [ActionSuccess()]
 
+        settle_was_cancelled = asyncio.Event()
+
         async def hanging_download_completion(**kwargs: object) -> None:
             assert kwargs["timeout"] == 0.03
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                settle_was_cancelled.set()
+                raise
+
+        async def handle_action_until_the_budget_raises() -> None:
+            # The budget's TimeoutError is the expected outcome and is caught here. The runaway guard's
+            # TimeoutError is the same class, so it must be raised outside this catch to read as red.
+            with pytest.raises(TimeoutError):
+                await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
         mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
         mock_app.STORAGE = MagicMock()
-        started_at = time.monotonic()
 
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
@@ -2319,22 +2302,10 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(
-                    ActionHandler.handle_action(
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                        page=page,
-                        action=action,
-                    ),
-                    timeout=5,
-                )
+            await asyncio.wait_for(handle_action_until_the_budget_raises(), timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS)
 
-        elapsed = time.monotonic() - started_at
-
-    # Proves the 0.03s download budget raised, not the 5s wait_for safety net.
-    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
+    # The budget cancelled the hung settle mid-flight rather than the settle being skipped or abandoned.
+    assert settle_was_cancelled.is_set()
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:
@@ -3127,192 +3098,6 @@ async def test_handle_action_download_no_signal_preserves_action_failure() -> No
 
 
 @pytest.mark.asyncio
-async def test_handle_action_download_fails_on_transient_user_defined_error_text(
-    span_exporter: InMemorySpanExporter,
-) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
-        now=now,
-        organization=organization,
-        page_url="https://example.com/portal/invoices",
-        task_overrides={
-            "error_code_mapping": {
-                "data_not_downloadable": (
-                    "Return this error if the page displays "
-                    "download failure says the generated archive could not be saved"
-                ),
-            },
-        },
-    )
-    existing_error = UserDefinedError(
-        error_code="previous_error",
-        reasoning="Earlier action error",
-        confidence_float=0.8,
-    )
-    action.errors = [existing_error]
-    page.evaluate = AsyncMock()
-    download_listeners: dict[str, Callable[[object], None]] = {}
-    page.on.side_effect = lambda event, callback: download_listeners.__setitem__(event, callback)
-
-    async def expose_binding(_name: str, callback: Callable[[dict, dict], None]) -> None:
-        page._transient_text_callback = callback
-
-    page.expose_binding = AsyncMock(side_effect=expose_binding)
-    mock_xhr = MagicMock()
-    mock_xhr.has_in_flight_requests = True
-    mock_xhr.drain = AsyncMock(return_value=False)
-
-    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
-        page._transient_text_callback(
-            {},
-            {
-                "text": "Example download failure says the generated archive could not be saved",
-                "timestamp_ms": 1,
-                "tag": "DIV",
-                "role": "alert",
-            },
-        )
-        return [ActionSuccess()]
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        staging_dir = Path(temp_dir) / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "completed.pdf").write_bytes(b"%PDF-1.4 completed")
-        mock_app = MagicMock()
-        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
-        mock_app.STORAGE = MagicMock()
-        wait_for_downloads = AsyncMock()
-
-        started_at = time.monotonic()
-        with (
-            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
-            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=str(staging_dir)),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
-            patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
-            patch(
-                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
-                new=wait_for_downloads,
-            ),
-            patch("skyvern.webeye.actions.handler.app", mock_app),
-        ):
-            results = await ActionHandler.handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-        elapsed = time.monotonic() - started_at
-
-    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
-    assert isinstance(results[-1], ActionFailure)
-    assert results[-1].download_triggered is False
-    assert "download failure says the generated archive could not be saved" in (results[-1].exception_message or "")
-    assert action.download_triggered is False
-    # Page-confirmed terminal user errors are definitive: no "keep trying" followup.
-    assert results[-1].needs_followup is None
-    assert results[-1].followup_message is None
-    assert action.errors is not None
-    assert [error.error_code for error in action.errors] == ["previous_error", "data_not_downloadable"]
-    assert action.terminal_user_errors is True
-    assert wait_for_downloads.await_count == 0
-    page.off.assert_any_call("download", download_listeners["download"])
-    assert page.expose_binding.await_count == 1
-    observer_install_count = sum(
-        "new MutationObserver" in call.kwargs["expression"] for call in page.evaluate.await_args_list
-    )
-    assert observer_install_count == 2
-    span_attrs = _download_wait_span_attrs(span_exporter)
-    assert span_attrs["download_signal_observed"] is False
-    assert span_attrs["download_wait_observed_text_count"] == 1
-    assert span_attrs["download_wait_user_error_detected"] is True
-    assert span_attrs["download_wait_user_error_codes"] == "data_not_downloadable"
-    assert mock_xhr.drain.await_args_list == [call(timeout_seconds=0), call(timeout_seconds=0)]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "post_action_text, expect_terminal_error", [(None, False), ("The archive could not be saved", True)]
-)
-async def test_handle_action_download_scans_semantic_alerts_only_after_action(
-    span_exporter: InMemorySpanExporter,
-    post_action_text: str | None,
-    expect_terminal_error: bool,
-) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
-        now=now,
-        organization=organization,
-        page_url="https://example.com/download",
-        task_overrides={"error_code_mapping": {"archive_failed": "archive could not be saved"}},
-    )
-    callbacks: dict[str, Callable] = {}
-    visible_alert_text = "A stale archive could not be saved"
-    baseline_alert_text: str | None = None
-
-    async def expose_binding(_name: str, callback: Callable[[dict, dict], None]) -> None:
-        callbacks["transient_text"] = callback
-
-    async def evaluate(*, expression: str, arg: dict) -> None:
-        nonlocal baseline_alert_text
-        assert "new MutationObserver" in expression or "delete window[stateKey]" in expression
-        if not arg.get("scanInitialVisibleState"):
-            baseline_alert_text = visible_alert_text
-        elif visible_alert_text and visible_alert_text != baseline_alert_text:
-            callbacks["transient_text"]({}, {"text": visible_alert_text, "role": "alert"})
-
-    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
-        nonlocal visible_alert_text
-        if post_action_text is not None:
-            visible_alert_text = post_action_text
-        return [ActionSuccess()]
-
-    page.expose_binding = AsyncMock(side_effect=expose_binding)
-    page.evaluate = AsyncMock(side_effect=evaluate)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        mock_app = MagicMock()
-        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
-        mock_app.STORAGE = MagicMock()
-
-        with (
-            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
-            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
-            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
-            patch(
-                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
-                new=AsyncMock(),
-            ),
-            patch("skyvern.webeye.actions.handler.app", mock_app),
-        ):
-            results = await ActionHandler.handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-
-    install_options = [
-        call.kwargs["arg"]
-        for call in page.evaluate.await_args_list
-        if "new MutationObserver" in call.kwargs["expression"]
-    ]
-    assert [options["scanInitialVisibleState"] for options in install_options] == [False, True]
-    assert isinstance(results[-1], ActionFailure) is expect_terminal_error
-    assert action.terminal_user_errors is expect_terminal_error
-    assert [error.error_code for error in action.errors or []] == (["archive_failed"] if expect_terminal_error else [])
-
-
-@pytest.mark.asyncio
 async def test_handle_action_download_admits_request_event_queued_by_action(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -3322,22 +3107,13 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
         now=now,
         organization=organization,
         page_url="https://example.com/download",
-        task_overrides={
-            "error_code_mapping": {
-                "download_failed": "generated document could not be prepared for download",
-            },
-        },
     )
     task = task.model_copy(update={"download_timeout": None})
     callbacks: dict[str, Callable] = {}
     page.context._skyvern_cdp_download_active = False
     page.on.side_effect = lambda event, callback: callbacks.__setitem__(event, callback)
 
-    async def expose_binding(_name: str, callback: Callable[[dict, dict], None]) -> None:
-        callbacks["transient_text"] = callback
-
-    page.expose_binding = AsyncMock(side_effect=expose_binding)
-    page.evaluate = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
     request = MagicMock(resource_type="xhr")
     late_tasks: list[asyncio.Task[None]] = []
     first_download_wait_poll = asyncio.Event()
@@ -3352,17 +3128,13 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
             first_download_wait_poll.set()
         return []
 
-    async def expose_error_after_grace() -> None:
+    async def finish_request_after_grace() -> None:
         await first_download_wait_poll.wait()
-        callbacks["transient_text"](
-            {},
-            {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
-        )
         callbacks["requestfinished"](request)
 
     async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         asyncio.get_running_loop().call_soon(callbacks["request"], request)
-        late_tasks.append(asyncio.create_task(expose_error_after_grace()))
+        late_tasks.append(asyncio.create_task(finish_request_after_grace()))
         return [ActionSuccess()]
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -3394,198 +3166,14 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
             )
         await asyncio.gather(*late_tasks)
 
-    assert isinstance(results[-1], ActionFailure)
-    assert [error.error_code for error in action.errors or []] == ["download_failed"]
+    # A request event queued by the action is admitted and extends the bounded wait; when it finishes and
+    # no file arrives the wait ends. (No user-defined-error termination path exists after observer removal.)
+    assert results[-1].download_triggered is False
     assert clock.current == 0.01
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_wait_extended_for_in_flight_request"] is True
     for event in ("response", "request", "requestfinished", "requestfailed"):
         page.remove_listener.assert_any_call(event, callbacks[event])
-
-
-@pytest.mark.asyncio
-async def test_handle_action_download_observes_error_after_grace_while_xhr_is_in_flight(
-    span_exporter: InMemorySpanExporter,
-) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
-        now=now,
-        organization=organization,
-        page_url="https://example.com/download",
-        task_overrides={
-            "error_code_mapping": {
-                "download_failed": "generated document could not be prepared for download",
-            },
-        },
-    )
-    task = task.model_copy(update={"download_timeout": None})
-    callbacks: dict[str, Callable] = {}
-    page.context._skyvern_cdp_download_active = False
-    page.on.side_effect = lambda event, callback: callbacks.__setitem__(event, callback)
-
-    async def expose_binding(_name: str, callback: Callable[[dict, dict], None]) -> None:
-        callbacks["transient_text"] = callback
-
-    page.expose_binding = AsyncMock(side_effect=expose_binding)
-    page.evaluate = AsyncMock()
-    request = MagicMock(resource_type="xhr")
-    late_event_finished = asyncio.Event()
-    first_download_wait_poll = asyncio.Event()
-    list_calls = 0
-    clock = _FakeMonotonic()
-    clock.advance_after_next_read(0.01)
-
-    def list_files(_download_dir: object) -> list[str]:
-        nonlocal list_calls
-        list_calls += 1
-        if list_calls == 2:
-            first_download_wait_poll.set()
-        return []
-
-    async def finish_request_after_grace() -> None:
-        await first_download_wait_poll.wait()
-        callbacks["transient_text"](
-            {},
-            {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
-        )
-        callbacks["requestfinished"](request)
-        late_event_finished.set()
-
-    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
-        callbacks["request"](request)
-        asyncio.create_task(finish_request_after_grace())
-        return [ActionSuccess()]
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        mock_app = MagicMock()
-        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
-        mock_app.STORAGE = MagicMock()
-
-        with (
-            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
-            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
-            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
-            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
-            patch("skyvern.webeye.actions.handler.time", clock),
-            patch(
-                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
-                new=AsyncMock(),
-            ),
-            patch("skyvern.webeye.actions.handler.app", mock_app),
-        ):
-            results = await ActionHandler.handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-
-    assert late_event_finished.is_set()
-    assert isinstance(results[-1], ActionFailure)
-    assert [error.error_code for error in action.errors or []] == ["download_failed"]
-    assert action.terminal_user_errors is True
-    assert clock.current == 0.01
-    span_attrs = _download_wait_span_attrs(span_exporter)
-    assert span_attrs["download_wait_extended_for_in_flight_request"] is True
-    assert span_attrs["download_wait_user_error_detected"] is True
-    for event in ("response", "request", "requestfinished", "requestfailed"):
-        page.remove_listener.assert_any_call(event, callbacks[event])
-
-
-@pytest.mark.asyncio
-async def test_handle_action_download_custom_timeout_observes_error_after_grace_while_xhr_is_in_flight(
-    span_exporter: InMemorySpanExporter,
-) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
-        now=now,
-        organization=organization,
-        page_url="https://example.com/download",
-        task_overrides={
-            "error_code_mapping": {
-                "download_failed": "generated document could not be prepared for download",
-            },
-        },
-    )
-    task = task.model_copy(update={"download_timeout": 0.1})
-    callbacks: dict[str, Callable] = {}
-    page.context._skyvern_cdp_download_active = False
-    page.on.side_effect = lambda event, callback: callbacks.__setitem__(event, callback)
-
-    async def expose_binding(_name: str, callback: Callable[[dict, dict], None]) -> None:
-        callbacks["transient_text"] = callback
-
-    page.expose_binding = AsyncMock(side_effect=expose_binding)
-    page.evaluate = AsyncMock()
-    request = MagicMock(resource_type="xhr")
-    first_download_wait_poll = asyncio.Event()
-    list_calls = 0
-    clock = _FakeMonotonic()
-    clock.advance_after_next_read(0.01)
-
-    def list_files(_download_dir: object) -> list[str]:
-        nonlocal list_calls
-        list_calls += 1
-        if list_calls == 2:
-            first_download_wait_poll.set()
-        return []
-
-    async def expose_error_after_grace() -> None:
-        await first_download_wait_poll.wait()
-        callbacks["transient_text"](
-            {},
-            {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
-        )
-        callbacks["requestfinished"](request)
-
-    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
-        callbacks["request"](request)
-        asyncio.create_task(expose_error_after_grace())
-        return [ActionSuccess()]
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        mock_app = MagicMock()
-        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
-        mock_app.STORAGE = MagicMock()
-
-        with (
-            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
-            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
-            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
-            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
-            patch("skyvern.webeye.actions.handler.time", clock),
-            patch(
-                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
-                new=AsyncMock(),
-            ),
-            patch("skyvern.webeye.actions.handler.app", mock_app),
-        ):
-            results = await ActionHandler.handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-
-    assert isinstance(results[-1], ActionFailure)
-    assert [error.error_code for error in action.errors or []] == ["download_failed"]
-    assert action.terminal_user_errors is True
-    assert clock.current == 0.01
-    span_attrs = _download_wait_span_attrs(span_exporter)
-    assert span_attrs["no_signal_grace_seconds"] == 0.01
-    assert span_attrs["timeout_seconds"] == 0.1
-    assert span_attrs["download_wait_extended_for_in_flight_request"] is True
-    assert span_attrs["download_wait_user_error_detected"] is True
 
 
 @pytest.mark.asyncio

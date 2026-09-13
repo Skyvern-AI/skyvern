@@ -201,6 +201,23 @@ def _client() -> TestClient:
     return TestClient(test_app)
 
 
+@pytest.mark.asyncio
+async def test_a_file_past_its_expiry_no_longer_dereferences(
+    repo: FakeUploadedFilesRepository,
+    service_app: object,
+) -> None:
+    """The purge runs hourly, so an expired row still names live bytes until it runs; a workflow that
+    saved the id must not keep reading them in that window."""
+    now = datetime.now(timezone.utc)
+    expired = repo.seed(VICTIM_ORG_ID, expires_at=now - timedelta(minutes=1), filename="expired.csv")
+    live = repo.seed(VICTIM_ORG_ID, expires_at=now + timedelta(days=1), filename="live.csv")
+
+    assert await uploaded_file_service.resolve_file_reference(file_id=expired, organization_id=VICTIM_ORG_ID) is None
+    assert await uploaded_file_service.resolve_file_reference(file_id=live, organization_id=VICTIM_ORG_ID) == _uri(
+        VICTIM_ORG_ID, "live.csv"
+    )
+
+
 class TestDeleteEndpoint:
     def _request(self, file_id: str, caller_org_id: str, storage: FakeStorage) -> object:
         with (

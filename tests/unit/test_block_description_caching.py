@@ -59,6 +59,9 @@ def _setup_mocks(mock_app: MagicMock) -> None:
     mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(return_value=_mock_workflow_run_block())
     mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
     mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+    workflow_run_context = MagicMock()
+    workflow_run_context.cancel_failure_evidence_capture = AsyncMock()
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = workflow_run_context
 
 
 class TestDescriptionSkippedOnLoopIterations:

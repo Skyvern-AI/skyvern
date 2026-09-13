@@ -40,8 +40,10 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",
     "skyvern_clear_session_storage": "dc65cded7c6c8d4252f546c53248f94246574313a56c7a5bbe2df0de69bb6059",
     "skyvern_click": "efba4394a9c0b6bf39f480e0ab97cded9bcc40de92f5ceb53a3ab26bc1fa40d1",
-    "skyvern_clipboard_read": "fca638745f40e3d65cd61603037c7c94803373d86f68a3879a3084ed467331a2",
-    "skyvern_clipboard_write": "e766520b40a9edffa84ecaff725856e89a8bb963b49f512447a25b962ca54c90",
+    # Re-frozen for SKY-15733: both descriptions now say a read/write that never settles within the browser
+    # action deadline returns TIMEOUT. Description text only; the schemas are unchanged.
+    "skyvern_clipboard_read": "57fda3c1e8126f99ee6d6654110cfad6fdd34f4508b3310dd4be56105e91a226",
+    "skyvern_clipboard_write": "b7260b36ed2efcfcb307cca50ed327c59c8f18acc07490aa8851dc9d2b98c772",
     "skyvern_code_block_lint": "bfe1a5c65f9f7769b53029064aa127c54abc501d991a1c7d5fe8879e38b4f152",
     # Re-frozen against main: #14971 (SKY-13929) changed a param description upstream. Not a lean-scope change.
     "skyvern_code_block_synthesize": "c707c194228d1c60625d662c975b478f222ef5e70f108ae9dc6a9fae9e41ab59",
@@ -50,7 +52,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_credential_get": "b91bc6df14644a3a9b47e61ba05623652d208dbee58d75b595863112261c26b6",
     "skyvern_credential_list": "25377204b867b5ad92e7a18b49a081dc84a109002841263c5c2132857b6e5dac",
     "skyvern_drag": "58b53906edc106537f2c799da2bf5e1b8991ec9ce6a3ac5df01827aaf91b3564",
-    "skyvern_evaluate": "d25b3741856ed39bad3bb0e1cf76abad3f8a6e28e263b55befb1798cc7e93076",
+    # Re-frozen for SKY-15733: the description now says an expression that never settles returns TIMEOUT on
+    # the page/CDP route and ACTION_FAILED on the extension route. Description text only; the schema is unchanged.
+    "skyvern_evaluate": "b6877865ef47e4db303bc5e4d344f3715dd991ce471349831e8d35e3bf92b762",
     "skyvern_evaluate_and_screenshot": "2e886e466be8ed71e003f3f0c06d4ac7cb627a7eb4b2d8698a4cc0694d258de6",
     "skyvern_execute": "2cb175e508b11a4e40564d2057a0725566fc1ba72080ac789512e350b8b0d532",
     "skyvern_extract": "1a6323ec190bb05a00ff1739fc8e379fc6325e4ed16b4058d532743976c3f5dc",

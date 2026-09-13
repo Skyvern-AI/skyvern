@@ -8,14 +8,17 @@ Verifies that the CodeBlock safety layer:
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected, MissingJinjaVariables
@@ -23,6 +26,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
     BranchEvaluationContext,
     CodeBlock,
+    _bind_code_block_set_dialog_policy,
+)
+from skyvern.forge.sdk.workflow.models.credential_release import (
+    CodeBlockCredentialReleaseError,
+    CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
@@ -32,8 +40,9 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.workflows import BlockStatus
+from skyvern.webeye import dialog_handler
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
-from tests.unit.conftest import FakeSearchBrowserContext
+from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
@@ -1024,7 +1033,7 @@ async def wrapper({default_args}):
                 self.browser_artifacts = BrowserArtifacts()
 
             async def get_working_page(self) -> object:
-                return object()
+                return SimpleNamespace(context=MagicMock())
 
         class FakeWorkflowRunContext:
             values: dict[str, object] = {}
@@ -1104,7 +1113,7 @@ async def wrapper({default_args}):
                 if open_page_raises:
                     raise RuntimeError("browser is gone")
                 self.created_pages += 1
-                return object()
+                return SimpleNamespace(context=MagicMock())
 
             async def get_working_page(self) -> object | None:
                 return None
@@ -2727,6 +2736,157 @@ class TestFailedReadinessWaitPropagates:
         assert all(value in (None, {}) for value in persisted)
 
 
+class TestDirectPathDialogPolicyBinding:
+    """The direct path binds the same helper the secure runner brokers, and revokes the declared
+    policy at block end before any trusted browser work touches the page again."""
+
+    @staticmethod
+    def _block(code: str) -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="dialog_block",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="dialog_output",
+                description="test output",
+                output_parameter_id="op_dialog",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_the_helper_is_reserved_in_safe_vars(self) -> None:
+        assert "set_dialog_policy" in CodeBlock.build_safe_vars()
+
+    @pytest.mark.parametrize("key", ["set_dialog_policy", "set_dialog_policｙ"])
+    def test_a_block_declaring_a_colliding_parameter_is_rejected_at_bind_time(self, key: str) -> None:
+        # The fullwidth spelling binds under the normalized name as a wrapper argument, so the
+        # raw-key comparison the other builtins use would let it shadow the helper inline.
+        with pytest.raises(ValueError, match="set_dialog_policy"):
+            self._block("value = 1").generate_async_user_function(
+                "value = 1",
+                MagicMock(spec=Page),
+                {key: "shadowed"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_is_refused_unless_the_action_accepts_it(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        declare = _bind_code_block_set_dialog_policy(page)
+
+        with pytest.raises(ValueError, match="prompt_text"):
+            await declare(page, "dismiss", "Jamie")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_carrying_an_armed_credential_secret_is_refused(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("hunter2-long-secret", "https://accounts.example.com/login", "password")
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with pytest.raises(CodeBlockCredentialReleaseError, match="password"):
+            await declare(page, "accept", "hunter2-long-secret")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+        await declare(page, "accept", "Jamie")
+        assert dialog_handler._dialog_policies.get(page.context) is not None
+        dialog_handler.clear_dialog_policy(page.context)
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_embedding_a_short_armed_secret_is_refused(self) -> None:
+        """A CVV sits below the guard's substring floor, so a filled field matches it only on exact
+        equality; a dialog answer has no site to weigh that against, so it refuses at any length."""
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("123", "https://accounts.example.com/login", "card_cvv")
+        assert guard.matches("CVV: 123") == []
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with pytest.raises(CodeBlockCredentialReleaseError, match="card_cvv"):
+            await declare(page, "accept", "CVV: 123")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+    @pytest.mark.parametrize("revoke_fails", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_declared_policy_is_revoked_before_any_post_block_browser_work(
+        self, monkeypatch: pytest.MonkeyPatch, revoke_fails: bool
+    ) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        page.context.close = AsyncMock()
+        events: list[str] = []
+        real_clear = dialog_handler.clear_dialog_policy
+
+        def spy_clear(browser_context: object) -> None:
+            events.append(f"clear armed={dialog_handler._dialog_policies.get(browser_context) is not None}")
+            if revoke_fails:
+                raise RuntimeError("browser context unreachable")
+            real_clear(browser_context)
+
+        @asynccontextmanager
+        async def spy_settle(browser_context: object) -> AsyncIterator[None]:
+            events.append("settle downloads")
+            yield
+
+        monkeypatch.setattr(block_module.dialog_handler, "clear_dialog_policy", spy_clear)
+        monkeypatch.setattr(block_module, "settle_browser_downloads_for_context", spy_settle)
+
+        class ReadyBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+
+            async def get_working_page(self) -> object:
+                return page
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> ReadyBrowserState:
+            return ReadyBrowserState()
+
+        async def record_output(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(
+            CodeBlock, "get_workflow_run_context", lambda self, run_id: FakeWorkflowRunContext(values={})
+        )
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        block = self._block('seen = await set_dialog_policy(page, "dismiss")')
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is True
+        assert events == ["clear armed=True", "settle downloads"]
+        if revoke_fails:
+            # Closing only the page would leave the sandbox's answer armed on every sibling page.
+            page.context.close.assert_awaited_once()
+            return
+        page.context.close.assert_not_awaited()
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+        after_block = MagicMock()
+        after_block.type = "confirm"
+        after_block.message = "Leave without saving?"
+        after_block.default_value = ""
+        after_block.accept = AsyncMock()
+        after_block.dismiss = AsyncMock()
+        await dialog_handler._handle_dialog(after_block, page=page)
+
+        after_block.dismiss.assert_not_awaited()
+        after_block.accept.assert_awaited_once()
+
+
 class TestSearchWebHelperBinding:
     @staticmethod
     def _block() -> CodeBlock:
@@ -2770,3 +2930,72 @@ class TestSearchWebHelperBinding:
 
         assert result["error_kind"] == "not_configured"
         assert result["results"] == []
+
+
+class TestClearBrowserDataHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="clear_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="clear_output",
+                description="test output",
+                output_parameter_id="op_clear",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_clear_browser_data_is_reserved_in_safe_vars(self) -> None:
+        assert "clear_browser_data" in CodeBlock.build_safe_vars()
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_clear_browser_data_keeps_its_value(self) -> None:
+        # The name was a valid parameter name before it became a helper; a block that declared it
+        # must keep receiving its value rather than the function.
+        user_function = self._block().generate_async_user_function(
+            'return {"value": clear_browser_data}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"clear_browser_data": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "expected_origin"),
+        [
+            ("https://portal.example/login?next=%2Fhome", "https://portal.example"),
+            ("https://svc:s3cret@portal.example:8443/login", "https://portal.example:8443"),
+            ("about:blank", None),
+        ],
+        ids=["web_origin", "userinfo_stripped", "no_origin"],
+    )
+    async def test_authored_code_clears_cookies_and_the_current_origin_storage(
+        self, page_url: str, expected_origin: str | None
+    ) -> None:
+        context = FakeClearingBrowserContext()
+        page = SimpleNamespace(url=page_url, context=context)
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+        result = await user_function()
+
+        assert result == {"cleared": True}
+        assert context.clear_cookies_calls == 1
+        if expected_origin is None:
+            assert context.cdp_sessions == []
+            return
+        [(session_page, session)] = context.cdp_sessions
+        assert session_page is page
+        assert session.sent == [
+            ("Storage.clearDataForOrigin", {"origin": expected_origin, "storageTypes": "all"}),
+            ("DOMStorage.clear", {"storageId": {"securityOrigin": expected_origin, "isLocalStorage": False}}),
+        ]
+        assert session.detached

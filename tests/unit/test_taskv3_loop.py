@@ -33,6 +33,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
     ACTION_LOOP_TERMINATE_AFTER,
+    CODE_TOOL_NAME,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_RELEASED_EVENT,
@@ -54,14 +55,17 @@ from skyvern.forge.taskv3.loop import (
     PROGRESS_LEDGER_WINDOW,
     ActivityRecency,
     LoopOutcome,
+    RoundAction,
     SemanticCommitStats,
     SubmitWatch,
     ToolHandler,
     ToolResult,
     ToolSpec,
+    _arms_failure_evidence,
     _budget_extension_gate,
     _canonical_perception_content,
     _cap_trip_relieved,
+    _may_submit,
     _PerceptionLedger,
     _ProgressEvidence,
     _ProgressLedger,
@@ -2984,7 +2988,10 @@ async def test_on_action_round_fires_once_per_action_round() -> None:
     outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round, texts=texts)
     assert outcome.status == "completed"
     assert len(rounds) == 1
-    assert rounds[0] == [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)]
+    assert rounds[0] == [
+        RoundAction("click", {"selector": "#a"}, True, billable=True),
+        RoundAction("type", {"selector": "#b", "text": "x"}, True, billable=True),
+    ]
     # The action round's text is the SECOND turn's ("clicking the field..."), not the first
     # (perception-only) or third (finish) turn's text.
     assert round_texts == [texts[1]]
@@ -3068,9 +3075,9 @@ async def test_transcript_content_stays_none_when_text_empty_despite_reasoning_s
 async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() -> None:
     # A dispatched billable round consumes budget even when every call errors; it must reach the
     # callback (flagged unsuccessful) so the round persists into the workflow-run step budget.
-    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+    rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
         rounds.append(actions)
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -3079,7 +3086,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_on_round)
     assert outcome.status == "completed"
-    assert rounds == [[("click", {}, False)]]
+    assert rounds == [[RoundAction("click", {}, False, billable=True)]]
     assert outcome.billable_actions == []  # billing still counts successes only
 
 
@@ -6294,9 +6301,9 @@ async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
 
     tools = [_billable_tool("click", clicks), make_finish_tool()]
     script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
-    recorded_rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+    recorded_rounds: list[list[RoundAction]] = []
 
-    async def on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
+    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None) -> None:
         recorded_rounds.append(round_actions)
 
     outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
@@ -6308,7 +6315,7 @@ async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
     # The click that produced the download must be billed and persisted, not lost because the
     # probe fired before the recording step that appends it.
     assert outcome.billable_actions == ["click"]
-    assert recorded_rounds == [[("click", {"selector": "#a"}, True)]]
+    assert recorded_rounds == [[RoundAction("click", {"selector": "#a"}, True, billable=True)]]
 
 
 @pytest.mark.asyncio
@@ -7658,9 +7665,9 @@ async def test_refresh_reload_is_recorded_in_the_action_round() -> None:
         if len(attempts) == 2:
             raise RuntimeError("reload boom")
 
-    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+    rounds: list[list[RoundAction]] = []
 
-    async def on_round(actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
+    async def on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
         rounds.append(list(actions))
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -7681,9 +7688,9 @@ async def test_refresh_reload_is_recorded_in_the_action_round() -> None:
 
     # Turn 2's reload fails and re-arms; the retried reload on turn 3 succeeds and voids that finish.
     assert outcome.status == "completed"
-    recorded = [entry for round_ in rounds for entry in round_ if entry[0] == "reload_page"]
-    assert [ok for _name, _args, ok in recorded] == [True, False, True]
-    assert all(args.get("reason") for _name, args, _ok in recorded)
+    recorded = [entry for round_ in rounds for entry in round_ if entry.tool == "reload_page"]
+    assert [entry.succeeded for entry in recorded] == [True, False, True]
+    assert all(entry.args.get("reason") for entry in recorded)
 
 
 @pytest.mark.asyncio
@@ -9098,3 +9105,89 @@ async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_w
     assert outcome.status == "failed"
     assert caller.calls == 2
     assert state.giveup_deferrals == 0
+
+
+def test_the_code_tool_is_treated_as_possibly_having_submitted() -> None:
+    """The loop sees one call where any number of clicks and submits may have happened.
+
+    Answering "not a submit" for it would leave the failure-evidence guard live, correct, and blind
+    to a caller that can submit a form -- so the opaque tool gets the conservative verdict.
+    """
+    assert _may_submit(CODE_TOOL_NAME, {}) is True
+    assert _arms_failure_evidence(CODE_TOOL_NAME, {}, True) is True
+    # ...and only when it reached the page, exactly as for the tools already understood.
+    assert _arms_failure_evidence(CODE_TOOL_NAME, {}, False) is False
+
+
+def test_the_understood_tools_keep_their_existing_submit_verdicts() -> None:
+    """Naming the code tool must not change what any other tool means.
+
+    Pinned as an exact per-tool map rather than a spot check. An earlier attempt at this generalised
+    to "any tool the detector does not recognise may submit", which silently re-classified the
+    verification-code tools and every synthetic tool a caller supplies; this pins the blast radius to
+    one name.
+    """
+    assert _may_submit("click", {}) is True
+    assert _may_submit("press_key", {"key": "Enter"}) is True
+    assert _may_submit("type", {"text": "x", "press_enter": True}) is True
+
+    for tool, args in (
+        ("type", {"text": "x"}),
+        ("press_key", {"key": "Tab"}),
+        ("hover", {}),
+        ("select_option", {}),
+        ("select_combobox", {}),
+        ("file_upload", {}),
+        ("observe", {}),
+        ("get_html", {}),
+        ("look", {}),
+        ("wait", {}),
+        ("navigate", {}),
+        ("scroll", {}),
+        ("finish", {}),
+        # Caller-supplied tools, which is where the earlier generalisation did its damage: these are
+        # assembled outside the browser-tool list and the detector must keep ignoring them.
+        ("get_verification_code", {}),
+        ("open_verification_link", {}),
+        ("solve_captcha", {}),
+    ):
+        assert _may_submit(tool, args) is False, tool
+
+
+@pytest.mark.asyncio
+async def test_a_round_carries_billability_from_the_spec_not_from_a_name_list() -> None:
+    """Downstream budget accounting reads this flag instead of re-deriving it from the tool name.
+
+    A second name list is a second place for a new tool to be missing from, and the one that existed
+    counted a billable non-native tool's round as unbillable -- so a code-only round left the
+    workflow's round index where it was and never consumed its budget unit.
+    """
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], reasoning: str | None) -> None:
+        rounds.append(actions)
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("done")
+
+    novel = ToolSpec("execute_python", "run python", {"type": "object", "properties": {}}, handler, billable=True)
+    caller = _ScriptedCaller(
+        [
+            [("execute_python", {"code": "pass"})],
+            [("finish", {"status": "completed", "reason": "done"})],
+        ]
+    )
+
+    await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="s",
+        user_prompt="u",
+        tools=[novel, make_finish_tool()],
+        on_action_round=_on_round,
+        max_turns=5,
+        max_tool_calls=10,
+    )
+
+    acted = [entry for round_ in rounds for entry in round_ if entry.tool == "execute_python"]
+    assert acted, "the billable tool should have produced a round entry"
+    assert all(entry.billable for entry in acted)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
@@ -364,3 +365,37 @@ async def test_cold_locator_bootstraps_through_locator_evaluation() -> None:
     assert JS_FUNCTION_DEFS in locator.evaluate.await_args_list[1].args[0]
     assert locator.evaluate.await_args_list[2].args[0] == locator.evaluate.await_args_list[0].args[0]
     frame.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_retry_timeout_records_a_browser_strike(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The initial timeout handler records a strike; the recovery path raises the same exception and
+    must record one too, or a hang that dies on retry never counts toward a degraded browser."""
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+    from skyvern.webeye.browser_health import BrowserOperation
+
+    context = SkyvernContext(request_id="test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    async def context_lost_then_hangs() -> object:
+        if not getattr(context_lost_then_hangs, "lost", False):
+            context_lost_then_hangs.lost = True  # type: ignore[attr-defined]
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        await asyncio.sleep(3600)
+
+    frame = SimpleNamespace(
+        evaluate=AsyncMock(return_value=None),
+        wait_for_load_state=AsyncMock(),
+    )
+
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await SkyvernFrame._evaluate_expression(
+            frame=frame,
+            expression="() => 1",
+            evaluate_expression=context_lost_then_hangs,
+            timeout_ms=40,
+        )
+
+    assert context.browser_health.stuck_operations == {BrowserOperation.EVALUATE}
+    assert context.browser_health.consecutive_timeouts >= 1

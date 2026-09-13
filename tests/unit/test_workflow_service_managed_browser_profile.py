@@ -111,9 +111,14 @@ def _patch_execute_workflow_deps(
 ) -> None:
     created_run = _execute_workflow_run(WorkflowRunStatus.created)
     running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    workflow_run_context = SimpleNamespace(
+        browser_session_id=None,
+        drain_failure_evidence_capture=AsyncMock(),
+    )
     workflow_context_manager = SimpleNamespace(
         initialize_workflow_run_context=AsyncMock(),
-        get_workflow_run_context=lambda _workflow_run_id: SimpleNamespace(browser_session_id=None),
+        has_workflow_run_context=lambda _workflow_run_id: True,
+        get_workflow_run_context=lambda _workflow_run_id: workflow_run_context,
         remove_workflow_run_context=lambda _workflow_run_id: None,
     )
     database = SimpleNamespace(

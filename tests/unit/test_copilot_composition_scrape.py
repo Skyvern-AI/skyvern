@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
@@ -30,7 +29,6 @@ from skyvern.forge.sdk.copilot.tools._shared import (
     _composition_get_structured_evidence_result,
     admitted_requested_output_reads,
 )
-from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -112,29 +110,6 @@ async def test_navigation_to_evaluate_session_replacement_records_mixed_provenan
         "start_generation": 0,
         "end_generation": 1,
     }
-
-
-def test_inspection_regression_guard_uses_safe_query_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
-    page_url = "https://example.com/search?q=first"
-    evidence = parse_composition_structured(
-        {"page_title": "Results", "forms": [{"fields": [{"selector": "#q"}]}]},
-        inspected_url="https://example.com/search",
-        current_url="https://example.com/search",
-    )
-    assert evidence is not None
-    evidence["current_url_location_fingerprint"] = _page_evidence_location_fingerprint(page_url)
-    ctx = SimpleNamespace(
-        flow_evidence=[{"step": 3, "reached_via": "interaction", "had_bounded_schema": True, "evidence": evidence}]
-    )
-
-    assert tools.composition_capture._non_current_inspection_regression_error(ctx, entry_url=page_url) is None
-    assert (
-        tools.composition_capture._non_current_inspection_regression_error(
-            ctx, entry_url="https://example.com/search?q=second"
-        )
-        is not None
-    )
 
 
 _HOLLOW_HTML = "<div>loading</div>"
@@ -664,105 +639,45 @@ async def test_current_page_inspect_after_schema_less_interaction_grounds_a_page
 
 
 @pytest.mark.asyncio
-async def test_explicit_non_current_url_refuses_and_names_the_schema_less_reached_page(
+@pytest.mark.parametrize(
+    ("live_url", "expected_navigations"),
+    [
+        ("https://example.com/cart", ["https://example.com/checkout"]),
+        ("about:blank", ["https://example.com/checkout"]),
+        ("https://example.com/checkout", []),
+    ],
+    ids=["live_on_reached_page", "live_on_replaced_blank_page", "live_already_on_target"],
+)
+async def test_explicit_url_inspection_captures_target_after_an_interaction_reached_another_page(
     monkeypatch: pytest.MonkeyPatch,
+    live_url: str,
+    expected_navigations: list[str],
 ) -> None:
-    reached_url = "https://example.com/cart"
+    target_url = "https://example.com/checkout"
     ctx = make_copilot_ctx()
     ctx.flow_evidence = [
         _flow_entry(_bounded_packet("https://example.com/results"), reached_via="interaction", step=0),
-        _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
+        _flow_entry(_scout_interaction_packet("https://example.com/cart"), reached_via="interaction", step=1),
     ]
     navigations: list[str] = []
     _patch_inspection_seam(
         monkeypatch,
-        current_url=reached_url,
-        packet=_bounded_packet(reached_url),
+        current_url=live_url,
+        packet=_bounded_packet(target_url),
         navigations=navigations,
     )
 
-    result = await tools.composition_capture._inspect_page_for_composition_impl(
-        ctx,
-        "https://example.com/checkout",
-    )
+    result = await tools.composition_capture._inspect_page_for_composition_impl(ctx, target_url)
 
-    assert result["ok"] is False
-    assert navigations == []
-    assert result["data"]["current_url"] == reached_url
-    assert result["data"]["observation_step"] == 1
-
-
-@pytest.mark.asyncio
-async def test_explicit_non_current_url_after_a_current_page_reread_still_names_the_reached_page(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reached_url = "https://example.com/results"
-    ctx = make_copilot_ctx()
-    ctx.flow_evidence = [
-        _flow_entry(_bounded_packet("https://example.com/"), reached_via="navigate", step=0),
-        _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
+    assert result["ok"] is True
+    assert navigations == expected_navigations
+    assert [entry["evidence"]["current_url"] for entry in ctx.flow_evidence] == [
+        "https://example.com/results",
+        "https://example.com/cart",
+        target_url,
     ]
-    navigations: list[str] = []
-    _patch_inspection_seam(
-        monkeypatch,
-        current_url=reached_url,
-        packet=_bounded_packet(reached_url),
-        navigations=navigations,
-    )
-
-    reread = await tools.composition_capture._inspect_page_for_composition_impl(ctx, "current_page")
-    assert reread["ok"] is True
-    assert reread["observation_step"] == ctx.flow_evidence[-1]["step"]
-
-    refused = await tools.composition_capture._inspect_page_for_composition_impl(
-        ctx,
-        "https://example.com/checkout",
-    )
-
-    assert refused["ok"] is False
-    assert navigations == []
-    assert refused["data"]["current_url"] == reached_url
-    assert refused["data"]["observation_step"] == 1
-
-
-@pytest.mark.parametrize(
-    "reached_packet",
-    [_scout_interaction_packet("https://example.com/results"), _bounded_packet("https://example.com/results")],
-    ids=["schema_less", "bounded"],
-)
-def test_inspection_regression_guard_ignores_a_reached_page_left_by_a_navigation(reached_packet: dict) -> None:
-    ctx = SimpleNamespace(
-        flow_evidence=[
-            _flow_entry(reached_packet, reached_via="interaction", step=0),
-            _flow_entry(_bounded_packet("https://example.com/cart"), reached_via="navigate", step=1),
-        ]
-    )
-
-    assert (
-        tools.composition_capture._non_current_inspection_regression_error(ctx, entry_url="https://example.com/cart")
-        is None
-    )
-
-
-def test_inspection_regression_guard_uses_current_location_after_leave_and_return() -> None:
-    reached_url = "https://example.com/results"
-    ctx = SimpleNamespace(
-        flow_evidence=[
-            _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=0),
-            _flow_entry(_bounded_packet("https://example.com/cart"), reached_via="navigate", step=1),
-            _flow_entry(_bounded_packet(reached_url), reached_via="navigate", step=2),
-            _flow_entry(_bounded_packet(reached_url), reached_via="current_page", step=3),
-        ]
-    )
-
-    refusal = tools.composition_capture._non_current_inspection_regression_error(
-        ctx,
-        entry_url="https://example.com/checkout",
-    )
-
-    assert refusal is not None
-    assert refusal["data"]["current_url"] == reached_url
-    assert refusal["data"]["observation_step"] == 0
+    assert ctx.flow_evidence[-1]["reached_via"] == "navigate"
+    assert result["observation_step"] == ctx.flow_evidence[-1]["step"]
 
 
 def _tile_packet(*, with_relation: bool, match_count: int = 1, position: int = 0) -> dict:

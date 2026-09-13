@@ -39,6 +39,8 @@ from skyvern.forge.sdk.copilot.interruption import (
     MINIMAL_CANCEL_STOP,
     cancel_notice,
 )
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     USER_CANCELLED_TERMINAL_REASON,
@@ -1478,3 +1480,140 @@ async def test_cancel_during_shielded_finalisation_does_not_write_a_second_row(
     contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
     interrupted = [content for content in contents if content and "interrupted" in content.lower()]
     assert interrupted == [], f"finalisation owns this turn's row; got a competing write: {interrupted}"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_before_the_agent_starts_still_reports_a_cause_when_its_row_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This branch sits inside ``except CancelledError``, so the route's own ``except Exception``
+    is its sibling, not its backstop — a dead history read here would otherwise escape untold."""
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(user_response="", updated_workflow=None, global_llm_context=None)
+    captured = install_fake_create(monkeypatch)
+    _restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    def observe_user_cancel(
+        cache: Any,
+        organization_id: str,
+        cancel_token: str,
+        handler_task: Any,
+        observed: list[bool],
+        observed_source: list[str | None] | None = None,
+    ) -> Any:
+        observed[0] = True
+        if observed_source is not None:
+            observed_source[0] = "stop_button"
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(app._inst, "CACHE", _FakeCache(), raising=False)
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._watch_for_cancel", observe_user_cancel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        # Only the read inside the stop-report writer fails; initial loading must succeed, or the
+        # turn dies in the generic handler and never reaches the branch under test.
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    workflow_params.get_workflow_copilot_chat_messages = history
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+
+    sent: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+    await captured["handler"](stream)
+
+    assert reads > 1, "the stop-report writer must have reached its history read"
+    errors = [getattr(payload, "error", None) for payload in sent]
+    assert any(error and "dependency stopped responding" in error for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_that_rolled_back_before_its_write_failed_does_not_claim_the_workflow_survived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancel path rolls canonical back in its own finalizer, which never sets
+    ``finalise_started`` — so the reply must not read the agent's pre-rollback flag."""
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(
+        user_response="stopped",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=True,
+        cancelled=True,
+        turn_outcome=None,
+    )
+    captured = install_fake_create(monkeypatch)
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    async def landed_rollback(*args: Any, **kwargs: Any) -> None:
+        marker = workflow_copilot_route._CANONICAL_ROLLED_BACK.get()
+        assert marker is not None
+        marker[0] = True
+
+    restore.side_effect = landed_rollback
+
+    def observe_user_cancel(
+        cache: Any,
+        organization_id: str,
+        cancel_token: str,
+        handler_task: Any,
+        observed: list[bool],
+        observed_source: list[str | None] | None = None,
+    ) -> Any:
+        observed[0] = True
+        if observed_source is not None:
+            observed_source[0] = "stop_button"
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(app._inst, "CACHE", _FakeCache(), raising=False)
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._watch_for_cancel", observe_user_cancel)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+    workflow_params.get_workflow_copilot_chat_messages = history
+
+    sent: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+    await captured["handler"](stream)
+
+    restore.assert_awaited()
+    errors = [error for error in (getattr(payload, "error", None) for payload in sent) if error]
+    assert errors, "the turn must still terminate"
+    assert "was not modified" in errors[-1]
+    assert "preserved" not in errors[-1]

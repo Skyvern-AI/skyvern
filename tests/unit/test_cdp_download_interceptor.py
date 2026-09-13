@@ -1502,6 +1502,11 @@ class TestCDPDownloadInterceptorProxyAuth:
         interceptor = self._make_interceptor()
         assert interceptor._proxy_username is None
         assert interceptor._proxy_password is None
+        assert interceptor.proxy_auth_credentials is None
+
+    def test_proxy_credentials_are_available_to_context_security_guards(self) -> None:
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+        assert interceptor.proxy_auth_credentials == ("user", "pass")
 
     @pytest.mark.asyncio
     async def test_enable_for_page_with_proxy_auth(self) -> None:

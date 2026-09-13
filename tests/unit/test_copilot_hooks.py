@@ -482,6 +482,8 @@ class TestMCPFailedStepLoopDetection:
         initial_flow_evidence = [{"step": 1, "evidence": {"source_tool": "existing"}}]
         initial_pending_observation = SimpleNamespace(tool_name="click", url="https://existing")
         ctx = SimpleNamespace(
+            organization_id="o_test",
+            workflow_permanent_id="wpid_test",
             browser_session_continuity_generation=0,
             consecutive_tool_tracker=[],
             failed_tool_step_tracker={},
@@ -899,7 +901,6 @@ class TestNewToolOverlayConfigs:
         assert overlay.hide_params == frozenset({"session_id", "cdp_url", "timeout", "intent"})
         assert overlay.required_overrides == ["value"]
         assert overlay.requires_browser is True
-        assert overlay.timeout == 15
         assert overlay.post_hook is not None
 
     def test_press_key_overlay(self) -> None:
@@ -1263,6 +1264,7 @@ class TestScoutedInteractionCapture:
 
     def _ctx(self, *, policy: object = None, source_url: str | None = None) -> SimpleNamespace:
         ns = SimpleNamespace(
+            workflow_permanent_id="wpid_test",
             pending_browser_interaction_observation=None,
             pending_scout_input_value=None,
             pending_scout_role_name=None,

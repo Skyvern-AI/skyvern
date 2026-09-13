@@ -379,3 +379,161 @@ def test_the_rendered_prompt_hides_the_secret_and_keeps_the_facts() -> None:
     assert "wr_42" in rendered
     assert "user_code_error" in rendered
     assert '"failing_line": 6' in rendered or '"failing_line":6' in rendered
+
+
+def test_attached_files_reach_the_prompt_with_their_ids_and_missing_state() -> None:
+    """The prompt is the bar: a file id the model can put in ``file_url``, and a missing file
+    named as missing rather than silently dropped into a plausible-looking reference."""
+    from skyvern.forge.sdk.copilot.agent import _build_user_context
+    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
+
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="check every url in this sheet",
+            workflow_yaml="workflow_definition:\n  blocks: []",
+            attached_files=[
+                CopilotAttachedFile(file_id="file_live", filename="targets.xlsx", available=True),
+                CopilotAttachedFile(file_id="file_gone", filename="old.csv", available=False),
+            ],
+        )
+    )
+
+    assert packet.attached_file_context is not None
+    rendered = _build_user_context(
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message="check every url in this sheet",
+        attached_files_summary=packet.attached_file_context.render_prompt_block(),
+    )
+
+    assert "targets.xlsx" in rendered
+    assert "file_live" in rendered
+    assert "old.csv (file_id: file_gone) — NO LONGER AVAILABLE" in rendered
+
+
+def test_every_file_a_message_can_carry_reaches_the_prompt() -> None:
+    """The prompt lists a bounded number of files, so a message must not be able to attach more than
+    it shows; otherwise "process every attached sheet" silently drops the ones past the cut."""
+    import pydantic
+
+    from skyvern.forge.sdk.schemas.workflow_copilot import (
+        MAX_ATTACHED_FILES_PER_MESSAGE,
+        CopilotAttachedFile,
+        WorkflowCopilotChatRequest,
+    )
+
+    current = [f"file_{index}" for index in range(MAX_ATTACHED_FILES_PER_MESSAGE)]
+    older = [f"file_old_{index}" for index in range(5)]
+    request = {"workflow_permanent_id": "wpid_1", "workflow_id": "w_1", "message": "go", "workflow_yaml": ""}
+    with pytest.raises(pydantic.ValidationError):
+        WorkflowCopilotChatRequest(**request, attached_file_ids=[*current, "file_one_too_many"])
+    WorkflowCopilotChatRequest(**request, attached_file_ids=current)
+
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="process every attached sheet",
+            attached_files=[
+                CopilotAttachedFile(file_id=file_id, filename=f"{file_id}.csv") for file_id in [*current, *older]
+            ],
+        )
+    )
+
+    assert packet.attached_file_context is not None
+    rendered = packet.attached_file_context.render_prompt_block()
+    assert all(f"(file_id: {file_id})" in rendered for file_id in current)
+
+
+def test_a_turn_with_no_attachments_renders_no_attachment_section() -> None:
+    from skyvern.forge.sdk.copilot.agent import _build_user_context
+
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="build a workflow",
+            workflow_yaml="workflow_definition:\n  blocks: []",
+        )
+    )
+
+    assert packet.attached_file_context is None
+    rendered = _build_user_context(
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message="build a workflow",
+    )
+    assert "FILES THE USER ATTACHED" not in rendered
+
+
+def test_a_filename_shaped_like_a_credential_is_redacted_while_ordinary_names_survive() -> None:
+    """The deterministic patterns only catch secrets they can name, and no semantic screen sees a
+    filename, so a token-shaped stem is replaced while everyday names stay readable."""
+    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
+
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="parse these",
+            attached_files=[
+                CopilotAttachedFile(file_id="file_1", filename="AKIA1B2c3D4e5F6g7H8i9J0kLmNoP.csv"),
+                CopilotAttachedFile(file_id="file_2", filename="Q3_Report_2026_Final.xlsx"),
+                CopilotAttachedFile(file_id="file_3", filename="targets.xlsx"),
+                CopilotAttachedFile(file_id="file_4", filename="CustomerOrdersExport20260911.csv"),
+                CopilotAttachedFile(file_id="file_5", filename="SalesPipelineExport2026Q3.xlsx"),
+                CopilotAttachedFile(file_id="file_6", filename="X7yqwerty2Z8A1B2C3D4E5F6G7H.csv"),
+                CopilotAttachedFile(file_id="file_7", filename="ghp_A1b2c3D4e5F6g7H8i9J0kLmNoPqR.csv"),
+            ],
+        )
+    )
+
+    assert packet.attached_file_context is not None
+    rendered = packet.attached_file_context.render_prompt_block()
+
+    assert "AKIA1B2c3D4e5F6g7H8i9J0kLmNoP" not in rendered
+    assert "[REDACTED_SECRET].csv (file_id: file_1)" in rendered
+    assert "Q3_Report_2026_Final.xlsx" in rendered
+    assert "targets.xlsx" in rendered
+    # Separator-free export names carry whole words, so they stay readable.
+    assert "CustomerOrdersExport20260911.csv" in rendered
+    assert "SalesPipelineExport2026Q3.xlsx" in rendered
+    # One lowercase run can happen by chance in a random token, so it is not evidence of words.
+    assert "X7yqwerty2Z8A1B2C3D4E5F6G7H" not in rendered
+    assert "[REDACTED_SECRET].csv (file_id: file_6)" in rendered
+    # A token alphabet carries underscores and dashes, so the shape check reads those too.
+    assert "ghp_A1b2c3D4e5F6g7H8i9J0kLmNoPqR" not in rendered
+    assert "[REDACTED_SECRET].csv (file_id: file_7)" in rendered
+
+
+def test_a_secret_in_an_attachment_filename_never_reaches_the_prompt() -> None:
+    """The filename is user-chosen text that bypasses the message safety screen, and it is replayed
+    on every later turn — so the prompt boundary has to redact it like every other value."""
+    from skyvern.forge.sdk.copilot.agent import _build_user_context
+    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
+
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="parse it",
+            workflow_yaml="workflow_definition:\n  blocks: []",
+            attached_files=[
+                CopilotAttachedFile(file_id="file_7", filename="export password=hunter2.csv", available=True)
+            ],
+        )
+    )
+    assert packet.attached_file_context is not None
+
+    rendered = _build_user_context(
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message="parse it",
+        attached_files_summary=packet.attached_file_context.render_prompt_block(),
+    )
+
+    assert "hunter2" not in rendered
+    assert "file_7" in rendered

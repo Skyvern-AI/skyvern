@@ -6,7 +6,8 @@ raise with no manifest at all) fails closed exactly like an ordinary exception.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,7 +23,7 @@ class FakeBrowserState:
         self.browser_artifacts = BrowserArtifacts()
 
     async def get_working_page(self) -> object:
-        return object()
+        return SimpleNamespace(context=MagicMock())
 
 
 class FakeWorkflowRunContext:
