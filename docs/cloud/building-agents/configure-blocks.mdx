@@ -137,6 +137,15 @@ Extract structured data from the current page using AI.
 | **Data Extraction Goal** | text | What data to extract |
 | **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) defining the output format. Enable the checkbox to reveal the editor. Click **Generate with AI** to auto-suggest a schema from your extraction goal. |
 
+Additional fields in **Export:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Export as Parquet** | switch | Also write the extracted data to a downloadable Parquet file. No separate Data Export block needed. |
+| **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) for the exported records. When you first enable export, Skyvern seeds it from the block's extraction schema. |
+| **Filename** | text | Optional custom name for the exported file |
+| **Records** | text | Optional. Defaults to this block's own extracted data. Set it only to export something else, using `{{ parameter_name }}` to reference it. |
+
 *Plus [common browser fields](#common-fields).*
 
 <Frame>
