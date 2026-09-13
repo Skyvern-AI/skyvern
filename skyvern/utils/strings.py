@@ -1,6 +1,5 @@
-import os
-import random
 import re
+import secrets
 import string
 import unicodedata
 import uuid
@@ -18,9 +17,10 @@ _NEUTRALIZED_UNTRUSTED_WEB_PAGE_DATA_SENTINEL = "UNTRUSTED_BLOCK_SENTINEL_REMOVE
 
 
 def generate_random_string(length: int = 5) -> str:
-    # Use the os.urandom(16) as the seed
-    random.seed(os.urandom(16))
-    return "".join(random.choices(RANDOM_STRING_POOL, k=length))
+    # secrets.choice draws from OS entropy without touching the global
+    # `random` module's state, which callers elsewhere in the process may
+    # rely on staying reproducible.
+    return "".join(secrets.choice(RANDOM_STRING_POOL) for _ in range(length))
 
 
 def is_uuid(string: str) -> bool:
