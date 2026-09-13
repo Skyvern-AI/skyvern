@@ -3247,7 +3247,19 @@ class ForLoopBlock(Block):
         browser_session_id: str | None,
     ) -> BrowserState | None:
         if browser_session_id:
-            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+            context = skyvern_context.current()
+            expected_runnable_id = (
+                context.browser_session_runnable_id
+                if context and context.browser_session_runnable_id
+                else workflow_run_id
+            )
+            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_session_id,
+                organization_id,
+                expected_runnable_id=expected_runnable_id,
+                expected_runnable_generation_id=(context.browser_session_runnable_generation_id if context else None),
+                workflow_run_id=workflow_run_id,
+            )
         return app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
     async def _snapshot_loop_baseline_pages(

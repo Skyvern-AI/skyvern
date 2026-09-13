@@ -114,6 +114,7 @@ from skyvern.forge.sdk.copilot.context import (
     record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_pause import credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     CopilotNonRetriableNavError,
@@ -683,10 +684,7 @@ def _apply_raw_secret_turn_transition(
         return
 
     if policy.raw_secret_handling == "redacted_draft" and policy.raw_secret_safety_status != "blocked":
-        policy.testing_intent = "skip_test"
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
-        policy.credential_draft_deferred_explicitly = True
+        policy.apply_raw_secret_redacted_draft()
     else:
         policy.raw_secret_handling = "block"
         policy.user_response_policy = "ask_clarification"
@@ -5102,6 +5100,12 @@ async def _run_copilot_turn_impl(
         target_block_label=getattr(chat_request, "target_block_label", None),
         selected_block_label=getattr(chat_request, "selected_block_label", None),
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
+        client_supports_credential_pause_recovery=chat_request.supports_credential_pause_recovery,
+        credential_recovery_token_digest=credential_recovery_token_digest(
+            chat_request.credential_recovery_token.get_secret_value()
+            if chat_request.credential_recovery_token
+            else None
+        ),
         executed_block_fingerprints={
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
         },

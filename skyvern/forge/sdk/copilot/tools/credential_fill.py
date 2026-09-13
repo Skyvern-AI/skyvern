@@ -25,7 +25,10 @@ from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    QuestionResponseSiteURLSource,
     RequestPolicy,
+    SiteURLSource,
+    UserMessageSiteURLSource,
     admit_credential_for_live_page,
     loggable_origin,
 )
@@ -343,13 +346,23 @@ def _missing_credential_origin_error(credential_id: str, page_url: str | None) -
     )
 
 
-def _log_fill_grant(route: str, url: str, credential_id: str, source_message: int | None = None) -> None:
+def _log_fill_grant(
+    route: str,
+    url: str,
+    credential_id: str,
+    source: SiteURLSource | None = None,
+) -> None:
+    source_fields: dict[str, str | int] = {}
+    if isinstance(source, UserMessageSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_user_message": source.message_index}
+    elif isinstance(source, QuestionResponseSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
     LOG.info(
         "copilot credential fill grant",
         route=route,
         page_origin=loggable_origin(url),
         credential_id=credential_id,
-        source_user_message=source_message,
+        **source_fields,
     )
 
 
@@ -538,7 +551,12 @@ async def _credential_fill_origin_grant(
                 if settled or credential_id == await _sole_org_password_credential_id(load_once):
                     # An origin-only match (no registrable site) keeps the origin-scoped grant so the
                     # release guard can still compare it; site matches travel the whole site.
-                    _log_fill_grant("user_url", page_url, credential_id, policy.user_site_url_sources.get(matched_url))
+                    _log_fill_grant(
+                        "user_url",
+                        page_url,
+                        credential_id,
+                        policy.user_site_url_sources.get(matched_url),
+                    )
                     return _CredentialFillOriginGrant(page_url, whole_site=site_level), None
                 return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
         return None, _missing_credential_origin_error(credential_id, page_url or None)

@@ -40,6 +40,7 @@ SENSITIVE_HEADERS = {
     "set-cookie",
     "x-api-key",
     "x-posthog-attribution",
+    "x-copilot-credential-recovery-token",
 }
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
@@ -51,6 +52,8 @@ SENSITIVE_FIELDS: set[str] = {
     "password",
     "secret",
     "token",
+    "credential_recovery_token",
+    "resume_token",
     "api_key",
     "apikey",
     "api-key",

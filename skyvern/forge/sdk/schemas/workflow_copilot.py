@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SecretStr, StringConstraints, field_validator
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
@@ -250,6 +250,15 @@ class WorkflowCopilotChatRequest(BaseModel):
         ),
     )
     supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
+    credential_recovery_token: SecretStr | None = Field(
+        None,
+        repr=False,
+        exclude=True,
+        description="Client-held capability for restoring this turn's pending credential card.",
+    )
+    supports_credential_pause_recovery: bool = Field(
+        False, description="The client restores pending credential cards from chat history."
+    )
     supports_credential_pause: bool = Field(
         False,
         description=(
@@ -334,16 +343,6 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
     created_at: datetime = Field(..., description="When the message was created")
-
-
-class WorkflowCopilotChatHistoryResponse(BaseModel):
-    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
-    pending_question_cancel_token: str | None = None
-    workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
-    chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
-    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
-    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
-    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
 
 
 class WorkflowCopilotChatSummary(BaseModel):
@@ -709,6 +708,18 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
     timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotChatHistoryResponse(BaseModel):
+    pending_credential_requests: list[WorkflowCopilotCredentialRequiredUpdate] = Field(default_factory=list)
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    pending_question_cancel_token: str | None = None
+    workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
+    chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
+    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
 
 
 class WorkflowCopilotCodegenProgressUpdate(BaseModel):

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -42,6 +42,8 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseRejection,
     check_credential_pause_resumable,
+    credential_pause_is_active,
+    pending_credential_requests,
     resolve_credential_pause,
 )
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
@@ -2771,6 +2773,27 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
         )
         if last_activity > abandoned_before:
             continue
+        credential_pause_active = await credential_pause_is_active(
+            organization_id,
+            chat.workflow_copilot_chat_id,
+            entry.turn_id,
+        )
+        if credential_pause_active is True:
+            continue
+        has_recovery_handoff = any(
+            item.status == "resolved" and item.response is not None and not item.response.skipped
+            for item in entry.question_interactions
+        )
+        if (
+            credential_pause_active is None
+            and has_recovery_handoff
+            and last_activity
+            > abandoned_before - timedelta(seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+        ):
+            # A transient Redis failure must not reclaim a possible second
+            # credential wait, while an unrelated stale turn must eventually
+            # reconcile even if the auxiliary cache remains unavailable.
+            continue
         claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -2792,6 +2815,7 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
 
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
 async def workflow_copilot_chat_history(
+    credential_recovery_token: str | None = Header(None, alias="X-Copilot-Credential-Recovery-Token"),
     workflow_permanent_id: str | None = None,
     workflow_copilot_chat_id: str | None = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
@@ -2825,6 +2849,14 @@ async def workflow_copilot_chat_history(
     else:
         chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
+        pending_credential_requests=await pending_credential_requests(
+            organization.organization_id,
+            chat.workflow_copilot_chat_id,
+            list(chat.pending_turns),
+            credential_recovery_token,
+        )
+        if chat
+        else [],
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         question_interactions=list(
             {
@@ -2899,6 +2931,8 @@ async def workflow_copilot_question_response(
                 raise HTTPException(
                     status_code=503, detail="The safety screen is unavailable. Please retry your answer."
                 )
+            if safety.status == "detected":
+                response.raw_secret_detected = True
             return safety.canonical_user_message
 
         if response.text is not None:
