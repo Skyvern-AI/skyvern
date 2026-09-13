@@ -186,6 +186,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
+from skyvern.forge.sdk.workflow.code_block_safety import module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -5281,7 +5282,7 @@ def _link_without_overwrite(source: str, directory: str) -> str:
             candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
 
 
-_LATE_SAFE_GLOBALS = frozenset({"round", "abs", "attach_authorized_file", "clear_browser_data"})
+_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "html", "datetime"})
 
 CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
 
@@ -5411,55 +5412,18 @@ class CodeBlock(Block):
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
+        # Builtins live under __builtins__ rather than as globals so a workflow parameter can shadow
+        # a builtin name by normal scoping, matching codeblock_runtime.build_safe_vars.
         return {
             "__builtins__": {
-                # Only allow several builtins due to security concerns. LOAD_BUILD_CLASS and the
-                # class body's implicit __module__ binding resolve these from here, not globals.
+                **safe_builtins(),
+                # LOAD_BUILD_CLASS and the class body's implicit __module__ binding resolve these here.
                 "__build_class__": _code_block_build_class,
                 "__name__": "skyvern.code_block",
             },
             "print": print,
-            "len": len,
-            "range": range,
-            "str": str,
-            "int": int,
-            "float": float,
-            "dict": dict,
-            "list": list,
-            "tuple": tuple,
-            "set": set,
-            "bool": bool,
-            "isinstance": isinstance,
-            "enumerate": enumerate,
-            "any": any,
-            "all": all,
-            "max": max,
-            "min": min,
-            "sum": sum,
-            "round": round,
-            "abs": abs,
-            "sorted": sorted,
             "sleep": asyncio.sleep,
-            "asyncio": SimpleNamespace(sleep=asyncio.sleep),
-            "re": SimpleNamespace(
-                match=re.match,
-                search=re.search,
-                findall=re.findall,
-                finditer=re.finditer,
-                fullmatch=re.fullmatch,
-                sub=re.sub,
-                compile=re.compile,
-                split=re.split,
-                escape=re.escape,
-                I=re.I,
-                S=re.S,
-                IGNORECASE=re.IGNORECASE,
-                MULTILINE=re.MULTILINE,
-                DOTALL=re.DOTALL,
-            ),
-            "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
-            "html": SimpleNamespace(escape=html.escape),
-            "Exception": Exception,
+            **module_shims(),
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
             "solve_captcha": _bind_code_block_solve_captcha(None, None),
@@ -5516,6 +5480,7 @@ class CodeBlock(Block):
             _code_block_safe_print,
             parameters=app.AGENT_FUNCTION.serialize_codeblock_parameters(parameters or {}),
         )
+        safe_vars["__builtins__"]["print"] = safe_vars["print"]
         safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(organization_id, workflow_run_id)
         safe_vars["otp"] = partial(
             _code_block_otp_builtin,
