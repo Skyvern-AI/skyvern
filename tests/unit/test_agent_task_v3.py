@@ -19,9 +19,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
+from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
@@ -48,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
+from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -108,6 +111,7 @@ async def _run_execute_task_v3(
         # runs before any loop_raises, even when the loop goes on to raise).
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
+        loop_mock.frame_perception_enabled_during_loop = frame_perception_enabled()
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -198,6 +202,42 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_resolves_frame_perception_before_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_execute_task_v3` must actually call `resolve_frame_perception` with the run's real
+    identity before the loop starts -- an accessor that reads a hand-pinned context correctly
+    proves nothing about whether the real call site still resolves it. `workflow_run_id` is set to
+    a value distinct from `task_id` so a passing distinct_id assertion pins the documented
+    precedence (workflow_run_id wins) rather than passing because the two happened to match.
+    """
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+    provider = AsyncMock(return_value=True)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_frame_perception_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id == "wr_frame_perception_reach"
+    assert task.workflow_run_id != task.task_id
+
+    # As seen from inside the loop, before context is reset.
+    assert loop_mock.context.frame_perception_resolved_run_id == task.workflow_run_id
+    assert loop_mock.context.frame_perception_flag is True
+    assert loop_mock.frame_perception_enabled_during_loop is True
+
+    provider.assert_awaited_once_with(
+        FRAME_PERCEPTION_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
 
 
 @pytest.mark.asyncio

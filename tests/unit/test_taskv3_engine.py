@@ -1492,10 +1492,14 @@ def _stub_code_tool() -> ToolSpec:
     return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
 
 
-async def _run_to_finish(caller: _ScriptedCaller) -> None:
+async def _run_to_finish(caller: _ScriptedCaller, *, frame_perception: bool | None = None) -> None:
     # A real run always carries a context with a run identity; the code tool is withheld without one,
     # so a context-free call would exercise the identity gate rather than the surface under test.
-    skyvern_context.set(SkyvernContext(task_id="tsk_surface"))
+    context = SkyvernContext(task_id="tsk_surface")
+    if frame_perception is not None:
+        context.frame_perception_flag = frame_perception
+        context.frame_perception_resolved_run_id = context.task_id
+    skyvern_context.set(context)
     try:
         await run_task_v3_agent_loop(
             page_provider=_fixed_page_provider(_FakePage()),
@@ -1570,6 +1574,34 @@ async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.Monk
         monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
         caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
         await _run_to_finish(caller)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_per_run_pin_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same guarantee as `test_frame_perception_withholds_the_code_tool`, but for the per-run arm.
+
+    The env override is the force-on term; a run pinned on by the per-run resolver instead (env
+    False) must be withheld identically, or the code tool ends up gated on how the run was turned
+    on rather than on whether it was.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller, frame_perception=True)
 
         assert not asked, surface
         # And `replace` did not strip the action tools on its way to offering nothing.
