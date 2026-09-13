@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -916,6 +917,11 @@ class AgentFunction:
         ab_eligible: bool = True,
     ) -> RunEngine:
         return requested_engine
+
+    # OSS has no billing tiers; cloud overrides with the organization_pricing lookup. UNKNOWN keeps
+    # a tier-targeted experiment condition from matching rather than guessing a tier for everyone.
+    async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
+        return BillingTier.UNKNOWN
 
     # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
     # behind a flag when the task targets a gated application-tracking-system host.

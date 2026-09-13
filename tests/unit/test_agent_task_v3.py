@@ -31,6 +31,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
+from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -724,6 +725,17 @@ async def test_execute_task_v3_extraction_redaction_respects_word_boundaries(
 # ---------------------------------------------------------------------------
 # Task V3 model selection: task.llm_key -> TASK_V3_LLM_NAME (PostHog) -> TASK_V3_LLM_KEY -> LLM_KEY
 # ---------------------------------------------------------------------------
+
+
+def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: BillingTier = BillingTier.UNKNOWN) -> None:
+    """Give a patched workflow_block_engine ``app`` an awaitable billing-tier seam.
+
+    Without it, awaiting the bare MagicMock's ``resolve_billing_tier`` raises TypeError, which
+    ``_billing_tier_for_arm`` swallows into UNKNOWN (with a logged traceback); the arm is still
+    decided by the flag, but with ``billing_tier="unknown"`` in its properties. Only tests that
+    assert on that property need this; ``ForgeAgent.execute_step`` never reaches the arm resolver.
+    """
+    mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
 
 
 def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
