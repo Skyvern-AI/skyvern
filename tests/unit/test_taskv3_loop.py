@@ -9289,31 +9289,105 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
     list does not name, which is exactly what a tool registered through `extra_tools` does.
     """
     import ast  # noqa: PLC0415
+    import dataclasses  # noqa: PLC0415
     import pathlib  # noqa: PLC0415
     from typing import get_args  # noqa: PLC0415
 
     import skyvern  # noqa: PLC0415
-    from skyvern.forge.taskv3.loop import ToolErrorClass  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import ToolErrorClass, ToolResult  # noqa: PLC0415
 
-    def _is_tool_result_call(node: ast.Call) -> bool:
+    # Derived, not the literal 4: the positional read is a coupling to FIELD ORDER, and a reorder
+    # would otherwise move the census onto a different argument without anything going red.
+    error_class_position = [f.name for f in dataclasses.fields(ToolResult)].index("error_class")
+
+    def _is_tool_result_constructor(node: ast.Call, names: set[str], qualified: bool) -> bool:
+        # Every spelling of the CONSTRUCTOR -- bare, module-qualified, and import-aliased. It matters
+        # more than the classmethods because the positional write site exists only here.
         func = node.func
         if isinstance(func, ast.Name):
-            return func.id == "ToolResult"
-        return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "ToolResult"
+            return func.id in names
+        return qualified and isinstance(func, ast.Attribute) and func.attr == "ToolResult"
+
+    def _is_replace_call(node: ast.Call, names: set[str]) -> bool:
+        # `dataclasses.replace(result, error_class=...)` rebuilds the record, so it is a write site
+        # too -- and it is neither a `ToolResult` call nor necessarily inside this package. Aliased
+        # for the same reason the constructor is: `from dataclasses import replace as clone`.
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id in names
+        return isinstance(func, ast.Attribute) and func.attr == "replace"
+
+    def _is_tool_result_call(node: ast.Call, names: set[str], qualified: bool) -> bool:
+        if _is_tool_result_constructor(node, names, qualified):
+            return True
+        # ...and the classmethods on it, under either spelling of the owner.
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            return False
+        owner = func.value
+        if isinstance(owner, ast.Name):
+            return owner.id in names
+        return qualified and isinstance(owner, ast.Attribute) and owner.attr == "ToolResult"
 
     repo_root = pathlib.Path(skyvern.__file__).resolve().parent.parent
     taskv3 = repo_root / "skyvern" / "forge" / "taskv3"
     declared = set(get_args(ToolErrorClass))
     written: set[str] = set()
+    computed: set[str] = set()
     for root in (repo_root / "skyvern", repo_root / "cloud"):
         if not root.is_dir():
             continue
         for path in root.rglob("*.py"):
             source = path.read_text(encoding="utf-8", errors="replace")
-            if "error_class" not in source:
+            # `ToolResult` as well as the field name: a `**overrides` that carries the class need not
+            # spell it, so prefiltering on the field alone drops the file before it is ever parsed.
+            if "error_class" not in source and "ToolResult" not in source:
                 continue
             in_taskv3 = taskv3 in path.parents
-            for node in ast.walk(ast.parse(source)):
+            tree = ast.parse(source)
+            # `from ... import ToolResult as TResult` renames the constructor, and a name-matching
+            # scan then stops seeing it. Read the aliases the module actually bound.
+            # Resolved by IMPORT ORIGIN, not by name. `ToolResult` is not a unique name in this
+            # tree -- `skyvern/cli/mcp_tools/argument_validation.py` builds FastMCP's -- and a
+            # name-only match would read an unrelated class's arguments as if they were this facet.
+            loop_module = "skyvern.forge.taskv3.loop"
+            constructor_names = {"ToolResult"} if in_taskv3 else set()
+            replace_names = {"replace"}
+            imports_loop_module = in_taskv3
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        bound = alias.asname or alias.name
+                        if alias.name == "ToolResult" and node.module == loop_module:
+                            constructor_names.add(bound)
+                        elif alias.name == "replace" and node.module == "dataclasses":
+                            replace_names.add(bound)
+                        elif alias.name == "loop" and node.module == "skyvern.forge.taskv3":
+                            imports_loop_module = True
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == loop_module:
+                            imports_loop_module = True
+            # A file that never mentions the type cannot be assigning to one of its fields. This is
+            # what keeps `cloud/webeye`'s unrelated `error_class` out while still reaching a tool
+            # registered from outside this package, which the call census already supports.
+            builds_results = bool(constructor_names) or imports_loop_module
+            for node in ast.walk(tree):
+                # Not a frozen dataclass, so the field can also be set after construction; that
+                # reaches the same telemetry by a route no call-shaped scan would ever see.
+                # Scoped to this package for the same reason the call filter is: `cloud/webeye`
+                # carries an unrelated `error_class`, the very collision the emitted field was
+                # renamed to escape, and a scan that cannot tell them apart reports that instead.
+                if builds_results and isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    assigned = node.value if not isinstance(node, ast.AugAssign) else None
+                    for target in targets:
+                        if not (isinstance(target, ast.Attribute) and target.attr == "error_class"):
+                            continue
+                        if isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
+                            written.add(assigned.value)
+                        else:
+                            computed.add(path.relative_to(repo_root).as_posix())
                 if not isinstance(node, ast.Call):
                     continue
                 # Scoped by the CALL, not by a list of modules. `auth_tools` and `captcha_tools`
@@ -9322,16 +9396,69 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                 # whichever site nobody thought to add. Scoping by `ToolResult` also keeps
                 # `cloud/webeye`'s unrelated `error_class` out, which is the collision the emitted
                 # field was renamed to escape.
-                if not (in_taskv3 or _is_tool_result_call(node)):
+                # BEFORE the call-shape filter, and on the same scope as the assignment scan: a
+                # `setattr` is none of the shapes that filter admits, so anywhere but this package it
+                # was skipped before it could be read. A computed attribute NAME is the one shape no
+                # static scan can close, and it is recorded as unreadable rather than argued away.
+                if (
+                    builds_results
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "setattr"
+                    and len(node.args) == 3
+                ):
+                    attribute, assigned = node.args[1], node.args[2]
+                    named = isinstance(attribute, ast.Constant) and attribute.value == "error_class"
+                    if named and isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
+                        written.add(assigned.value)
+                    elif named:
+                        computed.add(path.relative_to(repo_root).as_posix())
+                    elif in_taskv3 and not isinstance(attribute, ast.Constant):
+                        # A computed attribute NAME could be this field or any other, and the target
+                        # object is not knowable either. Flagged only inside this package, where the
+                        # shape is rare enough to be worth a look; anywhere else it is ordinary
+                        # reflection -- `setattr(ctx, field_name, ...)` -- and flagging it would
+                        # report unrelated code instead of the thing asked about.
+                        computed.add(path.relative_to(repo_root).as_posix())
+                if not (
+                    in_taskv3
+                    or _is_tool_result_call(node, constructor_names, imports_loop_module)
+                    or _is_replace_call(node, replace_names)
+                ):
                     continue
+                here = path.relative_to(repo_root).as_posix()
+                # The field is the FIFTH positional, and the dataclass constructor accepts it there.
+                # `.error()`/`.ok()` cannot: one takes it keyword-only, the other not at all.
+                if _is_tool_result_constructor(node, constructor_names, imports_loop_module):
+                    if any(isinstance(argument, ast.Starred) for argument in node.args):
+                        # `ToolResult(*args)` -- the arity is a runtime property, so whether anything
+                        # lands in the fifth slot is not decidable here. Unreadable, not absent.
+                        computed.add(here)
+                    elif len(node.args) > error_class_position:
+                        positional = node.args[error_class_position]
+                        if isinstance(positional, ast.Constant) and isinstance(positional.value, str):
+                            written.add(positional.value)
+                        else:
+                            computed.add(here)
                 for keyword in node.keywords:
                     value = keyword.value
-                    if (
-                        keyword.arg == "error_class"
-                        and isinstance(value, ast.Constant)
-                        and isinstance(value.value, str)
-                    ):
+                    # `**mapping` on a result construction: `arg` is None and the keys are not
+                    # knowable here, so the call may or may not carry the field. Unreadable, and the
+                    # point of this half of the census is that unreadable is not the same as absent.
+                    if keyword.arg is None:
+                        if _is_tool_result_call(node, constructor_names, imports_loop_module) or _is_replace_call(
+                            node, replace_names
+                        ):
+                            computed.add(here)
+                        continue
+                    if keyword.arg != "error_class":
+                        continue
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
                         written.add(value.value)
+                    else:
+                        # Counted, not skipped. A value this scan cannot read -- a name, an f-string, a
+                        # call -- is invisible to the subset check below, so silently ignoring one would
+                        # make the census read clean over exactly the site it cannot vouch for.
+                        computed.add(here)
 
     # Anti-vacuity: a walk that matched nothing would satisfy the subset check silently. These three
     # live in tools.py, the module the subset check exists to cover.
@@ -9339,6 +9466,20 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
     assert written <= declared, f"error classes written but not declared: {sorted(written - declared)}"
     # Produced by the loop's fallback for an erroring call whose site named nothing, not by a kwarg.
     assert "other" in declared
+    # The other half of the guarantee, and the reason it is a set of FILES rather than a count: a
+    # non-literal value is unreadable here, so the only thing that can vouch for it is the `Literal`
+    # annotation -- which `follow_imports = skip` binds inside loop.py and nowhere else. Both sites
+    # there are pass-throughs of an already-typed parameter. One appearing anywhere else is checked by
+    # neither mypy nor this scan, which is the gap a reader would otherwise assume was covered.
+    accessor_module = "skyvern/forge/taskv3/loop.py"
+    # Split from the check below so each message is true on its own terms: asserting one equality
+    # would report "outside loop.py: []" in the case where the scan simply stopped finding the
+    # sites it is anchored on, which claims a violation while naming nothing.
+    assert accessor_module in computed, "the scan found no unreadable write at all; it is not looking"
+    assert not computed - {accessor_module}, (
+        f"error_class written from an unreadable expression outside loop.py, where the Literal "
+        f"annotation does not bind: {sorted(computed - {accessor_module})}"
+    )
 
 
 def test_the_loop_core_imports_with_no_browser_driver_installed() -> None:
