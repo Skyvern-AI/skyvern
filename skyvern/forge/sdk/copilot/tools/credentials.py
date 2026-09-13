@@ -802,19 +802,36 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
 _DENIED_PASS_ROUTES = ["typed_resume", "request_credential_tool", "literal_credential_id"]
 
 
-def _typed_resume_arm(reference: str, policy: RequestPolicy) -> str | None:
-    """Which server record already answered which credential this reference names, if any. Both arms
-    are server-owned records of an identifier, never an interpretation of prose: the user settled the
-    id this turn, or the server bound it from a login page it admitted.
+def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Credential]) -> str | None:
+    """Which server record already answered which credential this reference names, if any. Each arm is
+    a server-owned record of an identifier, never an interpretation of prose: the user settled the id
+    this turn, the server bound it from a login page it admitted, or the user approved it earlier in
+    this chat. ``matches`` is what the live inventory resolves the reference to.
     """
+
+    def keyed(credential: Credential) -> bool:
+        # A name on a stored record can have moved to another credential since it was written, so an
+        # arm vouches only for the one the live inventory resolved. Passing when the inventory did not
+        # resolve exactly one leaves the not-found and ambiguous answers below to report themselves.
+        return len(matches) != 1 or matches[0].credential_id == credential.credential_id
+
     if any(
         credential.credential_id in policy.current_turn_named_credential_ids
         and reference in {credential.credential_id, credential.name}
+        and keyed(credential)
         for credential in policy.resolved_credentials
     ):
         return "user_named_this_turn"
-    if any(reference in {credential.credential_id, credential.name} for credential in policy.auto_bound_credentials):
+    if any(
+        reference in {credential.credential_id, credential.name} and keyed(credential)
+        for credential in policy.auto_bound_credentials
+    ):
         return "server_auto_bound"
+    # Durable approval records the user's own answer, not a page's vouch; the recorder skips a
+    # page-stamped id except the carried proposal a citation passed, which keeps its admitting origin.
+    # It is recorded by id, so it reads the resolved id directly rather than any stored name.
+    if len(matches) == 1 and matches[0].credential_id in policy.prior_approved_credential_ids:
+        return "user_approved_earlier_turn"
     return None
 
 
@@ -839,7 +856,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     }
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
-    typed_resume_arm = _typed_resume_arm(reference, policy)
+    typed_resume_arm = _typed_resume_arm(reference, policy, matches)
     if len(matches) == 1 and matches[0].credential_id in _saved_workflow_credential_ids(policy):
         typed_resume_arm = typed_resume_arm or "saved_workflow"
     # The agent owns natural-language interpretation. This boundary verifies only
@@ -879,7 +896,9 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
         credential,
     ]
-    user_named = typed_resume_arm is None or reference in grounded_references or literal_reference
+    # A literal span the grounded check dropped — a shorter saved name sitting inside a longer one the
+    # user actually typed — is not the user naming this credential; no arm here already implies grounded.
+    user_named = typed_resume_arm is None or reference in grounded_references
     if user_named:
         policy.current_turn_named_credential_ids.add(credential.credential_id)
         # A carried origin answers where the secret belongs only while nobody better has. The user
