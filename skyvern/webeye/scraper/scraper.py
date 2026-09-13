@@ -312,12 +312,11 @@ async def scrape_website(
     number of attempts. This function should be used when reliability and error handling are crucial, such as in
     automated scraping tasks.
 
-    :param browser_context: BrowserContext instance used for scraping.
+    :param browser_state: BrowserState instance used for scraping.
     :param url: URL of the web page to be scraped.
-    :param page: Optional Page instance for scraping, a new page is created if None.
     :param num_retry: Tracks number of retries if scraping fails, defaults to 0.
 
-    :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
+    :return: The scraped page content and metadata.
 
     :raises Exception: When scraping fails after maximum retries.
     """
@@ -539,10 +538,9 @@ async def scrape_web_unsafe(
     for use cases where the caller handles exceptions or in controlled environments. It directly scrapes the provided
     URL or continues on the given page.
 
-    :param browser_context: BrowserContext instance used for scraping.
+    :param browser_state: BrowserState instance used for scraping.
     :param url: URL of the web page to be scraped. Used only when creating a new page.
-    :param page: Optional Page instance for scraping, a new page is created if None.
-    :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
+    :return: The scraped page content and metadata.
     :note: This function does not handle exceptions. Ensure proper error handling in the calling context.
     """
 
