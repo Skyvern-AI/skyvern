@@ -849,7 +849,7 @@ async def _record_output_parameter_value(
     if not workflow:
         return None
 
-    # get the output_paramter
+    # get the output_parameter
     output_parameter = workflow.get_output_parameter(label)
     if not output_parameter:
         # NOT sure if this is legit hack to create output parameter like this
@@ -1617,7 +1617,7 @@ async def _fallback_to_ai_run(
         context.step_id = ai_step.step_id
         ai_step_id = ai_step.step_id
 
-        # get the output_paramter
+        # get the output_parameter
         output_parameter = workflow.get_output_parameter(cache_key)
         if not output_parameter:
             # NOT sure if this is legit hack to create output parameter like this
