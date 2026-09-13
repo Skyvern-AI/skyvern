@@ -97,6 +97,10 @@ import { QuestionPartsCard } from "./cards/QuestionPartsCard";
 import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import { composerPlaceholder } from "./composerPlaceholder";
+import {
+  ensureCredentialRecoveryToken,
+  readCredentialRecoveryHistory,
+} from "./credentialRecovery";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -1039,6 +1043,9 @@ export function WorkflowCopilotChat({
   // turn_start and at every terminal so a dead resume_token can never render.
   const [livePauseFrame, setLivePauseFrame] =
     useState<WorkflowCopilotCredentialRequiredUpdate | null>(null);
+  const [recoveredPauseFrames, setRecoveredPauseFrames] = useState<
+    WorkflowCopilotCredentialRequiredUpdate[]
+  >([]);
   // Local credential-card resolutions keyed by turn_id: live pauses after a
   // successful resume POST, and terminal-mode connect/skip (which never POST).
   // name is captured at connect so the receipt keeps showing it after the turn
@@ -1125,6 +1132,9 @@ export function WorkflowCopilotChat({
   const cancelInFlightController = useRef<AbortController | null>(null);
   const recoveryPolls = useRef(new Map<string, () => void>());
   const recoveryGeneration = useRef(0);
+  // A turn resumed from saved human input has no live SSE controller, but it
+  // still owns the composer until history proves that continuation finished.
+  const recoveredTurnOwnerRef = useRef<string | null>(null);
   // The poll is declared before the reconcile it calls on a recovered row.
   const reconcileCanonicalWorkflowRef = useRef<(() => Promise<void>) | null>(
     null,
@@ -1438,6 +1448,9 @@ export function WorkflowCopilotChat({
       location.state,
     ],
   );
+  const recoverCredentialTurn = useRef<
+    (chatId: string, turnId: string) => void
+  >(() => {});
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
@@ -1447,6 +1460,8 @@ export function WorkflowCopilotChat({
     ) => {
       if (credentialResponseInFlight.current) return;
       credentialResponseInFlight.current = true;
+      const generation = recoveryGeneration.current;
+      const chatId = workflowCopilotChatIdRef.current;
       try {
         // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -1457,6 +1472,19 @@ export function WorkflowCopilotChat({
           action,
           credential_id: action === "connected" ? credentialId : undefined,
         });
+        if (
+          recoveryGeneration.current !== generation ||
+          workflowCopilotChatIdRef.current !== chatId ||
+          chatId !== frame.workflow_copilot_chat_id
+        ) {
+          return;
+        }
+        if (!streamingAbortController.current) {
+          recoverCredentialTurn.current(
+            frame.workflow_copilot_chat_id,
+            frame.turn_id,
+          );
+        }
         setCredentialResolutions((prev) =>
           withCappedResolution(
             prev,
@@ -1741,6 +1769,7 @@ export function WorkflowCopilotChat({
     streamingAbortController.current = null;
     inFlightRef.current = false;
     setIsLoading(false);
+    setRecoveredPauseFrames([]);
     setQuestionInteractions([]);
     setQuestionCancelToken(null);
     stopRecoveryPolls();
@@ -1767,6 +1796,7 @@ export function WorkflowCopilotChat({
       data: WorkflowCopilotChatHistoryResponse,
       carryForwardLifecycle = true,
     ) => {
+      setRecoveredPauseFrames(data.pending_credential_requests ?? []);
       setQuestionInteractions(data.question_interactions ?? []);
       setQuestionCancelToken(data.pending_question_cancel_token ?? null);
       const historyMessages = data.chat_history.map((message, index) => ({
@@ -1832,10 +1862,11 @@ export function WorkflowCopilotChat({
     recoveryGeneration.current += 1;
     recoveryPolls.current.forEach((stop) => stop());
     recoveryPolls.current.clear();
+    recoveredTurnOwnerRef.current = null;
   }, []);
 
   const startRecoveryPoll = useCallback(
-    (chatId: string | null, turnId: string) => {
+    (chatId: string | null, turnId: string, ownsTurn = false) => {
       if (!workflowPermanentId) {
         return;
       }
@@ -1875,6 +1906,10 @@ export function WorkflowCopilotChat({
         if (recoveryPolls.current.get(turnId) === finish) {
           recoveryPolls.current.delete(turnId);
         }
+        if (recoveredTurnOwnerRef.current === turnId) {
+          recoveredTurnOwnerRef.current = null;
+          setIsLoading(false);
+        }
       }
 
       // Ending without the turn's row leaves a notice describing work that has
@@ -1892,6 +1927,10 @@ export function WorkflowCopilotChat({
 
       recoveryPolls.current.get(turnId)?.();
       recoveryPolls.current.set(turnId, finish);
+      if (ownsTurn) {
+        recoveredTurnOwnerRef.current = turnId;
+        setIsLoading(true);
+      }
       // A read that never returns leaves schedule() unreached, so the budget
       // needs a timer of its own or the deadline can never fire.
       deadlineTimer = setTimeout(giveUp, RECOVERY_POLL_BUDGET_MS);
@@ -1900,8 +1939,11 @@ export function WorkflowCopilotChat({
         clearTimer();
         // finish() aborts the in-flight read, which surfaces in tick's catch;
         // without this the rejection would reschedule a stopped poll.
-        if (stopped || Date.now() >= deadline) {
-          finish();
+        if (stopped) {
+          return;
+        }
+        if (Date.now() >= deadline) {
+          giveUp();
           return;
         }
         const delay = RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS;
@@ -1922,15 +1964,17 @@ export function WorkflowCopilotChat({
           const client = await getClient(credentialGetter, "sans-api-v1");
           const controller = new AbortController();
           inFlight = controller;
-          const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-            "/workflow/copilot/chat-history",
-            {
-              params: chatId
-                ? { workflow_copilot_chat_id: chatId }
-                : { workflow_permanent_id: workflowPermanentId },
-              signal: controller.signal,
-            },
-          );
+          const response =
+            await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+              client,
+              workflowPermanentId,
+              {
+                params: chatId
+                  ? { workflow_copilot_chat_id: chatId }
+                  : { workflow_permanent_id: workflowPermanentId },
+                signal: controller.signal,
+              },
+            );
           if (inFlight === controller) {
             inFlight = null;
           }
@@ -1943,6 +1987,20 @@ export function WorkflowCopilotChat({
           if (recoveryGeneration.current !== generation) {
             finish();
             return;
+          }
+          const pendingCredentialRequests =
+            response.data.pending_credential_requests ?? [];
+          setRecoveredPauseFrames(pendingCredentialRequests);
+          // The backend can persist the pause before its SSE frame reaches the
+          // browser. Once history proves this poll owns a credential wait, it
+          // must block another turn just like a poll armed from the live frame.
+          if (
+            !ownsTurn &&
+            pendingCredentialRequests.some((item) => item.turn_id === turnId)
+          ) {
+            ownsTurn = true;
+            recoveredTurnOwnerRef.current = turnId;
+            setIsLoading(true);
           }
           const pendingQuestion = response.data.question_interactions?.find(
             (item) => item.turn_id === turnId && item.status === "pending",
@@ -2040,6 +2098,16 @@ export function WorkflowCopilotChat({
     [applyHistoryResponse, credentialGetter, workflowPermanentId],
   );
 
+  const adoptRecoveredCredentialPause = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const pendingRequests = data.pending_credential_requests ?? [];
+      const pending = pendingRequests[pendingRequests.length - 1];
+      if (!pending) return;
+      startRecoveryPoll(data.workflow_copilot_chat_id, pending.turn_id, true);
+    },
+    [startRecoveryPoll],
+  );
+
   const loadChatInPlace = useCallback(
     async (chatId: string) => {
       if (!workflowPermanentId) return;
@@ -2061,16 +2129,19 @@ export function WorkflowCopilotChat({
       repin();
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: {
-              workflow_permanent_id: workflowPermanentId,
-              workflow_copilot_chat_id: chatId,
+        const response =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: {
+                workflow_permanent_id: workflowPermanentId,
+                workflow_copilot_chat_id: chatId,
+              },
             },
-          },
-        );
+          );
         applyHistoryResponse(response.data, false);
+        adoptRecoveredCredentialPause(response.data);
         // Mark history loaded for this workflow so the mount effect won't reload
         // the latest chat over the one the user just selected.
         historyLoadedForRef.current = workflowPermanentId;
@@ -2085,11 +2156,15 @@ export function WorkflowCopilotChat({
       credentialGetter,
       workflowPermanentId,
       applyHistoryResponse,
+      adoptRecoveredCredentialPause,
       stopRecoveryPolls,
       repin,
       discardQueuedPrompt,
     ],
   );
+
+  recoverCredentialTurn.current = (chatId, turnId) =>
+    startRecoveryPoll(chatId, turnId, true);
 
   const handleSelectHistoryChat = useCallback(
     (chat: WorkflowCopilotChatSummary) => {
@@ -2291,12 +2366,14 @@ export function WorkflowCopilotChat({
       return null;
     }
     const client = await getClient(credentialGetter, "sans-api-v1");
-    const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-      "/workflow/copilot/chat-history",
-      {
-        params: { workflow_permanent_id: workflowPermanentId },
-      },
-    );
+    const response =
+      await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+        client,
+        workflowPermanentId,
+        {
+          params: { workflow_permanent_id: workflowPermanentId },
+        },
+      );
     const latestChatId = response.data.workflow_copilot_chat_id ?? null;
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
@@ -2689,9 +2766,19 @@ export function WorkflowCopilotChat({
     if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
-    // Reached only when this workflow's transcript is about to replace another's,
-    // so a poll armed against the outgoing chat must not apply history here.
+    const isWorkflowSwitch = historyLoadedForRef.current !== null;
+    // A poll armed against the outgoing chat must not apply history to the new
+    // workflow. The state reset is only needed after a workflow was loaded;
+    // writing fresh empty arrays on first mount can restart this async effect
+    // before its history request records completion.
     stopRecoveryPolls();
+    if (isWorkflowSwitch) {
+      setRecoveredPauseFrames([]);
+      setQuestionInteractions([]);
+      setQuestionCancelToken(null);
+      setWorkflowCopilotChatId(null);
+      workflowCopilotChatIdRef.current = null;
+    }
 
     let isMounted = true;
 
@@ -2700,16 +2787,20 @@ export function WorkflowCopilotChat({
       repin();
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: { workflow_permanent_id: workflowPermanentId },
-          },
-        );
+        const response =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: { workflow_permanent_id: workflowPermanentId },
+            },
+            { retryTransientFailure: true },
+          );
 
         if (!isMounted) return;
 
         applyHistoryResponse(response.data);
+        adoptRecoveredCredentialPause(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
@@ -2727,6 +2818,7 @@ export function WorkflowCopilotChat({
     };
   }, [
     credentialGetter,
+    adoptRecoveredCredentialPause,
     repin,
     stopRecoveryPolls,
     updateQueuedPrompt,
@@ -2923,8 +3015,9 @@ export function WorkflowCopilotChat({
           ),
         );
         setIsLoading(true);
-        if (!streamingAbortController.current)
-          startRecoveryPoll(workflowCopilotChatId, interaction.turn_id);
+        if (!streamingAbortController.current) {
+          startRecoveryPoll(workflowCopilotChatId, interaction.turn_id, true);
+        }
         return true;
       } catch {
         toast({
@@ -3046,12 +3139,14 @@ export function WorkflowCopilotChat({
     const refresh = async () => {
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const { data } = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: { workflow_copilot_chat_id: workflowCopilotChatId },
-          },
-        );
+        const { data } =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: { workflow_copilot_chat_id: workflowCopilotChatId },
+            },
+          );
         if (disposed) return;
         const interactions = data.question_interactions ?? [];
         setQuestionInteractions(interactions);
@@ -3064,8 +3159,7 @@ export function WorkflowCopilotChat({
             .reverse()
             .find((item) => item.status === "resolved");
           if (resolved) {
-            setIsLoading(true);
-            startRecoveryPoll(workflowCopilotChatId, resolved.turn_id);
+            startRecoveryPoll(workflowCopilotChatId, resolved.turn_id, true);
           } else {
             setIsLoading(false);
             inFlightRef.current = false;
@@ -3083,6 +3177,7 @@ export function WorkflowCopilotChat({
   }, [
     hasPendingQuestion,
     workflowCopilotChatId,
+    workflowPermanentId,
     credentialGetter,
     startRecoveryPoll,
   ]);
@@ -3116,7 +3211,7 @@ export function WorkflowCopilotChat({
         );
       };
       const action = resolveSendAction({
-        inFlight: inFlightRef.current,
+        inFlight: inFlightRef.current || recoveredTurnOwnerRef.current !== null,
         hasQueuedPrompt: Boolean(queuedPromptRef.current),
         requiresLiveBrowser,
         isLiveBrowserReady,
@@ -3395,6 +3490,7 @@ export function WorkflowCopilotChat({
       };
       let streamChatId: string | null = null;
       let sawTerminalFrame = false;
+      let sawCredentialPause = false;
       const shouldArmRecovery = () =>
         streamTurnId !== null &&
         !sawTerminalFrame &&
@@ -3772,6 +3868,8 @@ export function WorkflowCopilotChat({
         for (const attached of sentAttachments) {
           inFlightFileIds.current.add(attached.file_id);
         }
+        const credentialRecoveryToken =
+          ensureCredentialRecoveryToken(workflowPermanentId);
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -3797,6 +3895,10 @@ export function WorkflowCopilotChat({
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
+            supports_credential_pause_recovery: Boolean(
+              credentialRecoveryToken,
+            ),
+            credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -3882,6 +3984,7 @@ export function WorkflowCopilotChat({
                   .setTitleFromCopilotIfDefault(payload.title);
                 return false;
               case "credential_required":
+                sawCredentialPause = true;
                 setLivePauseFrame(payload);
                 return false;
               case "turn_start": {
@@ -4055,6 +4158,7 @@ export function WorkflowCopilotChat({
             startRecoveryPoll(
               streamChatId ?? workflowCopilotChatIdRef.current,
               streamTurnId,
+              sawCredentialPause,
             );
           }
         }
@@ -4244,7 +4348,7 @@ export function WorkflowCopilotChat({
     const lastTurn = lastTurnRef.current;
     const drainAction = resolveDrainAction({
       queuedReason: queuedPrompt.reason,
-      inFlight: isLoading,
+      inFlight: isLoading || recoveredTurnOwnerRef.current !== null,
       hasLiveBrowserSession: Boolean(liveBrowserSessionId),
       hasWorkflowPermanentId: Boolean(workflowPermanentId),
       queuedContent: queuedPrompt.content,
@@ -5190,6 +5294,33 @@ export function WorkflowCopilotChat({
             RESPONSE has frozen the narrative into the latest AI message —
             otherwise the same turn would render twice.
           */}
+            {!isLoadingHistory &&
+              recoveredPauseFrames
+                .filter(
+                  (frame) =>
+                    frame.workflow_copilot_chat_id === workflowCopilotChatId &&
+                    frame.turn_id !== livePauseFrame?.turn_id,
+                )
+                .map((frame) => (
+                  <CredentialCard
+                    key={frame.turn_id}
+                    frame={liveFrameToCardFrame(frame)}
+                    mode="inline-pause"
+                    reloadKey={credentialsReloadKey}
+                    resolvedOutcome={credentialResolutions[frame.turn_id]}
+                    onConnect={(credentialId, name) =>
+                      credentialId
+                        ? void respondToCredentialPause(
+                            frame,
+                            "connected",
+                            credentialId,
+                            name,
+                          )
+                        : openCredentialModal(frame, frame.turn_id)
+                    }
+                    onSkip={() => void respondToCredentialPause(frame, "skip")}
+                  />
+                ))}
             {narrative.turnId !== null && narrative.terminal === null && (
               <div
                 className="flex flex-col gap-2"
