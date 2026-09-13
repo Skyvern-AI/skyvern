@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getCredentialParam } from "@/util/env";
+import { copyText } from "@/util/copyText";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   mouseButtonName,
@@ -36,6 +37,7 @@ interface UseCdpInputReturn {
     handleMouseMove: (e: React.MouseEvent<HTMLImageElement>) => void;
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
+    handlePaste: (e: React.ClipboardEvent) => void;
   };
   navigate: (url: string) => void;
   historyNavigate: (action: HistoryAction) => void;
@@ -54,6 +56,56 @@ const NAVIGATE_ERROR_MESSAGES: Record<string, string> = {
   blocked: "That destination isn't allowed.",
   invalid_url: "Enter a valid http(s) URL.",
 };
+
+function isShortcut(e: React.KeyboardEvent, key: string): boolean {
+  return (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === key;
+}
+
+function editingCommandsFor(e: React.KeyboardEvent): string[] {
+  if (isShortcut(e, "a")) {
+    return ["selectAll"];
+  }
+  if (e.altKey && !e.metaKey && !e.ctrlKey) {
+    if (e.key === "Enter") {
+      return ["insertNewline"];
+    }
+    if (e.key === "ArrowLeft") {
+      return [e.shiftKey ? "moveWordLeftAndModifySelection" : "moveWordLeft"];
+    }
+    if (e.key === "ArrowRight") {
+      return [e.shiftKey ? "moveWordRightAndModifySelection" : "moveWordRight"];
+    }
+  }
+  if (e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key === "ArrowLeft") {
+      return [
+        e.shiftKey
+          ? "moveToLeftEndOfLineAndModifySelection"
+          : "moveToLeftEndOfLine",
+      ];
+    }
+    if (e.key === "ArrowRight") {
+      return [
+        e.shiftKey
+          ? "moveToRightEndOfLineAndModifySelection"
+          : "moveToRightEndOfLine",
+      ];
+    }
+  }
+  if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key === "Backspace") return ["deleteBackward"];
+    if (e.key === "Delete") return ["deleteForward"];
+    if (e.key === "Enter") return ["insertNewline"];
+  }
+  return [];
+}
+
+function mouseButtonNameForButtons(buttons: number): string {
+  if (buttons & 1) return "left";
+  if (buttons & 2) return "right";
+  if (buttons & 4) return "middle";
+  return "none";
+}
 
 export function useCdpInput({
   inputWsUrl,
@@ -150,6 +202,13 @@ export function useCdpInput({
               NAVIGATE_ERROR_MESSAGES[msg.reason] ??
                 "Couldn't navigate to that URL.",
             );
+          }
+          if (
+            msg.kind === "copied-text" &&
+            typeof msg.text === "string" &&
+            msg.text
+          ) {
+            void copyText(msg.text);
           }
         } catch {
           // ignore non-JSON messages
@@ -355,7 +414,8 @@ export function useCdpInput({
         x: coords.x,
         y: coords.y,
         button: mouseButtonName(e.button),
-        clickCount: 1,
+        buttons: e.buttons,
+        clickCount: Math.max(1, Math.min(e.detail || 1, 3)),
         modifiers: getModifiers(e),
       });
     },
@@ -380,7 +440,8 @@ export function useCdpInput({
         x: coords.x,
         y: coords.y,
         button: mouseButtonName(e.button),
-        clickCount: 1,
+        buttons: e.buttons,
+        clickCount: Math.max(1, Math.min(e.detail || 1, 3)),
         modifiers: getModifiers(e),
       });
     },
@@ -403,7 +464,8 @@ export function useCdpInput({
         eventType: "mouseMoved",
         x: coords.x,
         y: coords.y,
-        button: "none",
+        button: mouseButtonNameForButtons(e.buttons),
+        buttons: e.buttons,
         clickCount: 0,
         modifiers: getModifiers(e),
       };
@@ -435,11 +497,16 @@ export function useCdpInput({
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
-      e.preventDefault();
-      const clipboardModifier = e.metaKey || e.ctrlKey;
-      const key = e.key.toLowerCase();
-      if (clipboardModifier && key === "v" && onClipboardPasteRef.current) {
+
+      if (isShortcut(e, "v")) {
         interceptedClipboardKeysRef.current.add(e.code);
+        e.stopPropagation();
+        if (!onClipboardPasteRef.current) {
+          // Keep the native paste event alive so ClipboardEvent carries local
+          // clipboard text into the direct CDP fallback in handlePaste.
+          return;
+        }
+        e.preventDefault();
         if (!navigator.clipboard) {
           console.warn("Clipboard API not available.");
           return;
@@ -452,13 +519,23 @@ export function useCdpInput({
           });
         return;
       }
-      if (clipboardModifier && key === "c" && onClipboardCopyRef.current) {
+
+      if (isShortcut(e, "c")) {
+        e.preventDefault();
+        e.stopPropagation();
         interceptedClipboardKeysRef.current.add(e.code);
-        onClipboardCopyRef.current();
+        if (onClipboardCopyRef.current) {
+          onClipboardCopyRef.current();
+        } else {
+          sendInputEvent({ type: "copySelectedText" });
+        }
         return;
       }
-      const isPrintable = e.key.length === 1;
+
+      e.preventDefault();
+      const isPrintable = e.key.length === 1 && !e.metaKey && !e.ctrlKey;
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const commands = editingCommandsFor(e);
       const payload: Record<string, unknown> = {
         type: "keyEvent",
         eventType: isPrintable ? "keyDown" : "rawKeyDown",
@@ -469,6 +546,9 @@ export function useCdpInput({
       };
       if (windowsVirtualKeyCode !== undefined) {
         payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
+      }
+      if (commands.length) {
+        payload.commands = commands;
       }
       sendInputEvent(payload);
     },
@@ -494,6 +574,18 @@ export function useCdpInput({
         payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
       }
       sendInputEvent(payload);
+    },
+    [interactive, userIsControlling, sendInputEvent],
+  );
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      if (!interactive || !userIsControlling) return;
+      const text = e.clipboardData.getData("text/plain");
+      if (!text) return;
+      e.preventDefault();
+      e.stopPropagation();
+      sendInputEvent({ type: "insertText", text });
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -527,6 +619,7 @@ export function useCdpInput({
       handleMouseMove,
       handleKeyDown,
       handleKeyUp,
+      handlePaste,
     },
     navigate,
     historyNavigate,
