@@ -5768,10 +5768,15 @@ async def test_handle_action_blocked_inline_recovery_is_time_bounded(tmp_path: P
     )
     task.download_timeout = 0.01
     entered = asyncio.Event()
+    recovery_was_cancelled = asyncio.Event()
 
     async def hung_recovery(*_args: object, **_kwargs: object) -> None:
         entered.set()
-        await asyncio.Event().wait()  # never returns
+        try:
+            await asyncio.Event().wait()  # never returns
+        except asyncio.CancelledError:
+            recovery_was_cancelled.set()
+            raise
 
     mock_app = MagicMock()
     mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
@@ -5794,13 +5799,16 @@ async def test_handle_action_blocked_inline_recovery_is_time_bounded(tmp_path: P
         ),
         patch("skyvern.webeye.actions.handler.app", mock_app),
     ):
-        # A bound well under the outer wait_for proves handle_action self-bounds the hung recovery.
+        # Hang detector, not a latency assertion: it must dwarf any scheduler stall, because on 3.12+ this
+        # wait_for and the asyncio.timeout under test cancel the same task, so a tight guard fires first.
         results = await asyncio.wait_for(
             ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
-            timeout=1.0,
+            timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
         )
 
     assert entered.is_set()
+    # The bound fired mid-flight rather than the recovery being skipped or left running.
+    assert recovery_was_cancelled.is_set()
     assert results[-1].download_triggered is False
     assert results[-1].needs_followup is True
     assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
