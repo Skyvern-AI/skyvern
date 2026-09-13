@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import dataclasses
+import functools
 import json
 import re
 import time
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     is_custom_llm_owned_by_organization,
 )
 from skyvern.forge.sdk.api.llm.exceptions import (
+    BaseLLMError,
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     LLMOutputTruncatedError,
@@ -381,6 +383,18 @@ def _redact_message_text_content(
     return redacted_messages if changed else messages
 
 
+def _recording_correlation_fields(
+    recording_attempt_id: str | None,
+    interpretation_session_id: str | None,
+) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    if recording_attempt_id is not None:
+        fields["recording_attempt_id"] = recording_attempt_id
+    if interpretation_session_id is not None:
+        fields["interpretation_session_id"] = interpretation_session_id
+    return fields
+
+
 def _enrich_llm_span(
     span: otel_trace.Span,
     *,
@@ -395,12 +409,15 @@ def _enrich_llm_span(
     image_tokens: int = 0,
     image_cost: float = 0.0,
     image_count: int = 0,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
+    mark_completed: bool = True,
 ) -> None:
-    """Set canonical attributes + emit llm.request.completed event on an LLM span.
+    """Set canonical attributes and optionally mark an LLM span completed.
 
-    Only called on success paths. Error paths set `status=error` as a custom
-    string attribute; the OTEL-native ``StatusCode.ERROR`` is set separately by
-    the ``@traced`` decorator when the re-raised exception propagates through it.
+    Call with ``mark_completed=False`` after receiving a billable response but
+    before parsing it. If parsing fails, the tracing decorator records the error
+    while the cost and recording correlation remain available on the span.
     """
     span.set_attribute("llm_model", model)
     span.set_attribute("prompt_tokens", prompt_tokens)
@@ -408,7 +425,6 @@ def _enrich_llm_span(
     span.set_attribute("reasoning_tokens", reasoning_tokens)
     span.set_attribute("cached_tokens", cached_tokens)
     span.set_attribute("latency_ms", latency_ms)
-    span.set_attribute("status", "ok")
     span.set_attribute("cache_hit", bool(cached_tokens))
     span.set_attribute("llm_cost", llm_cost)
     span.set_attribute("image_tokens", image_tokens)
@@ -423,9 +439,15 @@ def _enrich_llm_span(
     span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
     span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
     span.set_attribute("gen_ai.usage.cost", llm_cost)
+    recording_correlation = _recording_correlation_fields(recording_attempt_id, interpretation_session_id)
+    for key, value in recording_correlation.items():
+        span.set_attribute(key, value)
     ctx = skyvern_context.current()
     if ctx is not None and ctx.copilot_session_id is not None:
         span.set_attribute("copilot.session_id", ctx.copilot_session_id)
+    if not mark_completed:
+        return
+    span.set_attribute("status", "ok")
     span.add_event(
         LLM_REQUEST_COMPLETED_EVENT,
         attributes={
@@ -440,6 +462,7 @@ def _enrich_llm_span(
             "image_cost": image_cost,
             "image_count": image_count,
             "prompt_name": prompt_name,
+            **recording_correlation,
         },
     )
 
@@ -1685,6 +1708,8 @@ class LLMAPIHandlerFactory:
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
             system_prompt: str | None = None,
+            recording_attempt_id: str | None = None,
+            interpretation_session_id: str | None = None,
         ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -2279,44 +2304,6 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
-                    parsed_response = content or ""
-                else:
-                    parsed_response = parse_api_response(
-                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
-                    )
-                parsed_response_json = json.dumps(parsed_response, indent=2)
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_parsed = parsed_response_json.encode("utf-8")
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=parsed_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                                **artifact_targets,
-                            )
-                        )
-
-                rendered_response_json = None
-                if context and len(context.hashed_href_map) > 0:
-                    llm_content = json.dumps(parsed_response)
-                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
-                    parsed_response = loads_with_repair(rendered_content)
-                    rendered_response_json = json.dumps(parsed_response, indent=2)
-                    if should_persist_llm_artifacts:
-                        if _should_bundle:
-                            _bundle_rendered = rendered_response_json.encode("utf-8")
-                        else:
-                            artifacts.append(
-                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                    data=rendered_response_json.encode("utf-8"),
-                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                    **artifact_targets,
-                                )
-                            )
-
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
@@ -2358,9 +2345,11 @@ class LLMAPIHandlerFactory:
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
+                    **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
                 )
 
-                _enrich_llm_span(
+                enrich_llm_span = functools.partial(
+                    _enrich_llm_span,
                     _llm_span,
                     model=model_used or main_model_group,
                     prompt_name=prompt_name,
@@ -2373,7 +2362,54 @@ class LLMAPIHandlerFactory:
                     image_tokens=int(image_tokens or 0),
                     image_cost=float(image_cost or 0.0),
                     image_count=int(image_count or 0),
+                    recording_attempt_id=recording_attempt_id,
+                    interpretation_session_id=interpretation_session_id,
                 )
+                enrich_llm_span(mark_completed=False)
+
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    try:
+                        parsed_response = parse_api_response(
+                            response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                        )
+                    except BaseLLMError:
+                        _llm_span.set_attribute("status", "error")
+                        raise
+                parsed_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
+                        )
+
+                rendered_response_json = None
+                if context and len(context.hashed_href_map) > 0:
+                    llm_content = json.dumps(parsed_response)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
+                    parsed_response = loads_with_repair(rendered_content)
+                    rendered_response_json = json.dumps(parsed_response, indent=2)
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
+                            )
+
+                enrich_llm_span()
 
                 if step and is_speculative_step:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -2487,6 +2523,8 @@ class LLMAPIHandlerFactory:
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
             system_prompt: str | None = None,
+            recording_attempt_id: str | None = None,
+            interpretation_session_id: str | None = None,
         ) -> dict[str, Any] | Any:
             _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
@@ -2892,44 +2930,6 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
-                    parsed_response = content or ""
-                else:
-                    parsed_response = parse_api_response(
-                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
-                    )
-                parsed_response_json = json.dumps(parsed_response, indent=2)
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_parsed = parsed_response_json.encode("utf-8")
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=parsed_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                                **artifact_targets,
-                            )
-                        )
-
-                rendered_response_json = None
-                if context and len(context.hashed_href_map) > 0:
-                    llm_content = json.dumps(parsed_response)
-                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
-                    parsed_response = loads_with_repair(rendered_content)
-                    rendered_response_json = json.dumps(parsed_response, indent=2)
-                    if should_persist_llm_artifacts:
-                        if _should_bundle:
-                            _bundle_rendered = rendered_response_json.encode("utf-8")
-                        else:
-                            artifacts.append(
-                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                    data=rendered_response_json.encode("utf-8"),
-                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                    **artifact_targets,
-                                )
-                            )
-
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
@@ -2970,13 +2970,15 @@ class LLMAPIHandlerFactory:
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
+                    **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
                 )
 
                 # actual_model is the response's model normalized by _normalize_llm_model.
                 # It's only None if response.model AND model_name were both falsy (broken
                 # config). The llm_config.model_name fallback satisfies mypy and is a no-op
                 # safety net — it matches the value already fed to _normalize_llm_model.
-                _enrich_llm_span(
+                enrich_llm_span = functools.partial(
+                    _enrich_llm_span,
                     _llm_span,
                     model=actual_model or llm_config.model_name,
                     prompt_name=prompt_name,
@@ -2989,7 +2991,54 @@ class LLMAPIHandlerFactory:
                     image_tokens=int(image_tokens or 0),
                     image_cost=float(image_cost or 0.0),
                     image_count=int(image_count or 0),
+                    recording_attempt_id=recording_attempt_id,
+                    interpretation_session_id=interpretation_session_id,
                 )
+                enrich_llm_span(mark_completed=False)
+
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    try:
+                        parsed_response = parse_api_response(
+                            response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                        )
+                    except BaseLLMError:
+                        _llm_span.set_attribute("status", "error")
+                        raise
+                parsed_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
+                        )
+
+                rendered_response_json = None
+                if context and len(context.hashed_href_map) > 0:
+                    llm_content = json.dumps(parsed_response)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
+                    parsed_response = loads_with_repair(rendered_content)
+                    rendered_response_json = json.dumps(parsed_response, indent=2)
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
+                            )
+
+                enrich_llm_span()
 
                 if step and is_speculative_step:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -3335,6 +3384,8 @@ class LLMCaller:
         window_dimension: Resolution | None = None,
         force_dict: bool = True,
         system_prompt: str | None = None,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
         _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
@@ -3689,9 +3740,11 @@ class LLMCaller:
                 **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
+                **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
             )
 
-            _enrich_llm_span(
+            enrich_llm_span = functools.partial(
+                _enrich_llm_span,
                 _llm_span,
                 model=actual_model or self.llm_config.model_name,
                 prompt_name=prompt_name or "<unknown>",
@@ -3704,15 +3757,23 @@ class LLMCaller:
                 image_tokens=int(image_tokens or 0),
                 image_cost=float(image_cost or 0.0),
                 image_count=int(image_count or 0),
+                recording_attempt_id=recording_attempt_id,
+                interpretation_session_id=interpretation_session_id,
             )
+            enrich_llm_span(mark_completed=False)
 
             # Raw response is used for CUA engine LLM calls.
             if raw_response:
+                enrich_llm_span()
                 return response.model_dump(exclude_none=True)
 
-            parsed_response = parse_api_response(
-                response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
-            )
+            try:
+                parsed_response = parse_api_response(
+                    response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
+                )
+            except BaseLLMError:
+                _llm_span.set_attribute("status", "error")
+                raise
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:
                 if _should_bundle:
@@ -3743,6 +3804,8 @@ class LLMCaller:
                                 **artifact_targets,
                             )
                         )
+
+            enrich_llm_span()
 
             if step and is_speculative_step:
                 step.speculative_llm_metadata = SpeculativeLLMMetadata(

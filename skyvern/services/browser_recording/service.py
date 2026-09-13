@@ -363,10 +363,14 @@ class Processor:
         browser_session_id: str,
         organization_id: str,
         workflow_permanent_id: str,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
     ) -> None:
         self.browser_session_id = browser_session_id
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
+        self.recording_attempt_id = recording_attempt_id
+        self.interpretation_session_id = interpretation_session_id
 
     @property
     def class_name(self) -> str:
@@ -374,11 +378,16 @@ class Processor:
 
     @property
     def identity(self) -> dict[str, str]:
-        return dict(
-            browser_session_id=self.browser_session_id,
-            organization_id=self.organization_id,
-            workflow_permanent_id=self.workflow_permanent_id,
-        )
+        identity = {
+            "browser_session_id": self.browser_session_id,
+            "organization_id": self.organization_id,
+            "workflow_permanent_id": self.workflow_permanent_id,
+        }
+        if self.recording_attempt_id is not None:
+            identity["recording_attempt_id"] = self.recording_attempt_id
+        if self.interpretation_session_id is not None:
+            identity["interpretation_session_id"] = self.interpretation_session_id
+        return identity
 
     def decompress(self, base64_payload: str) -> bytes | None:
         """
@@ -822,10 +831,18 @@ class Processor:
             action=action,
         )
 
+        llm_kwargs: dict[str, t.Any] = {
+            "prompt": metadata_prompt,
+            "prompt_name": prompt_name,
+            "organization_id": self.organization_id,
+        }
+        if self.recording_attempt_id is not None:
+            llm_kwargs["recording_attempt_id"] = self.recording_attempt_id
+        if self.interpretation_session_id is not None:
+            llm_kwargs["interpretation_session_id"] = self.interpretation_session_id
+
         metadata_response = await _recording_enrichment_llm_handler()(
-            prompt=metadata_prompt,
-            prompt_name=prompt_name,
-            organization_id=self.organization_id,
+            **llm_kwargs,
         )
 
         block_label: str = metadata_response.get("block_label", None) or "act"
@@ -940,6 +957,8 @@ class BrowserSessionRecordingService:
         draft_steps: list[RecordingDraftStep] | None = None,
         code_first: bool = False,
         supports_credential_tokens: bool = False,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
     ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
@@ -948,6 +967,8 @@ class BrowserSessionRecordingService:
             browser_session_id,
             organization_id,
             workflow_permanent_id,
+            recording_attempt_id=recording_attempt_id,
+            interpretation_session_id=interpretation_session_id,
         )
 
         return await processor.process(

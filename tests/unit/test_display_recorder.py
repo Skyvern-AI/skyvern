@@ -633,3 +633,37 @@ async def test_acquire_kills_real_wedged_subprocess_and_falls_back(monkeypatch, 
         assert key not in dr._REGISTRY
     finally:
         dr._REGISTRY.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_release_all_frees_reserved_recorders() -> None:
+    # The run-teardown boundary (after pkill ends the run's browser) must free EVEN reserved entries — the exact
+    # entries stop_display_recorders_for_owner and _prune_dead_entries skip — so the next sequential run on the
+    # long-lived worker can re-acquire the display instead of degrading to per-page recording (SKY-15807).
+    live = _recorder(_FakeProc(exits_on="SIGINT"))
+    reserved = _recorder(_FakeProc(exits_on="SIGINT"))
+    reserved.display = ":100"
+    reserved._reserved = True
+    dr._REGISTRY[(live.display, live.owner_id)] = live
+    dr._REGISTRY[(reserved.display, reserved.owner_id)] = reserved
+    try:
+        await dr.release_all_display_recorders()
+        assert (live.display, live.owner_id) not in dr._REGISTRY
+        assert (reserved.display, reserved.owner_id) not in dr._REGISTRY  # reserved dropped too, unlike owner sweep
+        assert live.is_stopped and reserved.is_stopped
+        assert reserved._reserved is False  # reservation cleared so a later acquire is not refused
+    finally:
+        dr._REGISTRY.pop((live.display, live.owner_id), None)
+        dr._REGISTRY.pop((reserved.display, reserved.owner_id), None)
+
+
+@pytest.mark.asyncio
+async def test_release_all_is_idempotent() -> None:
+    rec = _recorder(_FakeProc(exits_on="SIGINT"))
+    dr._REGISTRY[(rec.display, rec.owner_id)] = rec
+    try:
+        await dr.release_all_display_recorders()
+        assert (rec.display, rec.owner_id) not in dr._REGISTRY
+        await dr.release_all_display_recorders()  # our entry already gone -> safe no-op, must not raise
+    finally:
+        dr._REGISTRY.pop((rec.display, rec.owner_id), None)

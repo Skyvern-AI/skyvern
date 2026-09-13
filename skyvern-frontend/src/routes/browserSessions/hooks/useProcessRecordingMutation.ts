@@ -73,6 +73,8 @@ const useProcessRecordingMutation = ({
 
       const currentRecording = useRecordingStore.getState();
       const eventCount = currentRecording.getEventCount();
+      const recordingAttemptId = currentRecording.recordingAttemptId;
+      const interpretationSessionId = currentRecording.interpretationSessionId;
       recordingStatsRef.current = {
         transport: currentRecording.recordingTransport,
         durationMs: Math.round(currentRecording.getSecondsRecording() * 1000),
@@ -104,6 +106,8 @@ const useProcessRecordingMutation = ({
             draft_steps?: Array<RecordingDraftStep>;
             code_first: boolean;
             supports_credential_tokens: boolean;
+            recording_attempt_id?: string;
+            interpretation_session_id?: string;
           },
           {
             data: {
@@ -118,6 +122,12 @@ const useProcessRecordingMutation = ({
           // This build substitutes credential tokens in a code block's code; a build that
           // does not must not be handed blocks whose code reads a token it cannot rename.
           supports_credential_tokens: true,
+          ...(recordingAttemptId !== null
+            ? { recording_attempt_id: recordingAttemptId }
+            : {}),
+          ...(interpretationSessionId !== null
+            ? { interpretation_session_id: interpretationSessionId }
+            : {}),
           ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({

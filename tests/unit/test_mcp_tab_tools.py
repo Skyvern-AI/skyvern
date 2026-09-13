@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.cli.core import session_manager
+from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
@@ -59,6 +61,14 @@ def _patch_session(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> Magi
     return mock
 
 
+@pytest.fixture
+def public_dns_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_public)
+
+
 # ═══════════════════════════════════════════════════
 # skyvern_tab_list
 # ═══════════════════════════════════════════════════
@@ -86,6 +96,7 @@ async def test_tab_list_returns_all_tabs(monkeypatch: pytest.MonkeyPatch) -> Non
     assert tabs[0]["is_active"] is True
     assert tabs[1]["url"] == "https://b.com"
     assert tabs[1]["is_active"] is False
+    assert "debugger_attached" not in tabs[0]
     assert result["data"]["count"] == 2
 
 
@@ -109,6 +120,27 @@ async def test_tab_list_answers_within_its_bound_when_a_page_title_hangs(monkeyp
     assert result["ok"] is True
     assert result["data"]["tabs"][0]["title"] == ""
     assert result["data"]["tabs"][0]["url"] == "https://slow.com"
+
+
+@pytest.mark.asyncio
+async def test_tab_list_reports_debugger_attachment_only_in_extension_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    page_a = _make_mock_page("https://a.com", "Page A")
+    page_b = _make_mock_page("https://b.com", "Page B")
+    browser = _make_mock_browser(page_a, page_b)
+    ctx = BrowserContext(mode="extension", can_access_localhost=True)
+    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page_a), ctx)))
+    _patch_session(monkeypatch, _make_session_state(browser))
+
+    runtime = MagicMock()
+    runtime.page_debugger_attached = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(mcp_tabs.BrowserExtensionRuntime, "instance", MagicMock(return_value=runtime))
+
+    result = await mcp_tabs.skyvern_tab_list()
+
+    assert result["ok"] is True
+    assert [tab["debugger_attached"] for tab in result["data"]["tabs"]] == [True, False]
+    assert runtime.page_debugger_attached.await_args_list[0].args == (page_a,)
+    assert runtime.page_debugger_attached.await_args_list[1].args == (page_b,)
 
 
 @pytest.mark.asyncio
@@ -152,7 +184,7 @@ async def test_tab_new_creates_tab(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch, public_dns_resolver: None) -> None:
     existing_page = _make_mock_page()
     new_page = _make_mock_page("https://target.com", "Target")
     browser = _make_mock_browser(existing_page)
@@ -164,11 +196,23 @@ async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch) -> None:
 
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
+    do_navigate = AsyncMock(
+        return_value=NavigateResult(url="https://target.com/", title="Target", load_state="domcontentloaded")
+    )
+    monkeypatch.setattr(mcp_tabs, "do_navigate", do_navigate)
 
     result = await mcp_tabs.skyvern_tab_new(url="https://target.com")
 
     assert result["ok"] is True
-    new_page.goto.assert_awaited_once_with("https://target.com/", wait_until="domcontentloaded", timeout=30000)
+    assert result["data"]["title"] == "Target"
+    do_navigate.assert_awaited_once_with(
+        new_page,
+        "https://target.com/",
+        timeout=30000,
+        wait_until="domcontentloaded",
+        can_access_localhost=False,
+        is_localhost_destination=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -219,24 +263,31 @@ async def test_tab_new_allows_local_url_when_context_permits(monkeypatch: pytest
     ctx = BrowserContext(mode="local", can_access_localhost=True)
     _patch_get_page(monkeypatch, existing_page, ctx)
     _patch_session(monkeypatch, _make_session_state(browser))
+    do_navigate = AsyncMock(return_value=NavigateResult(url=url, title="Local", load_state="domcontentloaded"))
+    monkeypatch.setattr(mcp_tabs, "do_navigate", do_navigate)
 
     result = await mcp_tabs.skyvern_tab_new(url=url)
 
     assert result["ok"] is True
-    new_page.goto.assert_awaited_once_with(url, wait_until="domcontentloaded", timeout=30000)
+    do_navigate.assert_awaited_once_with(
+        new_page,
+        url,
+        timeout=30000,
+        wait_until="domcontentloaded",
+        can_access_localhost=True,
+        is_localhost_destination=True,
+    )
 
 
 @pytest.mark.asyncio
-async def test_tab_new_navigation_failure_restores_previous_active(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When goto() fails, active page should revert to the previous tab, not None."""
+async def test_tab_new_navigation_failure_retains_new_active_tab(
+    monkeypatch: pytest.MonkeyPatch, public_dns_resolver: None
+) -> None:
     existing_page = _make_mock_page("https://old.com", "Old")
     new_page = _make_mock_page("about:blank", "New Tab")
     browser = _make_mock_browser(existing_page)
     browser._browser_context.new_page = AsyncMock(return_value=new_page)
     browser._browser_context.pages = [existing_page, new_page]
-
-    new_page.goto = AsyncMock(side_effect=Exception("Navigation failed"))
-    new_page.close = AsyncMock()
 
     ctx = BrowserContext(mode="local")
     monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)))
@@ -244,13 +295,97 @@ async def test_tab_new_navigation_failure_restores_previous_active(monkeypatch: 
     state = _make_session_state(browser)
     state._active_page = existing_page
     _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "do_navigate", AsyncMock(side_effect=Exception("Navigation failed")))
 
     result = await mcp_tabs.skyvern_tab_new(url="https://example.com")
 
     assert result["ok"] is False
-    # Previous active page should be restored, not reset to None
+    assert result["error"]["code"] == "ACTION_FAILED"
+    assert result["error"]["details"] == {"tab_id": str(id(new_page))}
+    assert str(id(new_page)) in result["error"]["hint"]
+    assert "remains open and active" in result["error"]["hint"]
+    assert state._active_page is new_page
+    new_page.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tab_new_page_creation_failure_restores_previous_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_page = _make_mock_page("https://old.com", "Old")
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(side_effect=Exception("creation failed"))
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, existing_page, ctx)
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_tab_new()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "ACTION_FAILED"
+    assert "tab_id" not in result["error"]["details"]
+    assert "could not be created" in result["error"]["hint"]
+    assert "previous active tab was unchanged" in result["error"]["hint"]
     assert state._active_page is existing_page
-    new_page.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tab_new_navigation_failure_restores_previous_tab_if_new_tab_closes(
+    monkeypatch: pytest.MonkeyPatch, public_dns_resolver: None
+) -> None:
+    existing_page = _make_mock_page("https://old.com", "Old")
+    new_page = _make_mock_page("about:blank", "New Tab", closed=True)
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+    browser._browser_context.pages = [existing_page]
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, existing_page, ctx)
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+    monkeypatch.setattr(mcp_tabs, "do_navigate", AsyncMock(side_effect=Exception("Navigation failed")))
+
+    result = await mcp_tabs.skyvern_tab_new(url="https://example.com")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "ACTION_FAILED"
+    assert "tab_id" not in result["error"]["details"]
+    assert "closed during navigation" in result["error"]["hint"]
+    assert state._active_page is existing_page
+
+
+@pytest.mark.asyncio
+async def test_tab_new_navigation_degradation_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, public_dns_resolver: None
+) -> None:
+    existing_page = _make_mock_page()
+    new_page = _make_mock_page("https://target.com", "Ignored title")
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+    browser._browser_context.pages = [existing_page, new_page]
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, existing_page, ctx)
+    _patch_session(monkeypatch, _make_session_state(browser))
+    monkeypatch.setattr(
+        mcp_tabs,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://target.com/", title="Target", load_state="commit")),
+    )
+
+    result = await mcp_tabs.skyvern_tab_new(url="https://target.com")
+
+    assert result["ok"] is True
+    assert result["data"]["url"] == "https://target.com/"
+    assert result["data"]["title"] == "Target"
+    assert result["warnings"]
+    assert "domcontentloaded" in result["warnings"][0]
+    assert "commit" in result["warnings"][0]
+    new_page.title.assert_not_awaited()
 
 
 # ═══════════════════════════════════════════════════

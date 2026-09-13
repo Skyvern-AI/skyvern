@@ -423,12 +423,24 @@ MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
 
 
+def _has_multi_field_totp_action(actions: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(action.get("totp_timing_info"), dict) and action["totp_timing_info"].get("is_totp_sequence") is True
+        for action in actions
+    )
+
+
 def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
-    return not any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    return not (
+        _has_multi_field_totp_action(actions)
+        or any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    )
 
 
 def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> None:
     if not _actions_support_cached_scripts(actions):
+        if _has_multi_field_totp_action(actions):
+            raise ValueError("Multi-field TOTP has no cached-script representation")
         raise ValueError("PASTE_TEXT has no cached-script representation")
 
 

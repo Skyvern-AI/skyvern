@@ -221,7 +221,11 @@ async def do_navigate(
         # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
         remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
         load_state = await _reached_load_state(page, requested, remaining_ms)
-    return NavigateResult(url=page.url, title=await page.title(), load_state=load_state)
+    try:
+        title = await asyncio.wait_for(page.title(), timeout=5.0)
+    except Exception:  # noqa: BLE001
+        title = ""
+    return NavigateResult(url=page.url, title=title, load_state=load_state)
 
 
 async def do_screenshot(

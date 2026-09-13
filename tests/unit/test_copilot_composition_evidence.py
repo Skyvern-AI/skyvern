@@ -3703,7 +3703,7 @@ async def _capture_live_dom(
             await route.abort()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         context = await browser.new_context()
         await context.route("**/*", _handle)
         page = await context.new_page()
@@ -4447,7 +4447,9 @@ async def test_blocking_layer_twins_report_exact_omitted_control_count() -> None
 @pytest.mark.asyncio
 async def test_rendered_snapshot_skips_hit_testing_for_non_viewport_fixed_layers() -> None:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         try:
             page = await browser.new_page(viewport={"width": 1280, "height": 720})
             await page.set_content(
@@ -4944,7 +4946,9 @@ async def test_capture_reports_oversize_structured_dict_without_calling_get_html
 @pytest.mark.asyncio
 async def test_capture_compacts_dense_live_structured_packet_before_the_python_bound() -> None:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_oversized_structured_html())
         server = _LiveCompositionServer(page)
@@ -5005,7 +5009,9 @@ async def test_capture_preserves_python_under_limit_astral_packet_byte_for_byte(
     assert unbounded_expression != COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_astral_structured_html())
         expected_raw = await page.evaluate(unbounded_expression)
@@ -5040,7 +5046,9 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     )
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_astral_structured_html(value_chars=145, text_chars=105))
         expected_raw = await page.evaluate(unbounded_expression)
@@ -5845,7 +5853,7 @@ def _playwright_chromium_available() -> bool:
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
         with sync_playwright() as runner:
-            browser = runner.chromium.launch()
+            browser = runner.chromium.launch(args=["--use-mock-keychain", "--password-store=basic"])
             browser.close()
         return True
     except Exception:
@@ -5876,7 +5884,7 @@ async def test_browser_twin_spends_the_container_budget_on_containers_a_value_ca
     # page: an icon sprite sheet sits at the top of the document, so a substring test that reads "row"
     # out of "arrow" claims every slot of the bounded budget before any real result is reached.
     async with async_playwright() as runner:
-        browser = await runner.chromium.launch()
+        browser = await runner.chromium.launch(args=["--use-mock-keychain", "--password-store=basic"])
         try:
             page = await browser.new_page()
             await page.set_content(_ICON_SPRITE_SHEET_PAGE)
@@ -7150,6 +7158,59 @@ async def test_field_state_the_agent_produced_survives_capture_while_markup_attr
         "Password password",
         "Notes date",
     ]
+
+    for marked in (True, False):
+        values = ["654321", "54", "4", "3", "2", "1"]
+        placeholders = ["654321", "9", "Digit 3", "3", "2", "1"]
+        marker = ' data-skyvern-otp-box="1"' if marked else ""
+        html = (
+            '<html data-skyvern-otp-filled="6"><body><form id="otp">'
+            + "".join(
+                f'<div><input id="otp-{index}" name="otp-{index}" type="text" maxlength="1"'
+                f'{marker} value="{value}" placeholder="{placeholders[index]}"></div>'
+                for index, value in enumerate(values)
+            )
+            + '<input id="ordinary" name="ordinary" maxlength="32" value="ordinary text" placeholder="Name">'
+            + '<input id="verify" type="submit" value="Verify">'
+            + '<textarea name="message" value="notes-value" placeholder="2468">Notes</textarea>'
+            + '<select name="choice"><option value="a1" selected>Alpha</option></select>'
+            + "</form></body></html>"
+        )
+        raw, content = await _capture_live_dom(
+            _OBSERVED_STATE_URL,
+            html,
+            "#otp-0",
+            interact=lambda page: page.evaluate("document.querySelector('#otp-0').value = '987654'"),
+        )
+        packet = json.loads(raw)
+        fields = {field["name"]: field for field in packet["forms"][0]["fields"]}
+        for index, value in enumerate(values):
+            field = fields[f"otp-{index}"]
+            assert field["value"] == "*" * len(value)
+            assert field["observed_value"] == "*" * len(value)
+            assert field["placeholder"] == ("Digit 3" if index == 2 else "*" * len(placeholders[index]))
+            assert field["filled"] is True
+            assert field["label"] == "*" * len(value)
+            assert all(
+                candidate["source"] not in {"name_value", "class_value"} for candidate in field["selector_candidates"]
+            )
+        assert fields["ordinary"]["value"] == "ordinary text"
+        assert fields["ordinary"]["placeholder"] == "Name"
+        assert "observed_value" not in fields["ordinary"]
+        assert fields["message"]["value"] == "notes-value"
+        assert fields["message"]["placeholder"] == "2468"
+        assert "observed_value" not in fields["message"]
+        assert fields["choice"]["options"][0]["value"] == "a1"
+        assert packet["forms"][0]["submit_controls"][0]["value"] == "Verify"
+        assert "654321" not in raw and "987654" not in raw
+        assert 'value="654321"' in content
+        parsed = parse_composition_structured(
+            packet, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL
+        )
+        assert parsed is not None
+        parsed_fields = {field["name"]: field for field in parsed["forms"][0]["fields"]}
+        assert all(parsed_fields[f"otp-{index}"]["value"] == "*" * len(value) for index, value in enumerate(values))
+        assert all(parsed_fields[f"otp-{index}"]["filled"] is True for index in range(6))
 
 
 def test_a_structured_packet_claiming_an_observed_password_value_is_not_admitted() -> None:

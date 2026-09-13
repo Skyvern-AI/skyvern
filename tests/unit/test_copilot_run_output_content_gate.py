@@ -6,6 +6,7 @@ result rows; domains and person names are generic placeholders.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -31,9 +32,15 @@ from skyvern.forge.sdk.copilot.tools import (
     run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
-from skyvern.forge.sdk.copilot.tools.blockers import _code_output_has_goal_content
+from skyvern.forge.sdk.copilot.tools.blockers import _PROJECTED_BLOCK_FACT_KEYS, _code_output_has_goal_content
 from skyvern.forge.sdk.copilot.tools.completion import _apply_present_value_upgrades, _build_run_evidence_snapshot
-from skyvern.forge.sdk.copilot.tools.run_execution import _attach_registered_output_parameter_values
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _attach_block_fact_projection,
+    _attach_registered_output_parameter_values,
+    build_test_evidence_packet,
+)
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
 
 
 @pytest.mark.parametrize(
@@ -140,6 +147,19 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
     return ctx
 
 
+def _gating_challenge_evidence() -> dict[str, Any]:
+    return {
+        "challenge_state": {
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+        "anti_bot_indicators": ["captcha", "verify you are human"],
+    }
+
+
 def _no_evidence(cid: str) -> CompletionVerificationResult:
     verdict = CriterionVerdict(criterion_id=cid, state="unsatisfied", reason_code="no_evidence")
     return CompletionVerificationResult(status="evaluated", criterion_ids=[cid], verdicts=[verdict])
@@ -186,24 +206,20 @@ def _blocked_status_run_result(block_type: str = "CODE") -> dict[str, Any]:
 
 
 def _domain_blocker_run_result() -> dict[str, Any]:
-    return _run_result(
-        [
-            _code_block(
-                "inspect_access_path",
-                {
-                    "login_only": True,
-                    "blocked_by": "online_account_required",
-                    "public_form_exists": False,
-                    "visible_page_path_label": "Account login page",
-                    "recommended_next_action": "Ask the user for online account access before continuing.",
-                    "safety_flags": {
-                        "no_sensitive_data_entered": True,
-                        "no_submission_attempted": True,
-                    },
-                },
-            )
-        ]
-    )
+    payload = {
+        "login_only": True,
+        "blocked_by": "online_account_required",
+        "public_form_exists": False,
+        "visible_page_path_label": "Account login page",
+        "recommended_next_action": "Ask the user for online account access before continuing.",
+        "safety_flags": {
+            "no_sensitive_data_entered": True,
+            "no_submission_attempted": True,
+        },
+    }
+    block = _code_block("inspect_access_path", payload)
+    block["output"] = payload
+    return _run_result([block])
 
 
 def _genuine_success_run_result() -> dict[str, Any]:
@@ -557,22 +573,95 @@ def test_candidacy_and_recording_agree_on_blocked_run() -> None:
 
 
 @pytest.mark.parametrize("block_type", ["CODE", "code"])
-def test_blocked_status_value_rejected_deterministically(block_type: str) -> None:
+def test_blocked_status_value_reports_a_blocker_without_halting(block_type: str) -> None:
     result = _blocked_status_run_result(block_type)
     ctx = _ctx(result["data"]["blocks"])
 
-    blocker = _run_blocks_structured_blocker_message(result)
-    assert blocker is not None
-    assert "blocked_by_challenge" in blocker
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _run_blocks_structured_blocker_message(result) == "The run output reported status 'blocked_by_challenge'."
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
-    assert result["ok"] is False
     assert ctx.blocker_signal is None
     assert ctx.turn_halt is None
-    assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is False
+
+
+def test_status_blocked_with_challenge_evidence_never_records_a_tested_success() -> None:
+    result = _run_result(
+        [
+            _code_block(
+                "search_registry_person",
+                {"status": "blocked", "records": [{"name": "DOE, JANE"}], "record_count": 1},
+            )
+        ]
+    )
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.composition_page_evidence = _gating_challenge_evidence()
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert result["ok"] is False
+    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert ctx.last_test_ok is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+
+
+def test_status_blocked_with_challenge_evidence_terminalizes_at_the_settle_seam() -> None:
+    result = _run_result(
+        [
+            _code_block(
+                "search_registry_person",
+                {"status": "blocked", "records": [{"name": "DOE, JANE"}], "record_count": 1},
+            )
+        ]
+    )
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.composition_page_evidence = _gating_challenge_evidence()
+    ctx.last_test_ok = True
+
+    assert run_execution.settle_terminal_challenge_after_enrichment(ctx, result) is True
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+
+
+def test_flag_key_with_non_empty_data_still_withholds_the_tested_latch() -> None:
+    result = _run_result(
+        [
+            _code_block(
+                "search_registry_person",
+                {"anti_bot_blocked": True, "records": [{"name": "DOE, JANE", "status": "Active"}]},
+            )
+        ]
+    )
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    snapshot = getattr(ctx, "outcome_verification_trace_snapshot", {})
+    assert snapshot.get("run_output_latch_blocker_detected") is True
+    assert snapshot.get("run_output_blocker_detected") is False
+
+
+def test_challenge_shaped_block_label_does_not_withhold_the_tested_latch() -> None:
+    result = _run_result([_code_block("solve_and_submit_recaptcha_demo", {"submitted": True})])
+    result["data"]["observed_block_end_urls"] = {
+        "solve_and_submit_recaptcha_demo": "https://registry.example.com/demo/result"
+    }
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    snapshot = ctx.outcome_verification_trace_snapshot
+    assert snapshot.get("run_output_latch_blocker_detected") is False
+    assert snapshot.get("run_output_blocker_detected") is False
+    assert result["data"]["observed_block_end_urls"] == {
+        "solve_and_submit_recaptcha_demo": "https://registry.example.com/demo/result"
+    }
 
 
 def test_challenge_observation_prevents_false_satisfied_completion_without_halting() -> None:
@@ -598,7 +687,7 @@ def test_domain_blocker_run_is_recorded_without_becoming_terminal_ready() -> Non
     result = _domain_blocker_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
-    assert _run_blocks_structured_blocker_message(result) == "online_account_required"
+    assert _run_blocks_structured_blocker_message(result) is None
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
@@ -606,9 +695,27 @@ def test_domain_blocker_run_is_recorded_without_becoming_terminal_ready() -> Non
     assert result["ok"] is True
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_test_failure_reason is None
+    assert result["data"]["blocks"][0]["extracted_data"]["blocked_by"] == "online_account_required"
     assert verified_goal_satisfied_context(ctx) is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_terminal_proposal_ready is False
+    assert ctx.last_good_workflow is None
+
+    recorded_output = build_test_evidence_packet(ctx, result).registered_outputs[0].output
+    assert recorded_output["blocked_by"] == "online_account_required"
+    assert recorded_output["safety_flags"]["no_submission_attempted"] is True
+
+
+def test_genuine_success_run_still_latches_terminal_ready() -> None:
+    result = _genuine_success_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.verified_terminal_proposal_ready is True
+    assert ctx.last_good_workflow is not None
 
 
 @pytest.mark.parametrize(
@@ -633,9 +740,7 @@ def test_online_account_required_blocker_never_uses_interactive_completion_verif
     assert blocker_payload["safety_flags"]["no_submission_attempted"] is True
     assert result["ok"] is True
     assert ctx.last_test_ok is True
-    assert ctx.last_full_workflow_test_ok is False
     assert verified_goal_satisfied_context(ctx) is False
-    assert getattr(ctx, "last_good_workflow", None) is None
 
 
 def test_satisfied_interactive_completion_does_not_override_domain_blocker_fact() -> None:
@@ -648,7 +753,6 @@ def test_satisfied_interactive_completion_does_not_override_domain_blocker_fact(
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
-    assert ctx.last_full_workflow_test_ok is False
     assert verified_goal_satisfied_context(ctx) is False
 
 
@@ -1110,19 +1214,6 @@ def test_falsy_blocker_flags_and_action_only_outputs_do_not_trip() -> None:
     assert empty_data_blocks is False
 
 
-def test_flag_rule_requires_strict_blocker_terms() -> None:
-    benign = _run_result([_code_block("notify", {"verification_passed": True})])
-    assert _run_blocks_structured_blocker_message(benign) is None
-
-    # SKY-10916: broad terms like ``verification`` no longer key the code-block
-    # string arm; only the strict term set does.
-    broad_term_string = _run_result([_code_block("notify", {"verification_code_sent": "yes"})])
-    assert _run_blocks_structured_blocker_message(broad_term_string) is None
-
-    strict_term_string = _run_result([_code_block("notify", {"human_verification_step": "solve the puzzle"})])
-    assert _run_blocks_structured_blocker_message(strict_term_string) == "solve the puzzle"
-
-
 def test_verification_key_counts_as_goal_content_for_code_outputs() -> None:
     # SKY-10916: an output key carrying ``verification`` is data, not a blocker —
     # it must satisfy the emptiness denominator instead of being stripped.
@@ -1166,9 +1257,7 @@ class _MetadataCtx:
         self.code_artifact_metadata = metadata
 
 
-def test_declared_outcome_keys_exempt_from_blocker_term_matching() -> None:
-    # Metadata-declared goal keys (the #12034 typed source) override string
-    # matching even for strict terms.
+def test_declared_outcome_keys_count_as_goal_content() -> None:
     metadata = {
         "check_challenge": {
             "claimed_outcomes": [{"id": "captcha_audit_log", "entities": ["challenge_summary"], "required_tokens": []}]
@@ -1176,39 +1265,9 @@ def test_declared_outcome_keys_exempt_from_blocker_term_matching() -> None:
     }
     block = _code_block("check_challenge", {"captcha_audit_log": "3 challenges recorded this month"})
     result = _run_result([block])
-    assert _run_blocks_structured_blocker_message(result) is not None
-    assert _run_blocks_structured_blocker_message(result, _MetadataCtx(metadata)) is None
+    assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, _MetadataCtx(metadata))
     assert empty_data_blocks is False
-
-
-def test_flag_rule_synthesizes_message_and_prefers_sibling_reason() -> None:
-    flag_only = _run_result([_code_block("search", {"captcha_required": True, "clicked": True})])
-    blocker = _run_blocks_structured_blocker_message(flag_only)
-    assert blocker is not None
-    assert "captcha" in blocker
-
-    flag_with_reason = _run_result(
-        [_code_block("search", {"blocked_by_challenge": True, "reason": "The submit control stayed disabled."})]
-    )
-    assert _run_blocks_structured_blocker_message(flag_with_reason) == "The submit control stayed disabled."
-
-
-def test_positive_status_value_with_strict_term_still_trips_blocker() -> None:
-    result = _run_result([_code_block("search", {"status": "captcha_solved", "records": [{"name": "DOE, JANE"}]})])
-    blocker = _run_blocks_structured_blocker_message(result)
-    assert blocker is not None
-    assert "captcha_solved" in blocker
-
-
-def test_status_rule_ignores_long_values_and_matches_state_key() -> None:
-    long_value = _run_result([_code_block("search", {"status": "x" * 100 + " challenge"})])
-    assert _run_blocks_structured_blocker_message(long_value) is None
-
-    state_value = _run_result([_code_block("search", {"state": "captcha_pending"})])
-    blocker = _run_blocks_structured_blocker_message(state_value)
-    assert blocker is not None
-    assert "captcha_pending" in blocker
 
 
 def test_extraction_payload_flag_semantics_unchanged() -> None:
@@ -1418,3 +1477,245 @@ def test_unstructured_failure_prose_leaves_category_consumers_clear() -> None:
     assert result["data"].get("failure_categories") is None
     assert ctx.last_failure_category_top is None
     assert ctx.last_test_anti_bot is None
+
+
+def _projected_run_result(block_label: str, end_url: str) -> dict[str, Any]:
+    """A completed run carrying an uncleared challenge flag, whose block-fact projection is
+    written by the real producer so the only thing an arm varies is the label."""
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_projection",
+            "overall_status": "completed",
+            "current_url": end_url,
+            "page_title": "Demo submitted",
+            "challenge_detected": True,
+            "blocks": [_code_block(block_label, {"submitted": True})],
+        },
+    }
+    row = WorkflowRunBlock(
+        workflow_run_block_id="wrb_projection",
+        workflow_run_id="wr_projection",
+        organization_id="org",
+        block_type=BlockType.CODE,
+        label=block_label,
+        status="completed",
+        final_url=end_url,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        modified_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    _attach_block_fact_projection(
+        result["data"], [row], {}, unreported_predecessor_labels=[], sensitive_origin_run=False
+    )
+    return result
+
+
+def _settled(result: dict[str, Any]) -> tuple[bool, str | None, dict[str, str] | None]:
+    ctx = _ctx(result["data"].get("blocks") or [])
+    ctx.last_test_ok = True
+    terminalized = run_execution.settle_terminal_challenge_after_enrichment(ctx, result)
+    verdict = ctx.last_run_outcome.verdict if ctx.last_run_outcome is not None else None
+    return terminalized, verdict, result["data"].get("observed_block_end_urls")
+
+
+def test_block_label_rename_does_not_change_the_terminal_verdict() -> None:
+    end_url = "https://registry.example.com/demo/result"
+    neutral = _projected_run_result("submit_demo", end_url)
+    challenge_shaped = _projected_run_result("solve_and_submit_recaptcha_demo", end_url)
+    nested = _projected_run_result("verification_url", end_url)
+
+    neutral_settled = _settled(neutral)
+    challenge_settled = _settled(challenge_shaped)
+    nested_settled = _settled(nested)
+
+    assert neutral_settled[:2] == challenge_settled[:2] == nested_settled[:2] == (False, None)
+    assert neutral_settled[2] == {"submit_demo": end_url}
+    assert challenge_settled[2] == {"solve_and_submit_recaptcha_demo": end_url}
+    assert nested_settled[2] == {"verification_url": end_url}
+    assert neutral["data"]["current_url"] == challenge_shaped["data"]["current_url"] == end_url
+
+
+@pytest.mark.parametrize(
+    "envelope_fact",
+    [
+        {"observed_block_end_urls": {"solve_recaptcha_demo": "https://registry.example.com/ok"}},
+        {"build_test_packet": {"observed_block_end_urls": {"solve_recaptcha_demo": "https://registry.example.com/ok"}}},
+        {"execution_source": {"block_code_sha256": {"human_verification_step": "9f2c"}}},
+        # Page-fact strings were never reachable by the key scan; these two rows pin drift.
+        {"current_url": "https://registry.example.com/human-verification/complete"},
+        {"page_title": "Human verification complete"},
+        {"registered_output_parameter_values": [{"value": {"captcha_demo_result": "https://registry.example.com/ok"}}]},
+        {"observed_block_end_urls": {"captcha_message": "https://registry.example.com/captcha"}},
+        {"build_test_packet": {"observed_block_end_urls": {"captcha_message": "https://x.example.com/captcha"}}},
+        {"per_block_action_observations": {"solve_captcha": ["saw https://x.example.com/captcha"]}},
+    ],
+)
+def test_envelope_key_and_value_names_never_mint_a_blocker(envelope_fact: dict[str, Any]) -> None:
+    result = _run_result([_code_block("submit_demo", {"submitted": True})])
+    result["data"].update(envelope_fact)
+
+    assert _run_blocks_structured_blocker_message(result) is None
+
+
+def test_projection_writer_emits_exactly_the_keys_the_envelope_scan_skips() -> None:
+    """A new block-fact projection field must not silently rejoin the challenge verdict scan."""
+    data: dict[str, Any] = {}
+    row = WorkflowRunBlock(
+        workflow_run_block_id="wrb_drift",
+        workflow_run_id="wr_drift",
+        organization_id="org",
+        block_type=BlockType.CODE,
+        label="submit_demo",
+        status="completed",
+        final_url="https://registry.example.com/ok",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        modified_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    _attach_block_fact_projection(
+        data,
+        [row],
+        {"submit_demo": ["clicked submit"]},
+        unreported_predecessor_labels=["earlier_block"],
+        sensitive_origin_run=False,
+    )
+
+    assert set(data) == _PROJECTED_BLOCK_FACT_KEYS
+
+
+def test_envelope_failure_reason_still_reports_a_real_anti_bot_blocker() -> None:
+    result = _run_result([_code_block("submit_demo", {"submitted": True})])
+    result["data"]["failure_reason"] = "Access denied: verify you are human before continuing."
+
+    assert _run_blocks_structured_blocker_message(result) == "Access denied: verify you are human before continuing."
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        _code_block("report_demo", {"captcha_demo_url": "https://registry.example.com/ok"}, block_type="TEXT_PROMPT"),
+        _code_block(
+            "read_result",
+            {"extracted_information": {"verification_ended_url": "https://registry.example.com/ok"}},
+            block_type="EXTRACTION",
+        ),
+        _code_block("report_demo", {"challenge_page_url": "https://registry.example.com/ok"}, block_type="TEXT_PROMPT"),
+        _code_block(
+            "read_result",
+            {"extracted_information": {"captcha_message": "https://registry.example.com/ok"}},
+            block_type="EXTRACTION",
+        ),
+        _code_block(
+            "read_result",
+            {"extracted_information": {"result_message": "https://registry.example.com/ok"}},
+            block_type="EXTRACTION",
+        ),
+    ],
+)
+def test_data_block_schema_key_names_never_mint_a_blocker(block: dict[str, Any]) -> None:
+    assert _run_blocks_structured_blocker_message(_run_result([block])) is None
+
+
+@pytest.mark.parametrize(
+    "extracted_data",
+    [
+        {"captcha_page_url": "https://registry.example.com/ok"},
+        {"no_captcha_encountered": True, "submitted": True},
+        {"blocked_by_challenge": False, "submitted": True},
+        {"blocked_by": "online_account_required", "login_only": True},
+        {"human_verification_step": "solve the puzzle"},
+        {"captcha_message": "https://registry.example.com/ok"},
+        {"result_message": "https://registry.example.com/ok"},
+    ],
+)
+def test_code_block_key_names_and_flags_never_mint_a_blocker(extracted_data: dict[str, Any]) -> None:
+    assert _run_blocks_structured_blocker_message(_run_result([_code_block("submit_demo", extracted_data)])) is None
+
+
+@pytest.mark.parametrize(
+    ("extracted_data", "expected"),
+    [
+        ({"status": "challenge cleared", "records": [{"name": "DOE, JANE"}]}, "challenge cleared"),
+        ({"state": "captcha_pending"}, "captcha_pending"),
+    ],
+)
+def test_code_block_status_value_reports_a_blocker(extracted_data: dict[str, Any], expected: str) -> None:
+    blocker = _run_blocks_structured_blocker_message(_run_result([_code_block("submit_demo", extracted_data)]))
+    assert blocker == f"The run output reported status '{expected}'."
+
+
+@pytest.mark.parametrize(
+    ("extracted_data", "expected"),
+    [
+        (
+            {"notes": "The search form is gated by a human verification challenge."},
+            "The search form is gated by a human verification challenge.",
+        ),
+        (
+            {"reason": "Access denied: verify you are human before continuing."},
+            "Access denied: verify you are human before continuing.",
+        ),
+    ],
+)
+def test_code_block_values_still_report_a_real_blocker(extracted_data: dict[str, Any], expected: str) -> None:
+    assert _run_blocks_structured_blocker_message(_run_result([_code_block("submit_demo", extracted_data)])) == expected
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        (
+            _code_block(
+                "report_demo",
+                {"message": "Access denied: verify you are human before continuing."},
+                block_type="TEXT_PROMPT",
+            ),
+            "Access denied: verify you are human before continuing.",
+        ),
+        (
+            _code_block(
+                "read_result",
+                {"extracted_information": {"captcha_message": "hCaptcha challenge is still on screen."}},
+                block_type="EXTRACTION",
+            ),
+            "hCaptcha challenge is still on screen.",
+        ),
+    ],
+)
+def test_data_block_values_still_report_a_real_blocker(block: dict[str, Any], expected: str) -> None:
+    assert _run_blocks_structured_blocker_message(_run_result([block])) == expected
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        _code_block(
+            "read_result",
+            {"extracted_information": {"title": "Why do I see Access Denied on the portal?"}},
+            block_type="EXTRACTION",
+        ),
+        _code_block(
+            "read_result",
+            {"extracted_information": {"shipment": "Requested port of loading: Rotterdam"}},
+            block_type="EXTRACTION",
+        ),
+        _code_block(
+            "report_demo",
+            {"summary": "The requested port of discharge is Hamburg."},
+            block_type="TEXT_PROMPT",
+        ),
+    ],
+)
+def test_scraped_page_prose_never_mints_a_blocker(block: dict[str, Any]) -> None:
+    assert _run_blocks_structured_blocker_message(_run_result([block])) is None
+
+
+def test_registered_output_key_name_does_not_terminalize_a_completed_run() -> None:
+    end_url = "https://registry.example.com/demo/result"
+    result = _projected_run_result("submit_demo", end_url)
+    result["data"]["registered_output_parameter_values"] = [{"value": {"captcha_demo_result": end_url}}]
+
+    terminalized, verdict, observed = _settled(result)
+
+    assert (terminalized, verdict) == (False, None)
+    assert observed == {"submit_demo": end_url}
+    assert result["data"]["registered_output_parameter_values"] == [{"value": {"captcha_demo_result": end_url}}]

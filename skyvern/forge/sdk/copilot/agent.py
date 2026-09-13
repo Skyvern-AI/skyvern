@@ -5233,6 +5233,7 @@ async def _run_copilot_turn_impl(
     prior_choice_context = connected_account_choice_context(
         prior_turn_outcome,
         explicit_selected_connection_id=request_policy.selected_connected_account_id,
+        from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
     )
     if prior_choice_context:
         scoped_global_llm_context = (

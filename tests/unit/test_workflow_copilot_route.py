@@ -4598,3 +4598,54 @@ async def test_a_turn_that_dies_before_it_starts_still_writes_the_opening_row_as
         call.kwargs.get("sender") for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
     ]
     assert senders == [WorkflowCopilotChatSender.PRODUCT, WorkflowCopilotChatSender.AI]
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    # Drives the real stream handler rather than the action helper: the reported defect was the
+    # route never supplying the account, which a helper-only test cannot catch.
+    proposal_yaml = (
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "    - label: write_visitor_count_to_sheet\n"
+        "      block_type: google_sheets_write\n"
+        "      credential_id: goac_route_bound\n"
+    )
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "pending-build", "_copilot_yaml": proposal_yaml},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    agent_mock = AsyncMock(return_value=agent_result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
+
+    request = _make_chat_request(mode="build", product_action="test_end_to_end")
+    response = await workflow_copilot_chat_post(api_key_request, request, organization)
+    assert response is captured["sentinel"]
+    await captured["handler"](copilot_stream)
+
+    agent_mock.assert_awaited_once()
+    dispatched = agent_mock.await_args.kwargs["chat_request"]
+    assert dispatched.selected_connected_account_id == "goac_route_bound"
+    assert dispatched.selected_connected_account_from_pending_proposal is True

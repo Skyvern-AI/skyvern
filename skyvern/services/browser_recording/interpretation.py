@@ -394,6 +394,8 @@ class RecordingInterpretationSession:
                 self.browser_session_id,
                 self.organization_id,
                 self.workflow_permanent_id,
+                recording_attempt_id=self.recording_attempt_id,
+                interpretation_session_id=self.interpretation_session_id,
             )
 
             if self._processed_event_count < len(self.events):

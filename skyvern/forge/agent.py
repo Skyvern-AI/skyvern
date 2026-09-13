@@ -6,15 +6,17 @@ import json
 import os
 import random
 import re
+import secrets
 import string
 import time
 import uuid
 from asyncio.exceptions import CancelledError
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence, Tuple, cast
+from typing import Any, Awaitable, Callable, Literal, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -64,6 +66,7 @@ from skyvern.exceptions import (
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
     MissingExtractActionsResponse,
+    MultiFieldTotpGroupGone,
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
@@ -131,7 +134,12 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import (
+    MultiFieldTotpAttempt,
+    SkyvernContext,
+    action_for_multi_field_totp_persistence,
+    redact_multi_field_totp_element_data,
+)
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -232,13 +240,18 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
+from skyvern.webeye.actions.multi_field_totp import (
+    MultiFieldTotpBindingFailure,
+    _multi_field_totp_box_group,
+    _refresh_multi_field_totp_group_binding,
+)
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
     parse_anthropic_actions,
     parse_cua_actions,
     parse_ui_tars_actions,
 )
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
@@ -251,7 +264,7 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
@@ -403,18 +416,19 @@ _RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
 
 
 _PAGE_FINGERPRINT_PROBE_JS = (
-    "() => { if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+    "() => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
     " const mix = (str, seed) => { let x = seed;"
     " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
     # The act-by-mark tag is OUR writing and it now outlives the action, so a page that never
     # moved still hashes differently the first time each control is acted on. That reads as a
     # page change and resets the stall counter -- on a frozen page the model works through
     # mark after mark, which is precisely the run the stall detector exists to catch.
-    ' const scrub = (s) => s.replace(/ data-tv3-act="[^"]*"/g, \'\');'
-    " const walk = (root) => { h = mix(scrub(root.innerHTML || ''), h);"
+    # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
+    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
+    " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
-    " v = mix(String(el.value || '') + '|' + (el.checked === true ? '1' : '0'), v);"
+    " v = mix((isOtpInputValueSecret(el) ? '*' : String(el.value || '')) + '|' + (el.checked === true ? '1' : '0'), v);"
     " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
     " walk(document.body);"
     " return h + ':' + elems + ':' + v; }"
@@ -537,27 +551,101 @@ def _classify_reasoning_kind(reasoning: str | None) -> str:
     return "literal" if any(s in text for s in _LITERAL_REASONING_SIGNALS) else "semantic"
 
 
-def _has_multi_field_totp_shape(observations: Iterable[tuple[str, Any]]) -> bool:
-    """True when ``observations`` BEGIN with 4+ consecutive single-digit INPUT_TEXT actions.
+def _generate_multi_field_totp_hint(expected_digits: int) -> str:
+    return "".join(secrets.choice(string.digits) for _ in range(expected_digits))
 
-    ``observations`` are normalized ``(action_type, text)`` pairs. The run must start at action-list
-    index 0: the multi-field execution path (``_handle_multi_field_totp_sequence``) generates and
-    caches the TOTP only for the digit whose absolute ``action_index == 0`` and expects that cache to
-    already exist for every later digit. A leading non-TOTP action pushes the first digit to index 1,
-    so the handler never seeds the cache and every digit fails with a cache miss. Requiring the
-    single-digit run to begin at index 0 keeps this shared shape check aligned with that runtime
-    invariant. Actions after the run (e.g. a model-requested submit click) are irrelevant and may
-    remain. Shared behind both the raw-dict first-plan predicate and the parsed-Action detector.
-    """
-    single_digit_run = 0
-    for action_type, text in observations:
-        if action_type == ActionType.INPUT_TEXT.value and isinstance(text, str) and len(text) == 1 and text.isdigit():
-            single_digit_run += 1
-            if single_digit_run >= 4:
-                return True
+
+def _multi_field_totp_credential_entries(payload: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(payload, dict):
+        if "totp" in payload:
+            yield payload
+        for value in payload.values():
+            yield from _multi_field_totp_credential_entries(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            yield from _multi_field_totp_credential_entries(value)
+
+
+def _replace_multi_field_totp_code(value: Any, code: str, hint: str) -> Any:
+    if isinstance(value, str):
+        return re.sub(rf"(?<![0-9A-Za-z]){re.escape(code)}(?![0-9A-Za-z])", hint, value)
+    if isinstance(value, dict):
+        return {key: _replace_multi_field_totp_code(item, code, hint) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_multi_field_totp_code(item, code, hint) for item in value]
+    return value
+
+
+def _replace_multi_field_totp_prompt_code(task_id: str, prompt_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Replace standalone external codes in prompt text, preserving URLs, history, and error mappings."""
+    context = skyvern_context.ensure_context()
+    attempt = context.multi_field_totp.get(task_id)
+    cached_code = context.totp_codes.get(f"{task_id}_totp_cache")
+    if not (attempt and attempt.code_source == "external" and attempt.hint_code and cached_code):
+        return prompt_kwargs
+    context.register_secret_value(cached_code)
+    return {
+        key: value
+        if key in {"current_url", "starting_url", "action_history", "error_code_mapping_str"}
+        else _replace_multi_field_totp_code(value, cached_code, attempt.hint_code)
+        for key, value in prompt_kwargs.items()
+    }
+
+
+def _multi_field_totp_action_indices(
+    actions: Sequence[Action | dict[str, Any]],
+    attempt: MultiFieldTotpAttempt,
+) -> set[int]:
+    expected_value = attempt.hint_code
+    if not expected_value or not expected_value.isdigit() or len(expected_value) != attempt.expected_digits:
+        return set()
+    box_indices = {element_id: index for index, element_id in enumerate(attempt.box_element_ids)}
+    group_actions: list[tuple[int, int, str]] = []
+    for action_index, action in enumerate(actions):
+        if isinstance(action, dict):
+            if str(action.get("action_type") or "").upper() != ActionType.INPUT_TEXT.value.upper():
+                continue
+            element_id = action.get("element_id") or action.get("id")
+            text = action.get("text")
+        elif isinstance(action, InputTextAction):
+            element_id = action.element_id
+            text = action.text
         else:
-            return False
-    return False
+            continue
+        if isinstance(element_id, str) and element_id in box_indices:
+            group_actions.append((box_indices[element_id], action_index, text if isinstance(text, str) else ""))
+
+    if not all(
+        text == expected_value or (box_index < len(expected_value) and text == expected_value[box_index])
+        for box_index, _, text in group_actions
+    ):
+        return set()
+    if any(text == expected_value for _, _, text in group_actions) or sorted(
+        box_index for box_index, _, _ in group_actions
+    ) == list(range(attempt.expected_digits)):
+        return {action_index for _, action_index, _ in group_actions}
+    return set()
+
+
+def _maybe_arm_multi_field_totp(action: Action, task_id: str, *, carries_expected_value: bool) -> bool:
+    if action.action_type != ActionType.INPUT_TEXT:
+        return False
+    action.totp_timing_info = None
+    context = skyvern_context.current()
+    if context is None or not carries_expected_value:
+        return False
+    attempt = context.multi_field_totp.get(task_id)
+    if attempt is None or action.element_id not in attempt.box_element_ids:
+        return False
+    if action.skyvern_element_data is not None:
+        action.skyvern_element_data = redact_multi_field_totp_element_data(action.skyvern_element_data)
+    action.totp_timing_info = {
+        "is_totp_sequence": True,
+        "action_index": attempt.box_element_ids.index(action.element_id),
+        "box_element_ids": list(attempt.box_element_ids),
+        "code_source": attempt.code_source,
+    }
+    return True
 
 
 def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_run_id: str | None) -> list[str] | None:
@@ -584,24 +672,13 @@ def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_r
     ]
 
 
-def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_ready: bool) -> bool:
-    """Whether the first-pass plan already carries a shape the existing runtime materializes into a
-    credential TOTP at DOM-write time: a multi-field single-digit sequence backed by a runtime secret
-    stash. A literal digit string, a bare placeholder, a provider marker, or a
-    ``get_verification_code`` action is not runtime-consumable on this v1 two-pass seam, so it keeps
-    the polling re-plan.
-
-    The multi-field arm is only consumable when the runtime already holds the code the multi-field
-    execution path types per digit — the existing ``totp_codes[f"{task_id}_secret"]`` stash. Without
-    it the runtime cannot materialize the digits, so ``multi_field_secret_ready`` gates that arm.
-    """
-    if not multi_field_secret_ready:
-        return False
-    observations = (
-        (str(action.get("action_type") or "").lower(), action.get("text")) if isinstance(action, dict) else ("", None)
-        for action in actions
-    )
-    return _has_multi_field_totp_shape(observations)
+def _first_plan_carries_consumable_totp(
+    actions: list[Any],
+    multi_field_source_ready: bool,
+    attempt: MultiFieldTotpAttempt,
+) -> bool:
+    """Whether the first plan contains a consumable action for the armed OTP group."""
+    return multi_field_source_ready and bool(_multi_field_totp_action_indices(actions, attempt))
 
 
 def _first_plan_carries_single_field_credential_totp(
@@ -1222,41 +1299,84 @@ class ForgeAgent:
         """Bounded best-effort close of exactly the given recorded download-popup claims.
 
         A file-download click that opens a new page is expected to have that page closed once the
-        download finishes, regardless of its URL. On dynamic/remote-CDP runs the download is carried by
-        the CDP monitor and credited by the file-scan task lifecycle after the action seam has returned,
-        so no Playwright popup download event fires and the in-seam cleanup never sees it — the popup
-        lingers and the next task can select it as the working page, wedging on screenshot/scrape/reload.
-        Called only once a download is durably credited, this closes exactly the recorded popup Pages
-        that are still open and still live in this run; an absent/closed page or a listing/close failure
-        never closes an unrelated page, and the opener (never recorded as a claim) is never touched.
+        download finishes, regardless of its URL/commit/scrape state. On dynamic/remote-CDP runs the
+        download is carried by the CDP monitor and credited by the file-scan task lifecycle after the
+        action seam has returned, so no Playwright popup download event fires and the in-seam cleanup
+        never sees it — the popup lingers and the next task can select it as the working page, wedging
+        on screenshot/scrape/reload. Called only once a download is durably credited, this closes each
+        recorded popup that is still open and still belongs to the run's current BrowserContext.
+        Cleanup liveness is structural ownership, not scraper validity, so it is NOT gated on the
+        scraper-oriented ``list_valid_pages()`` (which omits PDF-viewer/odd-scheme pages and would
+        strand a genuinely live wedged popup). A stale-context/foreign-context page, an already-closed
+        page, or a close failure never closes an unrelated page and never overturns the durable credit;
+        the opener (never recorded as a claim) is never touched.
         """
-        if browser_state is None or not claims:
+        if not claims:
             return
-        try:
-            valid_pages = await browser_state.list_valid_pages()
-        except Exception:
-            LOG.warning(
-                "Failed to list valid pages while closing credited download popups",
+        if browser_state is None:
+            LOG.info(
+                "Skipping credited download popup close: no browser state",
                 task_id=task.task_id,
-                exc_info=True,
+                claims_taken=len(claims),
+                skip_reason="no_browser_state",
             )
             return
+        try:
+            owning_context = browser_state.browser_context
+        except Exception:
+            # A context-access fault (e.g. a torn-down/recycled session) must not overturn the durable
+            # credit. Claims were already atomically taken, so simply expire them without a close. Log
+            # only a bounded reason — never an exception payload.
+            LOG.info(
+                "Skipping credited download popup close: browser context unavailable",
+                task_id=task.task_id,
+                claims_taken=len(claims),
+                skip_reason="context_unavailable",
+            )
+            return
+        closed = 0
+        close_failed = 0
+        skipped_already_closed = 0
+        skipped_foreign_context = 0
+        skipped_budget_exhausted = 0
+        # One monotonic deadline shared across the whole sequential batch, so a same-context popup storm
+        # cannot delay the credited-task handoff by N x BROWSER_PAGE_CLOSE_TIMEOUT: each attempted close
+        # gets only the remaining budget, and once it is exhausted the rest are consumed without a close.
+        batch_deadline = time.monotonic() + BROWSER_PAGE_CLOSE_TIMEOUT
         for popup in claims:
             try:
                 if popup.is_closed():
+                    skipped_already_closed += 1
                     continue
-                if not any(candidate is popup for candidate in valid_pages):
+                # A recycled/replaced context (stale claim) or a page from another context falls here
+                # and is left open; only a page in the run's current BrowserContext is closable.
+                if popup.context is not owning_context:
+                    skipped_foreign_context += 1
                     continue
-                # Bound the close so a hung popup cannot block the completed-task handoff.
-                async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                remaining = batch_deadline - time.monotonic()
+                if remaining <= 0:
+                    # Budget spent by earlier closes: expire the claim without attempting a close.
+                    skipped_budget_exhausted += 1
+                    continue
+                # Bound this close to the batch's remaining budget so one hung popup cannot stretch the
+                # batch past a single BROWSER_PAGE_CLOSE_TIMEOUT.
+                async with asyncio.timeout(remaining):
                     await popup.close()
-                LOG.info("Closed credited download popup", task_id=task.task_id)
+                closed += 1
             except Exception:
-                LOG.warning(
-                    "Failed to close credited download popup",
-                    task_id=task.task_id,
-                    exc_info=True,
-                )
+                # Bounded, non-sensitive: a failed close never overturns durable credit and never emits
+                # the exception (URL/message/repr could carry a signed download URL or page content).
+                close_failed += 1
+        LOG.info(
+            "Closed credited download popups",
+            task_id=task.task_id,
+            claims_taken=len(claims),
+            closed=closed,
+            close_failed=close_failed,
+            skipped_already_closed=skipped_already_closed,
+            skipped_foreign_context=skipped_foreign_context,
+            skipped_budget_exhausted=skipped_budget_exhausted,
+        )
 
     async def _close_credited_download_popups(self, task: Task, browser_state: BrowserState | None) -> None:
         """complete_on_download credit seam: take this task's recorded download-popup claims and close
@@ -2009,7 +2129,9 @@ class ForgeAgent:
                         reasoning=turn_reasoning,
                     )
                     v3_persisted_actions.append(action)
-                    await app.DATABASE.workflow_params.create_action(action=action)
+                    await app.DATABASE.workflow_params.create_action(
+                        action=action_for_multi_field_totp_persistence(action)
+                    )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
             if any(name in _billable_tool_names for name, _args, _ok in round_actions):
@@ -2311,7 +2433,9 @@ class ForgeAgent:
                     screenshot_artifact_id=decision_screenshot_id,
                 )
                 v3_persisted_actions.append(decision_action)
-                await app.DATABASE.workflow_params.create_action(action=decision_action)
+                await app.DATABASE.workflow_params.create_action(
+                    action=action_for_multi_field_totp_persistence(decision_action)
+                )
         completed = task_status == TaskStatus.completed
         if task_status == TaskStatus.canceled:
             step_status = StepStatus.canceled
@@ -2656,6 +2780,7 @@ class ForgeAgent:
                     task,
                     status=TaskStatus.canceled,
                 )
+                context.clear_multi_field_totp_state(task.task_id)
                 return step, None, None
 
             if workflow_run and workflow_run.status == WorkflowRunStatus.timed_out:
@@ -2672,6 +2797,7 @@ class ForgeAgent:
                     task,
                     status=TaskStatus.timed_out,
                 )
+                context.clear_multi_field_totp_state(task.task_id)
                 return step, None, None
 
         refreshed_task = await app.DATABASE.tasks.get_task(
@@ -3035,6 +3161,9 @@ class ForgeAgent:
 
             return step, detailed_output, next_step
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
+        except CancelledError:
+            context.clear_multi_field_totp_state(task.task_id)
+            raise
         except StepUnableToExecuteError:
             LOG.exception("Step cannot be executed. Task execution stopped")
             raise
@@ -3661,6 +3790,9 @@ class ForgeAgent:
             # the step as failed (shielded, so the write survives the cancel) for observability, then
             # re-raise so the cancellation actually halts the run. Returning instead would let the step
             # loop treat it as a retryable failure and keep executing past the timeout.
+            current_context = skyvern_context.current()
+            if current_context is not None:
+                current_context.clear_multi_field_totp_state(task.task_id)
             LOG.info(
                 "CancelledError in agent_step, marking step failed and re-raising",
                 step_order=step.order,
@@ -3707,8 +3839,14 @@ class ForgeAgent:
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
         finally:
-            await _cancel_pending_prefetch_task(prefetched_summary_task)
-            await artifact_tracker.drain()
+            try:
+                await _cancel_pending_prefetch_task(prefetched_summary_task)
+                await artifact_tracker.drain()
+            except CancelledError:
+                current_context = skyvern_context.current()
+                if current_context is not None:
+                    current_context.clear_multi_field_totp_state(task.task_id)
+                raise
 
     async def _execute_step_actions(
         self,
@@ -3728,13 +3866,6 @@ class ForgeAgent:
         artifact_tracker: _BackgroundArtifactTaskTracker,
     ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
         # Execute the actions
-        LOG.info(
-            "Executing actions",
-            sampling=True,
-            step_order=step.order,
-            step_retry=step.retry_index,
-            actions=actions,
-        )
         action_results: list[ActionResult] = []
         detailed_agent_step_output.action_results = action_results
         # filter out wait action if there are other actions in the list
@@ -3751,7 +3882,6 @@ class ForgeAgent:
                 LOG.info(
                     "Skipping wait actions",
                     wait_actions_to_skip=wait_actions_to_skip,
-                    actions=actions,
                 )
 
         # The complete batch is evaluated here — after WAIT filtering, and before any of it is
@@ -3780,6 +3910,32 @@ class ForgeAgent:
             element_id_to_action_index[action.element_id] = action_idx
 
         element_id_to_last_action: dict[str, int] = dict()
+        totp_group_filled = False
+        context = skyvern_context.ensure_context()
+        attempt = context.multi_field_totp.get(task.task_id)
+        totp_action_indices = _multi_field_totp_action_indices(actions, attempt) if attempt is not None else set()
+        first_totp_action_index = min(totp_action_indices, default=None)
+        totp_dispatch_page = scraped_page
+        for action_idx, action in enumerate(actions):
+            _maybe_arm_multi_field_totp(action, task.task_id, carries_expected_value=action_idx in totp_action_indices)
+        if (
+            attempt
+            and not totp_action_indices
+            and any(
+                isinstance(action, InputTextAction) and action.element_id in attempt.box_element_ids
+                for action in actions
+            )
+        ):
+            LOG.warning(
+                "Multi-field TOTP plan rejected; executing ordinary inputs", task_id=task.task_id, step_order=step.order
+            )
+        LOG.info(
+            "Executing actions",
+            sampling=True,
+            step_order=step.order,
+            step_retry=step.retry_index,
+            actions=actions,
+        )
         try:
             wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
             base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
@@ -3824,6 +3980,62 @@ class ForgeAgent:
                 break
 
             action = action_node.action
+            if attempt is not None and action_idx == first_totp_action_index and action_idx > 0:
+                current_page = await browser_state.must_get_working_page()
+                refreshed_binding = await _refresh_multi_field_totp_group_binding(scraped_page, current_page, attempt)
+                if isinstance(refreshed_binding, MultiFieldTotpBindingFailure):
+                    context.clear_multi_field_totp_state(task.task_id)
+                    for index in totp_action_indices:
+                        _maybe_arm_multi_field_totp(actions[index], task.task_id, carries_expected_value=False)
+                    LOG.warning(
+                        "Multi-field TOTP plan rejected; stopping the batch to re-plan",
+                        task_id=task.task_id,
+                        step_order=step.order,
+                    )
+                    stop_result = ActionFailure(MultiFieldTotpGroupGone(), stop_execution_on_failure=True)
+                    stop_result.skip_remaining_actions = True
+                    stop_result.data = {"totp_group_gone": True, "replan": True}
+                    stop_result.step_order = step.order
+                    stop_result.step_retry_number = step.retry_index
+                    action.status = ActionStatus.skipped
+                    action.started_at = action.finished_at = naive_utc_now()
+                    action.action_id = (
+                        await app.DATABASE.workflow_params.create_action(
+                            action=action_for_multi_field_totp_persistence(action)
+                        )
+                    ).action_id
+                    detailed_agent_step_output.actions_and_results[action_idx] = (action, [stop_result])
+                    action_results.append(stop_result)
+                    step.output = detailed_agent_step_output.to_agent_step_output()
+                    llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+                    if llm_caller and action.tool_call_id:
+                        llm_caller.add_tool_result(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": action.tool_call_id,
+                                "content": STALE_TARGET_TOOL_RESULT,
+                            }
+                        )
+                    await app.AGENT_FUNCTION.post_action_execution(action)
+                    failed_step = await self.update_step(
+                        step=step,
+                        status=StepStatus.failed,
+                        output=detailed_agent_step_output.to_agent_step_output(),
+                    )
+                    return actions, (failed_step, detailed_agent_step_output.get_clean_detailed_output())
+                previous_box_ids = list(attempt.box_element_ids)
+                totp_dispatch_page, group = refreshed_binding
+                attempt.box_element_ids = group
+                for index in totp_action_indices:
+                    group_action = actions[index]
+                    assert isinstance(group_action, InputTextAction)
+                    box_index = previous_box_ids.index(group_action.element_id)
+                    group_action.element_id = group[box_index]
+                    # Keep the planning cache identity; a fresh hash could expose autofilled digits.
+                    group_action.skyvern_element_data = redact_multi_field_totp_element_data(
+                        {**totp_dispatch_page.id_to_element_dict[group[box_index]], "page_url": totp_dispatch_page.url}
+                    )
+                    _maybe_arm_multi_field_totp(group_action, task.task_id, carries_expected_value=True)
             if isinstance(action, WebAction):
                 previous_action_idx = element_id_to_last_action.get(action.element_id)
                 if previous_action_idx is not None:
@@ -3853,6 +4065,29 @@ class ForgeAgent:
 
                 element_id_to_last_action[action.element_id] = action_idx
 
+            totp_armed = action_idx in totp_action_indices
+            if totp_group_filled and totp_armed:
+                results = [ActionSuccess(data={"totp_group_prefilled": True})]
+                for result in results:
+                    result.step_retry_number = step.retry_index
+                    result.step_order = step.order
+                action.status = ActionStatus.completed
+                action.started_at = naive_utc_now()
+                action.finished_at = naive_utc_now()
+                persisted_action = await app.DATABASE.workflow_params.create_action(
+                    action=action_for_multi_field_totp_persistence(action)
+                )
+                action.action_id = persisted_action.action_id
+                detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
+                action_results.extend(results)
+                step.output = detailed_agent_step_output.to_agent_step_output()
+                await app.AGENT_FUNCTION.post_action_execution(action)
+                _step_span.add_event(
+                    "action.post_wait",
+                    attributes={"wait_time_ms": 0, "action_idx": action_idx},
+                )
+                continue
+
             if engine != RunEngine.openai_cua:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
             current_page = await browser_state.must_get_working_page()
@@ -3860,21 +4095,6 @@ class ForgeAgent:
                 # Do not verify the complete action when complete_verification is False
                 # set verified to True will skip the completion verification
                 action.verified = True
-
-            # Pass TOTP secret to handler for multi-field TOTP sequences
-            # Handler will generate TOTP at execution time
-            if (
-                action.action_type == ActionType.INPUT_TEXT
-                and self._is_multi_field_totp_sequence(actions)
-                and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
-            ):
-                # Pass TOTP secret to handler for execution-time generation
-                action.totp_timing_info = {
-                    "is_totp_sequence": True,
-                    "action_index": action_idx,
-                    "totp_secret": totp_secret,
-                    "is_retry": step.retry_index > 0,
-                }
 
             # Tell the handler to skip the auto-completion Tab hack when the
             # next batched action would be broken by a focus change — e.g. a
@@ -3890,7 +4110,7 @@ class ForgeAgent:
                 action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
             results = await ActionHandler.handle_action(
-                scraped_page=scraped_page,
+                scraped_page=totp_dispatch_page if totp_armed else scraped_page,
                 task=task,
                 step=step,
                 page=current_page,
@@ -3909,19 +4129,9 @@ class ForgeAgent:
             # Determine wait time between actions
             wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
 
-            # For multi-field TOTP sequences, use zero delay between all digits for fast execution
-            if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
-                current_text = action.text if hasattr(action, "text") else None
-
-                if current_text and len(current_text) == 1 and current_text.isdigit():
-                    # Zero delay between all TOTP digits for fast execution
-                    wait_time = 0.0
-                    LOG.debug(
-                        "TOTP: zero delay for digit",
-                        task_id=task.task_id,
-                        action_idx=action_idx,
-                        digit=current_text,
-                    )
+            if totp_armed:
+                wait_time = 0.0
+                LOG.debug("TOTP: zero delay for armed group action", task_id=task.task_id, action_idx=action_idx)
 
             # Skip sleep and post-action artifacts for page-level SCROLL to preserve
             # scroll-driven JS state. Many pages enable buttons only while scrolled to
@@ -3955,6 +4165,15 @@ class ForgeAgent:
                 result.step_order = step.order
             step.output = detailed_agent_step_output.to_agent_step_output()
             action_results.extend(results)
+            result_data = results[-1].data if results and isinstance(results[-1].data, dict) else None
+            if (
+                totp_armed
+                and results
+                and results[-1].success
+                and result_data is not None
+                and (result_data.get("totp_group_filled") is True or result_data.get("totp_group_prefilled") is True)
+            ):
+                totp_group_filled = True
             # Check the last result for this action. If that succeeded, assume the entire action is successful
             if results and results[-1].success:
                 if pdf_auto_download_src and isinstance(action, DownloadFileAction):
@@ -4057,26 +4276,6 @@ class ForgeAgent:
             step_retry=step.retry_index,
             action_results=detailed_agent_step_output.action_results,
         )
-
-        # Clean up TOTP cache after multi-field TOTP sequence completion
-        if self._is_multi_field_totp_sequence(actions):
-            context = skyvern_context.ensure_context()
-            cache_key = f"{task.task_id}_totp_cache"
-            removed_totp_cache = False
-            for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
-                if key in context.totp_codes:
-                    context.totp_codes.pop(key)
-                    removed_totp_cache = True
-
-            if removed_totp_cache:
-                LOG.debug(
-                    "Cleaned up TOTP cache after multi-field sequence completion",
-                    task_id=task.task_id,
-                )
-
-            secret_key = f"{task.task_id}_secret"
-            if secret_key in context.totp_codes:
-                context.totp_codes.pop(secret_key)
 
         # Update Navigator caller with actual action results so the next
         # step's tool responses include real execution data.
@@ -5959,6 +6158,9 @@ class ForgeAgent:
         element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
 
         if context:
+            attempt = context.multi_field_totp.get(task.task_id)
+            if attempt and attempt.code_source == "external":
+                context.register_secret_value(context.totp_codes.get(f"{task.task_id}_totp_cache"))
             app.ARTIFACT_MANAGER.accumulate_scrape_to_archive(
                 step=step,
                 html=scraped_page.html.encode("utf-8"),
@@ -6232,7 +6434,6 @@ class ForgeAgent:
         actions_and_results_str = await self._get_action_results(task)
 
         # Generate the extract action prompt
-        navigation_goal = task.navigation_goal
         context = skyvern_context.ensure_context()
         complete_criterion_is_untrusted = bool(task.complete_criterion and context.complete_criterion_is_untrusted)
         starting_url = task.url
@@ -6241,7 +6442,17 @@ class ForgeAgent:
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code, step=step, scraped_page=scraped_page
         )
-        navigation_payload_str = json.dumps(final_navigation_payload)
+        prompt_kwargs = _replace_multi_field_totp_prompt_code(
+            task.task_id,
+            {
+                "navigation_goal": task.navigation_goal,
+                "data_extraction_goal": task.data_extraction_goal,
+                "navigation_payload_str": json.dumps(final_navigation_payload),
+                "error_code_mapping_str": json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
+                "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
+                "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
+            },
+        )
 
         task_type = task.task_type if task.task_type else TaskType.general
         template = ""
@@ -6252,7 +6463,7 @@ class ForgeAgent:
             template = DECISIVE_CRITERION_VALIDATE_TEMPLATE
         elif task_type == TaskType.action:
             prompt = prompt_engine.load_prompt(
-                "infer-action-type", navigation_goal=navigation_goal, prompt_name="infer-action-type"
+                "infer-action-type", navigation_goal=prompt_kwargs["navigation_goal"], prompt_name="infer-action-type"
             )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key, default=get_org_aware_primary_llm_api_handler()
@@ -6289,16 +6500,15 @@ class ForgeAgent:
             raise UnsupportedTaskType(task_type=task_type)
 
         # Validation evidence router (SKY-10620 Route B)
-        error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
         local_datetime = datetime.now(context.tz_info).isoformat()
         if task_type == TaskType.validation:
             router_result = await resolve_validation_evidence_route(
                 task=task,
                 step=step,
-                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-                navigation_payload_str=navigation_payload_str,
-                error_code_mapping_str=error_code_mapping_str,
+                complete_criterion=prompt_kwargs["complete_criterion"],
+                terminate_criterion=prompt_kwargs["terminate_criterion"],
+                navigation_payload_str=prompt_kwargs["navigation_payload_str"],
+                error_code_mapping_str=prompt_kwargs["error_code_mapping_str"],
                 local_datetime=local_datetime,
             )
             without_page_information = (
@@ -6427,6 +6637,32 @@ class ForgeAgent:
             context.format_recent_dialog_messages() if template == EXTRACT_ACTION_TEMPLATE else None
         )
 
+        # Keep both render paths on the same substituted kwargs, including fields added later.
+        prompt_kwargs = _replace_multi_field_totp_prompt_code(
+            task.task_id,
+            {
+                **prompt_kwargs,
+                "starting_url": starting_url,
+                "current_url": current_url,
+                "enable_new_planner_actions": enable_new_planner_actions,
+                "planner_mini_goal_improvements": planner_mini_goal_improvements,
+                "action_history": actions_and_results_str,
+                "local_datetime": local_datetime,
+                "verification_code_check": verification_code_check,
+                "extra_action_guidance": extra_action_guidance,
+                "complete_criterion_is_untrusted": complete_criterion_is_untrusted,
+                "show_close_page_action": show_close_page_action,
+                "show_new_tab_action": show_new_tab_action,
+                "show_switch_tab_action": show_switch_tab_action,
+                "open_tabs_context": open_tabs_context,
+                "recent_dialog_messages_str": recent_dialog_messages_str,
+                "llm_screenshots_enabled": llm_screenshots_enabled,
+                "enriched_tree_enabled": enriched_tree_enabled,
+                "slim_output": slim_output,
+                "stable_prefix_ordering": stable_prefix_ordering,
+            },
+        )
+
         if template == DECISIVE_CRITERION_VALIDATE_TEMPLATE and cache_enabled:
             LOG.warning("Prompt caching is not supported for validation prompts; using uncached render")
             cache_enabled = False
@@ -6434,43 +6670,17 @@ class ForgeAgent:
         if template == EXTRACT_ACTION_TEMPLATE and cache_enabled:
             try:
                 # Try to load split templates for caching
-                prompt_kwargs = {
-                    "navigation_goal": navigation_goal,
-                    "navigation_payload_str": navigation_payload_str,
-                    "starting_url": starting_url,
-                    "current_url": current_url,
-                    "data_extraction_goal": task.data_extraction_goal,
-                    "enable_new_planner_actions": enable_new_planner_actions,
-                    "planner_mini_goal_improvements": planner_mini_goal_improvements,
-                    "action_history": actions_and_results_str,
-                    "error_code_mapping_str": error_code_mapping_str,
-                    "local_datetime": local_datetime,
-                    "verification_code_check": verification_code_check,
-                    "extra_action_guidance": extra_action_guidance,
-                    "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
-                    "complete_criterion_is_untrusted": complete_criterion_is_untrusted,
-                    "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    "show_close_page_action": show_close_page_action,
-                    "show_new_tab_action": show_new_tab_action,
-                    "show_switch_tab_action": show_switch_tab_action,
-                    "open_tabs_context": open_tabs_context,
-                    "recent_dialog_messages_str": recent_dialog_messages_str,
-                    "llm_screenshots_enabled": llm_screenshots_enabled,
-                    "enriched_tree_enabled": enriched_tree_enabled,
-                    "slim_output": slim_output,
-                    "stable_prefix_ordering": stable_prefix_ordering,
-                }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
-                    extra_action_guidance=extra_action_guidance,
+                    extra_action_guidance=prompt_kwargs["extra_action_guidance"],
                     show_close_page_action=show_close_page_action,
                     show_new_tab_action=show_new_tab_action,
                     show_switch_tab_action=show_switch_tab_action,
-                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    complete_criterion=prompt_kwargs["complete_criterion"],
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     slim_output=slim_output,
-                    has_data_extraction_goal=bool(task.data_extraction_goal),
+                    has_data_extraction_goal=bool(prompt_kwargs["data_extraction_goal"]),
                     enable_new_planner_actions=enable_new_planner_actions,
                     planner_mini_goal_improvements=planner_mini_goal_improvements,
                 )
@@ -6551,13 +6761,13 @@ class ForgeAgent:
         if template == DECISIVE_CRITERION_VALIDATE_TEMPLATE and without_page_information:
             full_prompt = prompt_engine.load_prompt(
                 template,
-                navigation_goal=navigation_goal,
-                navigation_payload_str=navigation_payload_str,
-                data_extraction_goal=task.data_extraction_goal,
-                error_code_mapping_str=error_code_mapping_str,
+                navigation_goal=prompt_kwargs["navigation_goal"],
+                navigation_payload_str=prompt_kwargs["navigation_payload_str"],
+                data_extraction_goal=prompt_kwargs["data_extraction_goal"],
+                error_code_mapping_str=prompt_kwargs["error_code_mapping_str"],
                 local_datetime=local_datetime,
-                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                complete_criterion=prompt_kwargs["complete_criterion"],
+                terminate_criterion=prompt_kwargs["terminate_criterion"],
                 without_page_information=True,
                 prompt_name=template,
             )
@@ -6566,30 +6776,7 @@ class ForgeAgent:
                 element_tree_builder=scraped_page,
                 prompt_engine=prompt_engine,
                 template_name=template,
-                navigation_goal=navigation_goal,
-                navigation_payload_str=navigation_payload_str,
-                starting_url=starting_url,
-                current_url=current_url,
-                data_extraction_goal=task.data_extraction_goal,
-                enable_new_planner_actions=enable_new_planner_actions,
-                planner_mini_goal_improvements=planner_mini_goal_improvements,
-                action_history=actions_and_results_str,
-                error_code_mapping_str=error_code_mapping_str,
-                local_datetime=local_datetime,
-                verification_code_check=verification_code_check,
-                extra_action_guidance=extra_action_guidance,
-                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-                complete_criterion_is_untrusted=complete_criterion_is_untrusted,
-                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-                show_close_page_action=show_close_page_action,
-                show_new_tab_action=show_new_tab_action,
-                show_switch_tab_action=show_switch_tab_action,
-                open_tabs_context=open_tabs_context,
-                recent_dialog_messages_str=recent_dialog_messages_str,
-                llm_screenshots_enabled=llm_screenshots_enabled,
-                enriched_tree_enabled=enriched_tree_enabled,
-                slim_output=slim_output,
-                stable_prefix_ordering=stable_prefix_ordering,
+                **prompt_kwargs,
                 lean_compress_long_href=False,
                 lean_compress_image_src=context.enable_lean_element_tree,
                 lean_strip_url_query_strings=context.enable_lean_element_tree,
@@ -6686,93 +6873,6 @@ class ForgeAgent:
             )
             return False
 
-    def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
-        """Detect TOTP pages by checking for multiple input fields or verification keywords."""
-        if not scraped_page:
-            return False
-
-        try:
-            # Count input fields that could be for TOTP (more flexible than maxlength="1")
-            input_fields = [
-                element
-                for element in scraped_page.elements
-                if element.get("tagName", "").lower() == "input"
-                and element.get("attributes", {}).get("type", "text").lower() in ["text", "number", "tel"]
-            ]
-
-            # Check for multiple input fields (potential multi-field TOTP)
-            if len(input_fields) >= 4:
-                # Additional check: look for patterns that suggest multi-field TOTP
-                # Check if inputs are close together or have similar attributes
-                has_maxlength_1 = any(elem.get("attributes", {}).get("maxlength") == "1" for elem in input_fields)
-
-                # Check for input fields with numeric patterns (type="number", pattern for digits)
-                has_numeric_patterns = any(
-                    elem.get("attributes", {}).get("type") == "number"
-                    or elem.get("attributes", {}).get("pattern", "").isdigit()
-                    or "digit" in elem.get("attributes", {}).get("pattern", "").lower()
-                    for elem in input_fields
-                )
-
-                if has_maxlength_1 or has_numeric_patterns:
-                    return True
-
-            # Check for TOTP-related keywords in page content
-            page_text = scraped_page.html.lower() if scraped_page.html else ""
-            totp_keywords = [
-                "verification code",
-                "authentication code",
-                "security code",
-                "2fa",
-                "two-factor",
-                "totp",
-                "authenticator",
-                "verification",
-                "enter code",
-                "verification number",
-                "security number",
-            ]
-
-            keyword_matches = sum(1 for keyword in totp_keywords if keyword in page_text)
-
-            # If we have multiple TOTP keywords and multiple input fields, likely TOTP
-            if keyword_matches >= 2 and len(input_fields) >= 6:
-                return True
-
-            # Strong single keyword match with multiple inputs
-            strong_keywords = ["verification code", "authentication code", "2fa", "two-factor"]
-            if any(keyword in page_text for keyword in strong_keywords) and len(input_fields) >= 3:
-                return True
-
-            return False
-
-        except Exception:
-            return False
-
-    def _is_multi_field_totp_sequence(self, actions: list) -> bool:
-        """
-        Check if the action sequence represents a multi-field TOTP input (6 single-digit fields).
-
-        Args:
-            actions: List of actions to analyze
-
-        Returns:
-            bool: True if this is a multi-field TOTP sequence
-        """
-        observations = (
-            (
-                action.action_type.value if isinstance(action.action_type, ActionType) else "",
-                getattr(action, "text", None),
-            )
-            for action in actions
-        )
-        is_multi_field_totp = _has_multi_field_totp_shape(observations)
-
-        if is_multi_field_totp:
-            LOG.debug("Detected multi-field TOTP sequence", total_actions=len(actions))
-
-        return is_multi_field_totp
-
     def _build_navigation_payload(
         self,
         task: Task,
@@ -6780,15 +6880,7 @@ class ForgeAgent:
         step: Step | None = None,
         scraped_page: ScrapedPage | None = None,
     ) -> dict[str, Any] | list | str | None:
-        final_navigation_payload = task.navigation_payload
-
-        # Represent any plaintext parameter value that exactly equals a stored credential value as
-        # that credential's resolvable placeholder token BEFORE the synthetic values below (the real
-        # verification code and the "123456" TOTP format hint) are injected, so those synthetic
-        # values can never be turned into resolvable credential tokens. Otherwise such a value would
-        # be one-way-redacted to [REDACTED_SECRET] at the LLM boundary and typed verbatim; here the
-        # planner never sees the raw value and the existing input path resolves the token before
-        # browser input.
+        final_navigation_payload = deepcopy(task.navigation_payload)
         if (
             task.workflow_run_id is not None
             and task.workflow_run_id in app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts
@@ -6799,65 +6891,171 @@ class ForgeAgent:
             )
 
         current_context = skyvern_context.ensure_context()
+        attempt = current_context.multi_field_totp.get(task.task_id)
         verification_code = current_context.totp_codes.get(task.task_id)
-        if verification_code:
+        external_code = verification_code if attempt is None or verification_code != attempt.hint_code else None
+        transient_from_seed = verification_code in current_context.seed_generated_totp_values.get(task.task_id, set())
+        payload_otp = extract_totp_from_navigation_inputs(final_navigation_payload)
+        if (
+            payload_otp
+            and payload_otp.get_otp_type() == OTPType.TOTP
+            and payload_otp.value.isdigit()
+            and (attempt is None or payload_otp.value != attempt.hint_code)
+        ):
+            external_code = payload_otp.value
+            transient_from_seed = False
+
+        if step and scraped_page is not None:
+            totp_secret: str | None = None
+            candidates: dict[str, str] = {}
             if (
-                isinstance(final_navigation_payload, dict)
-                and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
+                isinstance(final_navigation_payload, (dict, list))
+                and task.workflow_run_id in app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts
+            ):
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+                active_key = current_context.active_credential_parameter_key
+                active_value = workflow_run_context.values.get(active_key) if active_key else None
+                active_placeholder = active_value.get("totp") if isinstance(active_value, dict) else None
+                for value in _multi_field_totp_credential_entries(final_navigation_payload):
+                    totp_placeholder = value.get("totp")
+                    if not isinstance(totp_placeholder, str) or not totp_placeholder:
+                        continue
+                    secret_key = workflow_run_context.totp_secret_value_key(totp_placeholder)
+                    candidate_secret = workflow_run_context.get_original_secret_value_or_none(secret_key)
+                    if candidate_secret:
+                        candidates[totp_placeholder] = candidate_secret
+                if active_key and isinstance(active_placeholder, str):
+                    totp_secret = candidates.get(active_placeholder)
+                if totp_secret is None and len(candidates) == 1:
+                    totp_secret = next(iter(candidates.values()))
+                if candidates and totp_secret is None:
+                    LOG.info("No unambiguous active credential for multi-field TOTP", task_id=task.task_id)
+                    current_context.totp_codes.pop(f"{task.task_id}_secret", None)
+                    if attempt is not None and attempt.code_source == "secret":
+                        if verification_code == attempt.hint_code:
+                            current_context.pop_totp_code(task.task_id)
+                            verification_code = None
+                        current_context.multi_field_totp.pop(task.task_id)
+                        current_context.totp_codes.pop(f"{task.task_id}_totp_cache", None)
+                        attempt = None
+
+            cache_key = f"{task.task_id}_totp_cache"
+            cached_code = current_context.totp_codes.get(cache_key)
+            previous_secret = current_context.totp_codes.get(f"{task.task_id}_secret")
+            secret_changed = bool(totp_secret and previous_secret and previous_secret != totp_secret)
+            expected_digits = attempt.expected_digits if attempt else 6
+            code_source = attempt.code_source if attempt else None
+            if totp_secret and transient_from_seed:
+                external_code = None
+            if external_code:
+                expected_digits = len(external_code)
+                code_source = "external"
+            elif totp_secret and (
+                transient_from_seed or attempt is None or attempt.code_source == "secret" or secret_changed
+            ):
+                parsed_totp = parse_totp_config(totp_secret)
+                expected_digits = parsed_totp.digits if parsed_totp else 6
+                code_source = "secret"
+            elif code_source == "external" and cached_code:
+                expected_digits = len(cached_code)
+            if code_source == "external":
+                external_code = external_code or cached_code
+
+            group = _multi_field_totp_box_group(scraped_page, expected_digits)
+            if group is None:
+                if attempt or previous_secret or cached_code:
+                    current_context.clear_multi_field_totp_state(task.task_id, restore_unverified_external=True)
+                    if attempt and verification_code in (None, attempt.hint_code):
+                        verification_code = current_context.totp_codes.get(task.task_id)
+            elif code_source is not None:
+                if attempt is not None and (
+                    attempt.expected_digits != expected_digits or attempt.code_source != code_source or secret_changed
+                ):
+                    current_context.reset_attempt(task.task_id)
+                    if attempt.expected_digits != expected_digits or secret_changed:
+                        attempt.hint_code = None
+                elif (
+                    attempt is not None
+                    and code_source == "external"
+                    and external_code
+                    and (
+                        (cached_code and cached_code != external_code)
+                        or (
+                            attempt.filled_code_hash
+                            and hashlib.sha256(external_code.encode()).hexdigest() != attempt.filled_code_hash
+                        )
+                    )
+                ):
+                    current_context.reset_attempt(task.task_id)
+
+                if attempt is None:
+                    attempt = MultiFieldTotpAttempt(group, expected_digits, code_source)
+                    current_context.multi_field_totp[task.task_id] = attempt
+                else:
+                    attempt.box_element_ids = group
+                    attempt.expected_digits = expected_digits
+                    attempt.code_source = code_source
+                attempt.credential_placeholders = frozenset(candidates)
+
+                if totp_secret:
+                    current_context.totp_codes[f"{task.task_id}_secret"] = totp_secret
+                if code_source == "external" and external_code:
+                    current_context.totp_codes[cache_key] = external_code
+                cached_code = current_context.totp_codes.get(cache_key)
+                if attempt.hint_code is None or attempt.hint_code == cached_code:
+                    supplied_values = "\n".join(
+                        [
+                            task.navigation_goal or "",
+                            task.data_extraction_goal or "",
+                            json.dumps(task.navigation_payload),
+                            cached_code or "",
+                        ]
+                    )
+                    attempt.hint_code = None
+                    for _ in range(8):
+                        hint_code = _generate_multi_field_totp_hint(expected_digits)
+                        if hint_code not in supplied_values:
+                            attempt.hint_code = hint_code
+                            break
+                    if attempt.hint_code is None:
+                        LOG.warning("Unable to choose a multi-field TOTP decoy", task_id=task.task_id)
+                        current_context.clear_multi_field_totp_state(task.task_id)
+
+        attempt = current_context.multi_field_totp.get(task.task_id)
+        if attempt is not None and attempt.hint_code:
+            current_context.register_secret_value(attempt.hint_code)
+            cached_code = current_context.totp_codes.get(f"{task.task_id}_totp_cache")
+            if attempt.code_source == "external":
+                current_context.register_secret_value(cached_code)
+            for real_code in (external_code, cached_code, verification_code if transient_from_seed else None):
+                if real_code:
+                    final_navigation_payload = _replace_multi_field_totp_code(
+                        final_navigation_payload, real_code, attempt.hint_code
+                    )
+            for value in _multi_field_totp_credential_entries(final_navigation_payload):
+                value["totp"] = attempt.hint_code
+            verification_code = attempt.hint_code
+            if task.task_id in current_context.totp_codes:
+                current_context.totp_codes[task.task_id] = attempt.hint_code
+
+        if verification_code:
+            if isinstance(final_navigation_payload, dict) and (
+                attempt is not None or SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
             ):
                 final_navigation_payload[SPECIAL_FIELD_VERIFICATION_CODE] = verification_code
             elif (
                 isinstance(final_navigation_payload, str)
                 and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
             ):
-                final_navigation_payload = (
-                    final_navigation_payload + "\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
-                )
+                final_navigation_payload += "\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
             elif isinstance(final_navigation_payload, list):
                 verification_code_dict = str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
                 if verification_code_dict not in final_navigation_payload:
                     final_navigation_payload.append(verification_code_dict)
-                else:
-                    LOG.warning(
-                        "Verification code already exists in navigation payload",
-                        final_navigation_payload=final_navigation_payload,
-                    )
-
             elif final_navigation_payload is None:
                 final_navigation_payload = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
-            else:
-                LOG.warning(
-                    "Didn't add verification code to navigation payload",
-                    final_navigation_payload=final_navigation_payload,
-                )
-            if expire_verification_code:
-                current_context.totp_codes.pop(task.task_id)
-
-        # Store TOTP secrets and provide placeholder TOTP for LLM to see format
-        # Only when on a TOTP page to avoid premature processing
-        if (
-            task.workflow_run_id
-            and step
-            and isinstance(final_navigation_payload, dict)
-            and self._should_process_totp(scraped_page)
-        ):
-            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
-
-            for key, value in list(final_navigation_payload.items()):
-                if isinstance(value, dict) and "totp" in value:
-                    totp_placeholder = value.get("totp")
-                    if totp_placeholder and isinstance(totp_placeholder, str):
-                        totp_secret_key = workflow_run_context.totp_secret_value_key(totp_placeholder)
-                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-
-                        if totp_secret:
-                            # Store TOTP secret for handler to use during execution
-                            current_context = skyvern_context.ensure_context()
-                            current_context.totp_codes[f"{task.task_id}_secret"] = totp_secret
-
-                            # Send a placeholder TOTP for the LLM to see the format
-                            final_navigation_payload[key]["totp"] = "123456"
-
+        if expire_verification_code:
+            current_context.pop_totp_code(task.task_id)
         return final_navigation_payload
 
     async def _get_action_results(
@@ -6954,6 +7152,10 @@ class ForgeAgent:
         """
         send the task response to the webhook callback url
         """
+        cleanup_context = skyvern_context.current()
+        if cleanup_context is not None:
+            cleanup_context.clear_multi_field_totp_state(task.task_id)
+
         # Task-terminal expiry for download-popup claims: clean_up_task runs exactly when a task
         # reaches a terminal state (and not on retries, where the same task's next step may still
         # credit the download). Take (and drop) the claims into a local now, so terminal expiry holds
@@ -6965,6 +7167,15 @@ class ForgeAgent:
         cleanup_download_popup_claims = (
             _claim_context.take_download_popup_claims(task.task_id) if _claim_context is not None else []
         )
+        if cleanup_download_popup_claims:
+            # These reach terminal cleanup only when the complete_on_download seam did not already pop
+            # them (e.g. a failed/terminated task); they close below iff cleanup finalization proves a
+            # durable credit, otherwise they expire here without a destructive close.
+            LOG.info(
+                "Download popup claims carried into terminal cleanup",
+                task_id=task.task_id,
+                claims_carried=len(cleanup_download_popup_claims),
+            )
         _cleanup_span = otel_trace.get_current_span()
         # task_id, workflow_run_id auto-attached by @traced from SkyvernContext.
         _cleanup_span.set_attribute("close_browser_on_completion", bool(close_browser_on_completion))
@@ -7155,7 +7366,6 @@ class ForgeAgent:
         # Last point common to every terminal path, and late enough that the screenshot and
         # download work above has already given the billed speculative call time to land.
         await drain_speculative_persist_tasks(skyvern_context.current())
-
         # if it's a task block from workflow run,
         # we don't need to close the browser, save browser artifacts, or call webhook
         if task.workflow_run_id:
@@ -8854,31 +9064,41 @@ class ForgeAgent:
         ):
             return json_response, []
 
-        # The first plan may already carry a runtime-consumable multi-field TOTP shape backed by the
-        # runtime secret stash. In that case the existing per-digit execution path resolves it, so the
-        # polling verification re-plan is redundant and would discard the first plan. Magic-link
-        # verification and payload OTP both outrank it and are resolved on their own paths, so the skip
-        # never runs ahead of them.
+        # The prompt has already selected the multi-field source and replaced its code with a decoy.
+        # A complete decoy plan can execute directly when that source is ready.
         runtime_context = skyvern_context.current()
         workflow_run_id = getattr(task, "workflow_run_id", None)
         workflow_run_context = None
         if workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
             workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-        # The {task_id}_secret stash is populated only from this task's navigation payload, which is
-        # built from the originating block's own parameters — so the multi-field skip below cannot
-        # carry an out-of-scope credential's secret (SKY-15181 provenance; single write site is
-        # _process_totp over final_navigation_payload).
-        multi_field_secret_ready = bool(runtime_context and runtime_context.totp_codes.get(f"{task.task_id}_secret"))
+        multi_field_attempt = runtime_context.multi_field_totp.get(task.task_id) if runtime_context else None
+        multi_field_source_ready = bool(
+            runtime_context
+            and multi_field_attempt is not None
+            and runtime_context.totp_codes.get(
+                f"{task.task_id}_secret"
+                if multi_field_attempt.code_source == "secret"
+                else f"{task.task_id}_totp_cache"
+            )
+        )
         first_plan_actions = json_response.get("actions")
         if (
             should_resolve_verification_code
             and not should_verify_by_magic_link
             and isinstance(first_plan_actions, list)
-            and _first_plan_carries_consumable_totp(first_plan_actions, multi_field_secret_ready)
-            and extract_totp_from_navigation_inputs(task.navigation_payload) is None
+            and multi_field_attempt is not None
+            and _first_plan_carries_consumable_totp(
+                first_plan_actions,
+                multi_field_source_ready,
+                multi_field_attempt,
+            )
+            and (
+                multi_field_attempt.code_source == "external"
+                or extract_totp_from_navigation_inputs(task.navigation_payload) is None
+            )
         ):
             LOG.info(
-                "Keeping first-pass credential TOTP plan; skipping verification re-plan",
+                "Keeping first-pass multi-field TOTP plan; skipping verification re-plan",
                 task_id=task.task_id,
             )
             return json_response, []
@@ -8991,7 +9211,25 @@ class ForgeAgent:
             return json_response
 
         current_context = skyvern_context.ensure_context()
-        current_context.totp_codes[task.task_id] = otp_value.value
+        if otp_value.from_credential_seed:
+            current_context.seed_generated_totp_values.setdefault(task.task_id, set()).add(otp_value.value)
+        elif task.task_id in current_context.seed_generated_totp_values:
+            current_context.seed_generated_totp_values[task.task_id].discard(otp_value.value)
+        attempt = current_context.multi_field_totp.get(task.task_id)
+        if attempt is not None:
+            code_source = "secret" if otp_value.from_credential_seed else "external"
+            if attempt.code_source != code_source or (
+                code_source == "external"
+                and current_context.totp_codes.get(f"{task.task_id}_totp_cache") != otp_value.value
+            ):
+                current_context.reset_attempt(task.task_id)
+            attempt.code_source = code_source
+            if code_source == "external":
+                current_context.totp_codes[f"{task.task_id}_totp_cache"] = otp_value.value
+                current_context.register_secret_value(otp_value.value)
+            current_context.totp_codes[task.task_id] = attempt.hint_code
+        else:
+            current_context.totp_codes[task.task_id] = otp_value.value
 
         build_result = await self._build_extract_action_prompt(
             task,

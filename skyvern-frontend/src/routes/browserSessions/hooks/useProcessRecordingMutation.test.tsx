@@ -110,4 +110,30 @@ describe("useProcessRecordingMutation telemetry", () => {
       },
     );
   });
+
+  it("sends the recording correlation ids used by live interpretation", async () => {
+    mocks.post.mockResolvedValue({ data: { blocks: [], parameters: [] } });
+    useRecordingStore.setState({
+      recordingAttemptId: "attempt-1",
+      interpretationSessionId: "interpretation-1",
+    });
+    const { result } = renderHook(
+      () =>
+        useProcessRecordingMutation({
+          browserSessionId: "pbs-1",
+        }),
+      { wrapper },
+    );
+
+    act(() => result.current.mutate({ draftSteps: [draftStep] }));
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.post).toHaveBeenCalledWith(
+      "/browser_sessions/pbs-1/process_recording",
+      expect.objectContaining({
+        recording_attempt_id: "attempt-1",
+        interpretation_session_id: "interpretation-1",
+      }),
+    );
+  });
 });

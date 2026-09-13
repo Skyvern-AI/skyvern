@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye import transient_page_observer
 from skyvern.webeye.transient_page_observer import (
     TRANSIENT_TEXT_BINDING_NAME,
+    TRANSIENT_TEXT_EVENT_LIMIT,
     TRANSIENT_TEXT_MATCH_CONFIDENCE,
     TRANSIENT_TEXT_MAX_LENGTH,
     TRANSIENT_TEXT_MIN_LENGTH,
@@ -34,6 +36,47 @@ class _FakePage:
 
 
 @pytest.mark.asyncio
+async def test_transient_text_observer_preserves_error_when_window_closes_itself(chromium_browser: Browser) -> None:
+    now = datetime.now(UTC)
+    task = make_task(
+        now,
+        make_organization(now),
+        error_code_mapping={"data_not_downloadable": "archive could not be generated"},
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+    context = await chromium_browser.new_context()
+    try:
+        opener = await context.new_page()
+        async with context.expect_page() as child_info:
+            await opener.evaluate("() => { window.open('about:blank'); }")
+        child = await child_info.value
+        await child.set_content('<div id="host"></div>')
+        observer = TransientPageTextObserver(child)
+        await observer.start(scan_initial_visible_state=False)
+        async with child.expect_event("close", timeout=10000):
+            await child.evaluate(
+                """
+                () => {
+                  setTimeout(() => {
+                    const toast = document.createElement('div');
+                    toast.setAttribute('role', 'alert');
+                    toast.textContent = 'The archive could not be generated';
+                    document.getElementById('host').appendChild(toast);
+                    setTimeout(() => window.close(), 800);
+                  }, 300);
+                }
+                """
+            )
+        assert child.is_closed()
+        assert [event["text"] for event in observer.events] == ["The archive could not be generated"]
+        errors = match_user_defined_errors_from_transient_text(task, step, observer.events)
+        assert [error.error_code for error in errors] == ["data_not_downloadable"]
+        await observer.stop()
+    finally:
+        await context.close()
+
+
+@pytest.mark.asyncio
 async def test_transient_text_observer_start_uses_skyvern_frame_evaluate() -> None:
     page = _FakePage()
     observer = TransientPageTextObserver(page)  # type: ignore[arg-type]
@@ -51,6 +94,7 @@ async def test_transient_text_observer_start_uses_skyvern_frame_evaluate() -> No
         "stateKey": TRANSIENT_TEXT_OBSERVER_STATE_KEY,
         "minLength": TRANSIENT_TEXT_MIN_LENGTH,
         "maxLength": TRANSIENT_TEXT_MAX_LENGTH,
+        "eventLimit": TRANSIENT_TEXT_EVENT_LIMIT,
         "scanInitialVisibleState": False,
     }
 
@@ -526,3 +570,169 @@ def test_match_user_defined_error_reasoning_includes_only_text_matching_selected
     assert [error.error_code for error in errors] == ["data_not_downloadable"]
     assert "generated archive could not be saved" in errors[0].reasoning
     assert "Unrelated status update" not in errors[0].reasoning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_scan", [False, True])
+async def test_transient_text_observer_bounds_batches_and_preserves_latest_history(
+    chromium_browser: Browser, monkeypatch: pytest.MonkeyPatch, initial_scan: bool
+) -> None:
+    page = await chromium_browser.new_page()
+    await page.set_content('<div id="host"></div>')
+    batch_sizes: list[int] = []
+    expose_binding = page.expose_binding
+
+    async def count_binding(name: str, callback: Callable[..., None]) -> None:
+        def record(source: dict[str, Any], payload: Any) -> None:
+            batch_sizes.append(len(payload) if isinstance(payload, list) else 1)
+            callback(source, payload)
+
+        await expose_binding(name, record)
+
+    monkeypatch.setattr(page, "expose_binding", count_binding)
+    observer = TransientPageTextObserver(page)
+    if not initial_scan:
+        await observer.start(scan_initial_visible_state=False)
+    await page.evaluate(
+        """
+        () => {
+          const host = document.getElementById('host');
+          for (let i = 0; i < 1000; i++) {
+            const node = document.createElement('div');
+            node.setAttribute('role', 'status');
+            node.textContent = 'Status row ' + i + ' visible content';
+            host.appendChild(node);
+            node.className = 'status';
+            node.style.opacity = '1';
+          }
+        }
+        """
+    )
+    if initial_scan:
+        await observer.start()
+    expected = [f"Status row {i} visible content" for i in range(900, 1000)]
+    async with asyncio.timeout(10):
+        while [event["text"] for event in observer.events] != expected:
+            await asyncio.sleep(0.01)
+    await observer.stop()
+    assert 0 < len(batch_sizes) < 40
+    assert max(batch_sizes) <= TRANSIENT_TEXT_EVENT_LIMIT
+    assert [event["text"] for event in observer.events] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reinstall", [False, True])
+async def test_transient_text_observer_preserves_repeats_after_history_eviction(
+    chromium_browser: Browser, reinstall: bool
+) -> None:
+    page = await chromium_browser.new_page()
+    await page.set_content('<div id="host"></div>')
+    observer = TransientPageTextObserver(page)
+    await observer.start(scan_initial_visible_state=False)
+    expected: list[dict[str, Any]] = []
+
+    async def capture(texts: list[str]) -> None:
+        for text in texts:
+            _append_text_event(expected, {"text": text})
+        await page.evaluate(
+            """
+            texts => {
+              for (const text of texts) {
+                const node = document.createElement('div');
+                node.textContent = text;
+                document.getElementById('host').appendChild(node);
+              }
+            }
+            """,
+            texts,
+        )
+        async with asyncio.timeout(5):
+            while [event["text"] for event in observer.events] != [event["text"] for event in expected]:
+                await asyncio.sleep(0.01)
+
+    initial = [f"Initial status number {i}" for i in range(100)]
+    await capture(initial)
+    if reinstall:
+        await observer.start()
+    # The first repeat is skipped by Python, then the intervening text evicts it.
+    await capture([initial[0], "Intervening status number 0", initial[0]])
+    await capture([f"Next status number {i}" for i in range(150)])
+    await capture([initial[0], initial[0], "Final status message"])
+    if reinstall:
+        await page.goto("about:blank")
+        await page.set_content('<div id="host"></div>')
+        await observer.start()
+        await capture([f"New document status {i}" for i in range(101)] + [initial[0]])
+    await observer.stop()
+    assert [event["text"] for event in observer.events] == [event["text"] for event in expected]
+    assert len(observer.events) == TRANSIENT_TEXT_EVENT_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_preserves_error_after_navigation(chromium_browser: Browser) -> None:
+    page = await chromium_browser.new_page()
+    await page.set_content("<button>Continue</button>")
+    observer = TransientPageTextObserver(page)
+    await observer.start(scan_initial_visible_state=False)
+    await page.evaluate(
+        """
+        () => {
+          document.querySelector('button').onclick = () => {
+            document.body.insertAdjacentHTML('beforeend', '<div role="alert">Archive could not be generated</div>');
+            setTimeout(() => { location.href = 'about:blank'; }, 100);
+          };
+        }
+        """
+    )
+    async with page.expect_navigation():
+        await page.get_by_role("button").click()
+    await observer.start()
+    await observer.stop()
+    assert [event["text"] for event in observer.events] == ["Archive could not be generated"]
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_failed_stop_does_not_replay_prior_history(chromium_browser: Browser) -> None:
+    page = await chromium_browser.new_page()
+    await page.set_content('<div id="host"></div>')
+    first = TransientPageTextObserver(page)
+    await first.start(scan_initial_visible_state=False)
+    await page.evaluate(
+        "() => document.getElementById('host').insertAdjacentHTML('beforeend', "
+        "'<div role=alert>Prior action error message</div>')"
+    )
+    await page.wait_for_timeout(100)
+    with patch(
+        "skyvern.webeye.transient_page_observer.SkyvernFrame.evaluate",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("synthetic disconnect failure"),
+    ):
+        await first.stop()
+    second = TransientPageTextObserver(page)
+    await second.start(scan_initial_visible_state=False)
+    await page.goto("about:blank")
+    await second.stop()
+    assert [event["text"] for event in first.events] == ["Prior action error message"]
+    assert second.events == []
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_successful_download_has_no_error_match(chromium_browser: Browser) -> None:
+    now = datetime.now(UTC)
+    task = make_task(
+        now,
+        make_organization(now),
+        error_code_mapping={"data_not_downloadable": "archive could not be generated"},
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+    page = await chromium_browser.new_page()
+    await page.set_content('<a download="report.txt" href="data:text/plain,completed">Download report</a>')
+    observer = TransientPageTextObserver(page)
+    await observer.start(scan_initial_visible_state=False)
+    async with page.expect_download() as download_info:
+        await page.get_by_role("link", name="Download report").click()
+    download = await download_info.value
+    assert await download.failure() is None
+    assert download.suggested_filename == "report.txt"
+    await observer.stop()
+    assert match_user_defined_errors_from_transient_text(task, step, observer.events) == []

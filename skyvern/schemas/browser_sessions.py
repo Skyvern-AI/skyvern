@@ -138,6 +138,14 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
             "at run time; recorded credentials stay unbound for those callers."
         ),
     )
+    recording_attempt_id: str | None = Field(
+        default=None,
+        description="Client-generated ID for the Record Browser attempt.",
+    )
+    interpretation_session_id: str | None = Field(
+        default=None,
+        description="Server-generated ID for the logical live-interpretation session.",
+    )
 
 
 class ProcessBrowserSessionRecordingResponse(BaseModel):

@@ -8,6 +8,7 @@ import structlog
 
 from skyvern.forge.sdk.browser_egress_policy import DestinationBlockedError, classify_url_async
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.webeye.utils.page import mask_otp_values_in_html
 
 LOG = structlog.get_logger()
 
@@ -220,7 +221,7 @@ class RunBrowserTransport:
             return FetchedPage(
                 url=url,
                 title=await page.title(),
-                html=await page.content(),
+                html=mask_otp_values_in_html(await page.content()),
                 http_status=response.status if response is not None else None,
             )
         except Exception as exc:

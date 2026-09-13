@@ -121,7 +121,7 @@ const tabScope = {{
     return operation({{
       isCurrent: () => true,
       assertCurrent() {{}},
-      allowUrlChange(expectedUrl = null) {{ allowedUrlChanges.push(expectedUrl); }},
+      allowUrlChange() {{ allowedUrlChanges.push("granted"); }},
       revokeUrlChange() {{ revokedUrlChangeCount += 1; }},
     }});
   }},
@@ -211,7 +211,7 @@ for (const [method, params] of [
     throw new Error(`${{method}} did not complete`);
   }}
 }}
-if (JSON.stringify(allowedUrlChanges) !== JSON.stringify(["https://example.test/next", null, null])) {{
+if (JSON.stringify(allowedUrlChanges) !== JSON.stringify(["granted", "granted", "granted"])) {{
   throw new Error(`URL-changing CDP methods granted the wrong URL bindings: ${{JSON.stringify(allowedUrlChanges)}}`);
 }}
 if (revokedUrlChangeCount !== 0) {{
@@ -491,7 +491,11 @@ const settleWithin = (promise, timeoutMs = 100) => Promise.race([
   delay(timeoutMs).then(() => {{ throw new Error("promise did not settle"); }}),
 ]);
 
-const scope = new TabScope({{ sendEvent: () => undefined, operationTimeoutMs: 20 }});
+const scopeEvents = [];
+const scope = new TabScope({{
+  sendEvent: (event, params) => scopeEvents.push({{ event, params }}),
+  operationTimeoutMs: 20,
+}});
 await scope.initialize();
 // tabs.list marks only the active tab in Chrome's last-focused window.
 tabs.set(18, {{ id: 18, windowId: 1, groupId: 700, url: "https://one.example", active: true }});
@@ -511,15 +515,108 @@ scope.scopedGroupIds.delete(19);
 tabs.delete(18);
 tabs.delete(19);
 
+// Popup admission must survive the initial URL event during its first persistence.
+tabs.set(40, {{ id: 40, windowId: 1, groupId: 700, url: "https://popup-opener.example" }});
+tabs.set(41, {{ id: 41, openerTabId: 40, windowId: 1, groupId: -1, url: "https://popup.example" }});
+scope.scopedTabIds.add(40);
+scope.scopedGroupIds.set(40, 700);
+let popupInitialPersistStarted = false;
+const originalSessionSet = chrome.storage.session.set;
+chrome.storage.session.set = async (values) => {{
+  if (!popupInitialPersistStarted && values.createdTabIds?.includes(41)) {{
+    popupInitialPersistStarted = true;
+    listeners.updated.forEach((listener) =>
+      listener(41, {{ url: "https://popup.example" }}),
+    );
+  }}
+  return originalSessionSet(values);
+}};
+const popupAdmission = scope.handleTabCreated(tabs.get(41)).then(
+  () => null,
+  (error) => error,
+);
+const popupAdmissionOutcome = await settleWithin(popupAdmission);
+chrome.storage.session.set = originalSessionSet;
+const popupCreatedEvents = scopeEvents.filter(
+  (entry) => entry.event === "tabs.created" && entry.params?.tabId === 41,
+);
+if (
+  !popupInitialPersistStarted ||
+  popupAdmissionOutcome !== null ||
+  popupCreatedEvents.length !== 1 ||
+  !scope.scopedTabIds.has(41) ||
+  !scope.createdTabIds.has(41) ||
+  !tabs.has(41)
+) {{
+  throw new Error(`popup admission failed: ${{JSON.stringify({{
+    persisted: popupInitialPersistStarted,
+    outcome: popupAdmissionOutcome?.code ?? popupAdmissionOutcome,
+    createdEvents: popupCreatedEvents,
+    scoped: scope.scopedTabIds.has(41),
+    owned: scope.createdTabIds.has(41),
+    open: tabs.has(41),
+  }})}}`);
+}}
+scope.scopedTabIds.delete(40);
+scope.scopedGroupIds.delete(40);
+scope.scopedTabIds.delete(41);
+scope.scopedGroupIds.delete(41);
+scope.createdTabIds.delete(41);
+await scope.persistScope();
+tabs.delete(40);
+tabs.delete(41);
 
-// A navigation command may cause its own URL event without cancelling itself.
+// A persistence failure during popup admission must close and unown the popup.
+tabs.set(42, {{ id: 42, windowId: 1, groupId: 700, url: "https://popup-failure-opener.example" }});
+tabs.set(43, {{ id: 43, openerTabId: 42, windowId: 1, groupId: -1, url: "https://popup-failure.example" }});
+scope.scopedTabIds.add(42);
+scope.scopedGroupIds.set(42, 700);
+let forcedPopupPersistenceFailure = false;
+chrome.storage.session.set = async (values) => {{
+  if (!forcedPopupPersistenceFailure && values.createdTabIds?.includes(43)) {{
+    forcedPopupPersistenceFailure = true;
+    listeners.updated.forEach((listener) =>
+      listener(43, {{ url: "https://popup-failure.example" }}),
+    );
+    throw new Error("forced popup persistence failure");
+  }}
+  return originalSessionSet(values);
+}};
+const failedPopupAdmission = scope.handleTabCreated(tabs.get(43)).then(
+  () => null,
+  (error) => error,
+);
+const failedPopupOutcome = await settleWithin(failedPopupAdmission);
+chrome.storage.session.set = originalSessionSet;
+await waitUntil(() => !scope.tabOperationLeases.has(43));
+if (
+  !forcedPopupPersistenceFailure ||
+  failedPopupOutcome?.message !== "forced popup persistence failure" ||
+  scope.scopedTabIds.has(43) ||
+  scope.createdTabIds.has(43) ||
+  tabs.has(43)
+) {{
+  throw new Error(`failed popup was not cleaned up: ${{JSON.stringify({{
+    forced: forcedPopupPersistenceFailure,
+    outcome: failedPopupOutcome?.message,
+    scoped: scope.scopedTabIds.has(43),
+    owned: scope.createdTabIds.has(43),
+    open: tabs.has(43),
+  }})}}`);
+}}
+scope.scopedTabIds.delete(42);
+scope.scopedGroupIds.delete(42);
+tabs.delete(42);
+
+
+// A commanded navigation may receive any non-restricted URL without cancelling itself.
 tabs.set(23, {{ id: 23, windowId: 2, groupId: 700, url: "https://before.example" }});
 scope.scopedTabIds.add(23);
 scope.scopedGroupIds.set(23, 700);
 let expectedNavigationStarted = false;
 let releaseExpectedNavigation;
 const expectedNavigation = scope.runTabOperation(23, async (lease) => {{
-  lease.allowUrlChange("https://after.example");
+  lease.allowUrlChange();
   expectedNavigationStarted = true;
   await new Promise((resolve) => {{ releaseExpectedNavigation = resolve; }});
   lease.assertCurrent();
@@ -530,9 +627,16 @@ tabs.get(23).url = "https://after.example";
 listeners.updated.forEach((listener) =>
   listener(23, {{ url: "https://after.example" }}),
 );
+tabs.get(23).url = "https://redirected.example";
+listeners.updated.forEach((listener) =>
+  listener(23, {{ url: "https://redirected.example" }}),
+);
 releaseExpectedNavigation();
 if ((await settleWithin(expectedNavigation)) !== "navigated") {{
-  throw new Error("expected navigation URL change cancelled its own operation");
+  throw new Error("redirected navigation URL change cancelled its own operation");
+}}
+if (tabs.get(23).url !== "https://redirected.example") {{
+  throw new Error("redirected navigation did not retain its final URL");
 }}
 await waitUntil(() => !scope.tabOperations.has(23));
 scope.scopedTabIds.delete(23);
@@ -608,14 +712,14 @@ await waitUntil(() => !scope.scopedTabIds.has(26));
 tabs.delete(26);
 
 
-// A URL-change grant is consumed by one URL event; a replay must cancel, not survive.
+// A URL-change grant remains valid for repeated URL events while navigation is in flight.
 tabs.set(27, {{ id: 27, windowId: 2, groupId: 700, url: "https://before.example" }});
 scope.scopedTabIds.add(27);
 scope.scopedGroupIds.set(27, 700);
 let consumedNavigationStarted = false;
 let releaseConsumedNavigation;
 const consumedNavigation = scope.runTabOperation(27, async (lease) => {{
-  lease.allowUrlChange("https://after.example");
+  lease.allowUrlChange();
   consumedNavigationStarted = true;
   await new Promise((resolve) => {{ releaseConsumedNavigation = resolve; }});
   lease.assertCurrent();
@@ -631,25 +735,42 @@ listeners.updated.forEach((listener) =>
 );
 releaseConsumedNavigation();
 const consumedNavigationOutcome = await settleWithin(consumedNavigation);
-if (consumedNavigationOutcome === "survived") {{
-  throw new Error("URL-change grant survived a second URL event instead of being consumed");
+if (consumedNavigationOutcome !== "survived") {{
+  throw new Error(`repeated URL event cancelled navigation: ${{consumedNavigationOutcome?.code}}`);
 }}
-if (consumedNavigationOutcome?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
-  throw new Error(`consumed grant replay was not structured: ${{consumedNavigationOutcome?.code}}`);
+await waitUntil(() => !scope.tabOperations.has(27));
+// After the operation ends, an idle URL event has nothing to cancel.
+listeners.updated.forEach((listener) =>
+  listener(27, {{ url: "https://after.example" }}),
+);
+await waitUntil(() => !scope.tabOperations.has(27));
+// The grant is gone, so the same event cancels a new non-navigation operation.
+let postNavigationOperationStarted = false;
+const postNavigationOperation = scope.runTabOperation(27, async () => {{
+  postNavigationOperationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => postNavigationOperationStarted);
+listeners.updated.forEach((listener) =>
+  listener(27, {{ url: "https://after.example" }}),
+);
+const postNavigationError = await settleWithin(postNavigationOperation);
+if (postNavigationError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`post-operation URL event did not cancel: ${{postNavigationError?.code}}`);
 }}
 await waitUntil(() => !scope.tabOperations.has(27));
 scope.scopedTabIds.delete(27);
 scope.scopedGroupIds.delete(27);
 tabs.delete(27);
 
-// A grant bound to one URL must not spare a navigation to a different URL.
+// A URL-change grant accepts a different non-restricted navigation URL.
 tabs.set(28, {{ id: 28, windowId: 2, groupId: 700, url: "https://before.example" }});
 scope.scopedTabIds.add(28);
 scope.scopedGroupIds.set(28, 700);
 let mismatchedNavigationStarted = false;
 let releaseMismatchedNavigation;
 const mismatchedNavigation = scope.runTabOperation(28, async (lease) => {{
-  lease.allowUrlChange("https://intended.example");
+  lease.allowUrlChange();
   mismatchedNavigationStarted = true;
   await new Promise((resolve) => {{ releaseMismatchedNavigation = resolve; }});
   lease.assertCurrent();
@@ -662,11 +783,8 @@ listeners.updated.forEach((listener) =>
 );
 releaseMismatchedNavigation();
 const mismatchedNavigationOutcome = await settleWithin(mismatchedNavigation);
-if (mismatchedNavigationOutcome === "survived") {{
-  throw new Error("URL-change grant spared a navigation it was not bound to");
-}}
-if (mismatchedNavigationOutcome?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
-  throw new Error(`mismatched URL change was not structured: ${{mismatchedNavigationOutcome?.code}}`);
+if (mismatchedNavigationOutcome !== "survived") {{
+  throw new Error(`different non-restricted URL cancelled navigation: ${{mismatchedNavigationOutcome?.code}}`);
 }}
 await waitUntil(() => !scope.tabOperations.has(28));
 scope.scopedTabIds.delete(28);
@@ -701,6 +819,202 @@ if (interruptedCreateError?.code !== ERROR_CODES.TAB_NOT_FOUND) {{
 releaseAddToScope();
 scope.addToScopeLocked = originalAddToScopeLocked;
 await waitUntil(() => !scope.tabOperationLeases.has(22));
+
+const prepareCreate = async (tabId, url = "about:blank") => {{
+  createTab = undefined;
+  const createOutcome = scope.create(url === "about:blank" ? {{}} : {{ url }}).then(
+    () => null,
+    (error) => error,
+  );
+  await waitUntil(() => typeof createTab === "function");
+  const createdTab = {{ id: tabId, windowId: 2, groupId: -1, url }};
+  tabs.set(tabId, createdTab);
+  createTab({{ ...createdTab }});
+  return {{ outcome: createOutcome }};
+}};
+
+// A redirect before tabs.create resolves is accepted by the publication re-read.
+createTab = undefined;
+const earlyRedirectCreate = scope.create({{ url: "https://created-early.example" }}).then(
+  () => null,
+  (error) => error,
+);
+await waitUntil(() => typeof createTab === "function");
+const earlyRedirectTab = {{
+  id: 39,
+  windowId: 2,
+  groupId: -1,
+  url: "https://created-early.example",
+}};
+tabs.set(39, earlyRedirectTab);
+tabs.get(39).url = "https://created-early-redirected.example";
+listeners.updated.forEach((listener) =>
+  listener(39, {{ url: "https://created-early-redirected.example" }}),
+);
+createTab({{ ...earlyRedirectTab }});
+const earlyRedirectCreateOutcome = await settleWithin(earlyRedirectCreate);
+const earlyRedirectCreateEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 39,
+);
+if (
+  earlyRedirectCreateOutcome !== null ||
+  earlyRedirectCreateEvents.length !== 1 ||
+  earlyRedirectCreateEvents[0].params.origin !== "created" ||
+  earlyRedirectCreateEvents[0].params.url !==
+    "https://created-early-redirected.example"
+) {{
+  throw new Error(`early redirect create was not published: ${{JSON.stringify({{
+    outcome: earlyRedirectCreateOutcome?.code ?? earlyRedirectCreateOutcome,
+    events: earlyRedirectCreateEvents,
+  }})}}`);
+}}
+tabs.delete(39);
+listeners.removed.forEach((listener) => listener(39));
+await waitUntil(() => !scope.scopedTabIds.has(39) && !scope.createdTabIds.has(39));
+
+// A created tab may redirect after the requested URL event and before publication.
+const originalTabsGetForRedirect = chrome.tabs.get;
+let redirectEventsSent = false;
+chrome.tabs.get = async (tabId) => {{
+  await originalTabsGetForRedirect(tabId);
+  if (tabId === 30 && !redirectEventsSent) {{
+    redirectEventsSent = true;
+    tabs.get(30).url = "https://created.example";
+    listeners.updated.forEach((listener) =>
+      listener(30, {{ url: "https://created.example" }}),
+    );
+    tabs.get(30).url = "https://created-redirected.example";
+    listeners.updated.forEach((listener) =>
+      listener(30, {{ url: "https://created-redirected.example" }}),
+    );
+  }}
+  return {{ ...tabs.get(tabId) }};
+}};
+const {{ outcome: matchingCreate }} = await prepareCreate(30, "https://created.example");
+const matchingCreateOutcome = await settleWithin(matchingCreate);
+chrome.tabs.get = originalTabsGetForRedirect;
+const matchingCreateEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 30,
+);
+if (
+  matchingCreateOutcome !== null ||
+  matchingCreateEvents.length !== 1 ||
+  matchingCreateEvents[0].params.origin !== "created" ||
+  matchingCreateEvents[0].params.url !== "https://created-redirected.example"
+) {{
+  throw new Error(`redirected create was not published as the final URL: ${{JSON.stringify({{
+    outcome: matchingCreateOutcome?.code ?? matchingCreateOutcome,
+    events: matchingCreateEvents,
+  }})}}`);
+}}
+
+// A created tab whose only URL event is a non-restricted redirect publishes the redirect.
+let committedCreateEventSent = false;
+chrome.tabs.get = async (tabId) => {{
+  const tab = await originalTabsGetForRedirect(tabId);
+  if (tabId === 31 && !committedCreateEventSent) {{
+    committedCreateEventSent = true;
+    tabs.get(31).url = "https://created-redirected.example";
+    listeners.updated.forEach((listener) =>
+      listener(31, {{ url: "https://created-redirected.example" }}),
+    );
+    return {{ ...tabs.get(tabId) }};
+  }}
+  return tab;
+}};
+const {{ outcome: committedCreate }} = await prepareCreate(31, "https://created-requested.example");
+const committedCreateOutcome = await settleWithin(committedCreate);
+chrome.tabs.get = originalTabsGetForRedirect;
+const committedCreateEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 31,
+);
+if (
+  committedCreateOutcome !== null ||
+  committedCreateEvents.length !== 1 ||
+  committedCreateEvents[0].params.origin !== "created" ||
+  committedCreateEvents[0].params.url !== "https://created-redirected.example"
+) {{
+  throw new Error(`committed redirect create was not published as the final URL: ${{JSON.stringify({{
+    outcome: committedCreateOutcome?.code ?? committedCreateOutcome,
+    events: committedCreateEvents,
+  }})}}`);
+}}
+
+// A restricted URL observed by the pre-publication re-read fails closed.
+const {{ outcome: restrictedCreate }} = await prepareCreate(32, "https://created-restricted.example");
+tabs.get(32).url = "chrome://settings";
+const restrictedCreateError = await settleWithin(restrictedCreate);
+if (
+  restrictedCreateError?.code !== ERROR_CODES.RESTRICTED_URL ||
+  tabs.has(32)
+) {{
+  throw new Error(`restricted create did not fail closed: ${{restrictedCreateError?.code}}`);
+}}
+
+// The creation grant is revoked at operation end and cannot spare a later URL event.
+let replayOperationStarted = false;
+const replayOperation = scope.runTabOperation(30, async () => {{
+  replayOperationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => replayOperationStarted);
+listeners.updated.forEach((listener) =>
+  listener(30, {{ url: "https://created-redirected.example" }}),
+);
+const replayError = await settleWithin(replayOperation);
+if (replayError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`creation URL grant survived publication: ${{replayError?.code}}`);
+}}
+
+// Page.navigate remains available after publication and consumes its own grant.
+const creationRouter = new DebuggerRouter({{
+  tabScope: scope,
+  sendEvent: () => undefined,
+  onAttachedChange: () => undefined,
+  commandTimeoutMs: 5,
+  recoveryTimeoutMs: 5,
+  operationDeadlineMarginMs: 1,
+}});
+creationRouter.attachedTabs.add(30);
+creationRouter.attachStates.set(30, {{ status: "attached" }});
+chrome.debugger.sendCommand = async (target, method, params) => {{
+  if (method === "Page.navigate") {{
+    tabs.get(target.tabId).url = params.url;
+    listeners.updated.forEach((listener) => listener(target.tabId, {{ url: params.url }}));
+  }}
+  return {{ method }};
+}};
+const pageNavigateResult = await creationRouter.send({{
+  tabId: 30,
+  method: "Page.navigate",
+  params: {{ url: "https://created-next.example" }},
+}});
+if (pageNavigateResult.result.method !== "Page.navigate") {{
+  throw new Error("Page.navigate did not work after explicit-URL create");
+}}
+
+// Omitting url uses about:blank, which is an allowed creation URL.
+const {{ outcome: blankCreate }} = await prepareCreate(33);
+const blankCreateOutcome = await settleWithin(blankCreate);
+const blankCreateEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 33,
+);
+if (
+  blankCreateOutcome !== null ||
+  blankCreateEvents.length !== 1 ||
+  blankCreateEvents[0].params.origin !== "created" ||
+  blankCreateEvents[0].params.url !== "about:blank"
+) {{
+  throw new Error(`about:blank create failed: ${{JSON.stringify({{
+    outcome: blankCreateOutcome?.code ?? blankCreateOutcome,
+    events: blankCreateEvents,
+  }})}}`);
+}}
+tabs.delete(30);
+listeners.removed.forEach((listener) => listener(30));
+tabs.delete(33);
+listeners.removed.forEach((listener) => listener(33));
+await waitUntil(() => !scope.scopedTabIds.has(30) && !scope.scopedTabIds.has(33));
 
 // User revocation must invalidate an active operation before the queued update handler runs.
 tabs.set(20, {{ id: 20, windowId: 1, groupId: 700, url: "https://revoked.example" }});
@@ -889,15 +1203,232 @@ for (const tabId of [11, 12, 21]) {{
   scope.scopedTabIds.add(tabId);
   scope.scopedGroupIds.set(tabId, 700);
 }}
+const routerEvents = [];
 const router = new DebuggerRouter({{
   tabScope: scope,
-  sendEvent: () => undefined,
+  sendEvent: (event, params) => routerEvents.push({{ event, params }}),
   onAttachedChange: () => undefined,
   attachTimeoutMs: 5,
   commandTimeoutMs: 5,
   recoveryTimeoutMs: 5,
   operationDeadlineMarginMs: 1,
 }});
+
+scope.setDebuggerRouter(router);
+chrome.debugger.detach = async ({{ tabId }}) => {{
+  debuggerAttached.delete(tabId);
+}};
+const markAttached = (tabId, url) => {{
+  tabs.set(tabId, {{ id: tabId, windowId: 1, groupId: 700, url }});
+  scope.scopedTabIds.add(tabId);
+  scope.scopedGroupIds.set(tabId, 700);
+  router.attachedTabs.add(tabId);
+  router.attachStates.set(tabId, {{ status: "attached" }});
+  debuggerAttached.add(tabId);
+}};
+
+// Page.navigate accepts its only non-restricted committed URL event.
+markAttached(34, "https://before.example");
+let releaseRedirectNavigation;
+let redirectNavigationStarted = false;
+chrome.debugger.sendCommand = async (target, method, params) => {{
+  if (target.tabId === 34 && method === "Page.navigate") {{
+    redirectNavigationStarted = true;
+    tabs.get(34).url = "https://redirected.example";
+    listeners.updated.forEach((listener) =>
+      listener(34, {{ url: "https://redirected.example" }}),
+    );
+    await new Promise((resolve) => {{ releaseRedirectNavigation = resolve; }});
+  }}
+  return {{ method }};
+}};
+const redirectNavigation = router.send({{
+  tabId: 34,
+  method: "Page.navigate",
+  params: {{ url: "https://requested.example" }},
+}}).then((value) => value, (error) => error);
+await waitUntil(() => redirectNavigationStarted);
+releaseRedirectNavigation();
+const redirectNavigationOutcome = await settleWithin(redirectNavigation);
+if (
+  redirectNavigationOutcome?.result?.method !== "Page.navigate" ||
+  !router.attachedTabs.has(34) ||
+  !debuggerAttached.has(34) ||
+  !scope.scopedTabIds.has(34) ||
+  tabs.get(34)?.url !== "https://redirected.example"
+) {{
+  throw new Error(`redirected navigation failed: ${{JSON.stringify({{
+    outcome: redirectNavigationOutcome?.code ?? redirectNavigationOutcome,
+    attached: router.attachedTabs.has(34),
+    debuggerAttached: debuggerAttached.has(34),
+    scoped: scope.scopedTabIds.has(34),
+    url: tabs.get(34)?.url,
+  }})}}`);
+}}
+const tab34DetachEvents = routerEvents.filter(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 34,
+);
+const tab34RemovedEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabRemoved" && entry.params.tabId === 34,
+);
+if (
+  tab34DetachEvents.length !== 0 ||
+  tab34RemovedEvents.length !== 0 ||
+  router.attachStates.get(34)?.status === "quarantined"
+) {{
+  throw new Error(`accepted navigation generated cleanup events: ${{JSON.stringify({{
+    detach: tab34DetachEvents,
+    removed: tab34RemovedEvents,
+    state: router.attachStates.get(34),
+  }})}}`);
+}}
+
+// Reload and history navigation accept a different non-restricted committed URL.
+markAttached(36, "https://reload-before.example");
+chrome.debugger.sendCommand = async (target, method) => {{
+  if (target.tabId === 36 && method === "Page.reload") {{
+    tabs.get(36).url = "https://reload-after.example";
+    listeners.updated.forEach((listener) =>
+      listener(36, {{ url: "https://reload-after.example" }}),
+    );
+  }} else if (target.tabId === 36 && method === "Page.navigateToHistoryEntry") {{
+    tabs.get(36).url = "https://history-after.example";
+    listeners.updated.forEach((listener) =>
+      listener(36, {{ url: "https://history-after.example" }}),
+    );
+  }}
+  return {{ method }};
+}};
+for (const [method, params, expectedUrl] of [
+  ["Page.reload", {{}}, "https://reload-after.example"],
+  ["Page.navigateToHistoryEntry", {{ entryId: 1 }}, "https://history-after.example"],
+]) {{
+  const navigation = await router.send({{ tabId: 36, method, params }});
+  if (
+    navigation.result.method !== method ||
+    tabs.get(36)?.url !== expectedUrl ||
+    !router.attachedTabs.has(36) ||
+    !debuggerAttached.has(36) ||
+    !scope.scopedTabIds.has(36)
+  ) {{
+    throw new Error(`${{method}} did not accept its committed URL: ${{JSON.stringify({{
+      navigation,
+      url: tabs.get(36)?.url,
+      attached: router.attachedTabs.has(36),
+      debuggerAttached: debuggerAttached.has(36),
+      scoped: scope.scopedTabIds.has(36),
+    }})}}`);
+  }}
+}}
+tabs.delete(36);
+scope.scopedTabIds.delete(36);
+scope.scopedGroupIds.delete(36);
+router.attachedTabs.delete(36);
+router.attachStates.delete(36);
+debuggerAttached.delete(36);
+
+// A restricted committed URL cancels with RESTRICTED_URL and detaches the debugger.
+markAttached(35, "https://before.example");
+chrome.debugger.sendCommand = async (target, method, params) => {{
+  if (target.tabId === 35 && method === "Page.navigate") {{
+    tabs.get(35).url = "chrome://settings";
+    listeners.updated.forEach((listener) =>
+      listener(35, {{ url: "chrome://settings" }}),
+    );
+  }}
+  return {{ method }};
+}};
+const restrictedRedirect = router.send({{
+  tabId: 35,
+  method: "Page.navigate",
+  params: {{ url: "https://requested.example" }},
+}}).then((value) => value, (error) => error);
+const restrictedRedirectOutcome = await settleWithin(restrictedRedirect);
+await waitUntil(() => !scope.scopedTabIds.has(35) && !router.attachedTabs.has(35));
+if (
+  restrictedRedirectOutcome?.code !== ERROR_CODES.RESTRICTED_URL ||
+  router.attachedTabs.has(35) ||
+  debuggerAttached.has(35)
+) {{
+  throw new Error(`restricted redirect did not detach: ${{restrictedRedirectOutcome?.code}}`);
+}}
+const restrictedDetachEvents = routerEvents.filter(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 35,
+);
+const restrictedRemovedEvents = scopeEvents.filter(
+  (entry) => entry.event === "scope.tabRemoved" && entry.params.tabId === 35,
+);
+if (
+  restrictedDetachEvents.length !== 1 ||
+  restrictedDetachEvents[0].params.reason !== "controllability_lost" ||
+  restrictedRemovedEvents.length !== 1
+) {{
+  throw new Error(`restricted navigation cleanup was wrong: ${{JSON.stringify({{
+    detach: restrictedDetachEvents,
+    removed: restrictedRemovedEvents,
+  }})}}`);
+}}
+tabs.delete(35);
+
+// A non-navigation operation is cancelled by a URL event, but cancellation does not detach the debugger.
+markAttached(37, "https://before.example");
+let nonNavigationStarted = false;
+chrome.debugger.sendCommand = (target, method, params) => {{
+  if (
+    target.tabId === 37 &&
+    method === "Runtime.evaluate" &&
+    params.expression === "cancel-me"
+  ) {{
+    nonNavigationStarted = true;
+    return new Promise(() => undefined);
+  }}
+  return Promise.resolve({{ method }});
+}};
+const nonNavigation = router.send({{
+  tabId: 37,
+  method: "Runtime.evaluate",
+  params: {{ expression: "cancel-me" }},
+}}).then((value) => value, (error) => error);
+await waitUntil(() => nonNavigationStarted);
+tabs.get(37).url = "https://changed.example";
+listeners.updated.forEach((listener) =>
+  listener(37, {{ url: "https://changed.example" }}),
+);
+const nonNavigationOutcome = await settleWithin(nonNavigation);
+if (
+  nonNavigationOutcome?.code !== ERROR_CODES.COMMAND_TIMEOUT ||
+  !router.attachedTabs.has(37) ||
+  !scope.scopedTabIds.has(37) ||
+  router.attachStates.get(37)?.status !== "attached"
+) {{
+  throw new Error(`non-navigation cancellation detached or failed: ${{nonNavigationOutcome?.code}}`);
+}}
+if (
+  routerEvents.some((entry) =>
+    entry.event === "debugger.detached" && entry.params.tabId === 37
+  ) ||
+  scopeEvents.some((entry) =>
+    entry.event === "scope.tabRemoved" && entry.params.tabId === 37
+  ) ||
+  router.attachStates.get(37)?.status === "quarantined"
+) {{
+  throw new Error("non-navigation lease cancellation recovered or removed the tab");
+}}
+await waitUntil(() => !scope.tabOperations.has(37));
+const afterCancellation = await router.send({{
+  tabId: 37,
+  method: "Runtime.evaluate",
+  params: {{ expression: "2+2" }},
+}});
+if (afterCancellation.result.method !== "Runtime.evaluate") {{
+  throw new Error("next command did not succeed after lease cancellation");
+}}
+tabs.delete(34);
+tabs.delete(37);
+scope.scopedTabIds.delete(34);
+scope.scopedGroupIds.delete(34);
+scope.scopedTabIds.delete(37);
+scope.scopedGroupIds.delete(37);
 
 // Queued callers share the failed attach state. A late successful attach is
 // quarantined and detached before a later caller can retry.
@@ -934,6 +1465,30 @@ resolveLateAttach();
 await waitUntil(() => detachEvents.includes(11) && !router.attachStates.has(11));
 if (debuggerAttached.has(11) || router.attachedTabs.has(11)) {{
   throw new Error("late attach left a zombie debugger session");
+}}
+
+// Browser-originated detach is the only source of its Chrome reason, and a
+// later internal cleanup must not notify the bridge a second time.
+markAttached(38, "https://browser-detach.example");
+listeners.debuggerDetach.forEach((listener) => listener({{ tabId: 38 }}, "canceled_by_user"));
+await waitUntil(() => routerEvents.some(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 38,
+));
+await router.detachIfAttached(38);
+const browserDetachEvents = routerEvents.filter(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 38,
+);
+if (
+  browserDetachEvents.length !== 1 ||
+  browserDetachEvents[0].params.reason !== "canceled_by_user"
+) {{
+  throw new Error(`browser detach notification was duplicated or changed: ${{JSON.stringify(browserDetachEvents)}}`);
+}}
+router.clearDetachedState(39, null, "reset");
+if (routerEvents.some(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 39,
+)) {{
+  throw new Error("clearing an unattached tab emitted a detach notification");
 }}
 
 // A detach callback that arrives after the timeout must reconcile local state.
@@ -1030,6 +1585,15 @@ if (
     order.indexOf("detach-start") < order.indexOf("response"))
 ) {{
   throw new Error(`recovery escaped the tab queue or outer deadline: ${{JSON.stringify(order)}}`);
+}}
+const quarantineDetachEvents = routerEvents.filter(
+  (entry) => entry.event === "debugger.detached" && entry.params.tabId === 21,
+);
+if (
+  quarantineDetachEvents.length !== 1 ||
+  quarantineDetachEvents[0].params.reason !== "quarantined"
+) {{
+  throw new Error(`quarantine notification was wrong: ${{JSON.stringify(quarantineDetachEvents)}}`);
 }}
 resolveRecoveryDetach();
 await settleWithin(queuedOperation);

@@ -690,3 +690,29 @@ async def stop_display_recorders_for_owner(owner_id: str) -> int:
     if cancelled:
         raise asyncio.CancelledError()
     return released
+
+
+async def release_all_display_recorders() -> int:
+    """Release EVERY whole-display recorder in this process, **including reserved ones**.
+
+    Call ONLY from the single-activity (``BROWSER_WORKER_MAX_CONCURRENT_ACTIVITIES==1``) run-teardown boundary,
+    AFTER that boundary has killed this run's browsers. Under concurrency==1 the just-finished run is the sole
+    display owner, so once its browser is gone the retained fence (flock + registry) is safe to free — freeing it
+    here lets the next sequential run acquire the display instead of being starved until worker-process death
+    (SKY-15807). ``_reserved`` is intentionally NOT skipped (unlike the in-run ``stop_display_recorders_for_owner``
+    sweep, whose skip guards a browser that may still be live). Idempotent and cancellation-safe: it delegates to
+    ``release_display_recorder`` (serialized terminal stop, then flock close + registry drop), and finishes the
+    sweep before re-raising any cancellation so no entry is orphaned."""
+    released = 0
+    cancelled = False
+    for _key, recorder in list(_REGISTRY.items()):
+        try:
+            await release_display_recorder(recorder)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            LOG.warning("Failed to release whole-display recorder at run-teardown boundary", exc_info=True)
+        released += 1
+    if cancelled:
+        raise asyncio.CancelledError()
+    return released

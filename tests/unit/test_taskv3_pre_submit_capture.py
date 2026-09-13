@@ -120,7 +120,7 @@ async def _browser_page(html: str) -> Any:
     from playwright.async_api import async_playwright
 
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True)
+    browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
     page = await browser.new_page()
     await page.set_content(html)
     return pw, browser, page
@@ -584,7 +584,12 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     """The invariant behind every "capture touches the page" finding: one full capture (DOM + the
     production screenshot) right before the submit click leaves transitions, constructors,
     mutations, loads, requests and node count exactly where they were."""
+    from bs4 import BeautifulSoup
+
+    from skyvern.forge import agent
+    from skyvern.forge.sdk.copilot.composition_browser_expressions import COMPOSITION_STRIPPED_HTML_EXPRESSION
     from skyvern.forge.taskv3.pre_submit_capture import pre_submit_screenshot
+    from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
     pw, browser, page = await _browser_page("<html></html>")
     requests: list[str] = []
@@ -596,6 +601,16 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     try:
         await page.route("http://synthetic.invalid/**", _route)
         await page.set_content(_side_effect_fixture())
+        await page.evaluate("""() => {
+            const form = document.createElement('form'); form.id = 'otp';
+            for (const value of ['6','5','4','3','2','1']) {
+                const input = document.createElement('input');
+                input.setAttribute('data-skyvern-otp-box', '1');
+                for (const name of ['value','aria-valuenow','aria-valuetext','data-value','defaultvalue','placeholder']) input.setAttribute(name, value);
+                form.appendChild(input);
+            }
+            document.body.appendChild(form);
+        }""")
         await page.fill("#a", "typed-live")
         await page.wait_for_function("() => window.__imgLoad + window.__imgError > 0")
         await page.wait_for_function("() => document.getElementById('mover').classList.contains('go')")
@@ -611,6 +626,16 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
         async def _provider() -> Any:
             return page
 
+        safe_html = await page.evaluate("() => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(document.body);}")
+        stripped_html = await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
+        await page.evaluate(agent._PAGE_FINGERPRINT_PROBE_JS)
+        for html in (safe_html, stripped_html):
+            boxes = BeautifulSoup(html, "html.parser").select("#otp input")
+            assert len(boxes) == 6
+            for box in boxes:
+                for name in ("value", "aria-valuenow", "aria-valuetext", "data-value", "defaultvalue", "placeholder"):
+                    assert box[name] == "*"
+        assert (await page.evaluate(_COUNTERS_JS))["ctor"] == before["ctor"]
         ring = PreSubmitCaptureRing(_provider, pre_submit_screenshot)
         await ring.capture("click", {"selector": "#submit"})
         await page.wait_for_timeout(100)
@@ -624,6 +649,30 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
         assert after["imgLoad"] == before["imgLoad"] and after["imgError"] == before["imgError"]
         assert after["nodes"] == before["nodes"]
         assert requests == baseline_requests, "capture caused a network request"
+        for mismatch in ("count", "tags"):
+            checked = await page.evaluate(
+                "(mismatch) => {"
+                + OTP_INPUT_PRIVACY_JS
+                + """
+                const inert = document.implementation.createHTMLDocument('');
+                const copy = inert.importNode(document.body, true);
+                if (mismatch === 'count') {
+                    const extra = inert.createElement('input');
+                    extra.setAttribute('value', '8'); extra.setAttribute('placeholder', '8');
+                    copy.prepend(extra);
+                } else {
+                    const replacement = inert.createElement('section');
+                    copy.querySelector('#mover').replaceWith(replacement);
+                }
+                return {aligned: otpMaskHtmlCopy(document.body, copy), html: copy.outerHTML};
+            }""",
+                mismatch,
+            )
+            assert checked["aligned"] is False
+            for box in BeautifulSoup(checked["html"], "html.parser").select("input"):
+                for name in ("value", "aria-valuenow", "aria-valuetext", "data-value", "defaultvalue", "placeholder"):
+                    if box.get(name):
+                        assert set(box[name]) == {"*"}
         assert after["x"] != "matrix(1, 0, 0, 1, 500, 0)", "transition was jumped to its end state"
     finally:
         await browser.close()

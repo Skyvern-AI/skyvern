@@ -7342,3 +7342,52 @@ def test_direct_test_handoff_keeps_same_origin_pages_apart_but_still_drops_a_que
 
     assert reduced.observed_block_end_urls == {"run_search": "https://fixture.test/results"}
     assert "abc123" not in json.dumps(reduced.model_dump(mode="json"))
+
+
+def test_typed_runtime_failure_under_a_challenge_shaped_label_still_fails_with_its_true_reason() -> None:
+    failure_reason = "CodeBlock failed with NameError at line 1: name 'token' is not defined."
+    result = _generated_code_exception_result("wr_captcha_label", failure_reason)
+    result["data"]["blocks"][0]["label"] = "solve_and_submit_recaptcha_demo"
+    result["data"]["observed_block_end_urls"] = {"solve_and_submit_recaptcha_demo": "https://demo.example.com/form"}
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
+    assert failure_reason in outcome.observed_evidence_summary
+
+
+def test_uncleared_challenge_reports_its_real_reason_not_a_nearby_url() -> None:
+    end_url = "https://demo.example.com/verification/complete"
+    real_reason = "The page presented a human verification challenge that was never cleared."
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_uncleared",
+            "overall_status": "completed",
+            "current_url": end_url,
+            "failure_reason": real_reason,
+            "failure_categories": [
+                {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0}
+            ],
+            "observed_block_end_urls": {"solve_and_submit_recaptcha_demo": end_url},
+            "blocks": [
+                {
+                    "label": "solve_and_submit_recaptcha_demo",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"submitted": False},
+                }
+            ],
+        },
+    }
+    ctx = _locator_packet_ctx()
+    ctx.last_test_ok = True
+
+    assert run_execution_module.settle_terminal_challenge_after_enrichment(ctx, result) is True
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.verdict == "not_demonstrated"
+    assert real_reason in str(ctx.last_test_failure_reason)
+    assert end_url not in str(ctx.last_test_failure_reason)
+    assert result["data"]["observed_block_end_urls"] == {"solve_and_submit_recaptcha_demo": end_url}

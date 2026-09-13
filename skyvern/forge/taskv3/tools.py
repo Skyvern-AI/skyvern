@@ -22,7 +22,7 @@ import secrets
 import time
 import unicodedata
 import weakref
-from collections import deque
+from collections import Counter, defaultdict, deque
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 
@@ -46,6 +46,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
     # opaque_refs imports auth_tools which imports this module, so it can only be referenced for
@@ -2062,6 +2063,9 @@ _LOOK_MAX_PER_RUN = 20
 # index is cleared right after handles are grabbed — it exists only to pair a handle to a rect.
 _LOOK_ENUM_JS = (
     r"""(() => {
+"""
+    + OTP_INPUT_PRIVACY_JS
+    + r"""
   const _roots = """
     + _SHADOW_ROOTS_JS
     + r""";
@@ -2103,7 +2107,7 @@ _LOOK_ENUM_JS = (
         const t = (el.getAttribute('type') || '').toLowerCase();
         // .value is a useful label for a text/submit field but is 'on'/junk for a checkbox or radio —
         // and is the SECRET for a password field, which (like observe) must never enter the legend.
-        const valuable = el.tagName === 'INPUT' && !['checkbox', 'radio', 'password'].includes(t) ? (el.value || '') : '';
+        const valuable = el.tagName === 'INPUT' && !['checkbox', 'radio', 'password'].includes(t) && !isOtpInputValueSecret(el) ? (el.value || '') : '';
         // Cap generously (not the 80-char display width): the value is masked for payload-minted
         // signed URLs Python-side, which needs the WHOLE URL to match by provenance before the label
         // is truncated for display. A tighter cap here would truncate the URL past recognition.
@@ -2111,7 +2115,7 @@ _LOOK_ENUM_JS = (
         // not a name -- and travels separately when it differs, since a format hint makes the value typeable.
         let named = '';
         if (el.labels) { for (const l of el.labels) { named = (l.innerText || '').trim(); if (named) break; } }
-        placeholder = (el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 2000);
+        placeholder = (isOtpInputValueSecret(el) ? otpSafeInputAttribute(el, 'placeholder', el.getAttribute('placeholder')) || '' : el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 2000);
         // An opaque `name` is an identity, not a label: printing it here would hand the model a raw
         // id to retype, in a legend whose whole point is that it addresses by number instead.
         const nm = el.getAttribute('name') || '';
@@ -4219,10 +4223,121 @@ _DECLARES_SEARCH_AUTOCOMPLETE_JS = (
 
 # Page total for `group` text across one observe, counted at the 200-character display width of each
 # entry; the record retains up to the masking width, which Python masks and then caps to 200.
+# The identity attributes observe reads off a control itself, in the order it prefers them -- the
+# same three naturalSelector addresses an element by.
+_OBSERVE_OWN_IDENTITY_ATTRS = ("id", "name", "data-testid")
+# The same three read off an enclosing element. The attribute's name is kept here for the reason it
+# is kept on the control's own: an ancestor with id="row" and one with data-testid="row" are two
+# different statements about the page, and printing both as `within='row'` erases that.
+_OBSERVE_WITHIN_KINDS = tuple(f"within.{attr}" for attr in _OBSERVE_OWN_IDENTITY_ATTRS)
+# Each pass appends at most one qualifier per line, so a set that only splits in stages -- a tier
+# that separates a group of three into a pair and a single, then a deeper tier that separates the
+# pair -- still converges. This bounds work, not correctness: whatever is left after the last pass
+# is reported by the count.
+_OBSERVE_QUALIFIER_PASSES = 4
+
+
+def _disambiguate_digest_bodies(
+    elements: list[dict[str, Any]], bodies: list[str], field: Callable[[str, int], str]
+) -> tuple[list[str], int]:
+    """Two element lines that render the same bytes are two addresses with nothing to choose between
+    them. Append to each of a colliding set the shallowest thing the page itself says about where
+    that control sits -- its own identity, the identity of what encloses it, the heading it is filed
+    under -- that tells the set apart. Returns the bodies and how many lines are still identical to
+    another afterwards, which is what production has to be able to see."""
+    parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None]] = []
+    for e in elements:
+        owns: list[tuple[str, str]] = []
+        within: list[tuple[str, str]] = []
+        section: str | None = None
+        for entry in e.get("placement") or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            kind, value = str(entry[0]), str(entry[1])
+            # An opaque identifier names nothing to a reader and does not survive a copy -- the screen
+            # look()'s legend applies, for the same reason.
+            if not value or _OPAQUE_ID_RUN_RE.search(value):
+                continue
+            if kind in _OBSERVE_OWN_IDENTITY_ATTRS:
+                owns.append((kind, value))
+            elif kind in _OBSERVE_WITHIN_KINDS:
+                # Position in this list is the n-th enclosing identity WORTH PRINTING, not the n-th
+                # ancestor: a screened-out one shifts the rest up, so two colliding controls can be
+                # compared at different real depths. Both qualifiers are still true of their own
+                # element, which is all the line claims.
+                within.append((kind, value))
+            elif kind == "section" and section is None:
+                section = value
+        parsed.append((owns, within, section))
+
+    tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _ in parsed), default=1) or 1)]
+    tiers += [("within", i) for i in range(max((len(w) for _, w, _ in parsed), default=0))]
+    tiers.append(("section", 0))
+
+    def candidate(index: int, tier: tuple[str, int]) -> tuple[str, str] | None:
+        owns, within, section = parsed[index]
+        kind, depth = tier
+        if kind == "own":
+            return owns[depth] if depth < len(owns) else None
+        if kind == "within":
+            return within[depth] if depth < len(within) else None
+        return ("section", section) if section else None
+
+    def suffix(index: int, tier: tuple[str, int]) -> str:
+        # What this tier would actually append. Deciding on the value behind it instead reads two
+        # identities that differ only past the display cap as different -- they render the same
+        # bytes -- and reads a member with nothing to add as no member at all, when adding nothing
+        # is itself what tells it apart from a member that adds something.
+        found = candidate(index, tier)
+        if found is None:
+            return ""
+        return f" {found[0]}={field(found[1], OBSERVE_DISPLAY_WIDTHS['qualifier'])!r}"
+
+    final = list(bodies)
+    for _ in range(_OBSERVE_QUALIFIER_PASSES):
+        groups: dict[str, list[int]] = defaultdict(list)
+        for i, body in enumerate(final):
+            groups[body].append(i)
+        collisions = [ix for ix in groups.values() if len(ix) > 1]
+        if not collisions:
+            break
+        progressed = False
+        for ix in collisions:
+            best: list[str] | None = None
+            for tier in tiers:
+                rendered = [suffix(i, tier) for i in ix]
+                distinct = len(set(rendered))
+                if distinct == len(ix):
+                    best = rendered
+                    break
+                # A tier that splits the set only partway is still worth printing: the next pass
+                # takes the groups it left behind to a deeper one.
+                if best is None and distinct > 1:
+                    best = rendered
+            if best is None:
+                continue
+            for i, appended in zip(ix, best):
+                if appended:
+                    final[i] += appended
+                    progressed = True
+        if not progressed:
+            break
+    counts = Counter(final)
+    return final, sum(n for n in counts.values() if n > 1)
+
+
 OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
 # Display width of each masked-then-capped field of the observe digest. Every render site reads its
 # width here, so the retain margin below is always sized for the widest window.
-OBSERVE_DISPLAY_WIDTHS = {"label": 140, "placeholder": 60, "value": 100, "invalid": 140, "group": 200, "text": 300}
+OBSERVE_DISPLAY_WIDTHS = {
+    "label": 140,
+    "placeholder": 60,
+    "value": 100,
+    "invalid": 140,
+    "group": 200,
+    "text": 300,
+    "qualifier": 120,
+}
 # Floor for the width the enumeration retains per field before Python masks and caps it. Widened per
 # call so the longest payload-minted URL fits whole after the widest display window.
 OBSERVE_RETAIN_WIDTH_MIN = 2000
@@ -4233,6 +4348,9 @@ OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
 _OBSERVE_JS_TEMPLATE = (
     r"""
 async () => {
+"""
+    + OTP_INPUT_PRIVACY_JS
+    + r"""
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
@@ -4526,6 +4644,102 @@ async () => {
   const safeTag = (el) => {
     const t = String(el.tagName || '').toLowerCase();
     return /^[a-z][a-z0-9_-]*$/.test(t) ? t : null;
+  };
+  // Where the page itself puts a control, for a renderer that has found two element lines rendering
+  // the same bytes. Nearest first: the control's own identity, then each enclosing element carrying
+  // one, then the heading the page files it under. Attributes are read off Element.prototype and
+  // never as properties -- a form's named controls replace form.id with an ELEMENT, and String() of
+  // one is "[object HTMLInputElement]", a qualifier that describes nothing on every control of that
+  // form.
+  const _getAttr = Element.prototype.getAttribute;
+  const _cmpPos = Node.prototype.compareDocumentPosition;
+  // Node.DOCUMENT_POSITION_DISCONNECTED and _PRECEDING. The bits, not the globals: a page may
+  // rebind `Node`.
+  const _POS_DISCONNECTED = 1;
+  const _POS_PRECEDING = 2;
+  const _IDENTITY_ATTRS = ['id', 'name', 'data-testid'];
+  const _HEADING_SEL = 'h1,h2,h3,h4,h5,h6,[role=heading]';
+  // Every eligible one, not the first: a component library that reuses one id across its instances
+  // still gives each a distinct data-testid, and returning only the id would report the two as
+  // having the same identity when the page said otherwise.
+  const _identitiesOf = (node) => {
+    const out = [];
+    for (const a of _IDENTITY_ATTRS) {
+      const v = _normText(String(_getAttr.call(node, a) || ''));
+      // The same forgery screen the selector passes. This is page-controlled text on a line whose
+      // shape the model parses, and U+2028 is a legal ident character that ends a line for a reader.
+      if (v && !_FORGEABLE.test(v)) out.push([a, v.slice(0, _RETAIN_WIDTH)]);
+    }
+    return out;
+  };
+  let _headings = null;
+  let _headingsCapped = false;
+  const _headingFor = (el) => {
+    if (_headings === null) {
+      _headings = [];
+      _headingsCapped = false;
+      // The boundary exists before anything is decided about it. Pass 1 records every heading the
+      // page has and nothing else; pass 2 tries to name it. So no judgement -- visibility, text,
+      // forgery -- can remove one, and a heading that throws under any of them stays a boundary
+      // with no name, which the walk answers with nothing. A heading MISSING would instead hand
+      // every control below it the heading ABOVE: a wrong section rather than none.
+      try {
+        for (const h of _qsa.call(document.documentElement, _HEADING_SEL)) {
+          if (_headings.length >= 200) { _headingsCapped = true; break; }
+          _headings.push([h, '']);
+        }
+      } catch (e) {
+        // A throw while enumerating leaves a PREFIX of the page's headings, indistinguishable from
+        // having read them all. Treated as the cap, so the walk answers nothing past the last one
+        // held rather than filing later controls under a stale earlier heading.
+        _headingsCapped = true;
+      }
+      for (const entry of _headings) {
+        try {
+          if (_unseen(entry[0])) continue;
+          let t = '';
+          try { t = _normText(_innerTextOf.call(entry[0])); } catch (e) { t = _normText(_contentOf.call(entry[0])); }
+          if (t.length >= 2 && !_FORGEABLE.test(t)) entry[1] = t.slice(0, _RETAIN_WIDTH);
+        } catch (e) { /* unreadable: the boundary keeps its place, and stays unnamed */ }
+      }
+    }
+    for (let i = _headings.length - 1; i >= 0; i--) {
+      // Past the last heading we managed to collect, on a page that had more: the nearest one may
+      // be a heading we never saw, and answering with the last we did is the wrong section rather
+      // than none -- the same failure as dropping an unnameable heading.
+      if (_headingsCapped && i === _headings.length - 1) {
+        const tail = _cmpPos.call(el, _headings[i][0]);
+        if (!(tail & _POS_DISCONNECTED) && tail & _POS_PRECEDING) return '';
+      }
+      // A node in another tree -- a shadow root, or one already detached -- has no document order
+      // against these: compareDocumentPosition answers DISCONNECTED and then picks a direction bit
+      // by an implementation's own tie-break, which would file the control under an arbitrary
+      // heading. Only a genuine in-tree ordering counts.
+      const pos = _cmpPos.call(el, _headings[i][0]);
+      if (!(pos & _POS_DISCONNECTED) && pos & _POS_PRECEDING) return _headings[i][1];
+    }
+    return '';
+  };
+  const _placement = (el) => {
+    const out = [];
+    try {
+      for (const own of _identitiesOf(el)) out.push(own);
+      // parentElement, so the walk stops at a shadow boundary rather than stepping to the host: a
+      // composed walk here is SKY-15894's, to be built once with its own tests. What it cannot
+      // reach stays byte-identical and is reported by duplicate_digest_lines rather than guessed at.
+      let n = el;
+      for (let d = 0, kept = 0; d < 10 && kept < 8; d++) {
+        n = _parentOf.call(n);
+        if (!n) break;
+        // Every one it carries, for the same reason the control's own are all kept: two wrappers
+        // that share an id and differ only in their test id have already been told apart by the
+        // page, and reporting the shared one alone throws that away.
+        for (const a of _identitiesOf(n)) { if (kept < 8) { out.push(['within.' + a[0], a[1]]); kept++; } }
+      }
+      const h = _headingFor(el);
+      if (h) out.push(['section', h]);
+    } catch (e) { /* fail open: fewer qualifiers, never a dropped element */ }
+    return out;
   };
   // Why the last naturalSelector call returned null. The three causes need three different fixes,
   // so a single "no selector" tally would send the follow-up after the wrong one.
@@ -4903,10 +5117,10 @@ async () => {
       return [
         // Sliced at the width the record retains: a change in any byte the rendered line depends on
         // (its masking reads the whole retained value) must invalidate the record.
-        el.checked === true, el.type === 'password' ? '' : String(el.value || '').slice(0, _RETAIN_WIDTH), el.disabled === true,
+        el.checked === true, (el.type === 'password' || isOtpInputValueSecret(el)) ? '' : String(el.value || '').slice(0, _RETAIN_WIDTH), el.disabled === true,
         el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'), el.getAttribute('aria-expanded'),
-        el.getAttribute('aria-valuenow'),
-        el.getAttribute('aria-label'), el.getAttribute('aria-labelledby'), el.getAttribute('title'), el.getAttribute('placeholder'),
+        isOtpInputValueSecret(el) ? '' : el.getAttribute('aria-valuenow'),
+        el.getAttribute('aria-label'), el.getAttribute('aria-labelledby'), el.getAttribute('title'), isOtpInputValueSecret(el) ? otpSafeInputAttribute(el, 'placeholder', el.getAttribute('placeholder')) : el.getAttribute('placeholder'),
         el.getAttribute('aria-disabled'), el.readOnly === true, el.required === true, el.hidden === true, el.getAttribute('aria-hidden'),
       ].join('\u0001');
     } catch (e) { return null; }
@@ -5149,11 +5363,12 @@ async () => {
         mintedOn.push(minted);
       }
     }
+    const secretValue = el.type === 'password' || isOtpInputValueSecret(el);
     // The placeholder ranks below every real name (strongLabel already starts with aria-label) and
     // travels separately as a hint: a format placeholder ('dd/mm/yyyy') is what makes the value typeable.
-    const placeholder = (el.getAttribute('placeholder') || '').trim();
+    const placeholder = (secretValue ? otpSafeInputAttribute(el, 'placeholder', el.getAttribute('placeholder')) || '' : el.getAttribute('placeholder') || '').trim();
     let label = strongLabel || placeholder;
-    if (!label) label = (el.type === 'password' ? '' : el.value || '').trim();
+    if (!label) label = (secretValue ? '' : el.value || '').trim();
     if (!label) label = (el.getAttribute('title') || '').trim();
     const role = el.getAttribute('role');
     // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
@@ -5178,7 +5393,7 @@ async () => {
     // element line for a selector that does not exist.
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
-    if (el.type === 'password') { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    if (secretValue) { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
     // ARIA defines switch as a checkbox variant carrying the same aria-checked, so it belongs here.
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
     else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
@@ -5190,7 +5405,7 @@ async () => {
     }
     const selected = el.getAttribute('aria-selected');
     if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) rec.selected = selected === 'true';
-    if (role === 'spinbutton') {
+    if (role === 'spinbutton' && !secretValue) {
       const now = el.getAttribute('aria-valuenow');
       if (now !== null && !rec.value) rec.value = String(now).slice(0, _RETAIN_WIDTH);
     }
@@ -5202,7 +5417,7 @@ async () => {
     if (ai && ai !== 'false') rec.invalid = true;
     // willValidate excludes readonly/disabled fields the agent cannot fix; password is excluded so
     // validationMessage (which can echo the typed value) never leaks it.
-    else if (!isChoice && el.type !== 'password' && el.value && el.willValidate && !(el.form && el.form.noValidate) && el.validity && !el.validity.valid) {
+    else if (!isChoice && !secretValue && el.value && el.willValidate && !(el.form && el.form.noValidate) && el.validity && !el.validity.valid) {
       rec.invalid = (el.validationMessage || '').slice(0, _RETAIN_WIDTH) || true;
     }
     // Flag typeahead/autocomplete inputs so the model treats them as combobox fills instead of typing
@@ -5352,14 +5567,19 @@ async () => {
       } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
     if (!ok) { labelOfControl.delete(el); out.splice(k, 1); dropped++; }
-    // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
-    // can change either attribute in response to a marker write, and the line has to describe the
-    // page as it stands when the line is printed. Only the MARK is re-decided -- the omission is the
-    // pre-existing rule on its pre-existing predicate, so it has nothing new to re-decide.
-    else if (el && !rec.hidden) {
-      let now = '';
-      try { now = _a11yRemoved(el); } catch (e) { now = ''; }
-      if (now) rec.a11yRemoved = now; else delete rec.a11yRemoved;
+    else if (el) {
+      // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
+      // can change either attribute in response to a marker write, and the line has to describe the
+      // page as it stands when the line is printed. Only the MARK is re-decided -- the omission is the
+      // pre-existing rule on its pre-existing predicate, so it has nothing new to re-decide. Where the
+      // control sits is read here for the same reason, and only for a record that survived to print.
+      if (!rec.hidden) {
+        let now = '';
+        try { now = _a11yRemoved(el); } catch (e) { now = ''; }
+        if (now) rec.a11yRemoved = now; else delete rec.a11yRemoved;
+      }
+      const place = _placement(el);
+      if (place.length) rec.placement = place;
     }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
@@ -6459,6 +6679,7 @@ def build_browser_tools(
                 f"have no selector that identifies them: {'; '.join(why)}"
             )
 
+        bodies: list[str] = []
         for e in elements:
             extra = ""
             if e.get("value"):
@@ -6511,9 +6732,14 @@ def build_browser_tools(
                 kind += "/" + _digest_token(e["type"], 40)
             elif e.get("role"):
                 kind += "/" + _digest_token(e["role"], 40)
-            lines.append(
-                f"ref={e['ref']} {kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])!r}{extra}"
-            )
+            bodies.append(f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])!r}{extra}")
+        # Two lines rendering the same bytes are two addresses the model has nothing to choose
+        # between, and a form that repeats a section renders one caption many times over. Qualified
+        # here rather than at the record build: whether a line is ambiguous is a property of the
+        # whole reading, and it is not knowable until every line of it has been rendered.
+        bodies, duplicate_digest_lines = _disambiguate_digest_bodies(elements, bodies, _field)
+        for e, body in zip(elements, bodies):
+            lines.append(f"ref={e['ref']} {body}")
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         summary = {
@@ -6529,6 +6755,7 @@ def build_browser_tools(
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
             "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
+            "duplicate_digest_lines": duplicate_digest_lines,
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
         # text or a field value the model previously typed (a token resolved back to its URL), and
@@ -6570,17 +6797,13 @@ def build_browser_tools(
             el = await page.query_selector(selector)
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}")
-            html = await el.inner_html()
-            if not html:
-                # Void/leaf elements have no inner HTML; their own tag+attributes are the answer,
-                # not an empty string the model can't distinguish from a missing element. Best
-                # effort: a navigation between the two reads must not turn "" into a tool error.
-                try:
-                    html = await el.evaluate("el => el.outerHTML")
-                except Exception:
-                    html = ""
+            try:
+                html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_FRAGMENT_HTML_JS))
+            except Exception:
+                # A navigation between the two reads must not turn "" into a tool error.
+                html = ""
         else:
-            html = await page.content()
+            html = mask_otp_values_in_html(await page.content())
         # The click/type reaction gate stamps data-tv3-pre on every visible element; internal bookkeeping
         # that, left in place, costs a third of the truncation budget below in noise.
         html = html.replace(' data-tv3-pre="1"', "")

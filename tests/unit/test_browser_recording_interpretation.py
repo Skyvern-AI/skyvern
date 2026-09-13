@@ -258,6 +258,34 @@ async def test_jittered_reclick_yields_single_draft_step(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_live_enrichment_carries_recording_correlation_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click submit."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        recording_attempt_id="attempt-1",
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    assert len(calls) == 1
+    assert calls[0]["recording_attempt_id"] == "attempt-1"
+    assert calls[0]["interpretation_session_id"] == session.interpretation_session_id
+
+
+@pytest.mark.asyncio
 async def test_non_adjacent_duplicate_suppressed_but_later_repeat_kept(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
         return {"block_label": "click", "title": "Click", "prompt": "Click."}
