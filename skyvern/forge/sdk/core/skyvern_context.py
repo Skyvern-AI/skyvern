@@ -396,6 +396,18 @@ class SkyvernContext:
     workflow_block_engine_resolved_run_id: str | None = None
     # Single-flight the first-use provider resolution when parallel branches share one context.
     workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # TASK_V3_FRAME_PERCEPTION arm, resolved once per run before the v3 loop starts; read through
+    # frame_perception_enabled(), never directly. The flag is written before the run-id sentinel, so
+    # a concurrent reader sees "unresolved" -- off, today's behaviour -- rather than a torn pair.
+    frame_perception_flag: bool = False
+    # The run the pin above was resolved for; a nested execution with a different id re-resolves.
+    # Last writer wins with no save/restore, so this prevents inheriting an unchecked arm but would
+    # not isolate two interleaved runs sharing one context, which nothing constructs today.
+    frame_perception_resolved_run_id: str | None = None
+    # Single-flight the first resolution when parallel branches share one context. Without it both
+    # branches pass the sentinel check, and the second -- which answers False on any provider
+    # failure -- overwrites the arm the first already baked into its observe description.
+    frame_perception_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 

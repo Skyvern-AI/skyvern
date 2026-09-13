@@ -174,6 +174,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.target_label import compose_target_intention
@@ -1786,6 +1787,16 @@ class ForgeAgent:
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
         context = skyvern_context.current()
+        if context:
+            # Once for the whole run, before anything reads it: the tool list bakes one of these
+            # reads into the observe description at build time, and a value that could change
+            # afterwards would leave that description describing a different run than the one
+            # executing.
+            await resolve_frame_perception(
+                context,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+            )
         offer_error_codes = False
         if task.error_code_mapping:
             try:
@@ -2213,7 +2224,7 @@ class ForgeAgent:
             if peek is None:
                 return None
             own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
-            if not settings.TASK_V3_FRAME_PERCEPTION:
+            if not frame_perception_enabled():
                 return own
             # The completion-side settle deferral rides this, and it is a LIVE gate rather than only the
             # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is

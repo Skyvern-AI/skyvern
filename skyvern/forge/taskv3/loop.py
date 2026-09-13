@@ -21,6 +21,7 @@ import re
 import secrets
 import time
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
@@ -36,6 +37,36 @@ LOG = structlog.get_logger()
 ToolStatus = Literal["ok", "error"]
 FinishStatus = Literal["completed", "failed", "terminated"]
 
+# Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
+# because the whole value of the facet is that it is closed: it is written at ~28 sites across two
+# modules, and a typo or a near-synonym added later would split a cohort silently. mypy runs on both
+# modules, so a value not listed here is rejected at the call site rather than discovered in a chart.
+ToolErrorClass = Literal[
+    # The address did not resolve to what it named.
+    "stale_selector",
+    "invalid_selector",
+    "invalid_mark",
+    "ambiguous_selector",
+    "ambiguous_frame",
+    "stale_ref",
+    "ref_not_in_latest",
+    "stale_mark",
+    "mark_not_in_latest",
+    # The target resolved, but the page will not let the act happen.
+    "disabled",
+    "not_editable",
+    "covered",
+    "inert",
+    "unreachable",
+    # The handler raised instead of returning; classified by `_raised_error_class`.
+    "driver_timeout",
+    "timeout_other",
+    "handler_raised",
+    # An erroring call whose construction site named no class. Deliberately a value rather than an
+    # absence, so "errored, unnamed" is countable and cannot be confused with "did not error".
+    "other",
+]
+
 
 @dataclass
 class ToolResult:
@@ -46,14 +77,19 @@ class ToolResult:
     # tool's annotated screenshot). Threaded into one .call()'s ephemeral screenshots= arg and never
     # appended to the transcript, so it costs one image on one turn and is gone the turn after.
     screenshots: list[bytes] | None = None
+    # Telemetry only, and deliberately NOT in `data`: callers and tests pin `data` by equality, so a
+    # measurement riding in it would change an observable contract. Never shown to the model.
+    error_class: ToolErrorClass | None = None
 
     @classmethod
     def ok(cls, content: str, data: dict[str, Any] | None = None, screenshots: list[bytes] | None = None) -> ToolResult:
         return cls("ok", content, data, screenshots)
 
     @classmethod
-    def error(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
-        return cls("error", content, data)
+    def error(
+        cls, content: str, data: dict[str, Any] | None = None, *, error_class: ToolErrorClass | None = None
+    ) -> ToolResult:
+        return cls("error", content, data, error_class=error_class)
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
@@ -65,6 +101,111 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 # lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
 TARGET_LABEL_DATA_KEY = "target_label"
 TARGET_KIND_DATA_KEY = "target_kind"
+# How long a call spent turning an address into a target, before the act. A context variable rather
+# than a field on the result, because the cohort this exists to price is the one where the handler
+# RAISES -- a driver timeout on a resolved target -- and a result the handler never returned cannot
+# carry anything. Set before the handler runs, so the value survives whichever way the call ends.
+# Accumulated, because the mark wrapper resolves an address and the ref wrapper then runs inside it.
+#
+# WHAT ONE ROW MEANS, written here because a chart of this by `selector_kind` reads the field and
+# cannot see the branch that produced it:
+#   absent          no address was supplied. Its only meaning -- never "measured, and it was zero".
+#   ref / mark      the server-side table lookup and the frame routing it implies: the persistent-ref
+#                   model's own addressing cost, which is what this field exists to price.
+#   css             the frame ROUTING only, and only with frame perception ON. With it off, a plain
+#                   selector is resolved later, INSIDE the handler, so the row is ~0 and that
+#                   resolution is counted in `duration_seconds` instead.
+# Working-page acquisition is excluded on every branch: every design has to get the page, so it is
+# not a cost of the addressing model. Because the css meaning is the one that moves, every row that
+# carries this also carries `frame_perception` -- a dataset spanning the ramp otherwise mixes the two
+# definitions with nothing on the record to cut on.
+_RESOLVE_SECONDS: ContextVar[float | None] = ContextVar("taskv3_resolve_seconds", default=None)
+_FRAME_PERCEPTION: ContextVar[bool | None] = ContextVar("taskv3_frame_perception", default=None)
+
+
+def record_resolve_seconds(elapsed: float) -> None:
+    """Add `elapsed` to this tool call's address-resolution time. Telemetry only."""
+    _RESOLVE_SECONDS.set((_RESOLVE_SECONDS.get() or 0.0) + elapsed)
+
+
+def record_frame_perception(enabled: bool) -> None:
+    """Stamp which of the two definitions above produced this call's reading. Telemetry only."""
+    _FRAME_PERCEPTION.set(enabled)
+
+
+# What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
+# prints `ref=12` and that exact string is the selector argument, so "copy it as printed" has one
+# reading. Deliberately not an attribute-selector shape and deliberately not bracketed -- the ref
+# namespace is a server-side table, and accepting a `[ref=12]` form would let a page that authors a
+# `ref` attribute collide with it, which is the wrong-element class this addressing exists to close.
+# It lives here rather than in tools.py because both modules classify against it and a second copy
+# would drift.
+REF_SELECTOR_RE = re.compile(r"^\s*ref=(\d+)\s*$")
+
+
+DriverTimeoutPredicate = Callable[[BaseException], bool]
+
+
+def _no_driver_here(exc: BaseException) -> bool:
+    return False
+
+
+# Whether an exception is the browser driver's OWN timeout. Injected rather than imported, because
+# the driver package ships only in the `local`/`server` extras: importing it at this module's scope
+# would make the loop unimportable in a base install and would break the scripted-fake unit testing
+# the module docstring promises. `tools.py` -- the only module that can build a handler capable of
+# raising a driver error -- installs the real predicate as it imports, so the driver cohort cannot
+# read empty while a browser tool exists to fill it.
+_is_driver_timeout: DriverTimeoutPredicate = _no_driver_here
+
+
+def set_driver_timeout_predicate(predicate: DriverTimeoutPredicate) -> None:
+    global _is_driver_timeout
+    _is_driver_timeout = predicate
+
+
+def _raised_error_class(exc: BaseException) -> ToolErrorClass:
+    """Classify an exception that escaped a tool handler, for the failure-cost read.
+
+    A bare `TimeoutError` is NOT evidence of a driver timeout: `file_upload` awaits a source fetch
+    that raises one, and on 3.11 `asyncio.TimeoutError` IS `builtins.TimeoutError`. Folding those
+    into the driver cohort would corrupt the very number this field exists to produce.
+
+    The driver class is decided by the installed predicate -- `is_driver_timeout_error`, which
+    recognises BOTH Playwright-family packages -- and never by the exception's own module name: the
+    browser image rewrites this repository's driver imports to the fork, so a module test would
+    recognise driver timeouts only where the fork is absent -- i.e. nowhere that matters -- and
+    report the cohort as empty in production. Nothing here reads the exception's MESSAGE: a message
+    can carry page text and this field is indexed.
+    """
+    if _is_driver_timeout(exc):
+        return "driver_timeout"
+    if isinstance(exc, TimeoutError):
+        return "timeout_other"
+    return "handler_raised"
+
+
+def _selector_kind(args: dict[str, Any]) -> str:
+    """How the model addressed its target on this call, read off the ARGS AS SENT.
+
+    Must be taken before dispatch: the ref and act-by-mark wrappers rewrite `args["selector"]` in
+    place, so the same read afterwards reports the resolved address rather than the one the model
+    chose. It is the cut for `resolve_seconds`, but the two cohorts are NOT symmetric and the
+    contract above `_RESOLVE_SECONDS` says how: a `css` row bounds frame routing only, and only with
+    frame perception on -- a plain selector is otherwise resolved inside the handler and its row is
+    ~0. Read the two together with `frame_perception`, which rides the same record for that reason.
+    """
+    if args.get("mark") is not None:
+        return "mark"
+    selector = args.get("selector")
+    # `not selector`, matching what the wrappers themselves treat as absent. Note this does NOT make
+    # the record self-consistent: `selector_present` is read after dispatch, and act-by-mark leaves
+    # the selector it resolved in `args`, so a mark call logs kind=mark WITH selector_present=True.
+    # The two fields describe different moments on purpose -- read `selector_kind` for what the model
+    # sent.
+    if not isinstance(selector, str) or not selector:
+        return "none"
+    return "ref" if REF_SELECTOR_RE.match(selector) else "css"
 
 
 class RoundAction(NamedTuple):
@@ -1194,6 +1335,10 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "duration_seconds",
         "result_chars",
         "selector_present",
+        "selector_kind",
+        "tool_error_class",
+        "resolve_seconds",
+        "frame_perception",
         "billable",
         "turn",
         "batch_size",
@@ -2697,6 +2842,10 @@ async def run_agent_tool_loop(
                 # Refreshed per call, not per turn: a batched action+finish turn must not defer on
                 # a stale turn-start snapshot (the conversion the headroom guard exists to prevent).
                 activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
+            selector_kind = _selector_kind(args)
+            # Cleared per call, so a value can never carry over from the previous one in the batch.
+            _RESOLVE_SECONDS.set(None)
+            _FRAME_PERCEPTION.set(None)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -2709,13 +2858,36 @@ async def run_agent_tool_loop(
                     result = await spec.handler(args)
                 except Exception as exc:
                     LOG.warning("taskv3 tool handler raised", tool=tool_name, exc_info=True)
-                    result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}")
+                    raised_class = _raised_error_class(exc)
+                    result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
             # Observe's summary counters are the only trace a perception change leaves on this
             # record; its content is deliberately never logged. Gated on the tool, not the payload,
             # so every other tool's record keeps exactly today's fields.
             observe_summary = _observe_summary_fields(result) if tool_name == "observe" else {}
+            # Conditional for the same reason observe's counters are: a record only carries a field
+            # the call actually produced, so an ok call's record keeps exactly the fields it has
+            # today and `resolve_seconds` is absent (not null) on tools with no address to resolve.
+            cost_fields: dict[str, Any] = {}
+            if result.status == "error":
+                # `tool_error_class` on the record, `error_class` on the result: the log key lands in a
+                # FLAT index where `error_class` is already taken -- cloud/webeye logs it as
+                # `type(exc).__name__` at ~17 sites, so an unprefixed key here would mix this closed
+                # vocabulary with Python exception names under one facet, and taskv3 emits on every
+                # erroring tool call so it would dominate the values.
+                cost_fields["tool_error_class"] = result.error_class or "other"
+            # Read off the context variable, not the result: on the raise path the loop built the
+            # result itself and the handler's own resolution time would otherwise be lost.
+            resolve_seconds = _RESOLVE_SECONDS.get()
+            if resolve_seconds is not None:
+                cost_fields["resolve_seconds"] = resolve_seconds
+            # Rides every row that carries a reading, because the css reading's MEANING depends on it:
+            # a dataset spanning the frame-perception ramp otherwise mixes two definitions of the same
+            # field with nothing on the record to stratify on.
+            frame_perception = _FRAME_PERCEPTION.get()
+            if frame_perception is not None:
+                cost_fields["frame_perception"] = frame_perception
             # The action-loop guard's key and the perception ledger's digest, computed here (pure) so
             # their hashes ride the record below; the ledger itself is updated further down, unchanged.
             action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
@@ -2760,10 +2932,12 @@ async def run_agent_tool_loop(
                 # Truthiness, not presence: the tools treat a null or empty selector as absent and
                 # fall back to scanning the whole page, which is the case this field exists to find.
                 selector_present=bool(args.get("selector")),
+                selector_kind=selector_kind,
                 billable=bool(spec is not None and spec.billable),
                 turn=st.turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                **cost_fields,
                 **observe_summary,
                 **attribution,
             )

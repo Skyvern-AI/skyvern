@@ -38,24 +38,36 @@ from skyvern.core.script_generations.fuzzy_matcher import (
     normalize_option_label,
 )
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
+from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
+    REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
     SemanticCommitStats,
     ToolHandler,
     ToolResult,
     ToolSpec,
+    record_frame_perception,
+    record_resolve_seconds,
+    set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
+from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
     # opaque_refs imports auth_tools which imports this module, so it can only be referenced for
     # typing; the OpaqueUrlRefs instance is passed in at runtime, never imported here.
     from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs
+
+# At import, not inside build_browser_tools(): every handler that can raise a driver error is built
+# in this module, so binding the predicate to this module's own import makes the two impossible to
+# get out of step. The loop keeps a driver-blind default for the scripted-fake case, where nothing
+# can raise a driver error in the first place.
+set_driver_timeout_predicate(is_driver_timeout_error)
 
 LOG = structlog.get_logger()
 
@@ -136,12 +148,6 @@ _TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+
 _OPAQUE_ID_RUN_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]*[a-f])[0-9a-f]{12,}", re.I
 )
-# What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
-# prints `ref=12` and that exact string is the selector argument, so "copy it as printed" has one
-# reading. Deliberately not an attribute-selector shape and deliberately not bracketed -- the ref
-# namespace is a server-side table, and accepting a `[ref=12]` form would let a page that authors a
-# `ref` attribute collide with it, which is the wrong-element class this addressing exists to close.
-_REF_SELECTOR_RE = re.compile(r"^\s*ref=(\d+)\s*$")
 # Whitespace outside a quoted attribute value is a combinator: only hostAnchored composes selectors
 # that way, while a natural `[name="first name"]` keeps its single round trip.
 _TV3_QUOTED_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
@@ -192,7 +198,8 @@ def _invalid_selector_result(selector: Any, exc: Exception) -> ToolResult | None
         return None
     return ToolResult.error(
         f"{selector!r} is not a valid CSS selector. Use a selector from the latest observe(), or an "
-        '[id="..."] / [name="..."] attribute form (ids that start with a digit are not valid as a bare #id).'
+        '[id="..."] / [name="..."] attribute form (ids that start with a digit are not valid as a bare #id).',
+        error_class="invalid_selector",
     )
 
 
@@ -244,7 +251,8 @@ def _inert_target_error(selector: str) -> ToolResult:
         "else on the page is blocked is a separate question this does not answer. Hidden markup is "
         "usually a template the page clones (the live control is then a DIFFERENT element) or a panel "
         "some trigger opens (act on the trigger first), and something still loading may yet reveal "
-        "this one. Re-observe and act on what the page actually renders."
+        "this one. Re-observe and act on what the page actually renders.",
+        error_class="inert",
     )
 
 
@@ -2310,7 +2318,7 @@ async def pending_marker(page: Any, selector: str) -> str | None:
     # loses the case that matters: a durable selector like `#submit` or `button[type=submit]` commonly
     # matches in both documents, and the parent's unrelated control then answers "not pending" for a
     # frame control still showing "Processing" -- accepting finish(completed) on a live submission.
-    if settings.TASK_V3_FRAME_PERCEPTION:
+    if frame_perception_enabled():
         # ONE realm -- the one the submit was recorded in -- not a walk of every frame. A walk cannot be
         # bounded (a wedged renderer blocks the protocol queue), and the caller's single global deadline
         # cancelling a walk is what let a cancellation read as "nothing pending": a completion accepted
@@ -6733,7 +6741,7 @@ async def _count_filled_fields(page: Any) -> int:
         total = int(await page.evaluate(_FILLED_STATE_JS))
     except Exception:
         LOG.info("taskv3 filled-state probe failed, treating page as empty", exc_info=True)
-    if not settings.TASK_V3_FRAME_PERCEPTION:
+    if not frame_perception_enabled():
         return total
     # The main-frame count above is UNCHANGED, deliberately: it counts every field in that document
     # including ones the PAGE pre-filled, and refusing a reload over those is what the guard is for, not
@@ -7120,7 +7128,7 @@ async def _realm_document_id(target: Any) -> str:
     engine), which is what this was before either mechanism.
     """
     url = canonical_url(_safe_url(target))
-    if not settings.TASK_V3_FRAME_PERCEPTION:
+    if not frame_perception_enabled():
         # The flag-off path gets the url alone, which is the identity it always had. Ungated, this
         # helper opens a CDP session and issues Page.getFrameTree on EVERY observe and every ref
         # action -- on all production traffic, for a loaderId only frame refs need, against CDP
@@ -7330,7 +7338,7 @@ def _iframe_reach_clause(observation: _Observation) -> str:
     which have to stay VISIBLE as unread rather than vanish, because a silent omission is what turns
     "I could not see it" into a confident "the form never rendered".
     """
-    if not settings.TASK_V3_FRAME_PERCEPTION:
+    if not frame_perception_enabled():
         return "(contents NOT listed here and NOT reachable by selector)"
     unread = observation.unreadable_frames + observation.capped_frames
     if unread:
@@ -7615,7 +7623,7 @@ def build_browser_tools(
         main_data, main_handles, main_document = await _read_one_realm(page)
         documents: dict[Any, str] = {None: main_document}
         owners: list[Any] = [None] * len(main_handles)
-        if not settings.TASK_V3_FRAME_PERCEPTION:
+        if not frame_perception_enabled():
             return _Observation(main_data, main_handles, owners, {None: bool(main_data.get("refsFresh"))}, documents, 0)
         frames, skipped, unjudged = await _observable_child_frames(page)
         if not frames:
@@ -8086,7 +8094,7 @@ def build_browser_tools(
         if selector:
             target = await page.query_selector(selector)
             if target is None:
-                return ToolResult.error(f"no element for selector {selector!r}")
+                return ToolResult.error(f"no element for selector {selector!r}", error_class="stale_selector")
         text = await _page_rendered_text(target)
         if text is None:
             return ToolResult.error("the rendered text could not be read")
@@ -8115,7 +8123,7 @@ def build_browser_tools(
         frame blocks everything after it regardless. Adding one would look like a fix and be theatre.
         Disclosed and tracked rather than papered over -- v1 has the same exposure in `get_frame_text`.
         """
-        if not settings.TASK_V3_FRAME_PERCEPTION:
+        if not frame_perception_enabled():
             return ""
         frames, skipped, unjudged = await _observable_child_frames(page)
         parts: list[str] = []
@@ -8161,7 +8169,7 @@ def build_browser_tools(
         if selector:
             el = await page.query_selector(selector)
             if el is None:
-                return ToolResult.error(f"no element for selector {selector!r}")
+                return ToolResult.error(f"no element for selector {selector!r}", error_class="stale_selector")
             try:
                 html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_FRAGMENT_HTML_JS))
             except Exception:
@@ -8193,16 +8201,21 @@ def build_browser_tools(
         return ToolResult.error(
             f"{selector} is not rendered and nothing visible stands in for it — its section is collapsed, "
             "closed or inactive, so a person could not reach this control either. Act on whatever reveals "
-            "it (the section header, the step, the modal trigger), then re-observe."
+            "it (the section header, the step, the modal trigger), then re-observe.",
+            error_class="unreachable",
         )
 
     def _not_editable_error(exc: _FieldNotEditable) -> ToolResult:
         if exc.read_only:
             return ToolResult.error(
                 f"{exc.selector} is readonly — typing cannot change it. If it opens a list, click it and "
-                "pick an option instead; otherwise act on whatever sets it."
+                "pick an option instead; otherwise act on whatever sets it.",
+                error_class="not_editable",
             )
-        return ToolResult.error(f"{exc.selector} is disabled — it cannot be typed into until the page enables it")
+        return ToolResult.error(
+            f"{exc.selector} is disabled — it cannot be typed into until the page enables it",
+            error_class="disabled",
+        )
 
     def _covered_error(
         selector: str, occluder: dict[str, Any] | None = None, *, verb: str = "typed into"
@@ -8228,12 +8241,14 @@ def build_browser_tools(
                 f"{selector} is covered by {layer_desc} that is INVISIBLE — it intercepts clicks but paints "
                 f"nothing on screen, so you will not see it in a screenshot{also}. It is most likely a "
                 "leftover backdrop from a dialog or cookie banner that was already dismissed. Do not keep "
-                "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way."
+                "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way.",
+                error_class="covered",
             )
         if not occluder:
             return ToolResult.error(
                 f"{selector} is rendered but something else is on top of it, so it cannot be {verb}{also}. "
-                "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe."
+                "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe.",
+                error_class="covered",
             )
         layer_desc = f'"{name}"' if name else "a layer"
         if layer_selector:
@@ -8260,7 +8275,8 @@ def build_browser_tools(
             # found on it, not confirmed dismissers, since a destructive or navigational action
             # (e.g. "Delete account") is not distinguishable here from a close/cancel button.
             f"Its controls: {controls_desc}. Pick whichever one actually closes or dismisses the "
-            f"layer, then retry {selector}."
+            f"layer, then retry {selector}.",
+            error_class="covered",
         )
 
     async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
@@ -8339,7 +8355,9 @@ def build_browser_tools(
                 data[TARGET_LABEL_DATA_KEY] = name
             if kind is not None:
                 data[TARGET_KIND_DATA_KEY] = kind
-            return ToolResult(result.status, result.content, data, result.screenshots)
+            # `replace`, not a positional rebuild: this carries every field the result already has,
+            # including ones added later. A rebuild that lists fields drops the ones it forgets.
+            return dataclasses.replace(result, data=data)
 
         return wrapped
 
@@ -8423,10 +8441,12 @@ def build_browser_tools(
                 f"{selector} no longer matches anything on the page — the page re-rendered since it was "
                 "observed. Re-observe and act on fresh selectors from the new observation.",
                 data={"page_state_changed": True},
+                error_class="stale_selector",
             )
         return ToolResult.error(
             f"{selector} matches {matches} elements, so it does not identify one control. Re-observe and "
-            "act on a selector from the new observation, or narrow this one until it matches exactly one."
+            "act on a selector from the new observation, or narrow this one until it matches exactly one.",
+            error_class="ambiguous_selector",
         )
 
     async def _marker_matches(page: Any, selector: str) -> int:
@@ -8683,6 +8703,7 @@ def build_browser_tools(
                         "page re-renders (a closed menu destroys its options). Re-observe and act on "
                         "fresh selectors from the new observation.",
                         data={"page_state_changed": True},
+                        error_class="stale_selector",
                     )
                 # The re-attach may have been a re-render that cloned the row, so the count is re-read.
                 matches = await _marker_matches(page, selector)
@@ -8694,6 +8715,7 @@ def build_browser_tools(
                     "marked element, so the marker no longer identifies one control. Re-observe and act "
                     "on fresh selectors from the new observation.",
                     data={"page_state_changed": True},
+                    error_class="ambiguous_selector",
                 )
         else:
             ambiguous = await _ambiguous_selector_error(page, selector)
@@ -8750,7 +8772,10 @@ def build_browser_tools(
         except Exception:
             reach_pre = None
         if isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
-            return ToolResult.error(f"{selector} is disabled — it cannot be clicked until the page enables it")
+            return ToolResult.error(
+                f"{selector} is disabled — it cannot be clicked until the page enables it",
+                error_class="disabled",
+            )
         # `slotted` only qualifies unoccluded (the composed hit landed cleanly on the control's own
         # slotted label); `ownLabel` already implies occluded+skinned, so it qualifies on its own.
         label_over_control = isinstance(reach_pre, dict) and (
@@ -8793,7 +8818,10 @@ def build_browser_tools(
             if skin_probe.get("disabled"):
                 # Playwright refuses a label bound to a disabled control the same way it refuses the
                 # control, so the click path would spend its full timeout and then blame a re-render.
-                return ToolResult.error(f"{selector} is disabled — it cannot be toggled until the page enables it")
+                return ToolResult.error(
+                    f"{selector} is disabled — it cannot be toggled until the page enables it",
+                    error_class="disabled",
+                )
             try:
                 checked_before = await _probe_evaluate(page, _CHECKBOX_CHECKED_JS, selector, pre_click_arg)
             except Exception:
@@ -8865,6 +8893,7 @@ def build_browser_tools(
                     f"{selector} left the page before the click could land — it was replaced by a "
                     "re-render; re-observe and act on fresh selectors",
                     data={"page_state_changed": True},
+                    error_class="stale_selector",
                 )
             base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
@@ -8894,6 +8923,7 @@ def build_browser_tools(
                         "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
                         f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})",
                         data={"page_state_changed": True},
+                        error_class="stale_selector",
                     )
                 # Diagnosed only now, after the full actionability wait: a transient overlay (a toast,
                 # a closing menu) deserves the whole 15s to clear on its own, not a probe-shortened one.
@@ -10946,7 +10976,9 @@ def build_browser_tools(
         # A disabled control cannot be set whichever kind it is; check before diverting so a disabled
         # custom combobox gets the accurate "is disabled" message rather than the typeable-gate refusal.
         if isinstance(probe, dict) and probe.get("exists") and probe.get("disabled"):
-            return ToolResult.error(f"{selector} is disabled — it cannot be set until the page enables it")
+            return ToolResult.error(
+                f"{selector} is disabled — it cannot be set until the page enables it", error_class="disabled"
+            )
         # Native-vs-custom gates on the authoritative nodeName (a structural signal, not a heuristic).
         # Divert to the shared custom-combobox path ONLY when the probe positively confirms a
         # non-<select> element (React-Select, spl-autocomplete, div-list) that page.select_option would
@@ -11152,7 +11184,7 @@ def build_browser_tools(
         # is staged into downloads_dir, so the selector guard's residual error can never leave a phantom
         # upload for the download-signal wrapper to misread as a browser download.
         if await page.query_selector(selector) is None:
-            return ToolResult.error(f"no file input for selector {selector!r}")
+            return ToolResult.error(f"no file input for selector {selector!r}", error_class="stale_selector")
         source = _resolve_text(args["file"])
         # A failed download echoes the source back in the loop's generic tool_error; the model-facing
         # masking boundary (hide_from_model) rewrites any signed payload ref to its token there, so this
@@ -11167,7 +11199,10 @@ def build_browser_tools(
         el = await page.query_selector(selector)
         if el is None:
             return ToolResult(
-                "error", f"no file input for selector {selector!r}", {**staged, "page_state_changed": True}
+                "error",
+                f"no file input for selector {selector!r}",
+                {**staged, "page_state_changed": True},
+                error_class="stale_selector",
             )
         # Verify the upload took EFFECT, not just that set_input_files did not raise. Watch upload-like
         # network dispatches across the set_input_files + settle window (the window we already dwell in,
@@ -11265,7 +11300,7 @@ def build_browser_tools(
 
     def _look_nothing_marked_message() -> str:
         base = "look: no interactive controls are visible in the viewport."
-        if settings.TASK_V3_FRAME_PERCEPTION:
+        if frame_perception_enabled():
             return (
                 base + " Note that look marks only the page's own frame, so controls inside an embedded"
                 " frame are not numbered here even though observe lists them and they are actionable by"
@@ -11460,13 +11495,15 @@ def build_browser_tools(
         entry = _look_manifest.get(mark)
         if entry is None:
             return None, ToolResult.error(
-                f"mark {mark} is not in the current set of marks. Call look() first, then act on a number it drew."
+                f"mark {mark} is not in the current set of marks. Call look() first, then act on a number it drew.",
+                error_class="mark_not_in_latest",
             )
         handle = entry.get("handle")
         stale = ToolResult.error(
             f"mark {mark} no longer points to an element on the page — it moved or the page "
             "re-rendered since look(). Call look() again and act on a fresh number.",
             data={"page_state_changed": True},
+            error_class="stale_mark",
         )
         if handle is None:
             return None, stale
@@ -11475,35 +11512,98 @@ def build_browser_tools(
             return None, stale
         return selector, None
 
+    def _resolve_timer() -> tuple[Callable[[], None], Callable[[], None]]:
+        """`(page_acquired, record)` for pricing the turn from an ADDRESS into a target.
+
+        Working-page acquisition is EXCLUDED on every branch. Every design has to get the page, so it
+        is not a cost of the addressing model -- and only some branches acquire it inside this
+        wrapper, so counting it would make `resolve_seconds` bound different work depending on how
+        the model addressed its target, which is exactly the comparison the field exists to support.
+        Call `page_acquired()` right after `_resolve_page()` returns, on the failing path too, so a
+        call that never got a page records a zero rather than the acquisition it did not survive.
+
+        `record` LATCHES: the first call wins, later ones are no-ops. That is what lets each wrapper
+        put a single `finally: record()` around its whole resolution phase -- covering every early
+        return and every raise, including exits added later -- while still recording at the exact
+        point resolution ends on the path that goes on to dispatch the handler, whose own time is the
+        act and not resolution. Without the latch the two would double-count, because
+        `record_resolve_seconds` accumulates so the nested wrappers can sum.
+        """
+        started = time.monotonic()
+        recorded = False
+
+        def page_acquired() -> None:
+            nonlocal started
+            started = time.monotonic()
+
+        def record() -> None:
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
+            record_resolve_seconds(time.monotonic() - started)
+
+        return page_acquired, record
+
     def _with_act_by_mark(handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
             mark = args.get("mark")
             if mark is None:
                 return await handler(args)
-            existing = args.get("selector")
-            # A selector this wrapper minted is not the model passing both: since the resolved
-            # selector is now written back into the caller's dict, a re-dispatch of that same dict
-            # would otherwise fail a guard aimed at the model. The mark still wins and is re-resolved.
-            if existing and not str(existing).startswith(_ACT_SELECTOR_PREFIX):
-                return ToolResult.error("Pass either mark or selector to act on a control, not both.")
+            # Read once, for the same reason the ref wrapper does.
+            frame_perception = frame_perception_enabled()
+            # One guard for the whole resolution phase, not one per call that can raise: the latch in
+            # `record` makes every exit -- early return, raise, and exits added later -- record
+            # exactly once, so a mark rejected for bad input reports ~0 rather than nothing. Absent
+            # has to keep meaning "no address to resolve".
+            page_acquired, record = _resolve_timer()
             try:
-                mark_int = int(mark)
-            except (TypeError, ValueError):
-                return ToolResult.error(f"mark must be an integer from the last look(), got {mark!r}.")
-            page, error = await _resolve_page()
-            if error is not None:
-                return error
-            selector, mark_error = await _resolve_mark(page, mark_int)
-            if mark_error is not None:
-                return mark_error
-            # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
-            # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
-            # nudge's target -- and a copy leaves every one of them seeing only `mark`.
-            args["selector"] = selector
-            # The THIRD caller with this shape, found by checking rather than by being told about it: the
-            # mark was resolved against THIS page, so letting preflight resolve again lets a popup that
-            # became the working page in between be the one acted on.
-            _prefetched_page.append(page)
+                existing = args.get("selector")
+                # A selector this wrapper minted is not the model passing both: since the resolved
+                # selector is now written back into the caller's dict, a re-dispatch of that same dict
+                # would otherwise fail a guard aimed at the model. The mark still wins and is re-resolved.
+                if existing and not str(existing).startswith(_ACT_SELECTOR_PREFIX):
+                    return ToolResult.error("Pass either mark or selector to act on a control, not both.")
+                try:
+                    mark_int = int(mark)
+                except (TypeError, ValueError):
+                    # The mark cohort's `invalid_selector`: the address as SENT is not well formed.
+                    # Its neighbour above ("either mark or selector, not both") deliberately keeps no
+                    # class -- that is a schema error with no counterpart in the css cohort, so naming
+                    # it would add a value to one side of the comparison this record exists to support.
+                    return ToolResult.error(
+                        f"mark must be an integer from the last look(), got {mark!r}.",
+                        error_class="invalid_mark",
+                    )
+                # `page_acquired` restarts the clock on the raising path too, so acquisition is
+                # excluded from every branch rather than bounding this one row alone.
+                try:
+                    page, error = await _resolve_page()
+                finally:
+                    page_acquired()
+                if error is not None:
+                    return error
+                # A failed mark resolution spent real time looking; the phase guard reports it
+                # rather than hiding exactly the failure cost this field exists to price.
+                selector, mark_error = await _resolve_mark(page, mark_int)
+                if mark_error is not None:
+                    return mark_error
+                # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
+                # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
+                # nudge's target -- and a copy leaves every one of them seeing only `mark`.
+                args["selector"] = selector
+                # The THIRD caller with this shape, found by checking rather than by being told about it: the
+                # mark was resolved against THIS page, so letting preflight resolve again lets a popup that
+                # became the working page in between be the one acted on.
+                _prefetched_page.append(page)
+            finally:
+                # A mark resolves to a selector HERE, outside the ref wrapper, which therefore sees a
+                # plain selector and measures ~0. The inner wrapper's own reading adds to this one.
+                record()
+                # Stamped here as well as in the ref wrapper: a mark that fails to resolve returns
+                # from this wrapper and never reaches the inner one, so the row would otherwise
+                # carry a reading with nothing saying which definition produced it.
+                record_frame_perception(frame_perception)
             try:
                 return await handler(args)
             finally:
@@ -11542,12 +11642,14 @@ def build_browser_tools(
         entry = _observe_manifest.get(ref)
         if entry is None:
             return None, ToolResult.error(
-                f"ref={ref} is not a ref from the latest observe — re-observe and use a ref from the new observation"
+                f"ref={ref} is not a ref from the latest observe — re-observe and use a ref from the new observation",
+                error_class="ref_not_in_latest",
             )
         stale = ToolResult.error(
             f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
             "since observe(). Call observe() again and act on a fresh ref.",
             data={"page_state_changed": True},
+            error_class="stale_ref",
         )
         expected = str(entry.get("tag") or "").lower()
         remembered = str(entry.get("selector") or "")
@@ -11650,7 +11752,8 @@ def build_browser_tools(
                 return None, ToolResult.error(
                     f"ref={ref} was read from an embedded frame that shares a url with another frame on "
                     "this page, so it cannot be confirmed to still be the same document — call observe() "
-                    "again and act on a ref from the new reading."
+                    "again and act on a ref from the new reading.",
+                    error_class="ambiguous_frame",
                 )
             if recorded_document != await _realm_document_id(page if owner is None else owner):
                 return None, stale
@@ -11695,7 +11798,7 @@ def build_browser_tools(
         frames -- and a selector matching in more than one frame is an ERROR, never a pick: choosing
         between two documents on the model's behalf is the wrong-element commit in a new costume.
         """
-        if not settings.TASK_V3_FRAME_PERCEPTION:
+        if not frame_perception_enabled():
             return page, None
         found: list[Any] = []
         try:
@@ -11732,12 +11835,14 @@ def build_browser_tools(
             return None, ToolResult.error(
                 f"{selector} could not be confirmed to name one element: {uninspected} frame(s) of this "
                 "page were not readable, and a selector like this is numbered separately in every "
-                "document — re-observe and act on a ref, which names exactly one."
+                "document — re-observe and act on a ref, which names exactly one.",
+                error_class="ambiguous_frame",
             )
         if len(found) > 1:
             return None, ToolResult.error(
                 f"{selector} matches elements in {len(found)} different documents of this page, so it "
-                "does not name one element — re-observe and act on a ref, which names exactly one."
+                "does not name one element — re-observe and act on a ref, which names exactly one.",
+                error_class="ambiguous_frame",
             )
         return (found[0] if found else page), None
 
@@ -11785,70 +11890,110 @@ def build_browser_tools(
 
     def _with_ref_resolution(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
+            # Read ONCE, so the value stamped on the row is provably the one that chose the branch
+            # below. A stratifier read separately from the decision it describes can disagree with it.
+            frame_perception = frame_perception_enabled()
+            page_acquired, record = _resolve_timer()
             selector = args.get("selector")
-            match = _REF_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
-            if match is None:
-                # Inert with the flag off: no realm to route to, so not even a page resolution.
-                if not settings.TASK_V3_FRAME_PERCEPTION or not isinstance(selector, str) or not selector:
-                    return await handler(args)
-                page, error = await _resolve_page()
+            addressed = isinstance(selector, str) and bool(selector)
+            # ONE guard for the whole phase, rather than a `record(); raise` at each call that can
+            # raise: that shape was repeated six times here and four of this PR's own review findings
+            # were exits it did not cover. `record` latches, so the explicit calls that remain mark
+            # where resolution ENDS on a path that goes on to dispatch, and this covers every other
+            # exit -- including ones added later.
+            try:
+                match = REF_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
+                if match is None:
+                    # Inert with the flag off: no realm to route to, so not even a page resolution.
+                    if not frame_perception or not isinstance(selector, str) or not selector:
+                        # Recorded HERE and not left to the phase guard: the guard runs after the
+                        # handler on this path, and the handler's own time is the act, not resolution.
+                        if addressed:
+                            record()
+                        return await handler(args)
+                    # The page provider RAISES on an unrecoverable mid-run page loss rather than returning
+                    # an error; the phase guard below records that too, as a zero.
+                    try:
+                        page, error = await _resolve_page()
+                    finally:
+                        page_acquired()
+                    if error is not None:
+                        return error
+                    realm, realm_error = await _realm_for_typed_selector(page, selector)
+                    if realm_error is not None:
+                        return realm_error
+                    # The routed page is handed on, because the realm decision was made ABOUT it: the
+                    # provider is must_get_working_page and can switch to a newer tab, so letting preflight
+                    # resolve again would run the selector on a popup that became valid during the frame
+                    # queries while the routing belongs to the page before it. Cleared in the finally, which
+                    # is what keeps this writer from leaving a page for the next call to pop.
+                    _prefetched_page.append(page)
+                    if realm is not page:
+                        _acted_realm[:] = [realm]
+                    # Resolution ends here, before the act. The latch makes this the reading the phase
+                    # guard below reports, so the handler's own time is never billed to resolution.
+                    record()
+                    try:
+                        result = await handler(args)
+                        await _note_frame_work(tool_name, realm, args.get("selector"), result)
+                        return result
+                    finally:
+                        _acted_realm.clear()
+                        _prefetched_page.clear()
+                # `page_acquired` restarts the clock on the raising path too, so acquisition is excluded
+                # from every branch rather than bounding this one row alone.
+                try:
+                    page, error = await _resolve_page()
+                finally:
+                    page_acquired()
                 if error is not None:
                     return error
-                realm, realm_error = await _realm_for_typed_selector(page, selector)
-                if realm_error is not None:
-                    return realm_error
-                # The routed page is handed on, because the realm decision was made ABOUT it: the
-                # provider is must_get_working_page and can switch to a newer tab, so letting preflight
-                # resolve again would run the selector on a popup that became valid during the frame
-                # queries while the routing belongs to the page before it. Cleared in the finally, which
-                # is what keeps this writer from leaving a page for the next call to pop.
+                ref = int(match.group(1))
+                resolved, ref_error = await _resolve_ref(page, ref)
+                if ref_error is not None:
+                    return ref_error
+                _owner = (_observe_manifest.get(ref) or {}).get("owner")
+                # In place, for the same reason act-by-mark does it: the persisted action's element_id,
+                # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
+                args["selector"] = resolved
+                durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
+                # Handed on for the same reason the typed-selector branch does it: the ref was validated
+                # against THIS page, and letting preflight resolve again lets a popup that became the working
+                # page in between become the one acted on. Cleared in the finally, so it cannot outlive the
+                # call. This was fixed in the sibling branch and missed here.
                 _prefetched_page.append(page)
-                if realm is not page:
-                    _acted_realm[:] = [realm]
+                if _owner is not None:
+                    _acted_realm[:] = [_owner]
+                # Resolution ends here, before the act. The latch makes this the reading the phase
+                # guard below reports, so the handler's own time is never billed to resolution.
+                record()
                 try:
                     result = await handler(args)
-                    await _note_frame_work(tool_name, realm, args.get("selector"), result)
+                    # The DURABLE selector, not `args["selector"]`, which is still the transient
+                    # data-tv3-act token here and is restored to `durable` by the finally below. The submit
+                    # watch records that durable form, so `pending_marker` is later called with it -- keyed
+                    # by the token, the ledger lookup never matches and the gate accepts a completion over an
+                    # in-flight submit. The ledger would not have worked for framed submits at all.
+                    await _note_frame_work(tool_name, _owner, durable or args.get("selector"), result)
                     return result
                 finally:
                     _acted_realm.clear()
                     _prefetched_page.clear()
-            page, error = await _resolve_page()
-            if error is not None:
-                return error
-            ref = int(match.group(1))
-            resolved, ref_error = await _resolve_ref(page, ref)
-            if ref_error is not None:
-                return ref_error
-            _owner = (_observe_manifest.get(ref) or {}).get("owner")
-            # In place, for the same reason act-by-mark does it: the persisted action's element_id,
-            # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
-            args["selector"] = resolved
-            durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
-            # Handed on for the same reason the typed-selector branch does it: the ref was validated
-            # against THIS page, and letting preflight resolve again lets a popup that became the working
-            # page in between become the one acted on. Cleared in the finally, so it cannot outlive the
-            # call. This was fixed in the sibling branch and missed here.
-            _prefetched_page.append(page)
-            if _owner is not None:
-                _acted_realm[:] = [_owner]
-            try:
-                result = await handler(args)
-                # The DURABLE selector, not `args["selector"]`, which is still the transient
-                # data-tv3-act token here and is restored to `durable` by the finally below. The submit
-                # watch records that durable form, so `pending_marker` is later called with it -- keyed
-                # by the token, the ledger lookup never matches and the gate accepts a completion over an
-                # in-flight submit. The ledger would not have worked for framed submits at all.
-                await _note_frame_work(tool_name, _owner, durable or args.get("selector"), result)
-                return result
+                    # ...but those readers run turns LATER, and the act token is a stamp on one node: a
+                    # control the page REPLACES after the act -- a submit button swapped for its
+                    # "Submitting" version -- carries it away, and the in-flight probe fails open on a
+                    # selector that resolves to nothing. Hand them back an address that re-resolves.
+                    if durable:
+                        args["selector"] = durable
             finally:
-                _acted_realm.clear()
-                _prefetched_page.clear()
-                # ...but those readers run turns LATER, and the act token is a stamp on one node: a
-                # control the page REPLACES after the act -- a submit button swapped for its
-                # "Submitting" version -- carries it away, and the in-flight probe fails open on a
-                # selector that resolves to nothing. Hand them back an address that re-resolves.
-                if durable:
-                    args["selector"] = durable
+                # Only when an address was actually supplied. This wrapper also sits on
+                # selector-OPTIONAL tools (whole-page get_html, unfocused press_key, page scroll, timed
+                # wait), and recording for those would make the field present on calls that had nothing
+                # to resolve -- absent has to keep one meaning, or a cohort selected by presence is
+                # contaminated by calls that never addressed anything.
+                if addressed:
+                    record()
+                    record_frame_perception(frame_perception)
 
         return wrapped
 
@@ -11856,11 +12001,7 @@ def build_browser_tools(
         _spec(
             "observe",
             _OBSERVE_DESCRIPTION_BASE
-            + (
-                _OBSERVE_DESCRIPTION_FRAME_REACH
-                if settings.TASK_V3_FRAME_PERCEPTION
-                else _OBSERVE_DESCRIPTION_NO_FRAME_REACH
-            ),
+            + (_OBSERVE_DESCRIPTION_FRAME_REACH if frame_perception_enabled() else _OBSERVE_DESCRIPTION_NO_FRAME_REACH),
             _obj({}),
             observe,
         ),
@@ -12167,13 +12308,15 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
                 # The flag lets the loop's action-loop guard treat the download as progress without
                 # sniffing the notice lines back out of the content string. Preserve screenshots so a
                 # result that also carried a look image (or any future image) is not silently dropped.
-                return ToolResult(
-                    result.status,
-                    result.content + "\n" + "\n".join(capped),
+                # `replace`, not a positional rebuild: this is the OUTERMOST wrapper, so a rebuild
+                # that lists fields silently drops whatever the inner wrappers set -- the screenshots
+                # the old comment here guarded, and every field added since.
+                return dataclasses.replace(
+                    result,
+                    content=result.content + "\n" + "\n".join(capped),
                     # download_new marks a download detected on THIS call; a compactable tool
                     # replaying retained pending lines carries only download_notice.
-                    {**(result.data or {}), "download_notice": True, "download_new": bool(new_lines)},
-                    result.screenshots,
+                    data={**(result.data or {}), "download_notice": True, "download_new": bool(new_lines)},
                 )
             except Exception:
                 LOG.warning("taskv3 download signal computation failed", tool=_tool_name, exc_info=True)
