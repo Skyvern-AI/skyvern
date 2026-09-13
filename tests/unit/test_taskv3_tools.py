@@ -11118,7 +11118,7 @@ async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_
     # will do exactly that. If the digest ever prints a form the resolver does not accept, the string
     # falls through as CSS -- failing outright, or worse matching a page-authored attribute of the
     # same name. One shape, both directions.
-    from skyvern.forge.taskv3.tools import _REF_SELECTOR_RE  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import REF_SELECTOR_RE  # noqa: PLC0415
 
     async with _content_page('<button id="go" style="width:80px;height:20px">Go</button>') as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -11126,7 +11126,7 @@ async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_
         line = next(ln for ln in r.content.splitlines() if "'Go'" in ln)
         printed = line.split(" ", 1)[0]
 
-        assert _REF_SELECTOR_RE.match(printed), f"observe printed {printed!r}, which no tool accepts"
+        assert REF_SELECTOR_RE.match(printed), f"observe printed {printed!r}, which no tool accepts"
         clicked = await _tool(tools, "click").handler({"selector": printed})
         assert clicked.status == "ok", clicked.content
 
@@ -23028,6 +23028,117 @@ def test_merging_caps_elements_page_wide_and_counts_what_it_dropped() -> None:
     _merge_realm(page, {"elements": [{"f": 0}, {"f": 1}, {"f": 2}], "text": [], "textFull": [], "dropped": 7})
     assert page["dropped"] == 9
     assert page["mergeCapDropped"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_download_notice_rebuild_keeps_every_field_the_inner_wrappers_set() -> None:
+    # _apply_download_signal is the OUTERMOST wrapper on every tool, and when it has a notice to
+    # deliver it returns a NEW ToolResult built from the old one. A rebuild that lists fields drops
+    # the ones it does not list -- which silently blanked error_class on every download-adjacent
+    # call, turning a classified failure into "other". Nothing else in the suite covers that seam.
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.loop import ToolResult, ToolSpec  # noqa: PLC0415
+    from skyvern.forge.taskv3.tools import _apply_download_signal  # noqa: PLC0415
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("no", data={"page_state_changed": True}, error_class="stale_ref")
+
+    with tempfile.TemporaryDirectory() as downloads_dir:
+        spec = ToolSpec(name="click", description="c", parameters={}, handler=handler, billable=True)
+        _apply_download_signal([spec], downloads_dir)
+        # The baseline snapshot is taken inside the FIRST call, so the file has to appear after it --
+        # otherwise it is absorbed as pre-existing and the rebuild branch never executes.
+        first = await spec.handler({"selector": "ref=1"})
+        assert (first.data or {}).get("download_notice") is None
+        with open(os.path.join(downloads_dir, "statement.pdf"), "w") as fh:
+            fh.write("x")
+        result = await spec.handler({"selector": "ref=1"})
+
+    # The notice fired -- without this the assertions below would pass on the untouched result.
+    assert (result.data or {}).get("download_notice") is True
+    assert "Downloaded: statement.pdf" in result.content
+    assert result.error_class == "stale_ref"
+    assert (result.data or {}).get("page_state_changed") is True
+
+
+@pytest.mark.asyncio
+async def test_every_exit_from_address_resolution_records_exactly_one_stamped_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The contract the phase guard replaced six hand-written `record(); raise` blocks to hold.
+
+    `record_resolve_seconds` ACCUMULATES, so recording twice inflates the row and recording zero
+    times drops it -- and neither is visible in the value, only in the count. Four of this PR's own
+    review findings were exits that recorded zero times, all found by reading rather than by a red.
+    """
+    readings: list[float] = []
+    stamps: list[bool] = []
+    monkeypatch.setattr(taskv3_tools, "record_resolve_seconds", lambda elapsed: readings.append(elapsed))
+    monkeypatch.setattr(taskv3_tools, "record_frame_perception", lambda enabled: stamps.append(enabled))
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+
+    tools = {t.name: t for t in build_browser_tools(_fixed_page_provider(_FakePage()))}
+
+    # No address supplied: absent has to keep meaning "nothing to resolve".
+    readings.clear()
+    stamps.clear()
+    with contextlib.suppress(Exception):
+        await tools["get_html"].handler({})
+    assert readings == []
+    # ...and an unmeasured row must not be stamped either, or the two fields disagree about whether
+    # there was anything to describe.
+    assert stamps == []
+
+    # A plain selector, resolved later inside the handler: one reading, recorded before dispatch,
+    # stamped with the mode that decided where the resolution happens.
+    readings.clear()
+    stamps.clear()
+    with contextlib.suppress(Exception):
+        await tools["get_html"].handler({"selector": "#name"})
+    assert len(readings) == 1
+    assert stamps == [False]
+
+    # The same call under the other definition of that row -- the cut a ramp-spanning dataset needs.
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    framed = {t.name: t for t in build_browser_tools(_fixed_page_provider(_FakePage()))}
+    readings.clear()
+    stamps.clear()
+    with contextlib.suppress(Exception):
+        await framed["get_html"].handler({"selector": "#name"})
+    assert len(readings) == 1
+    assert stamps == [True]
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+
+    # An address that fails to resolve still spent real time looking.
+    readings.clear()
+    failed = await tools["click"].handler({"selector": "ref=1"})
+    assert failed.status == "error"
+    assert len(readings) == 1
+
+    # The exit the guard exists for: the page provider raises mid-resolution rather than returning
+    # an error, so the loop builds the result itself and anything left unrecorded here is gone.
+    async def _page_lost() -> Any:
+        raise RuntimeError("unrecoverable mid-run page loss")
+
+    raising = {t.name: t for t in build_browser_tools(_page_lost)}
+    readings.clear()
+    stamps.clear()
+    with pytest.raises(RuntimeError):
+        await raising["click"].handler({"selector": "ref=1"})
+    assert len(readings) == 1
+    assert stamps == [False]
+
+    # A mark that never resolves returns from the OUTER wrapper, so the inner one -- which is where
+    # the stamp used to be written -- never runs. The row would carry a reading with nothing saying
+    # which definition produced it, which is the one thing the contract says cannot happen.
+    readings.clear()
+    stamps.clear()
+    rejected = await tools["click"].handler({"mark": "not-an-integer"})
+    assert rejected.status == "error"
+    assert len(readings) == 1
+    assert stamps == [False]
 
 
 # Today's surface, written out rather than derived. A witness that derives the expected set from the

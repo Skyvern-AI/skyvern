@@ -13,6 +13,8 @@ import copy
 import hashlib
 import json
 import random
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -69,8 +71,11 @@ from skyvern.forge.taskv3.loop import (
     _PerceptionLedger,
     _ProgressEvidence,
     _ProgressLedger,
+    _raised_error_class,
     _RevisitMemory,
     make_finish_tool,
+    record_frame_perception,
+    record_resolve_seconds,
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
@@ -9105,6 +9110,257 @@ async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_w
     assert outcome.status == "failed"
     assert caller.calls == 2
     assert state.giveup_deferrals == 0
+
+
+@pytest.mark.asyncio
+async def test_selector_kind_reports_the_address_the_model_sent_not_the_one_the_wrappers_left() -> None:
+    # The ref and act-by-mark wrappers rewrite args["selector"] IN PLACE, and ref resolution restores
+    # it to the manifest's durable CSS selector on the way out. Read after dispatch, every ref=N call
+    # would therefore record as "css" and the ref-vs-selector cost split would silently invert --
+    # with no test failing and no error anywhere. This pins the read to before dispatch.
+    async def rewrites_in_place(args: dict[str, Any]) -> ToolResult:
+        args["selector"] = '[data-x="durable"]'  # what the real wrapper leaves behind
+        return ToolResult.ok("done")
+
+    click = ToolSpec(name="click", description="c", parameters={}, handler=rewrites_in_place, billable=True)
+    script = [
+        [("click", {"selector": "ref=12"})],
+        [("click", {"selector": "#plain"})],
+        [("click", {"mark": 3})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [click, make_finish_tool()])
+    assert outcome.status == "completed"
+    records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "click"]
+    assert [e["selector_kind"] for e in records] == ["ref", "css", "mark"]
+    # The mark call carries selector_present=True even though the model sent no selector: the wrapper
+    # left its resolved selector in `args` and that field is read after dispatch. Pinned rather than
+    # fixed -- the two fields describe different moments, and a reader of the data needs to know.
+    assert [e["selector_present"] for e in records] == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_records_its_error_class_and_a_successful_one_records_none() -> None:
+    # error_class is what separates a stale-ref refusal from a driver timeout in the failure-cost
+    # read. It is never shown to the model, so a drift here is invisible except as a measurement
+    # that quietly reports every failure as "other".
+    async def stale(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("gone", data={"page_state_changed": True}, error_class="stale_ref")
+
+    async def untagged(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("something else")
+
+    async def fine(args: dict[str, Any]) -> ToolResult:
+        record_resolve_seconds(0.25)
+        record_frame_perception(True)
+        return ToolResult.ok("ok")
+
+    tools = [
+        ToolSpec(name="click", description="c", parameters={}, handler=stale, billable=True),
+        ToolSpec(name="hover", description="h", parameters={}, handler=untagged, billable=True),
+        ToolSpec(name="scroll", description="s", parameters={}, handler=fine),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "ref=1"})],
+        [("hover", {"selector": "#a"})],
+        [("scroll", {"selector": "#b"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+    assert outcome.status == "completed"
+    by_tool = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert by_tool["click"]["tool_error_class"] == "stale_ref"
+    assert by_tool["hover"]["tool_error_class"] == "other"
+    # A successful call carries no error_class at all, and a call that resolved no address carries
+    # no resolve_seconds -- absent, not null, so the two are distinguishable in the read.
+    assert "error_class" not in by_tool["scroll"]
+    assert "tool_error_class" not in by_tool["scroll"]
+    assert by_tool["scroll"]["resolve_seconds"] == 0.25
+    assert "resolve_seconds" not in by_tool["click"]
+    # The measurement and the definition it was taken under travel together, or a dataset
+    # spanning the frame-perception ramp cannot separate the two meanings of a css row.
+    assert by_tool["scroll"]["frame_perception"] is True
+    assert "frame_perception" not in by_tool["click"]
+
+
+@pytest.mark.asyncio
+async def test_a_handler_that_raises_still_reports_the_time_it_spent_resolving_the_address() -> None:
+    # The cohort this telemetry exists to price is the one where the handler RAISES -- a driver
+    # timeout on a target that resolved fine. The loop builds that result itself, so anything the
+    # wrappers wrote onto the handler's return value is gone. Reading the resolution time off the
+    # context variable instead is what keeps the dominant failure cohort measurable; reading it off
+    # the result would silently report addressing as free exactly where it is not.
+    # The REAL driver error, not a look-alike: the classifier decides by driver-family TYPE, so a
+    # stand-in defined here would prove nothing about what is actually raised in production. The
+    # fork's arm cannot be exercised here (the package is absent outside the browser image) and is
+    # covered by construction -- `is_driver_timeout_error` enumerates both packages.
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # noqa: PLC0415
+
+    async def times_out(args: dict[str, Any]) -> ToolResult:
+        record_resolve_seconds(0.75)  # the wrapper resolved the address, then the act hung
+        raise PlaywrightTimeoutError("Timeout 30000ms exceeded")
+
+    async def fetch_times_out(args: dict[str, Any]) -> ToolResult:
+        record_resolve_seconds(0.25)
+        # file_upload awaits a source fetch that raises this, and on 3.11 asyncio.TimeoutError IS
+        # builtins.TimeoutError -- neither is a DRIVER timeout, and folding them into that cohort
+        # would corrupt the failed-action cost this field exists to produce.
+        raise TimeoutError("fetching the file took too long")
+
+    async def blows_up(args: dict[str, Any]) -> ToolResult:
+        record_resolve_seconds(0.5)
+        raise RuntimeError("something else entirely")
+
+    tools = [
+        ToolSpec(name="click", description="c", parameters={}, handler=times_out, billable=True),
+        ToolSpec(name="file_upload", description="u", parameters={}, handler=fetch_times_out, billable=True),
+        ToolSpec(name="type", description="t", parameters={}, handler=blows_up, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "ref=1"})],
+        [("file_upload", {"selector": "ref=3"})],
+        [("type", {"selector": "ref=2"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+    assert outcome.status == "completed"
+    by_tool = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert by_tool["click"]["tool_error_class"] == "driver_timeout"
+    assert by_tool["click"]["resolve_seconds"] == 0.75
+    # A bare TimeoutError is NOT driver evidence: it must not land in the driver cohort.
+    assert by_tool["file_upload"]["tool_error_class"] == "timeout_other"
+    assert by_tool["file_upload"]["resolve_seconds"] == 0.25
+    # Classified on the exception's module and CLASS name, never its message -- a message can carry
+    # page text, and this field is indexed.
+    assert by_tool["type"]["tool_error_class"] == "handler_raised"
+    assert by_tool["type"]["resolve_seconds"] == 0.5
+    # Per call, never carried over: finish resolved no address and must report none.
+    assert "resolve_seconds" not in by_tool["finish"]
+
+
+def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:
+    # Written against the driver-type TABLE rather than a hard-coded package, because the hazard is
+    # precisely that CI and production do not install the same driver: the browser image repoints
+    # this repository's driver imports to the fork, so a test that names one package green-lights a
+    # classifier that is dead in production.
+    #
+    # STATED LIMIT, because green here is easy to over-read: CI installs only the un-forked driver,
+    # so in CI this test CANNOT tell a module-name check from a type check -- both pass. It reds on
+    # a dead driver arm, and it reds on a package-name check wherever the fork IS the installed
+    # driver, which is the environment that was broken. It is not a CI regression test for that
+    # case, and nothing available in CI could be.
+    import skyvern.forge.taskv3.tools  # noqa: F401, PLC0415
+    from skyvern.webeye.browser_driver_errors import DRIVER_TIMEOUT_ERROR_TYPES  # noqa: PLC0415
+    from skyvern.webeye.browser_driver_errors import is_driver_timeout_error  # noqa: PLC0415
+
+    # The loop no longer imports the driver itself, so the cohort is only non-empty once the browser
+    # wiring has installed the predicate. Asserted explicitly rather than relied on: everything below
+    # would still pass on the driver-blind default if the classifier had quietly stopped being
+    # installed, and it would pass by reporting every driver timeout as something else.
+    assert loop_module._is_driver_timeout is is_driver_timeout_error
+    # Without this the loop below would pass vacuously on an empty table -- the failure mode where a
+    # driver timeout is classified as something else on every single call.
+    assert DRIVER_TIMEOUT_ERROR_TYPES, "no driver timeout types are installed; the classifier cannot work"
+    for driver_timeout in DRIVER_TIMEOUT_ERROR_TYPES:
+        assert _raised_error_class(driver_timeout("timed out")) == "driver_timeout", driver_timeout
+    # And the classes that merely LOOK like one stay out of that cohort.
+    assert _raised_error_class(TimeoutError("a source fetch, not the driver")) == "timeout_other"
+    assert _raised_error_class(RuntimeError("something else")) == "handler_raised"
+
+
+def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
+    """The `Literal` alias is the declaration; this is what actually checks it.
+
+    `mypy.ini` sets `follow_imports = skip`, so `ToolResult` resolves to `Any` in every module that
+    imports it -- the annotation is enforced inside loop.py and nowhere else, and all but a handful
+    of the write sites are in tools.py. A typo or a near-synonym added there would split the facet
+    with nothing going red, which is the whole hazard of a closed vocabulary written at many sites.
+    Read out of the source rather than by calling, because the sites are error branches that a test
+    cannot all reach.
+
+    The population is DERIVED, not listed: every `ToolResult` construction under `skyvern/` and
+    `cloud/`, plus every `error_class=` kwarg anywhere in the taskv3 package. A named module list is
+    the same shape of hazard one level up -- it holds until someone writes the value somewhere the
+    list does not name, which is exactly what a tool registered through `extra_tools` does.
+    """
+    import ast  # noqa: PLC0415
+    import pathlib  # noqa: PLC0415
+    from typing import get_args  # noqa: PLC0415
+
+    import skyvern  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import ToolErrorClass  # noqa: PLC0415
+
+    def _is_tool_result_call(node: ast.Call) -> bool:
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id == "ToolResult"
+        return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "ToolResult"
+
+    repo_root = pathlib.Path(skyvern.__file__).resolve().parent.parent
+    taskv3 = repo_root / "skyvern" / "forge" / "taskv3"
+    declared = set(get_args(ToolErrorClass))
+    written: set[str] = set()
+    for root in (repo_root / "skyvern", repo_root / "cloud"):
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.py"):
+            source = path.read_text(encoding="utf-8", errors="replace")
+            if "error_class" not in source:
+                continue
+            in_taskv3 = taskv3 in path.parents
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.Call):
+                    continue
+                # Scoped by the CALL, not by a list of modules. `auth_tools` and `captcha_tools`
+                # register through `extra_tools` into the same loop and land on the same facet, and a
+                # registrar could live outside this package entirely -- a named module list drops
+                # whichever site nobody thought to add. Scoping by `ToolResult` also keeps
+                # `cloud/webeye`'s unrelated `error_class` out, which is the collision the emitted
+                # field was renamed to escape.
+                if not (in_taskv3 or _is_tool_result_call(node)):
+                    continue
+                for keyword in node.keywords:
+                    value = keyword.value
+                    if (
+                        keyword.arg == "error_class"
+                        and isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                    ):
+                        written.add(value.value)
+
+    # Anti-vacuity: a walk that matched nothing would satisfy the subset check silently. These three
+    # live in tools.py, the module the subset check exists to cover.
+    assert {"stale_selector", "disabled", "ambiguous_frame"} <= written
+    assert written <= declared, f"error classes written but not declared: {sorted(written - declared)}"
+    # Produced by the loop's fallback for an erroring call whose site named nothing, not by a kwarg.
+    assert "other" in declared
+
+
+def test_the_loop_core_imports_with_no_browser_driver_installed() -> None:
+    """The module docstring's claim, made checkable.
+
+    The driver packages are in the `local`/`server` extras only, so any module-scope reach for one
+    from this file makes the loop unimportable in a base install and unusable with the scripted fakes
+    every test here is built on. A blocked meta-path entry stands in for that environment; a real one
+    cannot be built in-process, and the import graph read by eye is what let this through once.
+    """
+    probe = (
+        "import sys\n"
+        "class B:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in ('playwright', 'patchright'):\n"
+        "            raise ModuleNotFoundError(name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, B())\n"
+        "import skyvern.forge.taskv3.loop\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
 
 
 def test_the_code_tool_is_treated_as_possibly_having_submitted() -> None:

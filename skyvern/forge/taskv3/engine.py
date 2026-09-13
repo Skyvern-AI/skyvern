@@ -34,6 +34,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
+from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.goal_composition import build_user_prompt
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
@@ -276,7 +277,7 @@ async def run_task_v3_agent_loop(
     code_tool: ToolSpec | None = None
     if code_surface.offers_code_tool and not page_free:
         execution_id = (_ctx.run_id or _ctx.workflow_run_id or _ctx.task_id or "") if _ctx else ""
-        if settings.TASK_V3_FRAME_PERCEPTION:
+        if frame_perception_enabled():
             # The realm-attributed ledger behind the data-loss guard and the completion gate is
             # written only by the native action tools' wrapper. Code driving the page directly
             # bypasses it, so in-frame fills and submits would be invisible to both -- worst under
