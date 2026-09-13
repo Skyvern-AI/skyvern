@@ -2555,8 +2555,8 @@ class WorkflowService:
         parameters with no default value, mark the workflow run as failed.
         :param request_id: The request id for the workflow run.
         :param workflow_request: The request body for the workflow run, containing the parameters and the config.
-        :param workflow_id: The workflow id to run.
-        :param organization_id: The organization id for the workflow.
+        :param workflow_permanent_id: The permanent id of the workflow to run.
+        :param organization: The organization the workflow run belongs to.
         :param max_steps_override: The max steps override for the workflow run, if any.
         :param resolved_workflow_id: Pin the exact workflow version row to run against, resolved by
             workflow_id. Used when the (permanent_id, version) index is non-unique and a version=
