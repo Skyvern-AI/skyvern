@@ -96,6 +96,9 @@ class TestIsSensitiveKey:
             "Cookie",
             "x-api-key",
             "X-Api-Key",
+            "X-Copilot-Credential-Recovery-Token",
+            "credential_recovery_token",
+            "resume_token",
             # Whole header dicts, masked wholesale because their inner key names are
             # caller-chosen and therefore unmatchable.
             "extra_http_headers",
@@ -1178,3 +1181,55 @@ class TestRawRequestLogLevel:
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == status_code
         log_mock.info.assert_not_called()
+
+
+@pytest.mark.parametrize("status_code", [200, 403, 500])
+def test_copilot_recovery_capabilities_never_enter_request_logs(
+    log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+    app = _make_app()
+    recovery_proof = "a" * 64
+    selection_token = "synthetic-selection-capability"
+
+    @app.get("/v1/workflow/copilot/chat-history")
+    async def history() -> dict:
+        if status_code == 403:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if status_code == 500:
+            raise RuntimeError("Synthetic history failure")
+        return {"pending_credential_requests": [{"resume_token": selection_token, "turn_id": "turn"}]}
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/v1/workflow/copilot/chat-history",
+        headers={"X-Copilot-Credential-Recovery-Token": recovery_proof, "X-Request-ID": "request"},
+    )
+    assert response.status_code == status_code
+    logger = log_mock.info if status_code == 200 else log_mock.warning if status_code == 403 else log_mock.error
+    logger.assert_called_once()
+    fields = logger.call_args.kwargs
+    assert fields["headers"]["x-request-id"] == "request"
+    assert "x-copilot-credential-recovery-token" not in fields["headers"]
+    assert recovery_proof not in str(log_mock.mock_calls)
+    assert selection_token not in str(log_mock.mock_calls)
+    if status_code == 200:
+        assert response.json()["pending_credential_requests"][0]["resume_token"] == selection_token
+        assert json.loads(fields["response_body"])["pending_credential_requests"] == [
+            {"resume_token": REDACTED, "turn_id": "turn"}
+        ]
+
+
+def test_structured_recovery_capabilities_are_redacted_without_masking_turn_identity() -> None:
+    assert redact_sensitive_fields(
+        {
+            "headers": {"X-Copilot-Credential-Recovery-Token": "synthetic-proof"},
+            "credential_recovery_token": "synthetic-proof",
+            "resume_token": "synthetic-selection",
+            "turn_id": "turn",
+        }
+    ) == {
+        "headers": {"X-Copilot-Credential-Recovery-Token": REDACTED},
+        "credential_recovery_token": REDACTED,
+        "resume_token": REDACTED,
+        "turn_id": "turn",
+    }

@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotPendingTurn
@@ -611,6 +612,55 @@ async def test_invalid_and_duplicate_replies_do_not_call_secret_provider(sqlite_
         duplicate = await client.post("/reply", json={**body, "answers": [answer] * 100})
         assert duplicate.json() == accepted.json()
         resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monkeypatch):
+    from skyvern.forge.sdk.routes import workflow_copilot as routes
+
+    _, client, ctx, frames = await setup_question_chat(sqlite_engine, monkeypatch)
+    ctx.request_policy = RequestPolicy()
+    monkeypatch.setattr(
+        routes,
+        "_screen_raw_secret_safety",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="detected",
+                canonical_user_message="https://portal.example.com/login [REDACTED]",
+            )
+        ),
+    )
+
+    async with client:
+        task = asyncio.create_task(
+            ask_user(
+                ctx,
+                AskUserArguments.model_validate({"parts": [{"prompt": "Sign-in URL?"}]}),
+                "call",
+            )
+        )
+        question = (await asyncio.wait_for(frames.get(), 5))["interactions"][0]
+        result = await client.post(
+            "/reply",
+            json={
+                "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+                "interaction_id": question["interaction_id"],
+                "text": "https://portal.example.com/login password=hunter2",
+            },
+        )
+        await asyncio.wait_for(task, 5)
+
+    assert result.status_code == 200
+    assert result.json()["response"] == {
+        "answers": [],
+        "text": "https://portal.example.com/login [REDACTED]",
+        "skipped": False,
+        "raw_secret_detected": True,
+    }
+    assert ctx.request_policy.raw_secret_detected is True
+    assert ctx.request_policy.testing_intent == "skip_test"
+    assert ctx.request_policy.allow_run_blocks is False
+    assert ctx.allow_untested_workflow_draft is True
 
 
 @pytest.mark.asyncio

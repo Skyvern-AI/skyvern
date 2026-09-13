@@ -1471,6 +1471,7 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
         browser_address=task.browser_address,
         browser_profile_id=None,
         browser_session_id=task.browser_session_id,
+        stale_context_is_unusable=True,
     )
     browser_state.navigate_to_url.assert_awaited_once_with(page=recovered_page, url=page.url)
     browser_state.set_active_page.assert_awaited_once_with(recovered_page)

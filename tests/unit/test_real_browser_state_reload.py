@@ -207,6 +207,7 @@ async def test_scrape_with_type_normal_no_reload_call() -> None:
 
 def _reconnect_state(binding: DownloadBinding) -> RealBrowserState:
     state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()
@@ -239,6 +240,7 @@ async def test_reconnect_keeps_run_dir_binding() -> None:
 
 def _reconnect_state_capturing_check(binding: DownloadBinding, captured: dict[str, object]) -> RealBrowserState:
     state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()

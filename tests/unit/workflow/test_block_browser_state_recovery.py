@@ -425,7 +425,7 @@ async def test_is_connected_false_after_real_driver_stop(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_reconnect_starts_fresh_driver_and_stops_stale_one(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_reconnect_restores_replacement_before_stopping_stale_driver(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     stale_pw = MagicMock()
     stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
@@ -437,15 +437,15 @@ async def test_reconnect_starts_fresh_driver_and_stops_stale_one(monkeypatch: py
             return fresh_pw
 
     monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
-
     state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild and replay scripts"))
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
     await state.reconnect(browser_address="ws://remote-browser")
 
     assert state.pw is fresh_pw
-    assert events == ["stop stale driver", "start fresh driver", "rebuild and replay scripts"]
+    assert events == ["start fresh driver", "rebuild and replay scripts", "stop stale driver"]
     stale_pw.stop.assert_awaited_once()
     assert check_and_fix.await_args.kwargs["browser_address"] == "ws://remote-browser"
 
@@ -464,14 +464,154 @@ async def test_reconnect_stops_fresh_driver_when_state_rebuild_fails(monkeypatch
     monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
 
     state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock(side_effect=RuntimeError("cdp handshake failed")))
 
     with pytest.raises(RuntimeError, match="cdp handshake failed"):
         await state.reconnect(browser_address="ws://remote-browser")
 
-    # A failed rebuild must stop both drivers so it never orphans the freshly started one.
+    # The failed replacement is stopped while the still-guarded stale driver remains attached.
     fresh_pw.stop.assert_awaited_once()
-    stale_pw.stop.assert_awaited_once()
+    stale_pw.stop.assert_not_awaited()
+    assert state.pw is stale_pw
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancellation_restores_still_guarded_stale_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(return_value=None)
+    fresh_pw = MagicMock()
+    fresh_pw.stop = AsyncMock(return_value=None)
+
+    class _FakeAsyncPlaywright:
+        async def start(self) -> object:
+            return fresh_pw
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+
+    stale_context = MagicMock()
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
+    stale_listener_browser = MagicMock()
+    state._disconnect_listener_browser = stale_listener_browser
+    registration = object()
+    state.add_sessionless_init_script_registration(registration)
+
+    async def cancel_after_replacement_context_was_published(**_kwargs: object) -> None:
+        replacement_context = MagicMock()
+        state.browser_context = replacement_context
+        state._disconnect_listener_browser = MagicMock()
+        state._on_browser_context_closed(replacement_context)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        state,
+        "check_and_fix_state",
+        AsyncMock(side_effect=cancel_after_replacement_context_was_published),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await state.reconnect(browser_address="ws://remote-browser")
+
+    assert state.pw is stale_pw
+    assert state.browser_context is stale_context
+    assert state._disconnect_listener_browser is stale_listener_browser
+    assert state.sessionless_init_script_registrations == (registration,)
+    fresh_pw.stop.assert_awaited_once()
+    stale_pw.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_pre_handoff_reconnect_preserves_sessionless_registrations_for_next_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_pw = MagicMock()
+    first_replacement_pw = MagicMock()
+    second_replacement_pw = MagicMock()
+    start_fresh = AsyncMock(side_effect=[first_replacement_pw, second_replacement_pw])
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    initial_context = MagicMock()
+    replacement_contexts = [MagicMock(), MagicMock()]
+    state = RealBrowserState(pw=initial_pw, browser_context=initial_context)
+    state._connection_status = MagicMock(return_value=(True, None))
+    registration = object()
+    state.add_sessionless_init_script_registration(registration)
+    replayed_registrations: list[tuple[object, ...]] = []
+
+    async def stop_current_driver() -> None:
+        current_context = state.browser_context
+        assert current_context is not None
+        state._on_browser_context_closed(current_context)
+
+    initial_pw.stop = AsyncMock(side_effect=stop_current_driver)
+    first_replacement_pw.stop = AsyncMock(side_effect=stop_current_driver)
+
+    async def rebuild(**kwargs: object) -> None:
+        replayed_registrations.append(kwargs["sessionless_init_script_registrations"])  # type: ignore[arg-type]
+        state.browser_context = replacement_contexts.pop(0)
+
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock(side_effect=rebuild))
+
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+
+    assert replayed_registrations == [(registration,), (registration,)]
+    assert state.sessionless_init_script_registrations == (registration,)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restores_stale_state_before_cancelled_replacement_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(return_value=None)
+    fresh_pw = MagicMock()
+    shutdown_started = asyncio.Event()
+
+    async def wait_during_replacement_shutdown() -> None:
+        shutdown_started.set()
+        await asyncio.Event().wait()
+
+    fresh_pw.stop = AsyncMock(side_effect=wait_during_replacement_shutdown)
+
+    class _FakeAsyncPlaywright:
+        async def start(self) -> object:
+            return fresh_pw
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+
+    stale_context = MagicMock()
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
+    replacement_context = MagicMock()
+
+    async def fail_after_replacement_context_was_published(**_kwargs: object) -> None:
+        state.browser_context = replacement_context
+        raise RuntimeError("replacement setup failed")
+
+    monkeypatch.setattr(
+        state,
+        "check_and_fix_state",
+        AsyncMock(side_effect=fail_after_replacement_context_was_published),
+    )
+
+    reconnect = asyncio.create_task(state.reconnect(browser_address="ws://remote-browser"))
+    await asyncio.wait_for(shutdown_started.wait(), timeout=1)
+    reconnect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+
+    assert state.pw is stale_pw
+    assert state.browser_context is stale_context
+    fresh_pw.stop.assert_awaited_once()
+    stale_pw.stop.assert_not_awaited()
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -497,6 +637,7 @@ async def test_reconnect_bounds_fresh_driver_shutdown_when_state_rebuild_fails(
     monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0.01)
 
     state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock(side_effect=RuntimeError("cdp handshake failed")))
 
     with pytest.raises(RuntimeError, match="cdp handshake failed"):
@@ -504,7 +645,8 @@ async def test_reconnect_bounds_fresh_driver_shutdown_when_state_rebuild_fails(
 
     assert stop_started.is_set()
     fresh_pw.stop.assert_awaited_once()
-    stale_pw.stop.assert_awaited_once()
+    stale_pw.stop.assert_not_awaited()
+    assert state.pw is stale_pw
 
 
 @pytest.mark.asyncio
@@ -526,17 +668,22 @@ async def test_reconnect_recovers_when_stale_driver_shutdown_has_already_failed(
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
     await state.reconnect(browser_address="ws://remote-browser")
+    await asyncio.sleep(0)
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
 
+    assert stale_pw.stop.await_count == 2
     start_fresh.assert_awaited_once()
     check_and_fix.assert_awaited_once()
+    assert state._detached_teardown_tasks == set()
 
 
 @pytest.mark.asyncio
-async def test_reconnect_does_not_overlap_driver_when_stale_connection_may_still_be_live(
+async def test_reconnect_refuses_to_overlap_driver_when_stale_connection_may_still_be_live(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_pw = MagicMock()
-    stale_pw.stop = AsyncMock(side_effect=RuntimeError("stale driver still attached"))
+    stale_pw.stop = AsyncMock()
     start_fresh = AsyncMock()
 
     class _FakeAsyncPlaywright:
@@ -545,28 +692,261 @@ async def test_reconnect_does_not_overlap_driver_when_stale_connection_may_still
     monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
 
     state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
-    state._connection_status = MagicMock(side_effect=[(True, None), (False, "browser_context_missing")])
+    state._connection_status = MagicMock(return_value=(True, None))
     check_and_fix = AsyncMock()
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
-    with pytest.raises(RuntimeError, match="stale Playwright driver"):
+    with pytest.raises(RuntimeError, match="may still be live"):
         await state.reconnect(browser_address="ws://remote-browser")
 
-    start_fresh.assert_not_awaited()
-    check_and_fix.assert_not_awaited()
-
-    # reconnect clears the context before attempting stop. A retry must treat that missing context
-    # as unknown rather than proof that the first driver detached.
-    with pytest.raises(RuntimeError, match="stale Playwright driver"):
-        await state.reconnect(browser_address="ws://remote-browser")
-
-    assert stale_pw.stop.await_count == 2
+    stale_pw.stop.assert_not_awaited()
     start_fresh.assert_not_awaited()
     check_and_fix.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_reconnect_bounds_stale_driver_shutdown_before_starting_fresh_driver(
+@pytest.mark.parametrize("disconnect_reason", ["browser_context_missing", "browser_context_closed"])
+async def test_reconnect_stops_known_unusable_context_before_starting_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect_reason: str,
+) -> None:
+    events: list[str] = []
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
+    start_fresh = AsyncMock(side_effect=lambda: events.append("start fresh driver"))
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, disconnect_reason))
+    check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild"))
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser")
+
+    assert events == ["stop stale driver", "start fresh driver", "rebuild"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_stops_driver_after_connection_probe_failure_before_starting_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
+    start_fresh = AsyncMock(side_effect=lambda: events.append("start fresh driver"))
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    stale_context = MagicMock()
+    stale_context._impl_obj = None
+    stale_context.browser.is_connected.side_effect = RuntimeError("connection probe failed")
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild"))
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser")
+
+    assert events == ["stop stale driver", "start fresh driver", "rebuild"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_keeps_guard_through_connection_probe_failure_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
+    start_fresh = AsyncMock(side_effect=lambda: events.append("start fresh driver"))
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+
+    stale_context = MagicMock()
+    stale_context._impl_obj = None
+    stale_context.browser.is_connected.side_effect = RuntimeError("connection probe failed")
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild and restore guard"))
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser")
+
+    assert events == ["start fresh driver", "rebuild and restore guard", "stop stale driver"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_stops_explicitly_unusable_live_context_before_starting_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
+    start_fresh = AsyncMock(side_effect=lambda: events.append("start fresh driver"))
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild"))
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+
+    assert events == ["stop stale driver", "start fresh driver", "rebuild"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replaces_guarded_live_context_before_stopping_stale_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=lambda: events.append("stop stale driver"))
+    start_fresh = AsyncMock(side_effect=lambda: events.append("start fresh driver"))
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    check_and_fix = AsyncMock(side_effect=lambda **_: events.append("rebuild and replay scripts"))
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+
+    assert events == ["start fresh driver", "rebuild and replay scripts", "stop stale driver"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_recovers_when_unusable_live_driver_stop_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=[RuntimeError("driver still attached"), None])
+    start_fresh = AsyncMock()
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    check_and_fix = AsyncMock()
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+
+    assert stale_pw.stop.await_count == 2
+    start_fresh.assert_awaited_once()
+    check_and_fix.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_aborts_when_unguarded_unusable_driver_shutdown_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def hang_during_stop() -> None:
+        state._on_browser_context_closed(stale_context)
+        await asyncio.Event().wait()
+
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=hang_during_stop)
+    start_fresh = AsyncMock()
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    stale_context = MagicMock()
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    state._connection_status = MagicMock(return_value=(True, None))
+    registration = object()
+    state.add_sessionless_init_script_registration(registration)
+    check_and_fix = AsyncMock()
+    monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
+
+    with pytest.raises(RuntimeError, match="Failed to stop unusable stale Playwright driver"):
+        await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+
+    start_fresh.assert_not_awaited()
+    check_and_fix.assert_not_awaited()
+    assert state.sessionless_init_script_registrations == (registration,)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancellation_during_pre_handoff_shutdown_restores_sessionless_registrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def stop_after_context_close() -> None:
+        stop_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_stop.wait()
+            state._on_browser_context_closed(stale_context)
+
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=stop_after_context_close)
+    start_fresh = AsyncMock()
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+
+    stale_context = MagicMock()
+    state = RealBrowserState(pw=stale_pw, browser_context=stale_context)
+    state._connection_status = MagicMock(return_value=(True, None))
+    registration = object()
+    state.add_sessionless_init_script_registration(registration)
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+
+    reconnect = asyncio.create_task(
+        state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    )
+    await asyncio.wait_for(stop_started.wait(), timeout=1)
+    reconnect.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+
+    start_fresh.assert_not_awaited()
+    assert state.sessionless_init_script_registrations == (registration,)
+
+    release_stop.set()
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+    assert state.sessionless_init_script_registrations == (registration,)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_bounds_stale_driver_shutdown_after_guarded_replacement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stop_started = asyncio.Event()
@@ -586,15 +966,236 @@ async def test_reconnect_bounds_stale_driver_shutdown_before_starting_fresh_driv
     monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0.01)
 
     state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     check_and_fix = AsyncMock()
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
-    with pytest.raises(RuntimeError, match="stale Playwright driver"):
-        await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.sleep(0)
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
 
     assert stop_started.is_set()
-    start_fresh.assert_not_awaited()
-    check_and_fix.assert_not_awaited()
+    assert stale_pw.stop.await_count == 2
+    start_fresh.assert_awaited_once()
+    check_and_fix.assert_awaited_once()
+    assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_does_not_retry_until_cancellation_resistant_stale_shutdown_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_stop = asyncio.Event()
+
+    async def cancellation_resistant_stop() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_stop.wait()
+
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=cancellation_resistant_stop)
+    start_fresh = AsyncMock()
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0.01)
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.sleep(0.02)
+
+    # The first stop remains owned without racing a second stop.
+    assert stale_pw.stop.await_count == 1
+    assert len(state._detached_teardown_tasks) == 1
+
+    release_stop.set()
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eventually_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_stop = asyncio.Event()
+    stop_attempts = 0
+
+    async def cancellation_resistant_stop() -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if stop_attempts != 1:
+            return
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_stop.wait()
+            raise RuntimeError("late shutdown failure")
+
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=cancellation_resistant_stop)
+    start_fresh = AsyncMock()
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0.01)
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.sleep(0.02)
+    assert stale_pw.stop.await_count == 1
+
+    release_stop.set()
+
+    async def wait_for_retry() -> None:
+        while stale_pw.stop.await_count < 2:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_retry(), timeout=0.1)
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert stale_pw.stop.await_count == 2
+    assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retries_post_replacement_stale_driver_stop_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=[RuntimeError("driver still attached"), None])
+    fresh_pw = MagicMock()
+    start_fresh = AsyncMock(return_value=fresh_pw)
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+
+    await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    await asyncio.gather(*list(state._detached_teardown_tasks))
+    await asyncio.sleep(0)
+
+    assert state.pw is fresh_pw
+    assert stale_pw.stop.await_count == 2
+    assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancellation_during_post_replacement_shutdown_retains_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_stop_started = asyncio.Event()
+    stop_attempts = 0
+
+    async def cancellation_sensitive_stop() -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if stop_attempts == 1:
+            first_stop_started.set()
+            await asyncio.Event().wait()
+
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock(side_effect=cancellation_sensitive_stop)
+    fresh_pw = MagicMock()
+    start_fresh = AsyncMock(return_value=fresh_pw)
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+
+    reconnect = asyncio.create_task(
+        state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    )
+    await asyncio.wait_for(first_stop_started.wait(), timeout=1)
+    reconnect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+    await asyncio.sleep(0)
+    await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert state.pw is fresh_pw
+    assert stale_pw.stop.await_count == 2
+    assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancellation_before_stale_shutdown_starts_wakes_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_pw = MagicMock()
+    stale_pw.stop = AsyncMock()
+    fresh_pw = MagicMock()
+    start_fresh = AsyncMock(return_value=fresh_pw)
+
+    class _FakeAsyncPlaywright:
+        start = start_fresh
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+
+    state = RealBrowserState(pw=stale_pw, browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
+    bounded_calls = 0
+
+    async def cancel_first_phase_before_start(
+        phase: object,
+        _timeout: float,
+        _description: str,
+        *,
+        accept_failure_as_completion: bool = False,
+    ) -> bool:
+        nonlocal bounded_calls
+        del accept_failure_as_completion
+        bounded_calls += 1
+        if bounded_calls == 1:
+            phase_task = asyncio.ensure_future(phase)  # type: ignore[arg-type]
+            phase_task.cancel()
+            await asyncio.gather(phase_task, return_exceptions=True)
+            raise asyncio.CancelledError
+        await phase  # type: ignore[misc]
+        return True
+
+    monkeypatch.setattr(state, "_run_bounded_detachable", cancel_first_phase_before_start)
+
+    with pytest.raises(asyncio.CancelledError):
+        await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
+    detached = list(state._detached_teardown_tasks)
+    done, pending = await asyncio.wait(detached, timeout=0.1)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert state.pw is fresh_pw
+    assert len(done) == len(detached)
+    stale_pw.stop.assert_awaited_once()
+    assert state._detached_teardown_tasks == set()
 
 
 @pytest.mark.asyncio
