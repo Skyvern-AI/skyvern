@@ -1872,6 +1872,9 @@ class ForgeAgent:
                     None if context and context.complete_criterion_is_untrusted else task.complete_criterion
                 ),
                 terminate_criterion=task.terminate_criterion,
+                # Validation only: that is the task type whose criteria a decision-maker weighs against
+                # each other in both engines, and the only one this was measured on (SKY-16193).
+                criteria_precedence=task.task_type == TaskType.validation,
                 error_code_mapping=task.error_code_mapping if offer_error_codes else None,
                 framing=framing,
                 block_context_section=block_context_section,

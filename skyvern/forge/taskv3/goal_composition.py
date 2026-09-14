@@ -39,6 +39,11 @@ class GoalDirectives:
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    # Whether to state which criterion wins when both hold. Scoped by the caller to the task type the
+    # measurement covers: on v1's general path the terminate criterion reaches no decision-maker at
+    # all, so "which wins" is not the difference there and a rule written for one population would be
+    # shipping ahead of its evidence.
+    criteria_precedence: bool = False
     framing: str = ""
     block_context_section: str = ""
 
@@ -69,6 +74,32 @@ def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
     if directives.terminate_criterion:
         goal = (
             f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {directives.terminate_criterion}"
+        ).strip()
+    if directives.complete_criterion and directives.terminate_criterion and directives.criteria_precedence:
+        # Two criteria can describe one page at once -- "no error is present" and "...or the pop up is
+        # not available" both hold on a page with neither. v1's validation prompt offers ONE forced choice
+        # and names completion first in its own rule; v3 read the termination clause as a standing
+        # interrupt and terminated, on criteria that were authored against v1 (SKY-16193). Neither
+        # engine evaluates the two in sequence -- the difference is how the choice is framed.
+        #
+        # Both criteria are NAMED rather than pointed at. A customer's terminate text routinely ends in
+        # a coordinated pair ("...or a dual-eligible flag", "...or shows a login form") sitting thousands
+        # of characters closer to this sentence than the two criteria are, so a demonstrative binds to
+        # the wrong pair -- and on one real workflow it would land directly after an instruction saying
+        # not to let anything override that guard.
+        #
+        # Worded without "the page": a page-free validation block is told it has no browser tools, so a
+        # rule conditioned on what the page shows is dead text on exactly the task type this targets.
+        #
+        # Scoped to the OVERLAP and nothing else. An earlier draft added "terminate only when the
+        # termination criterion holds", which reads as a ban on every other use of the status -- and
+        # `terminated` is also how this engine reports being blocked or the goal being impossible
+        # (engine.py's system prompt, loop.py's stuck options). v1 is broader still: its validation
+        # prompt terminates "when the terminate criterion is met, OR when a complete criterion is
+        # provided but not met". A precedence rule must not quietly narrow the status it mentions.
+        goal = (
+            f"{goal}\n\nIf the completion criterion and the termination criterion both hold at once, "
+            "the completion criterion wins: finish with status=completed."
         ).strip()
     if directives.error_code_mapping:
         # v1 shows the model these codes in-loop (see the error_code_mapping_str prompt sites), so

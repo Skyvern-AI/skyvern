@@ -444,6 +444,31 @@ async def test_execute_task_v3_surfaces_criteria_in_goal(monkeypatch: pytest.Mon
     goal = loop_mock.await_args.kwargs["goal"]
     assert "the confirmation page is shown" in goal
     assert "the posting is closed" in goal
+    # The precedence rule is gated to validation tasks, and this seam is the only place that can catch
+    # the gate regressing: compose_goal's own tests exercise its default, not the policy the caller
+    # sets. `make_task` defaults to TaskType.general.
+    assert "the completion criterion wins" not in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_states_criteria_precedence_only_for_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both criteria can describe one page at once, and the two engines resolved that differently
+    (SKY-16193). v1 shows the terminate criterion to a decision-maker on validation tasks only, so
+    saying which wins has no measured meaning anywhere else."""
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        navigation_goal="Confirm the store was added",
+        complete_criterion="no error message is present",
+        terminate_criterion="an error message is present, or the pop up is not available",
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "the completion criterion wins" in loop_mock.await_args.kwargs["goal"]
 
 
 @pytest.mark.asyncio
