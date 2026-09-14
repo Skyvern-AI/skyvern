@@ -340,6 +340,48 @@ secrets of at least five characters are also masked inside larger strings. Deriv
 or transformed values may no longer match. Do not expose credentials through output
 or errors. Opaque credential containment is tracked separately in SKY-11771.
 
+#### Web search helper
+
+Code blocks can search the web with the `search_web` helper instead of scripting
+a search engine's pages directly:
+
+```python
+observation = await search_web("industrial fastener suppliers in Ohio", max_results=10)
+for result in observation["results"]:
+    print(result["title"], result["url"], result["snippet"])
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | str | Search query. Must be a non-empty string. |
+| `max_results` | int | Maximum number of results to return. Must be a positive integer. Defaults to 10. |
+
+The helper returns an observation describing what the search actually produced:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `results` | list | Up to `max_results` entries, each with `title`, `url`, and `snippet`. Each `url` is a direct absolute link to the result site. |
+| `extracted_count` | int | Results found on the search page before any were withheld. |
+| `withheld_count` | int | Results withheld because their destination is not allowed. |
+| `http_status` | int or null | Status the search page was served with. `null` when the transport does not report one. |
+| `error_kind` | str or null | Failure kind when the fetch itself failed, else `null`. |
+| `page_title` | str | Title of the page that was served. |
+| `capture_truncated` | bool | `true` when the page was too large to read in full. |
+
+Read the observation rather than treating an empty `results` list as "no
+matches". `extracted_count` of 0 with a 2xx `http_status` means the page carried
+no results, which is a refusal page as often as a genuine miss; `page_title`
+usually says which. A non-2xx `http_status` or a non-null `error_kind` means the
+fetch failed and says nothing about whether matches exist. A `withheld_count`
+greater than 0 with an empty `results` list means the page had results and they
+were filtered.
+
+The search runs through the run's own browser, so `search_web` is only available
+while the run browser is open. If no web search provider is configured for the
+deployment, the observation carries `error_kind: "not_configured"`. Open-source
+deployments have no provider configured by default; Skyvern Cloud uses its
+configured provider.
+
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
 </Frame>
