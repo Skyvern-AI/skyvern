@@ -646,7 +646,7 @@ function WorkflowsFlat() {
 
   return (
     <div className="space-y-10">
-      <div className="flex h-32 justify-between gap-6">
+      <div className="flex flex-col justify-between gap-6 xl:h-32 xl:flex-row">
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
@@ -657,7 +657,7 @@ function WorkflowsFlat() {
             Define a series of actions, set it, and forget it.
           </p>
         </div>
-        <div className="flex gap-5">
+        <div className="flex flex-wrap gap-5 xl:flex-nowrap">
           <NarrativeCard
             index={1}
             description="Save browser sessions and reuse them in subsequent runs"
