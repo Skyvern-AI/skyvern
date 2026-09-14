@@ -11143,9 +11143,9 @@ class SendEmailBlock(Block):
         organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
-        msg["Subject"] = (
-            self.subject.strip().replace("\n", "").replace("\r", "") + f" - Workflow Run ID: {workflow_run_id}"
-        )
+        # Flattened after Jinja rendering: a substituted value carrying a newline would otherwise
+        # be rejected by the email header policy and fail the send.
+        msg["Subject"] = self.subject.strip().replace("\n", "").replace("\r", "")
         msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context))
         msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
