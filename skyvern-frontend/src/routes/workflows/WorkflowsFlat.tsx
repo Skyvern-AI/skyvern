@@ -938,7 +938,7 @@ function WorkflowsFlat() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-0.5">
-                              <Button size="icon" variant="default" disabled>
+                              <Button size="icon" variant="secondary" disabled>
                                 <Pencil2Icon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
@@ -1112,7 +1112,7 @@ function WorkflowsFlat() {
                                       <TooltipTrigger asChild>
                                         <Button
                                           size="icon"
-                                          variant="default"
+                                          variant="secondary"
                                           onClick={(event) => {
                                             handleIconClick(
                                               event,

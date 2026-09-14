@@ -7,7 +7,6 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
@@ -69,11 +68,12 @@ function CodeBlockEditorBody({
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
-  const codeFirstAccess = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
-  // Code-first layout needs the access flag plus a prompt; otherwise keep the legacy manual layout.
-  const isCodeFirst = data.prompt != null && codeFirstAccess;
   const steps = data.steps ?? [];
-  const [view, setView] = useState<CodeBlockView>("plain");
+  // A block with neither a goal nor a generated outline is hand-written, so open
+  // it on its code rather than on an empty Steps card.
+  const [view, setView] = useState<CodeBlockView>(
+    data.prompt == null && steps.length === 0 ? "code" : "plain",
+  );
   const [stepsOpen, setStepsOpen] = useState(true);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
   const activeStep =
@@ -370,19 +370,6 @@ function CodeBlockEditorBody({
         )}
       </div>
     ) : null;
-
-  if (!isCodeFirst) {
-    return (
-      <div data-testid="code-block-block-form" className="space-y-4">
-        {inputsField}
-        <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Code Input</Label>
-          {codeEditorElement}
-        </div>
-        {errorCodeMappingField}
-      </div>
-    );
-  }
 
   return (
     <div data-testid="code-block-block-form" className="space-y-4">

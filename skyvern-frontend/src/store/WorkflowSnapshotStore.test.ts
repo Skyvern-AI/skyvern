@@ -19,11 +19,14 @@ import { useWorkflowSnapshotStore } from "./WorkflowSnapshotStore";
 const block = (label: string, extra: Record<string, unknown> = {}): BlockYAML =>
   ({ label, block_type: "task", ...extra }) as unknown as BlockYAML;
 
-const saveData = (blocks: Array<BlockYAML>): WorkflowSaveData =>
+const saveData = (
+  blocks: Array<BlockYAML>,
+  parameters: Array<unknown> = [],
+): WorkflowSaveData =>
   ({
     title: "T",
     blocks,
-    parameters: [],
+    parameters,
     settings: { proxyLocation: "RESIDENTIAL" },
     workflow: {
       title: "T",
@@ -32,8 +35,10 @@ const saveData = (blocks: Array<BlockYAML>): WorkflowSaveData =>
   }) as unknown as WorkflowSaveData;
 
 /** Point getSaveData at a fresh draft — the store reads it live on each call. */
-function setDraft(blocks: Array<BlockYAML>) {
-  useWorkflowHasChangesStore.setState({ getSaveData: () => saveData(blocks) });
+function setDraft(blocks: Array<BlockYAML>, parameters: Array<unknown> = []) {
+  useWorkflowHasChangesStore.setState({
+    getSaveData: () => saveData(blocks, parameters),
+  });
 }
 
 beforeEach(() => {
@@ -173,6 +178,47 @@ describe("WorkflowSnapshotStore YAML-draft trigger", () => {
     unsub();
 
     expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(false);
+  });
+});
+
+describe("WorkflowSnapshotStore across a YAML commit", () => {
+  const param = {
+    parameter_type: "workflow",
+    key: "p",
+    workflow_parameter_type: "string",
+  };
+
+  // The commit's convert round-trip outruns the canvas gesture window, so
+  // FlowRenderer refreshes the rebuilt canvas as non-user materialization —
+  // and an edit the draft diff can't see (effectiveDraft only takes
+  // `parameters` when the draft parses it as an array) has marked nothing
+  // user-edited, so the baseline absorbs the commit and Save has nothing left
+  // to confirm. Workspace.commitYaml marks the non-persisting commit
+  // user-driven to pin the baseline; this is that path.
+  it("pins the baseline when the commit lands an edit the draft diff missed", () => {
+    const blocks = [block("a", { url: "x" })];
+    setDraft(blocks, [param]);
+    useWorkflowSnapshotStore.getState().captureSnapshot(); // frozen at YAML entry
+    useWorkflowYamlEditorStore
+      .getState()
+      .open(toYaml({ parameters: [param], blocks }));
+
+    // Dropping the whole `parameters:` key reads as unchanged against the canvas.
+    const unsub = subscribeToYamlDraftChanges(() =>
+      useWorkflowSnapshotStore.getState().noteDraftChange(true),
+    );
+    useWorkflowYamlEditorStore.getState().setDraft(toYaml({ blocks }));
+    unsub();
+    expect(useWorkflowSnapshotStore.getState().userHasEdited).toBe(false);
+
+    setDraft(blocks, []); // the commit rebuilds the canvas without the parameter
+    useWorkflowSnapshotStore.getState().markUserEdit();
+    useWorkflowYamlEditorStore.getState().close();
+    useWorkflowSnapshotStore.getState().noteDraftChange(false);
+
+    const { snapshot } = useWorkflowSnapshotStore.getState();
+    expect(snapshot?.parameters).toEqual([param]);
+    expect(isDraftDirty(saveData(blocks, []), snapshot)).toBe(true);
   });
 });
 
