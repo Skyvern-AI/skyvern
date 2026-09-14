@@ -37,6 +37,7 @@ APPROVED_TAGS = {
     "Server",
     "SDK",
     "Runs",
+    "Recipes",
 }
 # Pre-rebrand / internal tags that must never render a public section again.
 RETIRED_TAGS = {
@@ -69,6 +70,9 @@ RETAGGED_PATH_TAGS = {
     "/v1/runs/cancel": "Runs",
     "/v1/agents/runs": "Runs",
     "/v1/agents/{workflow_id}/runs": "Runs",
+    "/v1/recipes/jobs/extract": "Recipes",
+    "/v1/recipes/jobs/apply": "Recipes",
+    "/v1/recipes/jobs/runs": "Recipes",
 }
 
 

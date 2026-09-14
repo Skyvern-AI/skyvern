@@ -7693,7 +7693,7 @@
     "/v1/recipes/jobs/extract": {
       "post": {
         "tags": [
-          "Runs"
+          "Recipes"
         ],
         "summary": "Extract a job application posting",
         "description": "Start a workflow run that extracts structured details from a job posting.",
@@ -7747,13 +7747,18 @@
             "description": "Workflow launch failed"
           }
         },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
         "x-fern-sdk-method-name": "extract_job_application"
       }
     },
     "/v1/recipes/jobs/apply": {
       "post": {
         "tags": [
-          "Runs"
+          "Recipes"
         ],
         "summary": "Apply to a job",
         "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
@@ -7961,17 +7966,27 @@
             "description": "Credential service failed"
           }
         },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
         "x-fern-sdk-method-name": "apply_to_job"
       }
     },
     "/v1/recipes/jobs/runs": {
       "get": {
         "tags": [
-          "Runs"
+          "Recipes"
         ],
         "summary": "List job recipe runs",
         "description": "List workflow runs started by job recipe requests.",
         "operationId": "list_job_recipe_runs_v1_recipes_jobs_runs_get",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
         "parameters": [
           {
             "name": "page",
@@ -32122,6 +32137,14 @@
           "azure_vault"
         ],
         "title": "CredentialType"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "description": "Your Skyvern API key from https://app.skyvern.com/settings.",
+        "in": "header",
+        "name": "x-api-key"
       }
     }
   },
