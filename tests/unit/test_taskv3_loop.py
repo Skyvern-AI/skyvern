@@ -75,6 +75,7 @@ from skyvern.forge.taskv3.loop import (
     _RevisitMemory,
     make_finish_tool,
     record_frame_perception,
+    record_hit_class,
     record_resolve_seconds,
     run_agent_tool_loop,
 )
@@ -9588,3 +9589,70 @@ async def test_a_round_carries_billability_from_the_spec_not_from_a_name_list() 
     acted = [entry for round_ in rounds for entry in round_ if entry.tool == "execute_python"]
     assert acted, "the billable tool should have produced a round entry"
     assert all(entry.billable for entry in acted)
+
+
+@pytest.mark.asyncio
+async def test_every_click_row_carries_a_hit_class_and_no_other_tool_does() -> None:
+    """The facet has to be TOTAL over click rows: Datadog's groupBy drops rows missing a facet, so a
+    click that returned before the probe ever ran would silently leave the denominator rather than
+    showing up as the `unknown` it is. Gated on the tool so every other row keeps today's fields."""
+
+    async def probed(args: dict[str, Any]) -> ToolResult:
+        record_hit_class("non_target", needed=True, probe_seconds=0.012, isolated=True, raised=False)
+        return ToolResult.ok("clicked")
+
+    async def never_probed(args: dict[str, Any]) -> ToolResult:
+        # A click that refused before reaching the hit test — the shape that must not vanish.
+        return ToolResult.error("no element for selector '#gone'", error_class="stale_selector")
+
+    async def other_tool(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("hovered")
+
+    tools = [
+        ToolSpec(name="click", description="c", parameters={}, handler=probed, billable=True),
+        ToolSpec(name="hover", description="h", parameters={}, handler=other_tool, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#a"})],
+        [("hover", {"selector": "#b"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+    assert outcome.status == "completed"
+    by_tool = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert by_tool["click"]["hit_class"] == "non_target"
+    # Which realm answered, whether the probe threw, and the decision it produced. The class alone
+    # cannot recover the decision: a shadow-rooted target answers `unknown` with needed=True.
+    assert by_tool["click"]["hit_probe_isolated"] is True
+    assert by_tool["click"]["hit_probe_raised"] is False
+    assert by_tool["click"]["hit_needed"] is True
+    # What the probe cost where production calls it. The 15s actionability wait a pre-click probe
+    # would short-circuit is only worth paying for if this is small, and nothing measured it before.
+    assert by_tool["click"]["hit_probe_seconds"] == 0.012
+    # A tool with no hit test carries no such field at all — absent, not "unknown".
+    assert "hit_class" not in by_tool["hover"]
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=never_probed, billable=True)
+    with capture_logs() as logs:
+        await _run(script, tools)
+    unprobed = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert unprobed["click"]["hit_class"] == "unknown"
+    # A probe that never ran carries no qualifiers -- absent, not a fabricated value.
+    assert "hit_probe_isolated" not in unprobed["click"]
+    assert "hit_probe_seconds" not in unprobed["click"]
+    assert "hit_needed" not in unprobed["click"]
+    assert "hit_probe_raised" not in unprobed["click"]
+
+    # A run where `click` is not registered (page-free runs, or the REPLACE code surface) logs the
+    # call as `unknown_tool`. Such a row must not carry a click-only facet: a groupBy on hit_class
+    # without a tool filter would otherwise count it into `unknown`.
+    with capture_logs() as logs:
+        await _run(
+            [[("click", {"selector": "#a"})], [("finish", {"status": "completed", "reason": "ok"})]],
+            [make_finish_tool()],
+        )
+    unregistered = [e for e in logs if e["event"] == "taskv3 tool call finished"]
+    assert any(e["tool"] == "unknown_tool" for e in unregistered)
+    assert all("hit_class" not in e for e in unregistered)

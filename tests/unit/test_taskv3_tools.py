@@ -26,6 +26,7 @@ import pytest
 from playwright.async_api import Error as _PlaywrightError
 from structlog.testing import capture_logs
 
+import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge.taskv3.code_surface import (
@@ -23290,3 +23291,141 @@ def test_the_two_shared_row_refusals_carry_their_own_error_class() -> None:
         assert identical.error_class == "identical_rows", tags_live
         # Both wordings are one branch: the facet must not fork on which remedy the page allowed.
         assert "the field is NOT filled" in identical.content
+
+
+def test_the_widened_reach_probe_decides_exactly_what_the_boolean_decided() -> None:
+    """Equivalence, not presence: the widened return must not move a single decision.
+
+    A dict is always truthy in Python, so a caller left reading the raw return would run the expensive
+    scrolling probe on EVERY click. That regression is invisible to any test that only asserts the new
+    field is emitted, and it is on the path of every v3 click rather than only the covered ones.
+    """
+    needed = taskv3_tools._reach_probe_needed
+    # The wire format is a PRIMITIVE, "<0|1>:<class>". An object return would be corruptible by the
+    # page: Playwright's serializer runs in the page's world on bare Object.keys and
+    # Object.prototype.toString, and a page that clobbers either turns an object into {}, into None,
+    # or into truthy junk -- measured, all three -- which moves this decision in both directions.
+    assert needed("1:non_target") is True
+    assert needed("1:unknown") is True
+    assert needed("0:self") is False
+    assert needed("0:no_hit") is False
+    # Anything that is not the protocol decides on its own truthiness, exactly as the bare boolean did.
+    assert needed(True) is True
+    assert needed(False) is False
+    assert needed(None) is False
+    assert needed({}) is False
+    assert needed("garbage") is True
+
+
+def test_the_hit_class_is_total_over_every_shape_the_probe_can_answer_in() -> None:
+    """A row with no class would vanish from a groupBy, so an absent reading must be a VALUE."""
+    hit_class = taskv3_tools._reach_hit_class
+    assert hit_class("0:self") == "self"
+    # Both retired names are gone, not aliased: `foreign` claimed occlusion the probe cannot
+    # establish, and `offscreen` claimed a cause for a null hit that its own boundary contradicts.
+    assert hit_class("0:foreign") == "unknown"
+    assert hit_class("0:offscreen") == "unknown"
+    assert hit_class("1:non_target") == "non_target"
+    assert hit_class("0:no_hit") == "no_hit"
+    assert hit_class("1:unknown") == "unknown"
+    # Anything the probe could not answer reads as unknown rather than as a missing field.
+    assert hit_class(None) == "unknown"
+    assert hit_class(True) == "unknown"
+    assert hit_class({}) == "unknown"
+    assert hit_class("0:invented_value") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_reach_probe_that_says_no_still_runs_only_one_probe() -> None:
+    """The hot path: a clean hit must not buy the scrolling probe just because the answer got wider."""
+
+    class _CountingPage(_FakePage):
+        def __init__(self, answer: Any) -> None:
+            super().__init__()
+            self.answer = answer
+            self.expensive_probes = 0
+
+        async def evaluate(self, js: str, arg: Any = None) -> Any:
+            # Matched on a string unique to the reach probe: the expensive probe also runs
+            # elementFromPoint, so a looser match would swallow it and hide the regression.
+            # Anchored on this probe's own wire format, which no other probe emits: the expensive
+            # probe also runs elementFromPoint and the label scan, so a looser match swallows it.
+            if '(needed ? "1:" : "0:")' in js:
+                return self.answer
+            # `slotted:` is unique to the expensive target probe; the skinned-checkbox probe also
+            # calls scrollIntoView and runs regardless, so counting on that would never read zero.
+            if "slotted:" in js:
+                self.expensive_probes += 1
+                return {"exists": True, "disabled": False}
+            return await super().evaluate(js, arg)
+
+    clean = _CountingPage("0:self")
+    await _tool(build_browser_tools(_fixed_page_provider(clean)), "click").handler({"selector": "#submit"})
+    assert clean.expensive_probes == 0
+    assert (taskv3_loop._HIT_CLASS.get() or {}).get("hit_class") == "self"
+
+    covered = _CountingPage("1:non_target")
+    await _tool(build_browser_tools(_fixed_page_provider(covered)), "click").handler({"selector": "#submit"})
+    assert covered.expensive_probes == 1
+    recorded = taskv3_loop._HIT_CLASS.get() or {}
+    assert recorded.get("hit_class") == "non_target"
+    # The decision rides the record too: `unknown` alone cannot recover it, since a shadow-rooted
+    # target answers `unknown` with needed=True.
+    assert recorded.get("needed") is True
+    assert recorded.get("raised") is False
+    # Which realm answered -- the field is unwitnessed at this call site without an assertion here.
+    assert recorded.get("isolated") in (True, False)
+    # Nothing here claims occlusion: a real modal scrim drawn as `body::before` hit-tests as body and
+    # still blocks the click, so no cheap signal in this probe separates an occluder from a fall-through.
+    assert recorded.get("probe_seconds") is not None
+    # The loop clears this per tool call; a unit test must not leave the process-global set either.
+    taskv3_loop._HIT_CLASS.set(None)
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_raises_is_recorded_rather_than_dropped() -> None:
+    """The raise path is not random: it correlates with re-render, which is the cohort of interest.
+
+    Dropping those rows would bias the cost sample toward the calm cases — the defect that killed an
+    earlier hover-provenance field on this same path. Recorded, and TAGGED: a duration that pools
+    answers with blow-ups is two events under one name, so the cost figure filters on `raised`.
+    """
+
+    class _RaisingProbePage(_FakePage):
+        async def evaluate(self, js: str, arg: Any = None) -> Any:
+            if '(needed ? "1:" : "0:")' in js:
+                raise RuntimeError("Execution context was destroyed")
+            return await super().evaluate(js, arg)
+
+    taskv3_loop._HIT_CLASS.set(None)
+    await _tool(build_browser_tools(_fixed_page_provider(_RaisingProbePage())), "click").handler(
+        {"selector": "#submit"}
+    )
+
+    recorded = taskv3_loop._HIT_CLASS.get() or {}
+    assert recorded.get("raised") is True
+    assert recorded.get("hit_class") == "unknown"
+    # The decision a raising probe produces is the one the bare boolean produced: don't buy the
+    # expensive probe on a question that was never answered.
+    assert recorded.get("needed") is False
+    # And the duration is still there, so the raise stratum has an n rather than vanishing.
+    assert isinstance(recorded.get("probe_seconds"), float)
+    taskv3_loop._HIT_CLASS.set(None)
+
+
+@pytest.mark.asyncio
+async def test_the_isolated_leg_is_recorded_as_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The True side of the realm flag had no witness: deleting the assignment left the suite green.
+
+    A fake page has no CDP session, so every other test in this file exercises the fallback leg only —
+    which is exactly how an unwitnessed branch survives a suite that looks thorough.
+    """
+
+    async def _isolated_answer(_target: Any, _js: str, _selector: str) -> Any:
+        return "0:self"
+
+    monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _isolated_answer)
+    taskv3_loop._HIT_CLASS.set(None)
+    await _tool(build_browser_tools(_fixed_page_provider(_FakePage())), "click").handler({"selector": "#submit"})
+    assert (taskv3_loop._HIT_CLASS.get() or {}).get("isolated") is True
+    taskv3_loop._HIT_CLASS.set(None)

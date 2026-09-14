@@ -505,335 +505,343 @@ def _wire_impl(
 
     monkeypatch.setattr(credential_fill_module, "_register_scout_interaction_observation", fake_register)
 
-    @pytest.mark.asyncio
-    async def test_target_identity_is_captured_before_fill_and_effect_afterward(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        events: list[str] = []
 
-        class OrderedPage(_FakePage):
-            async def fill(self, *args: Any, **kwargs: Any) -> None:
-                events.append("fill")
-                await super().fill(*args, **kwargs)
+@pytest.mark.asyncio
+async def test_target_identity_is_captured_before_fill_and_effect_afterward(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
 
-            async def read_value(self, selector: str) -> str:
-                events.append("post_effect")
-                return await super().read_value(selector)
+    class OrderedPage(_FakePage):
+        async def fill(self, *args: Any, **kwargs: Any) -> None:
+            events.append("fill")
+            await super().fill(*args, **kwargs)
 
-        page = OrderedPage()
-        _wire_impl(monkeypatch, page)
+        async def read_value(self, selector: str) -> str:
+            events.append("post_effect")
+            return await super().read_value(selector)
 
-        async def pre_fact(*_args: Any, **_kwargs: Any) -> int:
-            events.append("pre_fact")
-            return 1
+    page = OrderedPage()
+    _wire_impl(monkeypatch, page)
 
-        async def selector_candidates(ctx: Any, _selector: str) -> None:
-            events.append("selector_candidates")
-            ctx.pending_scout_selector_candidates = [{"selector": 'input[name="password"]', "source": "name"}]
+    async def pre_fact(*_args: Any, **_kwargs: Any) -> int:
+        events.append("pre_fact")
+        return 1
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", pre_fact)
-        monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", selector_candidates)
+    async def selector_candidates(ctx: Any, _selector: str) -> None:
+        events.append("selector_candidates")
+        ctx.pending_scout_selector_candidates = [{"selector": 'input[name="password"]', "source": "name"}]
 
-        ctx = _ctx()
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", pre_fact)
+    monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", selector_candidates)
 
-        assert result["ok"] is True
-        assert events.index("selector_candidates") < events.index("fill")
-        assert events.index("pre_fact") < events.index("fill") < events.index("post_effect")
-        assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
-        assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
-        assert ctx.scout_trajectory[-1]["selector_candidates"] == [
-            {"selector": "#passwordInput", "source": "requested", "match_count": None},
-            {"selector": 'input[name="password"]', "source": "name", "match_count": None},
-        ]
+    ctx = _ctx()
+    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
-    def test_tool_layer_readback_cannot_verify_a_short_secret(self) -> None:
-        """Why the outcome is classified at the fill site, pinned against the real scrubber: a
-        registered secret returns from the tool layer as the placeholder, which no code recognises."""
-        otp = "mk-one"
-        ctx = SimpleNamespace(secret_scrub_values=[], browser_session_id=None)
-        register_secret_scrub_value(ctx, otp)
-        readback = scrub_secrets_from_structure(ctx, {"ok": True, "data": {"value": otp}})["data"]["value"]
+    assert result["ok"] is True
+    assert events.index("selector_candidates") < events.index("fill")
+    assert events.index("pre_fact") < events.index("fill") < events.index("post_effect")
+    assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
+    assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
+    assert ctx.scout_trajectory[-1]["selector_candidates"] == [
+        {"selector": "#passwordInput", "source": "requested", "match_count": None},
+        {"selector": 'input[name="password"]', "source": "name", "match_count": None},
+    ]
 
-        assert (
-            mcp_hooks_module._scout_readback_outcome(readback, otp) is mcp_hooks_module.ScoutReadbackOutcome.DIFFERENT
-        )
-        assert mcp_hooks_module._scout_readback_outcome(otp, otp) is mcp_hooks_module.ScoutReadbackOutcome.EXACT_MATCH
 
-    @pytest.mark.asyncio
-    async def test_multi_match_selector_still_reaches_an_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Reading the un-narrowed locator raises Playwright strict mode, which would leave the
-        field unread; the readback narrows the way the fill did."""
-        page = _FakePage(readback="8675309" + "123456")
-        page.selector_match_count = 2
-        _wire_impl(monkeypatch, page, secret_value="123456")
-        ctx = _ctx()
+def test_tool_layer_readback_cannot_verify_a_short_secret() -> None:
+    """Why the outcome is classified at the fill site, pinned against the real scrubber: a
+    registered secret returns from the tool layer as the placeholder, which no code recognises."""
+    otp = "mk-one"
+    ctx = SimpleNamespace(secret_scrub_values=[], browser_session_id=None)
+    register_secret_scrub_value(ctx, otp)
+    readback = scrub_secrets_from_structure(ctx, {"ok": True, "data": {"value": otp}})["data"]["value"]
 
-        result = await tools_module._fill_credential_field_impl(ctx, "input.otp", "cred_123", "totp")
+    assert mcp_hooks_module._scout_readback_outcome(readback, otp) is mcp_hooks_module.ScoutReadbackOutcome.DIFFERENT
+    assert mcp_hooks_module._scout_readback_outcome(otp, otp) is mcp_hooks_module.ScoutReadbackOutcome.EXACT_MATCH
 
-        assert result["ok"] is True
-        assert result["data"]["readback_outcome"] == "different"
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("secret_value", "readback"),
-        [
-            ("marker-value-one", "marker-val"),
-            ("alphabetagamma", "alpha beta gamma"),
-            ("marker-value-longer", "marker-value-lo"),
-        ],
-    )
-    async def test_a_field_not_holding_what_was_typed_is_reported_without_failing_or_claiming_a_wrong_field(
-        self, monkeypatch: pytest.MonkeyPatch, secret_value: str, readback: str
-    ) -> None:
-        page = _FakePage(readback=readback)
-        _wire_impl(monkeypatch, page, secret_value=secret_value)
-        ctx = _ctx()
+@pytest.mark.asyncio
+async def test_multi_match_selector_still_reaches_an_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reading the un-narrowed locator raises Playwright strict mode, which would leave the
+    field unread; the readback narrows the way the fill did."""
+    page = _FakePage(readback="8675309" + "123456")
+    page.selector_match_count = 2
+    _wire_impl(monkeypatch, page, secret_value="123456")
+    ctx = _ctx()
 
+    result = await tools_module._fill_credential_field_impl(ctx, "input.otp", "cred_123", "totp")
+
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "different"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret_value", "readback"),
+    [
+        ("marker-value-one", "marker-val"),
+        ("alphabetagamma", "alpha beta gamma"),
+        ("marker-value-longer", "marker-value-lo"),
+    ],
+)
+async def test_a_field_not_holding_what_was_typed_is_reported_without_failing_or_claiming_a_wrong_field(
+    monkeypatch: pytest.MonkeyPatch, secret_value: str, readback: str
+) -> None:
+    page = _FakePage(readback=readback)
+    _wire_impl(monkeypatch, page, secret_value=secret_value)
+    ctx = _ctx()
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
+
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "different"
+    assert result["data"]["landing_inferred_from_navigation"] is False
+    assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
+    assert "wrong" not in json.dumps(result)
+    assert "different input" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_field_records_the_fill_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable readback must not fail a fill that may well have landed, but must be visible."""
+
+    class UnreadablePage(_FakePage):
+        async def read_value(self, selector: str) -> str:
+            raise RuntimeError("element is not an <input>")
+
+    page = UnreadablePage()
+    _wire_impl(monkeypatch, page, secret_value="123456")
+    ctx = _ctx()
+
+    with capture_logs() as logs:
         result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
 
-        assert result["ok"] is True
-        assert result["data"]["readback_outcome"] == "different"
-        assert result["data"]["landing_inferred_from_navigation"] is False
-        assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
-        assert "wrong" not in json.dumps(result)
-        assert "different input" not in json.dumps(result)
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "unavailable"
+    assert result["data"]["landing_inferred_from_navigation"] is False
+    assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
+    assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
+    assert any(
+        entry.get("event") == "copilot fill_credential_field readback outcome" and entry.get("outcome") == "unavailable"
+        for entry in logs
+    )
 
-    @pytest.mark.asyncio
-    async def test_unreadable_field_records_the_fill_and_says_so(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An unreadable readback must not fail a fill that may well have landed, but must be visible."""
 
-        class UnreadablePage(_FakePage):
-            async def read_value(self, selector: str) -> str:
-                raise RuntimeError("element is not an <input>")
+@pytest.mark.asyncio
+async def test_happy_path_fills_and_records_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx()
 
-        page = UnreadablePage()
-        _wire_impl(monkeypatch, page, secret_value="123456")
-        ctx = _ctx()
+    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
-        with capture_logs() as logs:
-            result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
+    assert result["ok"] is True
+    assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
+    assert page.fill_kwargs[0]["mode"] == "direct"
+    assert result["data"]["typed_length"] == len(_FAKE_PASSWORD)
+    assert result["data"]["credential_id"] == "cred_123"
+    assert result["data"]["field"] == "password"
+    assert result["data"]["observation_step"] == 3
+    assert result["data"]["credential_name"] == "authtest simple"
+    assert result["data"]["readback_outcome"] == "exact_match"
+    assert result["data"]["landing_inferred_from_navigation"] is False
+    assert "credential_parameter" not in result["data"]
+    assert _FAKE_PASSWORD not in json.dumps(result)
 
-        assert result["ok"] is True
-        assert result["data"]["readback_outcome"] == "unavailable"
-        assert result["data"]["landing_inferred_from_navigation"] is False
-        assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
-        assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
-        assert any(
-            entry.get("event") == "copilot fill_credential_field readback outcome"
-            and entry.get("outcome") == "unavailable"
-            for entry in logs
-        )
+    assert len(ctx.scouted_interactions) == 1
+    recorded = ctx.scouted_interactions[0]
+    assert recorded["tool_name"] == "fill_credential_field"
+    assert recorded["credential_id"] == "cred_123"
+    assert recorded["credential_field"] == "password"
+    assert recorded["credential_name"] == "authtest simple"
+    assert recorded["typed_length"] == len(_FAKE_PASSWORD)
+    assert recorded["observed_effects"]["value_landed"] is True
+    assert _FAKE_PASSWORD not in json.dumps(recorded)
+    assert _FAKE_PASSWORD not in json.dumps(ctx.scout_trajectory)
 
-    @pytest.mark.asyncio
-    async def test_happy_path_fills_and_records_value_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
-        ctx = _ctx()
 
+@pytest.mark.asyncio
+async def test_email_otp_scout_failure_returns_only_factual_credential_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+
+    async def runtime_only_otp(_ctx: Any, _credential_id: str, _field: str) -> tuple[None, str, str]:
+        return None, "authtest simple", "Email OTP requires workflow-run polling."
+
+    monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", runtime_only_otp)
+
+    result = await tools_module._fill_credential_field_impl(_ctx(), "#otp", "cred_123", "totp")
+
+    assert result["ok"] is False
+    assert result["data"] == {
+        "credential_id": "cred_123",
+        "credential_name": "authtest simple",
+        "credential_field": "totp",
+    }
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fill_error_text_is_scrubbed(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(fill_error=RuntimeError(f"could not type {_FAKE_PASSWORD} into element"))
+    _wire_impl(monkeypatch, page)
+
+    result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+
+    assert result["ok"] is False
+    assert _FAKE_PASSWORD not in result["error"]
+    assert "[REDACTED_SECRET]" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_rejects_unknown_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+
+    result = await tools_module._fill_credential_field_impl(_ctx(), "#cvv", "cred_123", "cvv")
+
+    assert result["ok"] is False
+    assert "username, password, totp" in result["error"]
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rejects_empty_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+
+    result = await tools_module._fill_credential_field_impl(_ctx(), "   ", "cred_123", "password")
+
+    assert result["ok"] is False
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unresolved_credential_never_reaches_vault_or_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    resolver = AsyncMock()
+    monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolver)
+
+    result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_999", "password")
+
+    assert result["ok"] is False
+    assert "cred_999" in result["error"]
+    resolver.assert_not_awaited()
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_standard_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+    assert result["ok"] is False
+    assert page.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_readback_failure_surfaces_and_skips_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(readback="")
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx()
+
+    with capture_logs() as logs:
         result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
-        assert result["ok"] is True
-        assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
-        assert page.fill_kwargs[0]["mode"] == "direct"
-        assert result["data"]["typed_length"] == len(_FAKE_PASSWORD)
-        assert result["data"]["credential_id"] == "cred_123"
-        assert result["data"]["field"] == "password"
-        assert result["data"]["observation_step"] == 3
-        assert result["data"]["credential_name"] == "authtest simple"
-        assert result["data"]["readback_outcome"] == "exact_match"
-        assert result["data"]["landing_inferred_from_navigation"] is False
-        assert "credential_parameter" not in result["data"]
-        assert _FAKE_PASSWORD not in json.dumps(result)
+    assert result["ok"] is False
+    assert "still empty" in result["error"]
+    assert result["data"]["readback_outcome"] == "empty"
+    assert result["data"]["selector"] == "#passwordInput"
+    assert result["data"]["typed_length"] == len(_FAKE_PASSWORD)
+    assert result["data"]["landing_inferred_from_navigation"] is False
+    assert ctx.scouted_interactions == []
+    assert any(
+        entry.get("event") == "copilot fill_credential_field readback outcome" and entry.get("outcome") == "empty"
+        for entry in logs
+    )
 
-        assert len(ctx.scouted_interactions) == 1
-        recorded = ctx.scouted_interactions[0]
-        assert recorded["tool_name"] == "fill_credential_field"
-        assert recorded["credential_id"] == "cred_123"
-        assert recorded["credential_field"] == "password"
-        assert recorded["credential_name"] == "authtest simple"
-        assert recorded["typed_length"] == len(_FAKE_PASSWORD)
-        assert recorded["observed_effects"]["value_landed"] is True
-        assert _FAKE_PASSWORD not in json.dumps(recorded)
-        assert _FAKE_PASSWORD not in json.dumps(ctx.scout_trajectory)
 
-    @pytest.mark.asyncio
-    async def test_email_otp_scout_failure_returns_only_factual_credential_identity(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
+@pytest.mark.asyncio
+async def test_a_field_cleared_by_its_own_submit_is_not_reported_as_a_lost_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage(readback="")
+    _wire_impl(monkeypatch, page, secret_value="123456")
 
-        async def runtime_only_otp(_ctx: Any, _credential_id: str, _field: str) -> tuple[None, str, str]:
-            return None, "authtest simple", "Email OTP requires workflow-run polling."
+    async def navigated(_ctx: Any) -> str:
+        return _FIXTURE_LOGIN_URL + "verified/"
 
-        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", runtime_only_otp)
+    monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
+    ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#otp", "cred_123", "totp")
+    result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
 
-        assert result["ok"] is False
-        assert result["data"] == {
-            "credential_id": "cred_123",
-            "credential_name": "authtest simple",
-            "credential_field": "totp",
-        }
-        assert page.fill_calls == []
+    # The form committed on the last digit and cleared its own field. Calling that a lost fill
+    # sends the model back to re-type a code into a page the sign-in has already left.
+    assert result["ok"] is True
+    assert [entry["tool_name"] for entry in ctx.scouted_interactions] == ["fill_credential_field"]
+    # The readback said the field was empty. The model is told the landing was inferred, not
+    # that anyone saw the value sitting there.
+    assert ctx.scouted_interactions[0]["observed_effects"]["landing_inferred_from_navigation"] is True
+    assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
+    assert result["data"]["readback_outcome"] == "empty"
+    assert result["data"]["landing_inferred_from_navigation"] is True
 
-    @pytest.mark.asyncio
-    async def test_fill_error_text_is_scrubbed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage(fill_error=RuntimeError(f"could not type {_FAKE_PASSWORD} into element"))
-        _wire_impl(monkeypatch, page)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+@pytest.mark.asyncio
+async def test_a_navigation_cannot_stand_in_for_a_readback_nobody_took(monkeypatch: pytest.MonkeyPatch) -> None:
+    class UnreadablePage(_FakePage):
+        async def read_value(self, selector: str) -> str:
+            raise RuntimeError("execution context was destroyed")
 
-        assert result["ok"] is False
-        assert _FAKE_PASSWORD not in result["error"]
-        assert "[REDACTED_SECRET]" in result["error"]
+    page = UnreadablePage()
+    _wire_impl(monkeypatch, page, secret_value="mk-one")
 
-    @pytest.mark.asyncio
-    async def test_rejects_unknown_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
+    async def navigated(_ctx: Any) -> str:
+        return _FIXTURE_LOGIN_URL + "verified/"
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#cvv", "cred_123", "cvv")
+    monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
+    ctx = _ctx()
 
-        assert result["ok"] is False
-        assert "username, password, totp" in result["error"]
-        assert page.fill_calls == []
+    result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
 
-    @pytest.mark.asyncio
-    async def test_rejects_empty_selector(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "unavailable"
+    assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
+    assert "landing_inferred_from_navigation" not in ctx.scouted_interactions[0].get("observed_effects", {})
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "   ", "cred_123", "password")
 
-        assert result["ok"] is False
-        assert page.fill_calls == []
+@pytest.mark.asyncio
+async def test_a_rejected_code_re_rendering_the_same_page_is_still_a_lost_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(readback="")
+    _wire_impl(monkeypatch, page, secret_value="123456")
 
-    @pytest.mark.asyncio
-    async def test_unresolved_credential_never_reaches_vault_or_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
-        resolver = AsyncMock()
-        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolver)
+    async def same_page_with_error(_ctx: Any) -> str:
+        return _FIXTURE_LOGIN_URL + "?error=invalid"
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_999", "password")
+    monkeypatch.setattr(credential_fill_module, "_live_working_page_url", same_page_with_error)
 
-        assert result["ok"] is False
-        assert "cred_999" in result["error"]
-        resolver.assert_not_awaited()
-        assert page.fill_calls == []
+    result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp")
 
-    @pytest.mark.asyncio
-    async def test_standard_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page)
-        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+    # A rejected code re-renders the same page with an error param. That is not the form having
+    # carried the code away, so the empty field still means the fill did not land.
+    assert result["ok"] is False
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
-        assert result["ok"] is False
-        assert page.fill_calls == []
+@pytest.mark.asyncio
+async def test_a_verified_fill_is_still_reported_as_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(readback=_FAKE_PASSWORD)
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx()
 
-    @pytest.mark.asyncio
-    async def test_readback_failure_surfaces_and_skips_recording(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage(readback="")
-        _wire_impl(monkeypatch, page)
-        ctx = _ctx()
+    await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
-        with capture_logs() as logs:
-            result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
-
-        assert result["ok"] is False
-        assert "still empty" in result["error"]
-        assert result["data"]["readback_outcome"] == "empty"
-        assert result["data"]["selector"] == "#passwordInput"
-        assert result["data"]["typed_length"] == len(_FAKE_PASSWORD)
-        assert result["data"]["landing_inferred_from_navigation"] is False
-        assert ctx.scouted_interactions == []
-        assert any(
-            entry.get("event") == "copilot fill_credential_field readback outcome" and entry.get("outcome") == "empty"
-            for entry in logs
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_field_cleared_by_its_own_submit_is_not_reported_as_a_lost_fill(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        page = _FakePage(readback="")
-        _wire_impl(monkeypatch, page, secret_value="123456")
-
-        async def navigated(_ctx: Any) -> str:
-            return _FIXTURE_LOGIN_URL + "verified/"
-
-        monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
-        ctx = _ctx()
-
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
-
-        # The form committed on the last digit and cleared its own field. Calling that a lost fill
-        # sends the model back to re-type a code into a page the sign-in has already left.
-        assert result["ok"] is True
-        assert [entry["tool_name"] for entry in ctx.scouted_interactions] == ["fill_credential_field"]
-        # The readback said the field was empty. The model is told the landing was inferred, not
-        # that anyone saw the value sitting there.
-        assert ctx.scouted_interactions[0]["observed_effects"]["landing_inferred_from_navigation"] is True
-        assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
-        assert result["data"]["readback_outcome"] == "empty"
-        assert result["data"]["landing_inferred_from_navigation"] is True
-
-    @pytest.mark.asyncio
-    async def test_a_navigation_cannot_stand_in_for_a_readback_nobody_took(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class UnreadablePage(_FakePage):
-            async def read_value(self, selector: str) -> str:
-                raise RuntimeError("execution context was destroyed")
-
-        page = UnreadablePage()
-        _wire_impl(monkeypatch, page, secret_value="mk-one")
-
-        async def navigated(_ctx: Any) -> str:
-            return _FIXTURE_LOGIN_URL + "verified/"
-
-        monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
-        ctx = _ctx()
-
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
-
-        assert result["ok"] is True
-        assert result["data"]["readback_outcome"] == "unavailable"
-        assert "value_landed" not in ctx.scouted_interactions[0].get("observed_effects", {})
-        assert "landing_inferred_from_navigation" not in ctx.scouted_interactions[0].get("observed_effects", {})
-
-    @pytest.mark.asyncio
-    async def test_a_rejected_code_re_rendering_the_same_page_is_still_a_lost_fill(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        page = _FakePage(readback="")
-        _wire_impl(monkeypatch, page, secret_value="123456")
-
-        async def same_page_with_error(_ctx: Any) -> str:
-            return _FIXTURE_LOGIN_URL + "?error=invalid"
-
-        monkeypatch.setattr(credential_fill_module, "_live_working_page_url", same_page_with_error)
-
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp")
-
-        # A rejected code re-renders the same page with an error param. That is not the form having
-        # carried the code away, so the empty field still means the fill did not land.
-        assert result["ok"] is False
-
-    @pytest.mark.asyncio
-    async def test_a_verified_fill_is_still_reported_as_observed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage(readback=_FAKE_PASSWORD)
-        _wire_impl(monkeypatch, page)
-        ctx = _ctx()
-
-        await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
-
-        assert "landing_inferred_from_navigation" not in ctx.scouted_interactions[0]["observed_effects"]
+    assert "landing_inferred_from_navigation" not in ctx.scouted_interactions[0]["observed_effects"]
 
 
 class TestCredentialFillInCallSubmit:
