@@ -191,6 +191,13 @@ def test_acquired_video_artifact_advertises_mp4_before_first_artifact_creation(
         dr._REGISTRY.pop((":99", "wr_ext"), None)
 
 
+def test_startup_ack_deadline_is_15_seconds() -> None:
+    # The bridge cold start (double interpreter start + ctypes/X handshake + FFmpeg Popen) can take several
+    # seconds on a loaded worker; the READY ACK deadline must be 15s so a healthy-but-slow start is not refused
+    # and needlessly downgraded to Playwright. Regression guard against reverting to the old shorter default.
+    assert dr.STARTUP_ACK_TIMEOUT == 15.0
+
+
 def test_owner_id_is_deterministic_and_owner_exact() -> None:
     a = dr._safe_owner_id("wr_abc")
     assert a == dr._safe_owner_id("wr_abc")  # deterministic
