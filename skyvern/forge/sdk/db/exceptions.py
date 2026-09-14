@@ -36,6 +36,10 @@ class DuplicateCopilotTurnError(Exception):
         self.turn_id = turn_id
 
 
+class CopilotProposalConflictError(Exception):
+    """The candidate changed after the caller read its owner/revision token."""
+
+
 class ScheduleLimitExceededError(Exception):
     """Raised when attempting to create a schedule that would exceed the org-wide tier limit."""
 

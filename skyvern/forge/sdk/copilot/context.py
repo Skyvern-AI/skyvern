@@ -1052,6 +1052,9 @@ class AgentResult:
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    proposal_workflow_run_id: str | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     # Legacy marker for turns that wrote canonical before snapshot isolation.
@@ -1308,6 +1311,13 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # A single in-process writer at a time; the row-level CAS below this lock is the
+    # cross-process fence. The token is replaced only after a durable publication.
+    proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    proposal_canonical_fingerprint: str | None = None
+    proposal_workflow_run_id: str | None = None
     # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
     # staged draft at turn end. None on entrypoints that load no chat row.
     auto_accept: bool | None = None

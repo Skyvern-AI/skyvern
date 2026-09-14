@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -244,6 +244,137 @@ def _challenge_failure_ctx() -> CopilotContext:
         last_failure_category_top="ANTI_BOT_DETECTION",
         last_test_failure_reason="Verify you are human",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "product_action",
+        "request_run_id",
+        "expected_restore_run_id",
+        "expected_workflow_yaml",
+        "expected_run_id",
+        "expected_proposal_run_id",
+    ),
+    [
+        pytest.param(
+            None,
+            None,
+            None,
+            "title: Candidate\n",
+            "wr_candidate",
+            "wr_candidate",
+            id="ordinary-continuation",
+        ),
+        pytest.param(
+            None,
+            "wr_diagnose",
+            None,
+            "title: Candidate\n",
+            "wr_diagnose",
+            "wr_candidate",
+            id="ordinary-continuation-from-a-run-page",
+        ),
+        pytest.param(
+            "diagnose_run",
+            "wr_candidate",
+            "wr_candidate",
+            "title: Candidate\n",
+            "wr_candidate",
+            "wr_candidate",
+            id="matching-diagnose-run",
+        ),
+        pytest.param(
+            "diagnose_run",
+            "wr_diagnose",
+            "wr_diagnose",
+            "title: Canonical\n",
+            "wr_diagnose",
+            None,
+            id="explicit-diagnose-run",
+        ),
+    ],
+)
+async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coherent(
+    monkeypatch: pytest.MonkeyPatch,
+    product_action: str | None,
+    request_run_id: str | None,
+    expected_restore_run_id: str | None,
+    expected_workflow_yaml: str,
+    expected_run_id: str,
+    expected_proposal_run_id: str | None,
+) -> None:
+    class FakeMCPServerManager:
+        def __init__(self, servers: list[object]) -> None:
+            self.active_servers = servers
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+    restored_run_ids: list[str | None] = []
+    seeded: list[tuple[str | None, str, str | None]] = []
+    hydrated: list[tuple[str, str, str | None]] = []
+
+    async def restore_proposal(ctx: CopilotContext, *, required_workflow_run_id: str | None = None) -> None:
+        restored_run_ids.append(required_workflow_run_id)
+        if required_workflow_run_id is None or required_workflow_run_id == "wr_candidate":
+            ctx.workflow_yaml = "title: Candidate\n"
+            ctx.proposal_workflow_run_id = "wr_candidate"
+
+    async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
+        seeded.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+        return SimpleNamespace(finished=True)
+
+    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> None:
+        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", seed_run)
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", hydrate_run)
+    monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
+    monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+        lambda _handler, **_kwargs: ("model-primary", object(), "PRIMARY", True),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+        AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"})),
+    )
+    build_context = MagicMock(wraps=agent_module._build_user_context)
+    monkeypatch.setattr(agent_module, "_build_user_context", build_context)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="continue",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_run_id=request_run_id,
+            workflow_yaml="title: Canonical\n",
+            browser_session_id=None,
+            product_action=product_action,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == "ok"
+    assert restored_run_ids == [expected_restore_run_id]
+    assert seeded == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
 
 
 class TestFailedTestResponseNormalization:
@@ -3155,6 +3286,93 @@ class TestTranslateToAgentResultGating:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
         assert agent_result.response_type == "REPLACE_WORKFLOW"
+
+    def test_interrupted_draft_inline_replace_persists_before_emission(self, monkeypatch) -> None:
+        prior = SimpleNamespace(name="prior")
+        replacement = SimpleNamespace(name="replacement")
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=replacement),
+        )
+        order: list[str] = []
+        publish = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("persist"))
+        emit = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("emit"))
+        monkeypatch.setattr(agent_module, "publish_workflow_candidate", publish)
+        monkeypatch.setattr(agent_module, "maybe_emit_design_end", AsyncMock())
+        monkeypatch.setattr(agent_module, "emit_workflow_draft", emit)
+        ctx = _ctx(
+            workflow_copilot_chat_id="wcc-test",
+            stream=MagicMock(),
+            last_workflow=prior,
+            last_workflow_yaml="title: Prior",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                _fake_run_result(
+                    {
+                        "type": "REPLACE_WORKFLOW",
+                        "user_response": "Here is the replacement.",
+                        "workflow_yaml": "title: Replacement",
+                    }
+                ),
+                ctx,
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
+        )
+
+        assert order == ["persist", "emit"]
+        publish.assert_awaited_once_with(
+            ctx,
+            workflow=replacement,
+            workflow_yaml="title: Replacement",
+        )
+
+    def test_interrupted_draft_inline_replace_write_failure_emits_nothing(self, monkeypatch) -> None:
+        prior = SimpleNamespace(name="prior")
+        replacement = SimpleNamespace(name="replacement")
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=replacement),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "publish_workflow_candidate",
+            AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        emit = AsyncMock()
+        monkeypatch.setattr(agent_module, "emit_workflow_draft", emit)
+        ctx = _ctx(
+            workflow_copilot_chat_id="wcc-test",
+            stream=MagicMock(),
+            last_workflow=prior,
+            last_workflow_yaml="title: Prior",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            asyncio.run(
+                agent_module._translate_to_agent_result(
+                    _fake_run_result(
+                        {
+                            "type": "REPLACE_WORKFLOW",
+                            "user_response": "Here is the replacement.",
+                            "workflow_yaml": "title: Replacement",
+                        }
+                    ),
+                    ctx,
+                    global_llm_context=None,
+                    chat_request=_chat_request(),
+                    organization_id="org-1",
+                )
+            )
+
+        assert ctx.last_workflow is prior
+        assert ctx.last_workflow_yaml == "title: Prior"
+        emit.assert_not_awaited()
 
     def test_inline_replace_workflow_uses_request_policy_authority(self, monkeypatch) -> None:
         replacement = SimpleNamespace(name="diagnose-repair")

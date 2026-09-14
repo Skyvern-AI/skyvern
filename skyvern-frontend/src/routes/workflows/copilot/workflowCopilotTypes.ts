@@ -171,8 +171,29 @@ export interface WorkflowCopilotChatHistoryResponse {
   workflow_copilot_chat_id: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
+  proposed_workflow_metadata?: CopilotProposalMetadata | null;
+  proposed_workflow_run?: CopilotProposalRunFacts | null;
   auto_accept?: boolean | null;
   work_plan?: string[];
+}
+
+export interface CopilotProposalMetadata {
+  owner_turn_id: string;
+  revision: number;
+  canonical_fingerprint: string;
+  disposition: ProposalDisposition | "accepting";
+  workflow_run_id?: string | null;
+}
+
+export interface CopilotProposalRunFacts {
+  workflow_run_id: string;
+  status?: string | null;
+  available: boolean;
+  failure_reason?: string | null;
+  outputs: Array<{
+    output_parameter_id: string;
+    value: unknown;
+  }>;
 }
 
 export interface WorkflowCopilotChatSummary {
@@ -190,11 +211,15 @@ export interface WorkflowCopilotChatSummary {
 export interface WorkflowCopilotClearProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
 }
 
 export interface WorkflowCopilotApplyProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
 }
 
 export interface WorkflowCopilotAudioUploadResponse {
@@ -236,6 +261,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   response_type?: CopilotResponseType;
   proposal_disposition: ProposalDisposition;
   workflow_applied?: boolean;
+  proposed_workflow_metadata?: CopilotProposalMetadata | null;
   // Cancel forces explicit review.
   cancelled?: boolean;
   // Optional so the FE tolerates an older backend that does not emit the

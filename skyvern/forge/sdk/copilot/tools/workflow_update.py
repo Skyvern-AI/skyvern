@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
 )
+from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
+    ProposalDisposition,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
 from skyvern.forge.sdk.copilot.google_connection_notice import (
@@ -111,14 +113,24 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
+    with_workflow_yaml_title,
 )
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.schemas.workflow_copilot import copilot_proposal_metadata
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
 from skyvern.schemas.proxy_location import runtime_proxy_location
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import (
+    BLOCK_YAML_SUBCLASSES,
+    BlockType,
+    CodeBlockYAML,
+    ForLoopBlockYAML,
+    WhileLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import validate_webhook_url
 
@@ -3856,8 +3868,42 @@ def _author_time_findings(
     return findings
 
 
-async def restore_pending_workflow_proposal(ctx: CopilotContext) -> None:
-    """Restore only the server's pending proposal, never a prior canonical YAML fallback."""
+def _normalized_canvas_for_proposal_restore(
+    workflow_yaml: str,
+    *,
+    inherited_code_version: int | None = None,
+) -> WorkflowCreateYAMLRequest:
+    """Normalize editor-only empty code outlines before comparing canvas custody.
+
+    The editor submits ``steps: []`` while a persisted code block round-trips that
+    same absence as ``steps: null``. Both execute identically, so this representational
+    difference must not make an unchanged canonical canvas suppress proposal recovery.
+    """
+    normalized = _normalize_copilot_yaml(workflow_yaml)
+    normalized.webhook_callback_url = normalized.webhook_callback_url or None
+    normalized.extra_http_headers = normalized.extra_http_headers or None
+    normalized.mask_secrets = bool(normalized.mask_secrets)
+    if normalized.code_version is None:
+        normalized.code_version = inherited_code_version
+
+    def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
+        for block in blocks:
+            if isinstance(block, CodeBlockYAML):
+                block.steps = block.steps or None
+                block.parameter_keys = block.parameter_keys or None
+            elif isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
+                normalize_blocks(block.loop_blocks)
+
+    normalize_blocks(normalized.workflow_definition.blocks)
+    return normalized
+
+
+async def restore_pending_workflow_proposal(
+    ctx: CopilotContext,
+    *,
+    required_workflow_run_id: str | None = None,
+) -> None:
+    """Restore only the server's pending proposal, optionally constrained to its exact run."""
     if ctx.staged_workflow is not None or not ctx.workflow_copilot_chat_id:
         return
     chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
@@ -3869,6 +3915,42 @@ async def restore_pending_workflow_proposal(ctx: CopilotContext) -> None:
     proposal = chat.proposed_workflow
     if not isinstance(proposal, dict):
         return
+    metadata = copilot_proposal_metadata(proposal)
+    if metadata is not None:
+        # The token records the revision this turn observed, not the one it adopted. A turn that
+        # declines the candidate's content still has to supersede it when the model authors an edit,
+        # so every early return below this point keeps the token.
+        ctx.proposal_owner_turn_id = metadata.owner_turn_id
+        ctx.proposal_revision = metadata.revision
+        ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    if required_workflow_run_id is not None and (
+        metadata is None or metadata.workflow_run_id != required_workflow_run_id
+    ):
+        LOG.info(
+            "copilot_pending_proposal_restore_rejected",
+            reason="associated_run_mismatch",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            required_workflow_run_id=required_workflow_run_id,
+            proposal_workflow_run_id=metadata.workflow_run_id if metadata is not None else None,
+        )
+        return
+    if metadata is not None:
+        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
+        observed_fingerprint = (
+            workflow_content_fingerprint(canonical.model_dump(mode="json")) if canonical is not None else None
+        )
+        if canonical is None or observed_fingerprint != metadata.canonical_fingerprint:
+            LOG.info(
+                "copilot_pending_proposal_restore_rejected",
+                reason="canonical_fingerprint_mismatch",
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                expected_canonical_fingerprint=metadata.canonical_fingerprint,
+                observed_canonical_fingerprint=observed_fingerprint,
+            )
+            return
     workflow_yaml = proposal.get("_copilot_yaml")
     if not isinstance(workflow_yaml, str) or not workflow_yaml:
         return
@@ -3876,11 +3958,23 @@ async def restore_pending_workflow_proposal(ctx: CopilotContext) -> None:
         # An explicit canvas edit remains the model's input to the normal update tool.
         # Only restore over the persisted canvas or the same pending proposal.
         try:
-            submitted = _normalize_copilot_yaml(ctx.workflow_yaml)
             known_sources = [workflow_yaml]
             if ctx.persisted_workflow_yaml:
                 known_sources.append(ctx.persisted_workflow_yaml)
-            if all(submitted != _normalize_copilot_yaml(source) for source in known_sources):
+            source_canvases = [_normalized_canvas_for_proposal_restore(source) for source in known_sources]
+            if all(
+                _normalized_canvas_for_proposal_restore(
+                    ctx.workflow_yaml,
+                    inherited_code_version=source.code_version,
+                )
+                != source
+                for source in source_canvases
+            ):
+                LOG.info(
+                    "copilot_pending_proposal_restore_rejected",
+                    reason="canvas_custody_mismatch",
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                )
                 return
         except (yaml.YAMLError, ValidationError):
             return
@@ -3923,6 +4017,59 @@ async def restore_pending_workflow_proposal(ctx: CopilotContext) -> None:
     ctx.workflow_yaml = workflow_yaml
     ctx.last_workflow = workflow
     ctx.last_workflow_yaml = workflow_yaml
+    if metadata is not None:
+        ctx.proposal_workflow_run_id = metadata.workflow_run_id
+
+
+def _candidate_proposal_data(workflow: Workflow, workflow_yaml: str, ctx: CopilotContext) -> dict[str, Any]:
+    proposal = dict(workflow.model_dump(mode="json"))
+    proposal["_copilot_yaml"] = workflow_yaml
+    proposal["_copilot_unvalidated"] = True
+    if ctx.code_artifact_metadata:
+        proposal["_copilot_code_artifact_metadata"] = ctx.code_artifact_metadata
+    return proposal
+
+
+async def publish_workflow_candidate(
+    ctx: CopilotContext,
+    *,
+    workflow: Workflow,
+    workflow_yaml: str,
+    disposition: ProposalDisposition = "review_untested",
+) -> str:
+    """Durably publish admitted bytes before they become staged or visible.
+
+    Returns the bytes that were stored. Accept reparses them without going back through
+    ``_process_workflow_yaml``, so the title is resolved here — once, before the first durable
+    write — and callers stage what was stored so every later equality check compares like with like.
+    """
+    if not ctx.workflow_copilot_chat_id:
+        return workflow_yaml
+    workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if canonical is None:
+        raise RuntimeError("Canonical workflow disappeared before candidate publication")
+    updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+        proposal=_candidate_proposal_data(workflow, workflow_yaml, ctx),
+        owner_turn_id=ctx.turn_id,
+        canonical_fingerprint=workflow_content_fingerprint(canonical.model_dump(mode="json")),
+        disposition=disposition,
+        expected_owner_turn_id=ctx.proposal_owner_turn_id,
+        expected_revision=ctx.proposal_revision,
+    )
+    metadata = copilot_proposal_metadata(updated_chat.proposed_workflow)
+    if metadata is None:
+        raise RuntimeError("Candidate publication returned no ownership token")
+    ctx.proposal_owner_turn_id = metadata.owner_turn_id
+    ctx.proposal_revision = metadata.revision
+    ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    ctx.proposal_workflow_run_id = metadata.workflow_run_id
+    return workflow_yaml
 
 
 async def _update_workflow(
@@ -4175,10 +4322,38 @@ async def _update_workflow(
 
         # Runs materialize this proposal as their own version. The saved workflow
         # remains unchanged until Accept, including parameter and setting edits.
-        ctx.staged_workflow_yaml = workflow_yaml
-        ctx.staged_workflow = workflow
-        ctx.has_staged_proposal = True
-        ctx.workflow_yaml = workflow_yaml
+        if isinstance(ctx, CopilotContext):
+            # The durable write and the staged fields it backs move together, so a parallel tool
+            # call cannot read a staged draft the store has not accepted.
+            async with ctx.proposal_mutation_lock:
+                try:
+                    workflow_yaml = await publish_workflow_candidate(
+                        ctx, workflow=workflow, workflow_yaml=workflow_yaml
+                    )
+                except CopilotProposalConflictError as conflict:
+                    LOG.info(
+                        "copilot_candidate_publication_conflict",
+                        workflow_permanent_id=ctx.workflow_permanent_id,
+                        proposal_owner_turn_id=ctx.proposal_owner_turn_id,
+                        proposal_revision=ctx.proposal_revision,
+                        error=str(conflict),
+                    )
+                    return {
+                        "ok": False,
+                        "error": (
+                            "The pending proposal changed while this edit was being saved, so nothing was written. "
+                            "Read the current workflow again before re-submitting this edit."
+                        ),
+                    }
+                ctx.staged_workflow_yaml = workflow_yaml
+                ctx.staged_workflow = workflow
+                ctx.has_staged_proposal = True
+                ctx.workflow_yaml = workflow_yaml
+        else:
+            ctx.staged_workflow_yaml = workflow_yaml
+            ctx.staged_workflow = workflow
+            ctx.has_staged_proposal = True
+            ctx.workflow_yaml = workflow_yaml
         if isinstance(ctx, CopilotContext):
             ctx.runner_code_block_associations_by_label = runner_code_block_associations(
                 workflow_yaml,

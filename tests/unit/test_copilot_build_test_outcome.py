@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -92,6 +93,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     build_test_evidence_packet,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -1891,6 +1893,7 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _locator_packet_ctx()
+    ctx.proposal_workflow_run_id = "wr_failed_complete_packet"
     now = datetime(2026, 8, 28, tzinfo=UTC)
     output_parameter = OutputParameter(
         output_parameter_id="out_records",
@@ -1901,10 +1904,17 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         modified_at=now,
     )
     run_workflow = SimpleNamespace(
+        workflow_id="wf_run_snapshot",
         organization_id=ctx.organization_id,
         workflow_definition=SimpleNamespace(
             parameters=[output_parameter],
-            blocks=[SimpleNamespace(label="collect_records", block_type="CODE", output_parameter=output_parameter)],
+            blocks=[
+                CodeBlock(
+                    label="collect_records",
+                    output_parameter=output_parameter,
+                    code='return {"records": [{"name": "bounded result"}]}',
+                )
+            ],
         ),
     )
     run = SimpleNamespace(
@@ -2007,6 +2017,13 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
             "value_complete": True,
         }
     ]
+    assert hydrated["run"]["execution_source"] == {
+        "source_kind": "staged",
+        "workflow_id": "wf_run_snapshot",
+        "block_code_sha256": {
+            "collect_records": hashlib.sha256(b'return {"records": [{"name": "bounded result"}]}').hexdigest()
+        },
+    }
     assert '"status": "failed"' in ordinary_input
     assert '"workflow_run_id": "wr_failed_complete_packet"' in ordinary_input
     assert '"output_parameter_id": "out_records"' in ordinary_input
@@ -2022,6 +2039,15 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     assert "RECORDED BUILD-TEST OUTCOME" not in system_input
     assert "repairable_failure" not in system_input
     assert "wr_failed_complete_packet" not in system_input
+
+    nonassociated_ctx = _locator_packet_ctx()
+    nonassociated_ctx.proposal_workflow_run_id = "wr_different_proposal"
+    nonassociated = await run_execution_module.hydrate_prior_run_packet(
+        nonassociated_ctx,
+        workflow_run_id="wr_failed_complete_packet",
+    )
+    assert nonassociated is not None
+    assert "execution_source" not in nonassociated["run"]
 
 
 def test_unavailable_registered_output_rows_do_not_become_false_missing_output_facts() -> None:
@@ -5743,6 +5769,76 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
         output["output"] for output in packet["registered_outputs"] if output["label"] == "collect_payment_options"
     ]
     assert run_owned == [after_output], "the corrected run does not hand back the output its code produced"
+
+
+@pytest.mark.asyncio
+async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.proposal_owner_turn_id = "turn-source"
+    ctx.proposal_revision = 3
+    ctx.staged_workflow_yaml = HANDBACK_WORKFLOW_YAML
+    captured: dict[str, object] = {}
+
+    async def bind_candidate_run(**kwargs: object) -> None:
+        captured.update(kwargs)
+        raise CopilotProposalConflictError("candidate changed")
+
+    async def prepare_workflow(**_kwargs: object) -> SimpleNamespace:
+        ctx.proposal_owner_turn_id = "turn-newer"
+        ctx.proposal_revision = 1
+        ctx.staged_workflow = ctx.staged_workflow.model_copy(update={"title": "Newer candidate"})
+        return SimpleNamespace(
+            workflow_run_id="wr_source",
+            workflow_id="w_source",
+            browser_session_id="pbs_run",
+            sequential_credential_id=None,
+        )
+
+    forge_app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run = bind_candidate_run
+    forge_app.DATABASE.workflows.soft_delete_workflow_by_id = AsyncMock()
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
+    monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result == {
+        "ok": False,
+        "error": "The pending Copilot proposal changed before the test started; reload and try again.",
+    }
+    assert captured["expected_owner_turn_id"] == "turn-source"
+    assert captured["expected_revision"] == 3
+    assert captured["expected_workflow_yaml"] == HANDBACK_WORKFLOW_YAML
+
+
+@pytest.mark.asyncio
+async def test_canonical_run_does_not_bind_a_stale_proposal_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="completed",
+        terminal_blocks=[terminal_extraction_block("completed")],
+    )
+    bind_candidate_run = AsyncMock()
+    forge_app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run = bind_candidate_run
+    ctx = make_copilot_ctx(
+        browser_session_id="pbs_chat",
+        workflow_copilot_chat_id="chat-1",
+        proposal_owner_turn_id="turn-stale",
+        proposal_revision=2,
+    )
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is True, result
+    assert result["data"]["execution_source"]["source_kind"] == "canonical"
+    bind_candidate_run.assert_not_awaited()
+    assert harness["executor_cancelled"] is False
 
 
 @pytest.mark.asyncio

@@ -87,6 +87,12 @@ def setup_new_copilot_mocks(
         agent_result.cancellation_last_recorded_phase = None
     if not hasattr(agent_result, "cancellation_workflow_run_id"):
         agent_result.cancellation_workflow_run_id = None
+    if not hasattr(agent_result, "proposal_owner_turn_id"):
+        agent_result.proposal_owner_turn_id = None
+    if not hasattr(agent_result, "proposal_revision"):
+        agent_result.proposal_revision = None
+    if not hasattr(agent_result, "proposal_workflow_run_id"):
+        agent_result.proposal_workflow_run_id = None
     if not hasattr(original_workflow, "modified_at"):
         original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
     if not hasattr(original_workflow, "model_dump"):
