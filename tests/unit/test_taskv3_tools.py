@@ -23254,3 +23254,39 @@ def test_a_code_tool_the_submit_guard_cannot_recognise_is_refused() -> None:
     # stripped in favour of a tool that was refused.
     assert {t.name for t in kept} == _SURFACE_OFF_TOOL_NAMES
     assert misnamed.billable is False
+
+
+def test_the_two_shared_row_refusals_carry_their_own_error_class() -> None:
+    """Asserted on the builders, the single site each label is written at, not at the six call sites."""
+    rows = [{"n": 1, "text": "Nevada", "val": "NV"}, {"n": 2, "text": "Nevada", "val": "NB"}]
+
+    ambiguous = taskv3_tools._ambiguous_rows_error("#state", "Nevada", rows, next_step="pass the option's full text")
+    assert ambiguous.status == "error"
+    assert ambiguous.error_class == "ambiguous_rows"
+    assert "the field is NOT filled" in ambiguous.content
+
+    # The same builder's other arm is a different refusal: one row showing and it is not the value asked
+    # for is "nothing here is it", not "choose among these", and the two have different remedies.
+    lone = taskv3_tools._ambiguous_rows_error("#state", "NV", rows[:1], next_step="pass the option's full text")
+    assert lone.error_class == "no_matching_row"
+    assert "is not the one row showing" in lone.content
+
+    # ... but only when the whole list was read. A widget that declares more rows than it rendered has not
+    # shown that nothing matches, and the message says so in the same breath, so the facet must not claim it.
+    truncated = taskv3_tools._ambiguous_rows_error(
+        "#country",
+        "Nevada",
+        rows[:1],
+        next_step="pass the option's full text",
+        note="the list declares 195 rows and only 1 are rendered — type the option's full label",
+        rows_unread=True,
+    )
+    assert truncated.error_class == "rows_unread"
+    assert "195 rows" in truncated.content
+
+    for tags_live in (True, False):
+        identical = taskv3_tools._identical_text_rows_error("#state", "Nevada", rows, tags_live=tags_live)
+        assert identical.status == "error"
+        assert identical.error_class == "identical_rows", tags_live
+        # Both wordings are one branch: the facet must not fork on which remedy the page allowed.
+        assert "the field is NOT filled" in identical.content
