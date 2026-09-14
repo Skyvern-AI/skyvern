@@ -78,6 +78,20 @@ ToolErrorClass = Literal[
     "other",
 ]
 
+# The `ok` counterpart to `ToolErrorClass`, for a tool whose success status spans outcomes that are
+# not the same event. `tool_status` is the only total outcome field on the record, so a tool that
+# returns `ok` for "did the thing", "there was nothing to do", and "declined to try" is indexed
+# identically on all three and a blind detector reads as a working one. Naming the branch is
+# telemetry, never a behaviour change: like `error_class` this is never serialized into the tool
+# message, so the model cannot see it (the loop sends `content` only).
+ToolOkClass = Literal[
+    # `solve_captcha`. Its three `ok` branches are genuinely different events and the `ok` for
+    # "absent" is correct -- no challenge present is not an error and must not force a retry.
+    "solved",
+    "absent",
+    "attempts_exhausted",
+]
+
 
 @dataclass
 class ToolResult:
@@ -91,10 +105,22 @@ class ToolResult:
     # Telemetry only, and deliberately NOT in `data`: callers and tests pin `data` by equality, so a
     # measurement riding in it would change an observable contract. Never shown to the model.
     error_class: ToolErrorClass | None = None
+    # Same contract as `error_class`, on the other side of the status. Telemetry only, never shown
+    # to the model. Each is read only under its own status, so a result carrying the class for the
+    # OTHER one drops it silently; the classmethods below cannot express that pairing (neither
+    # accepts the other's kwarg) and the raw constructor is the only route that could.
+    ok_class: ToolOkClass | None = None
 
     @classmethod
-    def ok(cls, content: str, data: dict[str, Any] | None = None, screenshots: list[bytes] | None = None) -> ToolResult:
-        return cls("ok", content, data, screenshots)
+    def ok(
+        cls,
+        content: str,
+        data: dict[str, Any] | None = None,
+        screenshots: list[bytes] | None = None,
+        *,
+        ok_class: ToolOkClass | None = None,
+    ) -> ToolResult:
+        return cls("ok", content, data, screenshots, ok_class=ok_class)
 
     @classmethod
     def error(
@@ -1383,6 +1409,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "selector_present",
         "selector_kind",
         "tool_error_class",
+        "tool_ok_class",
         "resolve_seconds",
         "frame_perception",
         "billable",
@@ -2929,6 +2956,16 @@ async def run_agent_tool_loop(
                 # vocabulary with Python exception names under one facet, and taskv3 emits on every
                 # erroring tool call so it would dominate the values.
                 cost_fields["tool_error_class"] = result.error_class or "other"
+            elif result.ok_class is not None:
+                # Prefixed for the same flat-index reason as `tool_error_class` above. NOT defaulted
+                # the way that field is: it is emitted only by tools whose `ok` spans distinct
+                # outcomes, so a fleet-wide default would put a field on every successful call to
+                # say nothing. WHAT A DENOMINATOR MEANS HERE, because a groupBy drops rows missing a
+                # facet: grouping a tool by this facet alone shows its `ok` calls ONLY and silently
+                # excludes its errors. `tool_status` is the total partition -- cut on it first, then
+                # read this within `ok` and `tool_error_class` within `error`. A tool that emits
+                # this at all must emit it on EVERY `ok` branch, or the buckets don't sum to `ok`.
+                cost_fields["tool_ok_class"] = result.ok_class
             # Read off the context variable, not the result: on the raise path the loop built the
             # result itself and the handler's own resolution time would otherwise be lost.
             resolve_seconds = _RESOLVE_SECONDS.get()

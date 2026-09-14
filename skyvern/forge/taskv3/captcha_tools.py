@@ -6,6 +6,10 @@ submit. This tool gives the loop an explicit ``solve_captcha`` action that drive
 ladder (which detects the challenge via DOM/iframe markers and operates it), then returns an honest
 tri-state so the model stops blind-hammering. Solving routes through the ``AGENT_FUNCTION`` seam, so
 this module stays OSS-clean.
+
+Solved and "no challenge detected" are both ``ok`` -- absent is not an error and must not force a
+retry -- so every ``ok`` branch here names an ``ok_class``. That is what keeps the tri-state legible
+on the tool-call record; ``tool_status`` alone cannot tell a working detector from a blind one.
 """
 
 from __future__ import annotations
@@ -59,7 +63,8 @@ def build_captcha_tools(
         if failed_attempts >= _MAX_SOLVE_ATTEMPTS:
             return ToolResult.ok(
                 "captcha solve has already failed the maximum number of times for this task; do not call "
-                "solve_captcha again — report the captcha as blocking or try another approach."
+                "solve_captcha again — report the captcha as blocking or try another approach.",
+                ok_class="attempts_exhausted",
             )
         try:
             page = await page_provider()
@@ -97,11 +102,15 @@ def build_captcha_tools(
         if solved:
             # A real solve is progress; clear the failure streak so a later genuine captcha isn't disabled.
             failed_attempts = 0
-            return ToolResult.ok("captcha solved; re-observe the page and continue (e.g. retry submit).")
+            return ToolResult.ok(
+                "captcha solved; re-observe the page and continue (e.g. retry submit).",
+                ok_class="solved",
+            )
         # Absent: no challenge present. Cheap structural no-op that does not count toward the failure cap.
         return ToolResult.ok(
             "no captcha challenge was detected in the page or its visible frames; nothing was solved. "
-            "Re-observe before calling solve_captcha again."
+            "Re-observe before calling solve_captcha again.",
+            ok_class="absent",
         )
 
     tool = ToolSpec(

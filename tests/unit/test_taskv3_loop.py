@@ -9188,6 +9188,51 @@ async def test_a_failed_call_records_its_error_class_and_a_successful_one_record
 
 
 @pytest.mark.asyncio
+async def test_an_ok_call_records_the_branch_behind_its_success_and_an_unclassified_one_records_none() -> None:
+    # `tool_status` is the only total outcome field, so a tool whose `ok` spans distinct events
+    # (solve_captcha: solved / nothing-there / declined) indexes all of them identically and a blind
+    # detector reads as a working one. This has already produced a published conclusion that was
+    # arithmetically right and substantively backwards. The branch must reach the record as its own
+    # groupable value -- recovering it from `result_chars` is an accident of string length that has
+    # already changed once across builds.
+    async def solved(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("done", ok_class="solved")
+
+    async def nothing_there(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("nothing to do", ok_class="absent")
+
+    async def unclassified(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("ok")
+
+    tools = [
+        ToolSpec(name="click", description="c", parameters={}, handler=solved, billable=True),
+        ToolSpec(name="hover", description="h", parameters={}, handler=nothing_there, billable=True),
+        ToolSpec(name="scroll", description="s", parameters={}, handler=unclassified, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#a"})],
+        [("hover", {"selector": "#b"})],
+        [("scroll", {"selector": "#c"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+    assert outcome.status == "completed"
+    by_tool = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    # Distinct values, or the read this exists to enable cannot separate the branches.
+    assert by_tool["click"]["tool_ok_class"] == "solved"
+    assert by_tool["hover"]["tool_ok_class"] == "absent"
+    # Absent, not null and not a fleet-wide default: only a tool whose `ok` spans distinct outcomes
+    # emits this, so every other successful call keeps exactly the fields it has today.
+    assert "tool_ok_class" not in by_tool["scroll"]
+    assert "ok_class" not in by_tool["click"]  # the record key is the prefixed one, never the raw field
+    # The two sides of the status stay on their own side: an ok call names no error class, and this
+    # field must never appear on an erroring row (`tool_status` is the total partition between them).
+    assert "tool_error_class" not in by_tool["click"]
+
+
+@pytest.mark.asyncio
 async def test_a_handler_that_raises_still_reports_the_time_it_spent_resolving_the_address() -> None:
     # The cohort this telemetry exists to price is the one where the handler RAISES -- a driver
     # timeout on a target that resolved fine. The loop builds that result itself, so anything the
@@ -9274,8 +9319,21 @@ def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout
     assert _raised_error_class(RuntimeError("something else")) == "handler_raised"
 
 
-def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
+@pytest.mark.parametrize(
+    ("field", "alias", "anti_vacuity"),
+    [
+        ("error_class", "ToolErrorClass", {"stale_selector", "disabled", "ambiguous_frame"}),
+        ("ok_class", "ToolOkClass", {"solved", "absent", "attempts_exhausted"}),
+    ],
+)
+def test_every_outcome_class_written_anywhere_is_in_the_closed_set(
+    field: str, alias: str, anti_vacuity: set[str]
+) -> None:
     """The `Literal` alias is the declaration; this is what actually checks it.
+
+    Runs over BOTH closed vocabularies on `ToolResult`. They are the same mechanism on either side
+    of the status and share every hazard below, so one census covers both -- a second copy would be
+    the one that goes stale when the scan is next widened.
 
     `mypy.ini` sets `follow_imports = skip`, so `ToolResult` resolves to `Any` in every module that
     imports it -- the annotation is enforced inside loop.py and nowhere else, and all but a handful
@@ -9285,7 +9343,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
     cannot all reach.
 
     The population is DERIVED, not listed: every `ToolResult` construction under `skyvern/` and
-    `cloud/`, plus every `error_class=` kwarg anywhere in the taskv3 package. A named module list is
+    `cloud/`, plus every `<field>=` kwarg anywhere in the taskv3 package. A named module list is
     the same shape of hazard one level up -- it holds until someone writes the value somewhere the
     list does not name, which is exactly what a tool registered through `extra_tools` does.
     """
@@ -9295,11 +9353,12 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
     from typing import get_args  # noqa: PLC0415
 
     import skyvern  # noqa: PLC0415
-    from skyvern.forge.taskv3.loop import ToolErrorClass, ToolResult  # noqa: PLC0415
+    from skyvern.forge.taskv3 import loop as loop_for_census  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import ToolResult  # noqa: PLC0415
 
-    # Derived, not the literal 4: the positional read is a coupling to FIELD ORDER, and a reorder
+    # Derived, not a literal index: the positional read is a coupling to FIELD ORDER, and a reorder
     # would otherwise move the census onto a different argument without anything going red.
-    error_class_position = [f.name for f in dataclasses.fields(ToolResult)].index("error_class")
+    field_position = [f.name for f in dataclasses.fields(ToolResult)].index(field)
 
     def _is_tool_result_constructor(node: ast.Call, names: set[str], qualified: bool) -> bool:
         # Every spelling of the CONSTRUCTOR -- bare, module-qualified, and import-aliased. It matters
@@ -9332,7 +9391,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
 
     repo_root = pathlib.Path(skyvern.__file__).resolve().parent.parent
     taskv3 = repo_root / "skyvern" / "forge" / "taskv3"
-    declared = set(get_args(ToolErrorClass))
+    declared = set(get_args(getattr(loop_for_census, alias)))
     written: set[str] = set()
     computed: set[str] = set()
     for root in (repo_root / "skyvern", repo_root / "cloud"):
@@ -9342,7 +9401,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
             source = path.read_text(encoding="utf-8", errors="replace")
             # `ToolResult` as well as the field name: a `**overrides` that carries the class need not
             # spell it, so prefiltering on the field alone drops the file before it is ever parsed.
-            if "error_class" not in source and "ToolResult" not in source:
+            if field not in source and "ToolResult" not in source:
                 continue
             in_taskv3 = taskv3 in path.parents
             tree = ast.parse(source)
@@ -9383,7 +9442,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     assigned = node.value if not isinstance(node, ast.AugAssign) else None
                     for target in targets:
-                        if not (isinstance(target, ast.Attribute) and target.attr == "error_class"):
+                        if not (isinstance(target, ast.Attribute) and target.attr == field):
                             continue
                         if isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
                             written.add(assigned.value)
@@ -9408,7 +9467,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                     and len(node.args) == 3
                 ):
                     attribute, assigned = node.args[1], node.args[2]
-                    named = isinstance(attribute, ast.Constant) and attribute.value == "error_class"
+                    named = isinstance(attribute, ast.Constant) and attribute.value == field
                     if named and isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
                         written.add(assigned.value)
                     elif named:
@@ -9427,15 +9486,15 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                 ):
                     continue
                 here = path.relative_to(repo_root).as_posix()
-                # The field is the FIFTH positional, and the dataclass constructor accepts it there.
-                # `.error()`/`.ok()` cannot: one takes it keyword-only, the other not at all.
+                # The dataclass constructor accepts either field positionally, at the index derived
+                # above. The classmethods cannot: each takes its own class keyword-only.
                 if _is_tool_result_constructor(node, constructor_names, imports_loop_module):
                     if any(isinstance(argument, ast.Starred) for argument in node.args):
                         # `ToolResult(*args)` -- the arity is a runtime property, so whether anything
                         # lands in the fifth slot is not decidable here. Unreadable, not absent.
                         computed.add(here)
-                    elif len(node.args) > error_class_position:
-                        positional = node.args[error_class_position]
+                    elif len(node.args) > field_position:
+                        positional = node.args[field_position]
                         if isinstance(positional, ast.Constant) and isinstance(positional.value, str):
                             written.add(positional.value)
                         else:
@@ -9451,7 +9510,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                         ):
                             computed.add(here)
                         continue
-                    if keyword.arg != "error_class":
+                    if keyword.arg != field:
                         continue
                     if isinstance(value, ast.Constant) and isinstance(value.value, str):
                         written.add(value.value)
@@ -9461,12 +9520,16 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
                         # make the census read clean over exactly the site it cannot vouch for.
                         computed.add(here)
 
-    # Anti-vacuity: a walk that matched nothing would satisfy the subset check silently. These three
-    # live in tools.py, the module the subset check exists to cover.
-    assert {"stale_selector", "disabled", "ambiguous_frame"} <= written
-    assert written <= declared, f"error classes written but not declared: {sorted(written - declared)}"
-    # Produced by the loop's fallback for an erroring call whose site named nothing, not by a kwarg.
-    assert "other" in declared
+    # Anti-vacuity: a walk that matched nothing would satisfy the subset check silently. Each seed
+    # lives in the module that field is actually written from -- tools.py for `error_class`,
+    # captcha_tools.py for `ok_class` -- which is the module the subset check exists to cover.
+    assert anti_vacuity <= written, f"{field} census found none of its seed values; it is not looking"
+    assert written <= declared, f"{field} values written but not declared: {sorted(written - declared)}"
+    if field == "error_class":
+        # Produced by the loop's fallback for an erroring call whose site named nothing, not by a
+        # kwarg, so it is never `written` and has to be asserted against `declared` directly. There
+        # is deliberately no `ok_class` equivalent: an ok call that names no class emits no facet.
+        assert "other" in declared
     # The other half of the guarantee, and the reason it is a set of FILES rather than a count: a
     # non-literal value is unreadable here, so the only thing that can vouch for it is the `Literal`
     # annotation -- which `follow_imports = skip` binds inside loop.py and nowhere else. Both sites
@@ -9478,7 +9541,7 @@ def test_every_error_class_written_anywhere_is_in_the_closed_set() -> None:
     # sites it is anchored on, which claims a violation while naming nothing.
     assert accessor_module in computed, "the scan found no unreadable write at all; it is not looking"
     assert not computed - {accessor_module}, (
-        f"error_class written from an unreadable expression outside loop.py, where the Literal "
+        f"{field} written from an unreadable expression outside loop.py, where the Literal "
         f"annotation does not bind: {sorted(computed - {accessor_module})}"
     )
 

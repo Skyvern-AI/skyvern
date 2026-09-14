@@ -84,6 +84,96 @@ async def test_solve_captcha_absent_is_ok_and_steers_away(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_every_ok_branch_names_a_distinct_outcome_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The tool returns ok on three different events -- it solved one, there was none to solve, and it
+    # declined after the cap -- and `tool_status` cannot tell them apart, so a blind detector and a
+    # working one are the same row to every downstream reader. Drives all three through the real
+    # handler rather than pinning strings: the branches were previously separable only by
+    # `len(content)`, which is exactly the accident this replaces (it has already changed once).
+    ladder = AsyncMock(return_value=True)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
+    handler = tools[0].handler
+
+    solved = await handler({})
+    ladder.return_value = False
+    absent = await handler({})
+    # Exhaust the cap on real failures, then the next call is the short-circuit branch.
+    ladder.side_effect = CaptchaChallengeUnsolvedError("x")
+    for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
+        await handler({})
+    declined = await handler({})
+
+    assert (solved.status, solved.ok_class) == ("ok", "solved")
+    assert (absent.status, absent.ok_class) == ("ok", "absent")
+    assert (declined.status, declined.ok_class) == ("ok", "attempts_exhausted")
+    # Distinctness is the property that matters: two branches sharing a value would reintroduce the
+    # conflation while every per-branch assertion above still passed.
+    assert len({solved.ok_class, absent.ok_class, declined.ok_class}) == 3
+
+
+def test_every_ok_construction_in_the_module_names_an_ok_class() -> None:
+    """Totality, which the three per-branch assertions above cannot give.
+
+    `tool_ok_class` is emitted only when the site names one, so a fourth `ok` branch added here
+    without an `ok_class` is silently absent from the facet: its rows still carry `tool_status=ok`,
+    the buckets stop summing to the tool's own ok total, and every test above stays green because
+    each pins a branch that exists. Read out of the module's own AST rather than from a list of
+    known call sites -- an enumerated list is the same defect one level up and would not see the
+    fourth branch either.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    module_path = pathlib.Path(inspect.getfile(captcha_tools))
+    source = module_path.read_text()
+    tree = ast.parse(source)
+
+    ok_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "ok"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "ToolResult"
+    ]
+    # Anti-vacuity, both directions. A walk that matched nothing would satisfy the loop below in
+    # silence, and a walk that matched fewer sites than the file spells out is reading past some of
+    # them -- either way the check would vouch for branches it never saw.
+    assert len(ok_calls) == source.count("ToolResult.ok("), "the AST walk missed an ok construction"
+    assert len(ok_calls) >= 3, "the scan found no ok constructions to check; it is not looking"
+
+    unnamed = []
+    for node in ok_calls:
+        named = [k for k in node.keywords if k.arg == "ok_class"]
+        # `**mapping` carries keys this scan cannot read, so it cannot vouch for the site either.
+        readable = named and not any(isinstance(k.value, ast.Constant) and k.value.value is None for k in named)
+        if not readable:
+            unnamed.append(node.lineno)
+    assert not unnamed, f"ToolResult.ok() with no ok_class at {module_path.name} lines {unnamed}"
+
+    # The other route to an ok: the raw constructor takes the class positionally and can pair an
+    # `ok` status with an `error_class`, so it would evade the check above entirely. This module
+    # has no reason to use it, and the cheapest way to keep the scan total is to keep it that way.
+    raw = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
+    ]
+    assert not raw, f"raw ToolResult(...) construction bypasses the ok_class check at lines {raw}"
+
+    classes = {
+        k.value.value
+        for node in ok_calls
+        for k in node.keywords
+        if k.arg == "ok_class" and isinstance(k.value, ast.Constant)
+    }
+    assert {"solved", "absent", "attempts_exhausted"} <= classes, "the scan is not reading the real sites"
+
+
+@pytest.mark.asyncio
 async def test_solve_captcha_unsolved_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         captcha_tools, "solve_challenge_ladder", AsyncMock(side_effect=CaptchaChallengeUnsolvedError("x"))
