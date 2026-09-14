@@ -165,7 +165,9 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     expect(
       screen.getByPlaceholderText("example@gmail.com, example2@gmail.com..."),
     ).toBeDefined();
-    expect(screen.getByPlaceholderText("What is the gist?")).toBeDefined();
+    expect(
+      screen.getByPlaceholderText("Your Run is Finished {{workflow_run_id}}"),
+    ).toBeDefined();
     expect(
       screen.getByPlaceholderText("What would you like to say?"),
     ).toBeDefined();
@@ -220,7 +222,7 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     render(<SendEmailBlockForm blockId="b1" />);
 
     const input = screen.getByPlaceholderText(
-      "What is the gist?",
+      "Your Run is Finished {{workflow_run_id}}",
     ) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "new subject" } });
 
@@ -262,7 +264,7 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     render(<SendEmailBlockForm blockId="b1" />);
 
     const input = screen.getByPlaceholderText(
-      "What is the gist?",
+      "Your Run is Finished {{workflow_run_id}}",
     ) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "subject change" } });
 
