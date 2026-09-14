@@ -148,7 +148,7 @@ async def test_workflow_knowledge_marks_code_only_policy_as_authoritative() -> N
 def test_code_only_policy_is_short_and_contains_no_settled_block_conversion_steering() -> None:
     rendered = _code_only_browser_authoring_prompt()
 
-    assert "before authoring the first `code` block" in rendered
+    assert "Before authoring the first `code` block" in rendered
     assert "call `get_block_schema` with `block_type: code`" in rendered
     assert "solve_captcha" not in rendered
     assert "<key>.username" not in rendered

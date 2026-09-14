@@ -2216,6 +2216,44 @@ def test_unavailable_registered_output_rows_do_not_become_false_missing_output_f
     assert any("persisted registered output values were unavailable" in notice for notice in packet.omission_notices)
 
 
+def _code_exception_result(failure_reason: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_code_exception",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "count_items",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": failure_reason,
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+        },
+    }
+
+
+def test_a_classified_code_exception_keys_on_its_class_instead_of_the_runner_reason() -> None:
+    name_error = _code_exception_result("CodeBlock failed with NameError at line 48: name 'count' is not defined.")
+    unbound = _code_exception_result(
+        "CodeBlock failed with UnboundLocalError at line 47: cannot access local variable 'count' where it is not "
+        "associated with a value."
+    )
+
+    unclassified = [recorded_outcome_from_run_blocks_result(result) for result in (name_error, unbound)]
+    classified = [
+        recorded_outcome_from_run_blocks_result(result, runtime_failure_class="wrapper_scope_name_resolution")
+        for result in (name_error, unbound)
+    ]
+
+    assert all(outcome is not None and outcome.structural_key for outcome in [*unclassified, *classified])
+    assert unclassified[0].structural_key != unclassified[1].structural_key
+    assert classified[0].structural_key == classified[1].structural_key
+    assert classified[0].structural_key != unclassified[0].structural_key
+
+
 def test_runtime_block_failure_outcome_keys_playwright_hidden_locator_structure() -> None:
     table_result = {
         "ok": False,

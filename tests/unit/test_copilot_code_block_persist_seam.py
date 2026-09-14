@@ -27,12 +27,15 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    READINESS_WAIT_ADVISORY_REASON_CODE,
+    WRAPPER_SCOPE_ADVISORY_REASON_CODE,
     CodeArtifactCompletionCriterion,
     _accepted_code_delta,
-    _advisory_labels_by_message,
+    _advisory_labels_by_diagnostic,
     _author_time_findings,
     _changed_code_blocks,
     _update_workflow,
+    carry_author_time_findings,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
@@ -733,7 +736,9 @@ class TestBodyReadinessAdvisoryDelivery:
         return _author_time_findings(
             schema_incompatibility=None,
             metadata_violations=[],
-            code_block_diagnostics=_advisory_labels_by_message(_changed_code_blocks(prior, accepted, accepted)),
+            code_block_diagnostics=_advisory_labels_by_diagnostic(
+                _changed_code_blocks(prior, accepted, accepted), accepted
+            ),
         )
 
     def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
@@ -751,6 +756,94 @@ class TestBodyReadinessAdvisoryDelivery:
         prior = _code_yaml(self._BODY_WAIT, label="read_summary")
 
         assert self._findings(prior, prior) == []
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_is_its_own_finding_on_a_draft_that_persists_and_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    submitted = _code_yaml(
+        """
+        await page.locator("body").wait_for(state="visible", timeout=45000)
+        matches = 0
+
+        async def count_match():
+            global matches
+            matches += 1
+
+        for _ in range(3):
+            await count_match()
+        return {"output": {"matches": matches}}
+        """
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [
+        READINESS_WAIT_ADVISORY_REASON_CODE,
+        WRAPPER_SCOPE_ADVISORY_REASON_CODE,
+    ]
+    assert "`global matches` at line 5 inside `count_match`" in findings[1]["summary"]
+    assert "`submit_search`" in findings[1]["summary"]
+    run_result = {"ok": False, "data": {"workflow_run_id": "wr_x", "overall_status": "failed"}}
+    carried = carry_author_time_findings(result, run_result)["data"]
+    assert carried["findings"] == findings
+    assert carried["workflow_run_id"] == "wr_x"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_covers_a_global_on_a_declared_workflow_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    code = "\n".join(
+        [
+            "          async def bump():",
+            "              global retries",
+            "              retries += 1",
+            "",
+            "          await bump()",
+            '          return {"output": {"retries": retries}}',
+        ]
+    )
+    submitted = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - parameter_type: workflow\n"
+        "    workflow_parameter_type: integer\n"
+        "    key: retries\n"
+        "    default_value: 0\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit_search\n"
+        "    parameter_keys: [retries]\n"
+        "    code: |\n"
+        f"{code}\n"
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [WRAPPER_SCOPE_ADVISORY_REASON_CODE]
+    assert "`global retries` at line 2 inside `bump` for a workflow parameter" in findings[0]["summary"]
 
 
 @pytest.mark.asyncio
