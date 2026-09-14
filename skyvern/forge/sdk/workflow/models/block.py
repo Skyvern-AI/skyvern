@@ -16987,16 +16987,30 @@ class WorkflowTriggerBlock(Block):
                 # — the flag is written once, at spawn time, for both paths.
                 async_parent_context = skyvern_context.current()
                 async_inherited_trigger_type = async_parent_context.trigger_type if async_parent_context else None
-                triggered_workflow_run = await run_workflow(
-                    workflow_id=resolved_workflow_permanent_id,
-                    organization=organization,
-                    workflow_request=workflow_request,
-                    request=None,
-                    background_tasks=None,
-                    parent_workflow_run_id=workflow_run_id,
-                    ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
-                    trigger_type=async_inherited_trigger_type,
-                )
+                # run_workflow replaces the current context with the child's identity (setup_workflow_run).
+                # Scope the whole dispatch in a placeholder child context — mirroring the synchronous branch
+                # above — so the token reset restores the parent's exact context on every exit; otherwise the
+                # child identity leaks past the await and mislabels the parent's remaining execution.
+                with skyvern_context.scoped(
+                    skyvern_context.SkyvernContext(
+                        run_id=async_parent_context.run_id if async_parent_context else None,
+                        root_workflow_run_id=async_parent_context.root_workflow_run_id
+                        if async_parent_context
+                        else None,
+                        copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
+                        trigger_type=async_inherited_trigger_type,
+                    )
+                ):
+                    triggered_workflow_run = await run_workflow(
+                        workflow_id=resolved_workflow_permanent_id,
+                        organization=organization,
+                        workflow_request=workflow_request,
+                        request=None,
+                        background_tasks=None,
+                        parent_workflow_run_id=workflow_run_id,
+                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                        trigger_type=async_inherited_trigger_type,
+                    )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)
                 return await _fail(f"Failed to dispatch triggered workflow: {error_msg}")
