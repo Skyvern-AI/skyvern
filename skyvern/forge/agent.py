@@ -3583,7 +3583,7 @@ class ForgeAgent:
                 failure_category_source="code_level",
                 failure_category_path="exception",
             )
-            await self.update_task(
+            updated_task = await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=reason,
@@ -3604,7 +3604,7 @@ class ForgeAgent:
                         task=task,
                         step=step,
                         browser_state=browser_state,
-                        failure_reason=reason,
+                        failure_reason=updated_task.failure_reason if reason is not None else None,
                     )
 
                     # Update task errors if any were detected
