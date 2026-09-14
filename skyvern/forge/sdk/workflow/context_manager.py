@@ -206,6 +206,7 @@ class WorkflowRunContext:
         if block_outputs:
             for label, value in block_outputs.items():
                 workflow_run_context.values[f"{label}_output"] = value
+                workflow_run_context.register_block_reference_variable(label, value, carried=True)
 
         for secret_parameter in secret_parameters:
             if isinstance(secret_parameter, AWSSecretParameter):
@@ -291,6 +292,7 @@ class WorkflowRunContext:
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
         self.workflow_run_outputs: dict[str, Any] = {}
+        self.carried_block_labels: set[str] = set()
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.browser_session_id: str | None = None
@@ -1704,8 +1706,15 @@ class WorkflowRunContext:
         # output parameter key is formatted as `<block_label>_output`
         if not parameter.key.endswith("_output"):
             return
-        block_label = parameter.key.removesuffix("_output")
+        self.register_block_reference_variable(parameter.key.removesuffix("_output"), value)
 
+    def register_block_reference_variable(
+        self,
+        block_label: str,
+        value: dict[str, Any] | list | str | None,
+        *,
+        carried: bool = False,
+    ) -> None:
         block_reference_value = copy.deepcopy(value)
         if isinstance(block_reference_value, dict) and "extracted_information" in block_reference_value:
             block_reference_value.update({"output": block_reference_value.get("extracted_information")})
@@ -1715,9 +1724,12 @@ class WorkflowRunContext:
             # Merge old into new so the latest loop iteration's keys win. A failure payload describes
             # one attempt only, so it is never merged in either direction: merging it into a later
             # success would carry `failure_reason` forward, and merging an earlier success into it
-            # would let a prior iteration's keys leak into the failed one.
+            # would let a prior iteration's keys leak into the failed one. A carried value describes an
+            # earlier run, so it is replaced outright — merging would report that run's facts as this one's.
             if (
-                isinstance(current_value, dict)
+                block_label not in self.carried_block_labels
+                and not carried
+                and isinstance(current_value, dict)
                 and isinstance(block_reference_value, dict)
                 and not current_value.get("failure_reason")
                 and not block_reference_value.get("failure_reason")
@@ -1727,7 +1739,14 @@ class WorkflowRunContext:
                 LOG.debug(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
         self.values[block_label] = block_reference_value
-        self.workflow_run_outputs[block_label] = block_reference_value
+        # Templates iterate workflow_run_outputs as what this run produced, so a value carried in from an
+        # earlier run resolves by label without being listed there.
+        if not carried:
+            self.workflow_run_outputs[block_label] = block_reference_value
+        if carried:
+            self.carried_block_labels.add(block_label)
+        else:
+            self.carried_block_labels.discard(block_label)
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
         self,

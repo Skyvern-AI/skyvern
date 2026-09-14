@@ -14,6 +14,7 @@ try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
+from jinja2 import TemplateError, meta
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge import app
@@ -67,9 +68,9 @@ _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
 _MAX_BLOCK_NESTING_DEPTH = 10
 
 _JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-_OUTPUT_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})_output\s*(?=[\.|}}])")
-_BLOCK_FORM_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*\.")
-_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*(?=[\.|}}])")
+# Fallback only: this sees the identifier that opens an expression, so `{{ a ~ b }}` hides `b`.
+# _jinja_roots parses instead, and falls back to this when the text is not valid Jinja.
+_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})")
 
 _JINJA_RUNTIME_GLOBAL_ROOTS = frozenset(SandboxedEnvironment().globals)
 _JINJA_LITERAL_ROOTS = frozenset({"none", "true", "false"})
@@ -699,12 +700,51 @@ def _workflow_parameter_keys(definition: object | None) -> set[str]:
 _CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
 
 
+def _jinja_string_leaves(serialized: str) -> list[str]:
+    """The block config's own string values. The serialized form is JSON, so a quoted Jinja literal
+    arrives escaped as ``\\"`` — which no Jinja parser accepts — and parsing the whole blob would cost
+    every reference in a block that uses one."""
+    try:
+        payload = json.loads(serialized)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return [serialized]
+    leaves: list[str] = []
+    stack: list[Any] = [payload]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            leaves.append(item)
+        elif isinstance(item, dict):
+            # Keys too: error_code_mapping is templatable on both sides, so a key can carry a reference.
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return leaves
+
+
+def _jinja_roots(serialized: str) -> set[str]:
+    """Every identifier the config's Jinja expressions read, from Jinja's own parser. Falls back to the
+    opening-identifier regex for a leaf that does not parse, which keeps a malformed block classifiable
+    rather than silently referenceless."""
+    roots: set[str] = set()
+    for leaf in _jinja_string_leaves(serialized):
+        try:
+            roots |= meta.find_undeclared_variables(SandboxedEnvironment().parse(leaf))
+        except (TemplateError, RecursionError):
+            roots |= set(_JINJA_ROOT_RE.findall(leaf))
+    return roots
+
+
 def _classify_frontier_jinja_refs(
     frontier_labels: list[str],
     new_definition: object | None,
     serialized_configs: list[str] | None = None,
 ) -> tuple[set[str], set[str], set[str]]:
-    """Single pass over frontier blocks; returns ``(suffix_form_refs, block_form_refs, unknown_roots)``."""
+    """Single pass over frontier blocks; returns ``(suffix_form_refs, block_form_refs, unknown_roots)``.
+
+    A reference anywhere in an expression counts, not just the one that opens it: seeding only the
+    first of ``{{ a.output.x ~ b.output.x }}`` would leave ``b`` undefined in the scoped run."""
     if serialized_configs is None:
         serialized_configs = _serialized_frontier_block_configs(frontier_labels, new_definition)
     known_labels = set(_blocks_by_label(new_definition))
@@ -716,16 +756,14 @@ def _classify_frontier_jinja_refs(
     unknown_roots: set[str] = set()
 
     for serialized in serialized_configs:
-        for match in _OUTPUT_REF_RE.findall(serialized):
-            if match in known_labels:
-                suffix_form_refs.add(match)
-        for match in _BLOCK_FORM_REF_RE.findall(serialized):
-            if match in known_labels:
-                block_form_refs.add(match)
-        for root in _JINJA_ROOT_RE.findall(serialized):
-            if root in known_roots:
+        for root in _jinja_roots(serialized):
+            produced_by = root[: -len("_output")] if root.endswith("_output") else None
+            if produced_by in known_labels:
+                suffix_form_refs.add(str(produced_by))
                 continue
-            if root.endswith("_output") and root[: -len("_output")] in known_labels:
+            if root in known_labels:
+                block_form_refs.add(root)
+            if root in known_roots:
                 continue
             if any(
                 root.endswith(suffix) and root[: -len(suffix)] in parameter_keys
@@ -744,15 +782,6 @@ def _referenced_output_labels(
 ) -> set[str]:
     suffix_refs, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
     return suffix_refs | block_form_refs
-
-
-def _block_form_output_labels(
-    frontier_labels: list[str],
-    new_definition: object | None,
-    serialized_configs: list[str] | None = None,
-) -> set[str]:
-    _, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
-    return block_form_refs
 
 
 def _unknown_jinja_roots(
@@ -1201,10 +1230,6 @@ def _seed_for_frontier(
     suffix_refs, block_form_refs, unknown_roots = _classify_frontier_jinja_refs(
         labels_to_execute, new_definition, serialized_configs
     )
-    if any(label in block_form_refs for label in prefix_labels):
-        # Seeded block_outputs only register <label>_output; block-form refs
-        # need a normal upstream execution to populate the <label> namespace.
-        return requested_labels, {}, requested_labels[0]
     needed = suffix_refs | block_form_refs
     seed: dict[str, Any] = {}
     for label in prefix_labels:

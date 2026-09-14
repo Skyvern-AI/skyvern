@@ -1048,9 +1048,13 @@ class Block(BaseModel, abc.ABC):
             if error_codes
             else {"failure_reason": failure_reason}
         )
-        if isinstance(exc, FailedToFormatJinjaStyleParameter) and exc.available_keys:
+        # Blocks that re-raise a formatting error as another exception type keep the original on __cause__.
+        format_exc: BaseException | None = exc
+        while format_exc is not None and not isinstance(format_exc, FailedToFormatJinjaStyleParameter):
+            format_exc = format_exc.__cause__
+        if isinstance(format_exc, FailedToFormatJinjaStyleParameter) and format_exc.available_keys:
             failure_output["available_keys"] = [
-                self._redact_registered_secrets(key, workflow_run_context) for key in exc.available_keys
+                self._redact_registered_secrets(key, workflow_run_context) for key in format_exc.available_keys
             ]
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(

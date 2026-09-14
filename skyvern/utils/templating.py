@@ -1,3 +1,5 @@
+import json
+import keyword
 import re
 from typing import Any
 
@@ -66,6 +68,26 @@ def get_missing_variables(template_source: str, template_data: dict) -> set[str]
 
 MAX_AVAILABLE_KEYS = 200
 MAX_AVAILABLE_KEY_LENGTH = 128
+MAX_AVAILABLE_PATH_LENGTH = 512
+_JINJA_RESERVED = frozenset(word.lower() for word in keyword.kwlist) | {"true", "false", "none"}
+
+
+def _extend_path(path: str, segment: str | int) -> str | None:
+    """``path`` extended by one segment, written so Jinja resolves it back to that segment, or None
+    when no renderable form exists: an over-long key, or a non-identifier with no root to subscript.
+    A segment that also names a dict attribute (``items``, ``keys``) is subscripted, because dotted
+    access would resolve to the bound method instead of the value."""
+    if isinstance(segment, int):
+        return f"{path}[{segment}]" if path else None
+    if len(segment) > MAX_AVAILABLE_KEY_LENGTH:
+        return None
+    if segment.isidentifier() and segment.lower() not in _JINJA_RESERVED:
+        if not path:
+            return segment
+        # hasattr applies to dotted access on a dict, not to a top-level binding of the same name.
+        if not hasattr(dict, segment):
+            return f"{path}.{segment}"
+    return f"{path}[{json.dumps(segment)}]" if path else None
 
 
 def _flatten_reference_chain(node: nodes.Node) -> tuple[str, list[str | int]] | None:
@@ -85,26 +107,45 @@ def _flatten_reference_chain(node: nodes.Node) -> tuple[str, list[str | int]] | 
     return node.name, segments
 
 
-def _descend(data: dict[str, Any], root: str, segments: list[str | int]) -> Any:
+def _descend(data: dict[str, Any], root: str, segments: list[str | int]) -> tuple[str, Any]:
     current: Any = data
+    path = ""
     for segment in [root, *segments]:
         if isinstance(current, dict) and segment in current:
-            current = current[segment]
+            descended = current[segment]
         elif isinstance(current, list) and isinstance(segment, int) and -len(current) <= segment < len(current):
-            current = current[segment]
+            descended = current[segment]
         else:
-            return current
-    return current
+            return path, current
+        extended = _extend_path(path, segment)
+        if extended is None:
+            return path, current
+        path, current = extended, descended
+    return path, current
 
 
 def get_available_keys(template_source: str, template_data: dict[str, Any]) -> list[str]:
-    """Key names that a failing reference in ``template_source`` could have used: the keys of the
-    deepest dict each dotted chain resolved to, plus the top-level bindings. Values are never
-    included, but a key of a parsed file or an extracted object is itself run data, so the result
-    is bounded in count and per-key length rather than treated as free of customer content."""
-    keys: set[str] = set()
+    """Reference paths a failing reference in ``template_source`` could have used: one path per key
+    of the dict each dotted chain landed on, then the top-level bindings, each written so that
+    pasting it into ``{{ }}`` resolves to that key's value. A bare key name is not published: the
+    reader cannot tell it from a top-level binding, and pasting it renders nothing. Values are never
+    included, but a key of a parsed file or an extracted object is itself run data, so the result is
+    bounded in count and in path length rather than treated as free of customer content."""
+    reachable: set[str] = set()
+    roots: set[str] = set()
+
+    def add(into: set[str], entry: str | None) -> None:
+        if entry and len(entry) <= MAX_AVAILABLE_PATH_LENGTH:
+            into.add(entry)
+
+    def published() -> list[str]:
+        # Paths under the failing reference answer it; top-level names only say what else exists.
+        return (sorted(reachable) + sorted(roots - reachable))[:MAX_AVAILABLE_KEYS]
+
     try:
-        keys.update(str(key)[:MAX_AVAILABLE_KEY_LENGTH] for key in template_data)
+        for key in template_data:
+            if isinstance(key, str):
+                add(roots, _extend_path("", key))
         ast = SandboxedEnvironment().parse(template_source)
         chains = list(ast.find_all((nodes.Getattr, nodes.Getitem)))
         nested = {id(chain.node) for chain in chains}
@@ -114,9 +155,12 @@ def get_available_keys(template_source: str, template_data: dict[str, Any]) -> l
             flattened = _flatten_reference_chain(chain)
             if flattened is None:
                 continue
-            resolved = _descend(template_data, *flattened)
-            if isinstance(resolved, dict):
-                keys.update(str(key)[:MAX_AVAILABLE_KEY_LENGTH] for key in resolved)
+            path, resolved = _descend(template_data, *flattened)
+            if path and isinstance(resolved, dict):
+                for key in resolved:
+                    # An int key is subscripted as an int; coercing it to a string key would not resolve.
+                    if isinstance(key, str) or (isinstance(key, int) and not isinstance(key, bool)):
+                        add(reachable, _extend_path(path, key))
     except Exception:
-        return sorted(keys)[:MAX_AVAILABLE_KEYS]
-    return sorted(keys)[:MAX_AVAILABLE_KEYS]
+        return published()
+    return published()
