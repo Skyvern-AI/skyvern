@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -52,7 +53,7 @@ def test_omits_the_identifier_when_the_credential_carries_none() -> None:
         },
         "code": {
             "workflow_parameter_type": "credential_id",
-            "accessor": "await <credential_parameter_key>.otp()",
+            "accessor": "await <key>.otp()",
         },
     }
 
@@ -66,7 +67,7 @@ def test_email_otp_is_code_only_during_scouting() -> None:
         "scouting": {"available": False, "reason": "workflow_run_context_required"},
         "code": {
             "workflow_parameter_type": "credential_id",
-            "accessor": "await <credential_parameter_key>.otp()",
+            "accessor": "await <key>.otp()",
         },
     }
 
@@ -87,12 +88,50 @@ def test_serializes_metadata_only_so_no_secret_or_vault_material_reaches_the_age
         "name",
         "credential_type",
         "tested_url",
+        "code",
         "username",
         "totp_type",
         "totp_identifier",
         "one_time_code",
     }
+    assert entry["code"]["accessors"] == [
+        "<key>.username",
+        "<key>.password",
+        "await <key>.otp()",
+        "await <key>.magic_link(page)",
+    ]
+    assert entry["one_time_code"]["code"]["accessor"] in entry["code"]["accessors"]
     assert not any(SECRET_MARKER in str(value) for value in entry.values())
+
+
+@pytest.mark.parametrize("totp_type", [TotpType.NONE, TotpType.PASSKEY])
+def test_a_password_credential_without_a_one_time_code_source_advertises_no_otp_accessor(
+    totp_type: TotpType,
+) -> None:
+    entry = _serialize_credential(_password_credential(totp_type=totp_type))
+
+    assert entry["code"]["accessors"] == ["<key>.username", "<key>.password"]
+    assert "one_time_code" not in entry
+
+
+def test_a_secret_credential_advertises_only_secret_value_and_never_its_value() -> None:
+    entry = _serialize_credential(
+        _password_credential(
+            credential_type=CredentialType.SECRET,
+            username=None,
+            secret_label="fixture api key",
+            item_id=SECRET_MARKER,
+            user_context=SECRET_MARKER,
+        )
+    )
+
+    assert set(entry) == {"credential_id", "name", "credential_type", "tested_url", "code", "secret_label"}
+    assert entry["credential_type"] == "secret"
+    assert entry["code"] == {"workflow_parameter_type": "credential_id", "accessors": ["<key>.secret_value"]}
+    serialized = json.dumps(entry)
+    assert SECRET_MARKER not in serialized
+    for guessed in ("username", "password", "api_key", "token"):
+        assert guessed not in serialized
 
 
 async def _resolve(reference: str, policy: RequestPolicy, inventory: list[Credential]) -> dict[str, object]:
