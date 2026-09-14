@@ -427,7 +427,7 @@ Send an email notification, optionally with file attachments from previous block
 | Field | Type | Description |
 |-------|------|-------------|
 | **Recipients** | text | Comma-separated email addresses |
-| **Subject** | text | Email subject line |
+| **Subject** | text | Email subject line. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks) — add `{{workflow_run_id}}` to tag the subject with the run, e.g. `Your Run is Finished {{workflow_run_id}}`. |
 | **Body** | text | Email body. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks). |
 | **Body format** | select | `Text` (default) sends the body exactly as written. `HTML` renders the body as a formatted email and adds a plain-text version for clients that cannot show HTML; `<script>`, `<iframe>`, `<object>`, `<embed>`, `<svg>`, `<math>`, meta refresh directives, event-handler attributes and links whose scheme is not `http`, `https`, `mailto`, `tel` or `cid` (inline `data:image` sources are kept) are removed before sending. Mail clients strip inline SVG anyway, so use a raster image instead. `{{ }}` and `{% %}` are parameter syntax, so wrap literal braces in `{% raw %}…{% endraw %}`. |
 | **File Attachments** | text | Path to files to attach |
