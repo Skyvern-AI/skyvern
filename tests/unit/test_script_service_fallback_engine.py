@@ -301,6 +301,25 @@ async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_block_screenshot_timeout_is_logged_and_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pre-block capture is best effort: a capture that runs out of budget must not abort the block setup
+    # that already persisted its rows, mirroring Block.execute_safe.
+    log = MagicMock()
+    monkeypatch.setattr(script_service, "LOG", log)
+    browser_state = SimpleNamespace(take_fullpage_screenshot=AsyncMock(side_effect=TimeoutError()))
+    monkeypatch.setattr(script_service.app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_a, **_k: browser_state)
+    create_artifact = AsyncMock()
+    monkeypatch.setattr(script_service.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
+
+    await script_service._take_workflow_run_block_screenshot(
+        "wr_test", "o_test", SimpleNamespace(workflow_run_block_id="wrb_test")
+    )
+
+    log.warning.assert_called_once()
+    create_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_fallback_episode_excludes_decision_row_from_agent_action_count() -> None:
     # Twin pin of the workflow/service.py count-filter test: _fallback_to_ai_run keeps its own copy
     # of the decision-row exclusion, and a verdict row must not count as agent activity here either.

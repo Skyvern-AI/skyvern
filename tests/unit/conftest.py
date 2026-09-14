@@ -1,17 +1,20 @@
 """Shared pytest fixtures and setup for unit tests."""
 
 # -- begin speed up unit tests
+import asyncio
+import contextlib
 import itertools
 import logging
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from typing import TypeVar
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -29,6 +32,8 @@ from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.webeye.utils import page as page_module
+from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
 
@@ -615,3 +620,55 @@ class ScopeRecordingAgentFunction(AgentFunction):
         if self._record_arms:
             self.events.append("token")
         return False
+
+
+_T = TypeVar("_T")
+
+
+def stalling_async_mock(entered: asyncio.Event) -> AsyncMock:
+    """An awaitable that marks ``entered`` and then never returns, so only cancellation can release it."""
+
+    async def _stall(*args: object, **kwargs: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    return AsyncMock(side_effect=_stall)
+
+
+async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tuple[asyncio.Task[_T], float]:
+    """Run ``coro`` as a task and fail the test if it is still pending after ``wait_seconds``, so a hang fails
+    instead of passing as a slow TimeoutError. Returns the finished task and the elapsed seconds."""
+    task = asyncio.ensure_future(coro)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait({task}, timeout=wait_seconds)
+    elapsed = loop.time() - started
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        pytest.fail(f"task still running after {wait_seconds}s")
+    return task, elapsed
+
+
+def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
+    """A ``take_fullpage_screenshot`` stand-in that drives the real ``take_scrolling_screenshot`` with a stalled
+    stitched-capture helper, so a caller test exercises the primitive's own deadline."""
+    fake_frame = SimpleNamespace(
+        get_scroll_x_y=AsyncMock(return_value=(0, 0)),
+        safe_scroll_to_x_y=AsyncMock(return_value=None),
+    )
+
+    async def _capture() -> bytes:
+        with (
+            patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame)),
+            patch.object(page_module, "_scrolling_screenshots_helper", stalling_async_mock(entered)),
+        ):
+            return await page_module.SkyvernFrame.take_scrolling_screenshot(
+                page=MagicMock(name="page"),
+                mode=ScreenshotMode.LITE,
+                scrolling_number=1,
+                timeout=timeout_ms,
+            )
+
+    return AsyncMock(side_effect=_capture)
