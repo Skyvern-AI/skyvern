@@ -44,6 +44,8 @@ import { getSseClient } from "@/api/sse";
 import {
   CopilotAttachedFile,
   WorkflowCopilotCancelRequest,
+  CopilotProposalMetadata,
+  CopilotProposalRunFacts,
   WorkflowCopilotCancelSource,
   WorkflowCopilotChatHistoryMessage,
   WorkflowCopilotChatHistoryResponse,
@@ -555,6 +557,22 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
   return null;
 };
 
+const getLatestDiffCardTurnIdFromHistory = (
+  messages: WorkflowCopilotChatHistoryMessage[],
+): string | null => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const narrative = hydrateHistoryNarrative(
+      message?.narrative_payload,
+      message?.turn_outcome,
+    );
+    if (narrative?.turnId && shouldShowDiffCard(narrative)) {
+      return narrative.turnId;
+    }
+  }
+  return null;
+};
+
 // messages.length - 1 with any trailing run_lifecycle lines skipped, so
 // proposal actions keep attaching to the last real turn.
 const findLastTurnIndex = (messages: ChatMessage[]): number => {
@@ -859,6 +877,27 @@ interface TurnSnapshot {
   hadStagedDraft: boolean;
 }
 
+function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
+  if (!facts.available) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Associated test run unavailable. No other run was substituted.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-1 text-xs text-muted-foreground">
+      <p>Associated test: {facts.status ?? "status unavailable"}</p>
+      {facts.failure_reason ? <p>{facts.failure_reason}</p> : null}
+      {facts.outputs.map((output) => (
+        <p key={output.output_parameter_id}>
+          {output.output_parameter_id}: {JSON.stringify(output.value)}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 const AUTO_SEND_TIMEOUT_MS = 5000;
 
 const DEFAULT_WINDOW_WIDTH = 600;
@@ -952,6 +991,10 @@ export function WorkflowCopilotChat({
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  const [pendingProposalMetadata, setPendingProposalMetadata] =
+    useState<CopilotProposalMetadata | null>(null);
+  const [pendingProposalRun, setPendingProposalRun] =
+    useState<CopilotProposalRunFacts | null>(null);
   // Owning turn of the current proposedWorkflow. Kept alongside it (never
   // merged into one object) so the gate can re-attach to its owning message.
   const [pendingProposalTurnId, setPendingProposalTurnId] = useState<
@@ -1777,6 +1820,8 @@ export function WorkflowCopilotChat({
     discardQueuedPrompt();
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
+    setPendingProposalMetadata(null);
+    setPendingProposalRun(null);
     setPendingProposalTurnId(null);
     setAutoAccept(false);
     setWorkPlan([]);
@@ -1833,7 +1878,8 @@ export function WorkflowCopilotChat({
         if (rehydratedRunId) rememberTurnOwnedRun(rehydratedRunId);
       }
       const restoredPendingProposalTurnId = data.proposed_workflow
-        ? getLatestDiffCardTurnId(historyMessages)
+        ? (data.proposed_workflow_metadata?.owner_turn_id ??
+          getLatestDiffCardTurnId(historyMessages))
         : null;
       latestTurnId.current = restoredPendingProposalTurnId;
       // History never carries run_lifecycle lines (local-only); carry them
@@ -1846,6 +1892,8 @@ export function WorkflowCopilotChat({
       ]);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
+      setPendingProposalMetadata(data.proposed_workflow_metadata ?? null);
+      setPendingProposalRun(data.proposed_workflow_run ?? null);
       setPendingProposalTurnId(
         data.proposed_workflow ? restoredPendingProposalTurnId : null,
       );
@@ -2277,12 +2325,23 @@ export function WorkflowCopilotChat({
     }
 
     if (!chatId) {
+      if (pendingProposalMetadata) {
+        toast({
+          title: "Accept failed",
+          description:
+            "Copilot could not verify the current proposal. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
       // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
       if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
       markProposalAccepted();
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       if (alwaysAccept) {
         setAutoAccept(true);
       }
@@ -2297,6 +2356,8 @@ export function WorkflowCopilotChat({
         {
           workflow_copilot_chat_id: chatId,
           auto_accept: alwaysAccept,
+          owner_turn_id: pendingProposalMetadata?.owner_turn_id ?? null,
+          revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotApplyProposedWorkflowRequest,
       );
       // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
@@ -2307,10 +2368,31 @@ export function WorkflowCopilotChat({
       }
       markProposalAccepted();
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       if (alwaysAccept) {
         setAutoAccept(true);
       }
     } catch (applyError) {
+      if (getErrorStatus(applyError) === 409) {
+        await resyncProposalFromChatRow();
+        toast({
+          title: "Proposal changed",
+          description:
+            "Copilot reloaded the current proposal. Review it before applying.",
+        });
+        return;
+      }
+      if (pendingProposalMetadata) {
+        await resyncProposalFromChatRow();
+        toast({
+          title: "Accept failed",
+          description:
+            "Copilot kept the current proposal for review. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
       // Atomic accept can fail if the server-side proposal is missing
       // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
       // pre-#10568 client-side apply so users aren't blocked while a backend
@@ -2329,6 +2411,8 @@ export function WorkflowCopilotChat({
       }
       markProposalAccepted();
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       if (alwaysAccept) {
         setAutoAccept(true);
       }
@@ -2336,7 +2420,10 @@ export function WorkflowCopilotChat({
     }
   };
 
-  const handleRejectWorkflow = () => {
+  const handleRejectWorkflow = async () => {
+    if (!(await clearProposedWorkflow(false))) {
+      return;
+    }
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
@@ -2352,8 +2439,9 @@ export function WorkflowCopilotChat({
       setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
+    setPendingProposalMetadata(null);
+    setPendingProposalRun(null);
     setPendingProposalTurnId(null);
-    void clearProposedWorkflow(false);
   };
 
   const getErrorStatus = (error: unknown): number | undefined => {
@@ -2672,15 +2760,25 @@ export function WorkflowCopilotChat({
       );
       const nextProposal = response.data.proposed_workflow ?? null;
       setProposedWorkflow(nextProposal);
-      if (!nextProposal) {
-        setPendingProposalTurnId(null);
-      }
+      setPendingProposalMetadata(
+        response.data.proposed_workflow_metadata ?? null,
+      );
+      setPendingProposalRun(response.data.proposed_workflow_run ?? null);
+      setPendingProposalTurnId((currentTurnId) =>
+        nextProposal
+          ? (response.data.proposed_workflow_metadata?.owner_turn_id ??
+            getLatestDiffCardTurnIdFromHistory(response.data.chat_history) ??
+            currentTurnId)
+          : null,
+      );
     } catch (error) {
       console.error("Failed to resync pending proposal:", error);
     }
   }, [credentialGetter]);
 
-  const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
+  const clearProposedWorkflow = async (
+    autoAcceptValue: boolean,
+  ): Promise<boolean> => {
     const clearProposalByChatId = async (chatId: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
@@ -2688,6 +2786,8 @@ export function WorkflowCopilotChat({
         {
           workflow_copilot_chat_id: chatId,
           auto_accept: autoAcceptValue,
+          owner_turn_id: pendingProposalMetadata?.owner_turn_id ?? null,
+          revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotClearProposedWorkflowRequest,
       );
     };
@@ -2701,16 +2801,17 @@ export function WorkflowCopilotChat({
           "Failed to resolve chat ID before clearing proposal:",
           resolveError,
         );
-        return;
+        return false;
       }
     }
 
     if (!chatId) {
-      return;
+      return false;
     }
 
     try {
       await clearProposalByChatId(chatId);
+      return true;
     } catch (error) {
       const status = getErrorStatus(error);
       if (status === 404) {
@@ -2718,11 +2819,15 @@ export function WorkflowCopilotChat({
           const refreshedChatId = await fetchLatestChatId();
           if (refreshedChatId && refreshedChatId !== chatId) {
             await clearProposalByChatId(refreshedChatId);
-            return;
+            return true;
           }
         } catch (retryError) {
           console.error("Retry to clear proposed workflow failed:", retryError);
         }
+      }
+      if (status === 409) {
+        await resyncProposalFromChatRow();
+        return false;
       }
       console.error("Failed to clear proposed workflow:", error);
       toast({
@@ -2732,12 +2837,15 @@ export function WorkflowCopilotChat({
           : "Failed to clear copilot proposal. Please try again.",
         variant: "destructive",
       });
+      return false;
     }
   };
 
   const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
     onReviewWorkflow?.(workflow, () => {
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       setPendingProposalTurnId(null);
     });
   };
@@ -2755,6 +2863,8 @@ export function WorkflowCopilotChat({
       discardQueuedPrompt();
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       setPendingProposalTurnId(null);
       setAutoAccept(false);
       setWorkPlan([]);
@@ -3749,9 +3859,15 @@ export function WorkflowCopilotChat({
             // bypassed proposal — drop the stale handle so its gate cannot
             // reapply an outdated draft over what was just committed.
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           } else if (response.updated_workflow) {
             setProposedWorkflow(response.updated_workflow);
+            setPendingProposalMetadata(
+              response.proposed_workflow_metadata ?? null,
+            );
+            setPendingProposalRun(null);
             setPendingProposalTurnId(responseTurnId);
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
@@ -3762,6 +3878,8 @@ export function WorkflowCopilotChat({
           ) {
             applyWorkflowUpdate(responseEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           } else if (pendingProposalTurnId) {
             // No new draft this turn, but a bypassed proposal is still
@@ -3773,6 +3891,12 @@ export function WorkflowCopilotChat({
             // proposals, the Accept/Reject card is the user's next gate;
             // canvas keeps the staged content until the user acts.
             setProposedWorkflow(response.updated_workflow ?? null);
+            setPendingProposalMetadata(
+              response.updated_workflow
+                ? (response.proposed_workflow_metadata ?? null)
+                : null,
+            );
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           }
         };
@@ -3806,6 +3930,8 @@ export function WorkflowCopilotChat({
           if (errorEntry?.hadStagedDraft && errorEntry?.snapshot) {
             applyWorkflowUpdate(errorEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           }
         };
@@ -4697,7 +4823,22 @@ export function WorkflowCopilotChat({
     ? findLastIndexOfTurn(messages, pendingProposalTurnId)
     : -1;
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
-  const gateOwnerNarrative = messages[gateIndex]?.narrative;
+  const gateOwnerMessage = messages[gateIndex];
+  const gateOwnerNarrative = gateOwnerMessage?.narrative;
+  const gateOwnerRendersInline = Boolean(
+    gateOwnerMessage &&
+    gateOwnerMessage.sender === "ai" &&
+    gateOwnerMessage.kind !== "run_lifecycle" &&
+    gateOwnerMessage.kind !== "status_notice" &&
+    !(
+      gateOwnerNarrative &&
+      !(
+        shouldShowDiffCard(gateOwnerNarrative) ||
+        (gateOwnerNarrative.turnId !== null &&
+          gateOwnerNarrative.turnId === pendingProposalTurnId)
+      )
+    ),
+  );
   // Mid-turn Accept would be clobbered by the in-flight turn's terminal
   // restore, so gate actions wait for idle.
   const gateActionable =
@@ -5037,40 +5178,49 @@ export function WorkflowCopilotChat({
                         ),
                       )}
                       {showReviewGate ? (
-                        <ReviewGateCard
-                          turn={message.narrative}
-                          pending={
-                            index === gateIndex && Boolean(proposedWorkflow)
-                          }
-                          verdict={getReviewGateVerdict(
-                            message.narrative,
-                            proposedWorkflow,
-                          )}
-                          settled={
-                            turnId && acceptedTurnIds.has(turnId)
-                              ? "accepted"
-                              : turnId && rejectedTurnIds.has(turnId)
-                                ? "rejected"
-                                : null
-                          }
-                          actionsEnabled={gateActionable}
-                          onAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow)
-                          }
-                          onAlwaysAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          onReject={handleRejectWorkflow}
-                          onReview={() =>
-                            proposedWorkflow &&
-                            handleReviewWorkflow(proposedWorkflow)
-                          }
-                          onTestEndToEnd={handleTestEndToEnd}
-                          gateId={turnId ? `copilot-gate-${turnId}` : undefined}
-                          flash={turnId !== null && turnId === gateFlashTurnId}
-                        />
+                        <div className="space-y-2">
+                          {index === gateIndex && pendingProposalRun ? (
+                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                          ) : null}
+                          <ReviewGateCard
+                            turn={message.narrative}
+                            pending={
+                              index === gateIndex && Boolean(proposedWorkflow)
+                            }
+                            verdict={getReviewGateVerdict(
+                              message.narrative,
+                              proposedWorkflow,
+                            )}
+                            settled={
+                              turnId && acceptedTurnIds.has(turnId)
+                                ? "accepted"
+                                : turnId && rejectedTurnIds.has(turnId)
+                                  ? "rejected"
+                                  : null
+                            }
+                            actionsEnabled={gateActionable}
+                            onAccept={() =>
+                              proposedWorkflow &&
+                              handleAcceptWorkflow(proposedWorkflow)
+                            }
+                            onAlwaysAccept={() =>
+                              proposedWorkflow &&
+                              handleAcceptWorkflow(proposedWorkflow, true)
+                            }
+                            onReject={handleRejectWorkflow}
+                            onReview={() =>
+                              proposedWorkflow &&
+                              handleReviewWorkflow(proposedWorkflow)
+                            }
+                            onTestEndToEnd={handleTestEndToEnd}
+                            gateId={
+                              turnId ? `copilot-gate-${turnId}` : undefined
+                            }
+                            flash={
+                              turnId !== null && turnId === gateFlashTurnId
+                            }
+                          />
+                        </div>
                       ) : null}
                       {!isLoadingHistory &&
                       isLastMessage &&
@@ -5207,29 +5357,34 @@ export function WorkflowCopilotChat({
                     }
                     footer={
                       isGateOwnerOrLast ? (
-                        <ReviewGateCard
-                          pending
-                          verdict={getReviewGateVerdict(
-                            gateOwnerNarrative,
-                            proposedWorkflow,
-                          )}
-                          settled={null}
-                          actionsEnabled={gateActionable}
-                          onAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow)
-                          }
-                          onAlwaysAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          onReject={handleRejectWorkflow}
-                          onReview={() =>
-                            proposedWorkflow &&
-                            handleReviewWorkflow(proposedWorkflow)
-                          }
-                          onTestEndToEnd={handleTestEndToEnd}
-                        />
+                        <div className="space-y-2">
+                          {pendingProposalRun ? (
+                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                          ) : null}
+                          <ReviewGateCard
+                            pending
+                            verdict={getReviewGateVerdict(
+                              gateOwnerNarrative,
+                              proposedWorkflow,
+                            )}
+                            settled={null}
+                            actionsEnabled={gateActionable}
+                            onAccept={() =>
+                              proposedWorkflow &&
+                              handleAcceptWorkflow(proposedWorkflow)
+                            }
+                            onAlwaysAccept={() =>
+                              proposedWorkflow &&
+                              handleAcceptWorkflow(proposedWorkflow, true)
+                            }
+                            onReject={handleRejectWorkflow}
+                            onReview={() =>
+                              proposedWorkflow &&
+                              handleReviewWorkflow(proposedWorkflow)
+                            }
+                            onTestEndToEnd={handleTestEndToEnd}
+                          />
+                        </div>
                       ) : null
                     }
                   />
@@ -5240,6 +5395,26 @@ export function WorkflowCopilotChat({
                 .map(renderQuestionCard);
               return [...questions, rendered];
             })}
+            {proposedWorkflow && !gateOwnerRendersInline ? (
+              <div className="space-y-2">
+                {pendingProposalRun ? (
+                  <ProposalRunFactsLine facts={pendingProposalRun} />
+                ) : null}
+                <ReviewGateCard
+                  pending
+                  verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
+                  settled={null}
+                  actionsEnabled={gateActionable}
+                  onAccept={() => handleAcceptWorkflow(proposedWorkflow)}
+                  onAlwaysAccept={() =>
+                    handleAcceptWorkflow(proposedWorkflow, true)
+                  }
+                  onReject={handleRejectWorkflow}
+                  onReview={() => handleReviewWorkflow(proposedWorkflow)}
+                  onTestEndToEnd={handleTestEndToEnd}
+                />
+              </div>
+            ) : null}
             {questionInteractions
               .filter(
                 (item) =>

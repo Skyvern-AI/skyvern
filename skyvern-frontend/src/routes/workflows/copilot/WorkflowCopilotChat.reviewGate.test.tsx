@@ -43,6 +43,20 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
         workflow_copilot_chat_id: "chat-1" as string | null,
         chat_history: [] as unknown[],
         proposed_workflow: null as Record<string, unknown> | null,
+        proposed_workflow_metadata: null as {
+          owner_turn_id: string;
+          revision: number;
+          canonical_fingerprint: string;
+          disposition: "review_untested";
+          workflow_run_id: string | null;
+        } | null,
+        proposed_workflow_run: null as {
+          workflow_run_id: string;
+          status: string | null;
+          available: boolean;
+          failure_reason: string | null;
+          outputs: Array<{ output_parameter_id: string; value: unknown }>;
+        } | null,
         auto_accept: false,
       },
     };
@@ -292,6 +306,8 @@ beforeEach(() => {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
     proposed_workflow: null,
+    proposed_workflow_metadata: null,
+    proposed_workflow_run: null,
     auto_accept: false,
   };
 });
@@ -308,6 +324,142 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]!.body.keep_pending_proposal).toBe(false);
+  });
+
+  it("interrupted_draft resyncs a stale typed Accept without applying it locally", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      title: "Newer draft",
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-2",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 409 } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
+    );
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("retains and resyncs a typed proposal when atomic Accept fails", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not locally accept a typed proposal when its chat cannot be resolved", async () => {
+    historyResponse.data.workflow_copilot_chat_id = null;
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    await renderChat();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("interrupted_draft reload shows an actionable candidate and its exact run result", async () => {
+    // A hard kill can leave only the submitted user row. MessageItem does not
+    // render footers on user bubbles, so the durable candidate needs a
+    // standalone review gate until an assistant-owned row exists.
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "build the candidate",
+        created_at: "2026-09-08T12:00:00Z",
+      },
+    ];
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      title: "Recovered draft",
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-interrupted",
+      revision: 3,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-exact",
+    };
+    historyResponse.data.proposed_workflow_run = {
+      workflow_run_id: "wr-exact",
+      status: "completed",
+      available: true,
+      failure_reason: null,
+      outputs: [{ output_parameter_id: "op-metric", value: { metric: "42" } }],
+    };
+
+    await renderChat();
+
+    expect(await screen.findByText("Associated test: completed")).toBeTruthy();
+    expect(screen.getByText(/op-metric:.*42/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
 
   it("restores an actionable gate via the chip after a bypassed proposal (old code: buttons vanish forever)", async () => {
