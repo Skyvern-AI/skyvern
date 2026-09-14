@@ -1099,6 +1099,116 @@ class TestSharedBrowserCallOutcome:
         assert len(records) == 2
         assert all(record["dispatched"] is False for record in records)
 
+    def test_a_protocol_failure_reports_the_model_surface_tool_and_both_session_identities(self) -> None:
+        """A bare 'evaluate failed' leaves the model no way to tell where it now is, so the failed
+        call has to name a tool the model can actually call and both ends of the session identity."""
+        outcome = replace(
+            mcp_adapter._browser_protocol_exception_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_source",
+                source_browser_session_generation=2,
+                dispatched=True,
+                exception=RuntimeError("transport closed"),
+            ),
+            completion_browser_session_id="pbs_after",
+            completion_browser_session_generation=3,
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(outcome, display_tool_name="evaluate")
+        continuity = projected["data"]["browser_call_continuity"]
+
+        assert continuity["failed_tool"] == "evaluate"
+        assert continuity["browser_session_id"] == "pbs_source"
+        assert continuity["browser_session_generation"] == 2
+        assert continuity["browser_session_id_after"] == "pbs_after"
+        assert continuity["browser_session_generation_after"] == 3
+
+    def test_a_protocol_failure_states_no_liveness_or_read_fact_the_outcome_cannot_prove(self) -> None:
+        """Dispatch is recorded before the await, so a dispatched call cannot tell pre- from
+        post-execution failure — the projection may report delivery and effect, never liveness."""
+        outcome = mcp_adapter._browser_protocol_exception_outcome(
+            raw_tool_name="skyvern_evaluate",
+            source_browser_session_id="pbs_source",
+            source_browser_session_generation=0,
+            dispatched=True,
+            exception=RuntimeError("transport closed"),
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(outcome, display_tool_name="evaluate")
+        continuity = projected["data"]["browser_call_continuity"]
+
+        assert continuity["dispatched"] is True
+        assert continuity["result_delivered"] is False
+        assert continuity["prior_action_effect"] == "unknown"
+        assert "session_state" not in continuity
+        assert "read_completed" not in continuity
+        assert "Observe the page again" in projected["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_dispatch_reports_no_effect_on_the_targeted_browser(self) -> None:
+        """A pre-hook that dies never sends the call, so the block must say so instead of inviting a
+        re-observation, and a run-targeted call must name the run browser as where it ended, not the
+        chat's debug browser."""
+
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("hook transport closed")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        ctx.browser_session_continuity_generation = 4
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        with capture_logs() as captured:
+            projected = await server.call_tool("evaluate", {"target": "last_run"})
+
+        payload = json.loads(projected.content[0].text)
+        continuity = payload["data"]["browser_call_continuity"]
+        assert continuity["dispatched"] is False
+        assert continuity["prior_action_effect"] == "none"
+        assert continuity["browser_session_id"] == "pbs_run"
+        assert continuity["browser_session_id_after"] == "pbs_run"
+        assert continuity["browser_session_generation_after"] is None
+        assert "had no effect" in payload["error"]
+        assert "Observe the page again" not in payload["error"]
+        records = _browser_outcome_records(captured)
+        assert records[-1]["completion_browser_session_id"] == "pbs_run"
+
+    def test_a_protocol_failure_does_not_borrow_the_session_loss_continuity_block(self) -> None:
+        """The session is not known to be lost here; reusing the loss block would tell the model a
+        replacement browser is ready when nothing established that."""
+        protocol = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._browser_protocol_exception_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_source",
+                source_browser_session_generation=0,
+                dispatched=True,
+                exception=RuntimeError("transport closed"),
+            ),
+            display_tool_name="evaluate",
+        )
+        loss = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._not_dispatched_browser_call_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_lost",
+                source_browser_session_generation=0,
+                raw_result={},
+                ctx=make_copilot_ctx(browser_session_id="pbs_replacement"),
+                session_loss_disposition="reestablished",
+            ),
+            display_tool_name="evaluate",
+        )
+
+        assert "browser_session_continuity" not in protocol["data"]
+        assert "error_code" not in protocol
+        assert loss["data"]["browser_session_continuity"]["disposition"] == "reestablished"
+        assert "browser_call_continuity" not in loss["data"]
+
 
 @pytest.mark.usefixtures("_stub_browser_session")
 class TestMCPToolTiming:

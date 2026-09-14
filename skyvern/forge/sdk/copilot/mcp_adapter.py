@@ -360,8 +360,33 @@ def _project_browser_call_outcome(
 ) -> dict[str, Any]:
     if outcome.protocol_error_detail is not None:
         detail = outcome.protocol_error_detail
-        error = f"{display_tool_name} failed: {detail}" if detail else f"{display_tool_name} failed"
-        result: dict[str, Any] = {"ok": False, "error": error}
+        failure = f"{display_tool_name} failed: {detail}" if detail else f"{display_tool_name} failed"
+        if outcome.dispatched:
+            guidance = (
+                "No result was returned, so whether the call ran is unknown. Observe the page again "
+                "before relying on state that may have changed."
+            )
+            effect = "unknown"
+        else:
+            guidance = "The call was never sent to the browser, so it had no effect."
+            effect = "none"
+        result: dict[str, Any] = {
+            "ok": False,
+            "error": f"{failure}. {guidance}",
+            "data": {
+                "browser_call_continuity": {
+                    "source": "direct_mcp",
+                    "failed_tool": display_tool_name,
+                    "browser_session_id": outcome.source_browser_session_id,
+                    "browser_session_generation": outcome.source_browser_session_generation,
+                    "browser_session_id_after": outcome.completion_browser_session_id,
+                    "browser_session_generation_after": outcome.completion_browser_session_generation,
+                    "dispatched": outcome.dispatched,
+                    "result_delivered": False,
+                    "prior_action_effect": effect,
+                }
+            },
+        }
     else:
         raw_result = outcome.raw_result()
         result = mcp_to_copilot(raw_result) if raw_result else {}
@@ -2019,10 +2044,15 @@ class SkyvernOverlayMCPServer(MCPServer):
                     dispatched=dispatch_started,
                     exception=exc,
                 )
+                # The call was bound to one browser; a run-targeted call must not report the
+                # chat's browser as where it ended up. The generation counter belongs to the chat's
+                # browser only, so a fixed target has none to report.
                 outcome = replace(
                     outcome,
-                    completion_browser_session_id=copilot_ctx.browser_session_id,
-                    completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                    completion_browser_session_id=binding.session_id_for(copilot_ctx),
+                    completion_browser_session_generation=(
+                        None if binding.session_id_override else copilot_ctx.browser_session_continuity_generation
+                    ),
                 )
                 _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 err = _project_browser_call_outcome(
@@ -2330,8 +2360,12 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
                 outcome = replace(
                     _scrub_browser_call_outcome(ctx, outcome),
-                    completion_browser_session_id=ctx.browser_session_id,
-                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                    completion_browser_session_id=call_browser_session_id,
+                    completion_browser_session_generation=(
+                        None
+                        if (requested_session_id or call_session_override)
+                        else ctx.browser_session_continuity_generation
+                    ),
                 )
                 _record_browser_call_outcome(ctx, outcome, call_path="internal")
                 return _InternalToolCallResult(
