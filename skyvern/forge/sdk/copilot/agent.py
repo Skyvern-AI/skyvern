@@ -201,6 +201,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     PAGE_VALUE_BINDING_TEXT_MAX_CHARS,
+    REPAIR_INSTRUCTION_MAX_CHARS,
     RUNTIME_FAILURE_REASON_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
@@ -1116,7 +1117,9 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "For metadata rejects, author code_artifact_metadata with goal_value_paths, valid extraction_schema, "
             "and code return paths matching required requested output child paths; rerun update_and_run_blocks."
         )
-    lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
+    lines.append(
+        _clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=REPAIR_INSTRUCTION_MAX_CHARS)
+    )
     return "\n\n" + "\n".join(line for line in lines if line)
 
 

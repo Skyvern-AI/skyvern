@@ -6,6 +6,7 @@ import ast
 import asyncio
 import keyword
 import re
+import symtable
 import sys
 import tempfile
 import textwrap
@@ -29,6 +30,7 @@ from skyvern.utils.templating import get_missing_variables
 RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
 RENDER_UNDEFINED_NAME_REASON_CODE = "RENDER_UNDEFINED_NAME"
 SCANNER_ADVISORY_REASON_CODE = "SCANNER_ADVISORY"
+WRAPPER_SCOPE_GLOBAL_REASON_CODE = "WRAPPER_SCOPE_GLOBAL"
 SCANNER_ADVISORY_TIMEOUT_SECONDS = 3.0
 
 
@@ -57,6 +59,44 @@ class CodeBlockRenderDiagnostic:
     code: str
     message: str
     failing_expression: str
+
+
+@dataclass(frozen=True)
+class NestedHelperScope:
+    """A def nested in the block body, in block line coordinates."""
+
+    name: str
+    first_line: int
+    last_line: int
+    global_names: frozenset[str]
+    nonlocal_names: frozenset[str]
+    # (name, line) of each statement that reads a name while rebinding it (`n += 1`, `n = n + 1`):
+    # the shape that means the helper wanted the enclosing value rather than a fresh local.
+    read_write_bindings: frozenset[tuple[str, int]]
+
+    def contains_line(self, line: int) -> bool:
+        return self.first_line <= line <= self.last_line
+
+
+@dataclass(frozen=True)
+class WrapperScopeGlobal:
+    """A nested ``global`` naming a name the wrapper binds: a block-body assignment or a parameter key."""
+
+    names: tuple[str, ...]
+    line: int
+    helper: NestedHelperScope
+
+
+@dataclass(frozen=True)
+class WrapperScopeFacts:
+    bound_names: frozenset[str]
+    parameter_names: frozenset[str]
+    helpers: tuple[NestedHelperScope, ...]
+    globals: tuple[WrapperScopeGlobal, ...]
+
+    def innermost_helper_at(self, line: int) -> NestedHelperScope | None:
+        candidates = [helper for helper in self.helpers if helper.contains_line(line)]
+        return min(candidates, key=lambda helper: helper.last_line - helper.first_line, default=None)
 
 
 # Mirrors the runtime's strict-mode template formatter (jinja_json_finalize_strict_env)
@@ -231,7 +271,10 @@ _READINESS_WAIT_STATES = frozenset({"visible", "attached"})
 _READINESS_EXPECTATION_METHODS = frozenset({"to_be_attached", "to_be_visible"})
 # Advisory diagnostics reach the model as guidance only; keeping them out of the preflight
 # gate is what stops `skyvern_code_block_lint` from turning advice into a rejection.
-_ADVISORY_DIAGNOSTIC_CODES = frozenset({"ROOT_CONTAINER_READINESS_WAIT", "ROOT_CONTAINER_TEXT_READ"})
+_ADVISORY_DIAGNOSTIC_CODES = frozenset(
+    {"ROOT_CONTAINER_READINESS_WAIT", "ROOT_CONTAINER_TEXT_READ", WRAPPER_SCOPE_GLOBAL_REASON_CODE}
+)
+_WRAPPER_FUNCTION_NAME = "__code_block__"
 _WHOLE_PAGE_READ_METHODS = frozenset({"inner_text", "text_content", "all_inner_texts", "all_text_contents"})
 _TABLE_ROW_TAG_SELECTOR_RE = re.compile(r"(?<![a-z0-9_-])tr(?![a-z0-9_-])")
 _TABLE_ROW_ROLE_SELECTOR_RE = re.compile(r"\[role\s*=\s*(['\"]?)row\1\]")
@@ -443,17 +486,25 @@ def _may_invoke_locator_object(tree: ast.AST) -> bool:
     return False
 
 
-def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+def author_time_code_block_diagnostics(
+    code: str, *, parameter_keys: Iterable[str] = ()
+) -> list[CodeBlockPreflightDiagnostic]:
     tree, _ = _parse_static_ast(code)
     if tree is None:
         return []
-    return [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
+    return [
+        *_author_time_security_diagnostics(code),
+        *_author_time_ast_diagnostics(tree),
+        *wrapper_scope_diagnostics(code, parameter_keys=parameter_keys),
+    ]
 
 
-def advisory_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+def advisory_code_block_diagnostics(
+    code: str, *, parameter_keys: Iterable[str] = ()
+) -> list[CodeBlockPreflightDiagnostic]:
     return [
         diagnostic
-        for diagnostic in author_time_code_block_diagnostics(code)
+        for diagnostic in author_time_code_block_diagnostics(code, parameter_keys=parameter_keys)
         if diagnostic.code in _ADVISORY_DIAGNOSTIC_CODES
     ]
 
@@ -1105,6 +1156,128 @@ def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
             ),
         )
     return None
+
+
+def _read_write_bindings(own_nodes: Iterable[ast.AST], offset: int) -> frozenset[tuple[str, int]]:
+    bindings: set[tuple[str, int]] = set()
+    for node in own_nodes:
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            bindings.add((node.target.id, node.lineno + offset))
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        loaded = {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in loaded:
+                bindings.add((target.id, node.lineno + offset))
+    return frozenset(bindings)
+
+
+def _own_scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """Descendants of ``node`` that belong to its own scope: nested defs, lambdas and classes are
+    yielded but not entered, so a statement is attributed to the innermost scope that owns it."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            yield from _own_scope_nodes(child)
+
+
+def wrapper_scope_facts(code: str, *, parameter_keys: Iterable[str] = ()) -> WrapperScopeFacts | None:
+    """Scope facts about the block body as the runtime compiles it: the body of a wrapper function,
+    so every top-level binding and every parameter key is that function's local. Both executors also
+    publish parameter keys as exec globals, so a nested ``global`` on one resolves to a copy the
+    wrapper body never reads."""
+    source = _build_typed_module(code, parameter_keys=parameter_keys)
+    try:
+        tree = ast.parse(source)
+        table = symtable.symtable(source, "<code_block>", "exec")
+    except SyntaxError:
+        return None
+    wrapper_node = next(
+        (node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == _WRAPPER_FUNCTION_NAME),
+        None,
+    )
+    wrapper_table = next((child for child in table.get_children() if child.get_name() == _WRAPPER_FUNCTION_NAME), None)
+    if wrapper_node is None or wrapper_table is None:
+        return None
+    body_bound_names = frozenset(
+        symbol.get_name() for symbol in wrapper_table.get_symbols() if symbol.is_assigned() and symbol.is_local()
+    )
+    parameter_names = frozenset(
+        normalized
+        for normalized in (unicodedata.normalize("NFKC", key) for key in parameter_keys)
+        if _valid_python_identifier(normalized)
+    )
+    bound_names = body_bound_names | parameter_names
+    # The wrapper strips leading blank lines the runtime keeps, so add them back to land on the
+    # same line the runner reports.
+    dedented = textwrap.dedent(code)
+    offset = dedented[: len(dedented) - len(dedented.lstrip())].count("\n") - wrapper_node.lineno
+
+    helpers: list[NestedHelperScope] = []
+    globals_: list[WrapperScopeGlobal] = []
+    for node in ast.walk(wrapper_node):
+        if node is wrapper_node or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        own_nodes = list(_own_scope_nodes(node))
+        global_statements = [child for child in own_nodes if isinstance(child, ast.Global)]
+        nonlocal_statements = [child for child in own_nodes if isinstance(child, ast.Nonlocal)]
+        helper = NestedHelperScope(
+            name=node.name,
+            first_line=node.lineno + offset,
+            last_line=(node.end_lineno or node.lineno) + offset,
+            global_names=frozenset(name for statement in global_statements for name in statement.names),
+            nonlocal_names=frozenset(name for statement in nonlocal_statements for name in statement.names),
+            read_write_bindings=_read_write_bindings(own_nodes, offset),
+        )
+        helpers.append(helper)
+        for statement in global_statements:
+            bound = tuple(name for name in statement.names if name in bound_names)
+            if bound:
+                globals_.append(WrapperScopeGlobal(names=bound, line=statement.lineno + offset, helper=helper))
+    return WrapperScopeFacts(
+        bound_names=bound_names,
+        parameter_names=parameter_names,
+        helpers=tuple(helpers),
+        globals=tuple(globals_),
+    )
+
+
+_WRAPPER_SCOPE_REMEDY = (
+    "Accumulate in a flat loop at the top level, or inside the helper declare the name `nonlocal`, "
+    "return the value, or mutate a list/dict accumulator."
+)
+
+
+def _wrapper_scope_global_message(hit: WrapperScopeGlobal, parameter_names: frozenset[str]) -> str:
+    declared = f"Code block declares `global {', '.join(hit.names)}` at line {hit.line} inside `{hit.helper.name}`"
+    if all(name in parameter_names for name in hit.names):
+        return (
+            f"{declared} for a workflow parameter. Parameters are arguments of the wrapper function the block "
+            "body runs in, so the helper's `global` reads and writes a separate module-level copy and the "
+            f"block's own reads never see the update: the run passes with stale output. {_WRAPPER_SCOPE_REMEDY}"
+        )
+    return (
+        f"{declared} for a name assigned at the block's top level. The block body runs as the body of a wrapper "
+        "function it never sees, so top-level names are that function's locals and `global` looks them "
+        "up in a module scope that never holds them: reading the name raises NameError (and "
+        "UnboundLocalError once the `global` is dropped), while a plain assignment writes that module "
+        f"scope instead, so the block silently returns the stale top-level value. {_WRAPPER_SCOPE_REMEDY}"
+    )
+
+
+def wrapper_scope_diagnostics(code: str, *, parameter_keys: Iterable[str] = ()) -> list[CodeBlockPreflightDiagnostic]:
+    facts = wrapper_scope_facts(code, parameter_keys=parameter_keys)
+    if facts is None:
+        return []
+    return [
+        CodeBlockPreflightDiagnostic(
+            code=WRAPPER_SCOPE_GLOBAL_REASON_CODE,
+            message=_wrapper_scope_global_message(hit, facts.parameter_names),
+        )
+        for hit in facts.globals
+    ]
 
 
 def _build_typed_module(code: str, *, parameter_keys: Iterable[str]) -> str:
