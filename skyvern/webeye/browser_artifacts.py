@@ -14,6 +14,11 @@ from pydantic import BaseModel, PrivateAttr
 LOG = structlog.get_logger()
 
 
+async def _append_line(path: str, msg: str) -> int:
+    async with aiofiles.open(path, "a") as f:
+        return await f.write(msg)
+
+
 class ActionDownloadObservation(Protocol):
     """One action's view of a provider-owned remote download destination.
 
@@ -95,8 +100,9 @@ class BrowserArtifacts(BaseModel):
     # context-creation failure; leave a reused/adopted one live). Object-typed to avoid a display_recorder import.
     _display_recorder_acquisition: object | None = PrivateAttr(default=None)
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
-    # Latches so an unwritable console log is reported once per browser rather than once per console
+    # Latches so a wiped or unwritable console log is reported once per browser rather than once per console
     # message — a chatty page emits hundreds per second and would otherwise set the error volume itself.
+    _browser_console_log_recreated: bool = PrivateAttr(default=False)
     _browser_console_log_write_failed: bool = PrivateAttr(default=False)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
@@ -144,14 +150,22 @@ class BrowserArtifacts(BaseModel):
         if self.browser_console_log_path is None:
             return 0
 
+        log_path = self.browser_console_log_path
         async with self._browser_console_log_lock:
             try:
-                async with aiofiles.open(self.browser_console_log_path, "a") as f:
-                    return await f.write(msg)
+                try:
+                    return await _append_line(log_path, msg)
+                except FileNotFoundError:
+                    # Activity teardown and the stale sweep remove per-day dirs under the shared log root while
+                    # a browser context that outlives its activity still holds a path there. Append mode
+                    # recreates the file but not its parent; only the lines already on disk are lost.
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                    if not self._browser_console_log_recreated:
+                        self._browser_console_log_recreated = True
+                        LOG.warning("Browser console log directory was wiped mid-run, recreating it", log_path=log_path)
+                    return await _append_line(log_path, msg)
             except OSError:
-                # Activity teardown wipes the shared log root, so a browser context that outlives its
-                # activity keeps a path that no longer exists. The artifact is unrecoverable at that
-                # point and raising would only reach a pyee listener as an unhandled exception.
+                # Raising would only reach a pyee listener as an unhandled exception, once per console message.
                 if not self._browser_console_log_write_failed:
                     self._browser_console_log_write_failed = True
                     LOG.warning(
