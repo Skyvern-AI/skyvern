@@ -182,9 +182,9 @@
 
 ## Cookbooks
 
-- [Cookbooks Overview](https://skyvern.com/docs/cookbooks/overview.md): End-to-end workflow examples for common browser automation scenarios
+- [Cookbooks Overview](https://skyvern.com/docs/cookbooks/overview.md): Guides to common browser automation tasks using recipes and custom agents
 - [Bulk Invoice Downloader](https://skyvern.com/docs/cookbooks/bulk-invoice-downloader.md): Build a workflow that logs into vendor portals, finds invoices by date, and downloads them as PDFs
-- [Job Application Pipeline](https://skyvern.com/docs/cookbooks/job-application-filler.md): Search for jobs and automatically fill out applications using stored credentials and resume data
+- [Job Application Recipes](https://skyvern.com/docs/cookbooks/job-application-filler.md): Extract job details, apply with a resume, and track runs through the recipe page or authenticated API
 - [Healthcare Portal Data Extraction](https://skyvern.com/docs/cookbooks/healthcare-portal-data.md): Extract patient demographics and billing data from OpenEMR using the Python SDK
 
 ## Cloud UI
@@ -193,7 +193,7 @@ For visual dashboard documentation; running tasks, building workflows, managing 
 
 ## API Reference
 
-- [OpenAPI Specification](https://skyvern.com/docs/api-reference/openapi.json): Full OpenAPI 3.x spec for all Skyvern REST API endpoints; tasks, workflows, browser sessions, browser profiles, credentials, and artifacts
+- [OpenAPI Specification](https://skyvern.com/docs/api-reference/openapi.json): Full OpenAPI 3.x spec for all Skyvern REST API endpoints; tasks, workflows, recipes, browser sessions, browser profiles, credentials, and artifacts
 
 ## Changelog
 

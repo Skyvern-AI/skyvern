@@ -429,6 +429,18 @@
   },
   "redirects": [
     {
+      "source": "/api-reference/runs/extract-a-job-application-posting",
+      "destination": "/api-reference/recipes/extract-a-job-application-posting"
+    },
+    {
+      "source": "/api-reference/runs/apply-to-a-job",
+      "destination": "/api-reference/recipes/apply-to-a-job"
+    },
+    {
+      "source": "/api-reference/runs/list-job-recipe-runs",
+      "destination": "/api-reference/recipes/list-job-recipe-runs"
+    },
+    {
       "source": "/going-to-production/captcha-bot-detection",
       "destination": "/developers/features/captcha-and-bot-bypass"
     },
