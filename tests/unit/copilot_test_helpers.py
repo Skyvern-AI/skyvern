@@ -190,6 +190,7 @@ def install_get_run_results_harness(
         workflow_permanent_id="wpid-1",
         copilot_total_timeout_exceeded=False,
         last_run_blocks_workflow_run_id=None,
+        proposal_workflow_run_id=None,
         dispatched_run_ids_this_turn=set(),
     )
 

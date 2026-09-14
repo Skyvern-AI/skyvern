@@ -50,7 +50,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     InterruptedTurnFacts,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
-from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
     _completed_turn_id_for_idempotency_digest,
     _pending_turn_id_for_idempotency_digest,
@@ -67,13 +67,16 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
     CopilotPendingTurn,
+    WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
@@ -620,6 +623,194 @@ async def test_finalise_normal_turn_is_not_applied_without_a_proposal_on_auto_ac
         "narrative_payload"
     ]
     assert persisted_payload is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_does_not_commit_canonical_for_a_superseded_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that lost the candidate has no standing to write the saved workflow, and auto-accept
+    writes canonical before the proposal write ever runs."""
+    newer = {
+        "workflow_id": "wf-newer",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-newer",
+            "revision": 1,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=newer,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=MagicMock(),
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        narrative_payload=_narrative_payload(),
+        staged_workflow=MagicMock(),
+        has_staged_proposal=True,
+    )
+    agent_result.proposal_owner_turn_id = "turn-stale"
+    agent_result.proposal_revision = 1
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=SimpleNamespace(proposed_workflow=newer))
+    commit = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    commit.assert_not_awaited()
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.updated_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_turn_ships_no_draft_beside_the_winning_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The review card has to show what Accept will apply, so a turn that lost the candidate must
+    not stream its own draft next to the winner's token."""
+    newer = {
+        "workflow_id": "wf-newer",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-newer",
+            "revision": 2,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=newer,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=MagicMock(),
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        narrative_payload=_narrative_payload(),
+    )
+    agent_result.proposal_owner_turn_id = "turn-stale"
+    agent_result.proposal_revision = 1
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=SimpleNamespace(proposed_workflow=newer))
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    frame = stream.send.await_args.args[0]
+    assert frame.updated_workflow is None
+    assert frame.proposal_disposition == "no_proposal"
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_claimed_mid_turn_does_not_cost_the_user_the_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clicking Accept while a turn is still running makes its finalizing write lose the token.
+    That is a write failure to report, not a turn to end."""
+    stored = {
+        "workflow_id": "wf-1",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": "fp",
+            "disposition": "accepting",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    agent_result = AgentResult(
+        user_response="here is the change you asked for",
+        updated_workflow=MagicMock(),
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        narrative_payload=_narrative_payload(),
+    )
+    agent_result.proposal_owner_turn_id = "turn-a"
+    agent_result.proposal_revision = 1
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=SimpleNamespace(proposed_workflow=stored))
+    workflow_params.enrich_workflow_copilot_candidate = AsyncMock(
+        side_effect=CopilotProposalConflictError("Copilot proposal is being accepted")
+    )
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    frame = stream.send.await_args.args[0]
+    assert frame.message == "here is the change you asked for"
+    assert frame.updated_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_a_client_without_proposal_tokens_can_still_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frontend deployed before this change never sends tokens, and one already open outlives the
+    rollout. Refusing it would leave the user unable to dismiss a proposal at all."""
+    stored = {
+        "workflow_id": "wf-1",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 3,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    clear = AsyncMock()
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(return_value=SimpleNamespace(proposed_workflow=stored)),
+            clear_workflow_copilot_candidate=clear,
+        ),
+    )
+
+    await workflow_copilot_route.workflow_copilot_clear_proposed_workflow(
+        WorkflowCopilotClearProposedWorkflowRequest(workflow_copilot_chat_id="chat-1", auto_accept=False),
+        SimpleNamespace(organization_id="org-1"),
+    )
+
+    assert clear.await_args.kwargs["expected_owner_turn_id"] == "turn-a"
+    assert clear.await_args.kwargs["expected_revision"] == 3
 
 
 def test_chat_history_serves_a_saved_envelope_back_untouched() -> None:
@@ -2832,6 +3023,9 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         canonical_was_persisted_due_to_param_change=False,
         executed_block_fingerprints={},
         has_staged_proposal=False,
+        proposal_owner_turn_id=None,
+        proposal_revision=None,
+        proposal_workflow_run_id=None,
     )
 
     await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
@@ -2854,6 +3048,9 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         has_staged_proposal=False,
         output_policy_diagnostics=None,
         executed_block_fingerprints={},
+        proposal_owner_turn_id=None,
+        proposal_revision=None,
+        proposal_workflow_run_id=None,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -3224,6 +3421,152 @@ def _make_copilot_workflow(title: str, modified_at: datetime) -> Workflow:
 
 def _fingerprint_of(workflow: Workflow) -> str:
     return workflow_content_fingerprint(workflow.model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_apply_rejects_malformed_typed_proposal_before_canonical_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal = {
+        "_copilot_yaml": "title: Candidate\nworkflow_definition:\n  parameters: []\n  blocks: []\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {"owner_turn_id": "turn-1", "revision": 0},
+    }
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=proposal,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat)),
+    )
+    create_workflow = AsyncMock()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(create_workflow_from_request=create_workflow))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
+            WorkflowCopilotApplyProposedWorkflowRequest(
+                workflow_copilot_chat_id="chat-1",
+                owner_turn_id=None,
+                revision=None,
+            ),
+            SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 409
+    create_workflow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_rejects_typed_proposal_with_mismatched_owner_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal = {
+        "_copilot_yaml": "title: Candidate\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-owner",
+            "revision": 2,
+            "canonical_fingerprint": "canonical",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=proposal,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat)),
+    )
+    create_workflow = AsyncMock()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(create_workflow_from_request=create_workflow))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
+            WorkflowCopilotApplyProposedWorkflowRequest(
+                workflow_copilot_chat_id="chat-1",
+                owner_turn_id="turn-other",
+                revision=2,
+            ),
+            SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 409
+    create_workflow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_releases_the_candidate_claim_when_post_create_clear_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = _make_copilot_workflow("Canonical", _NOW)
+    candidate = _make_copilot_workflow("Candidate", _NOW + timedelta(seconds=1))
+    candidate_yaml = "title: Candidate\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+    proposal = {
+        "_copilot_yaml": candidate_yaml,
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-owner",
+            "revision": 2,
+            "canonical_fingerprint": _fingerprint_of(canonical),
+            "disposition": "review_tested",
+        },
+    }
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=proposal,
+    )
+    release_claim = AsyncMock()
+    claimed_at = _NOW + timedelta(seconds=2)
+    claimed_chat = SimpleNamespace(
+        proposed_workflow={
+            **proposal,
+            COPILOT_PROPOSAL_METADATA_KEY: {
+                **proposal[COPILOT_PROPOSAL_METADATA_KEY],
+                "disposition": "accepting",
+                "claimed_at": claimed_at.isoformat(),
+            },
+        }
+    )
+    workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+        claim_workflow_copilot_candidate=AsyncMock(return_value=claimed_chat),
+        clear_workflow_copilot_candidate=AsyncMock(side_effect=RuntimeError("transient clear failure")),
+        release_workflow_copilot_candidate_claim=release_claim,
+    )
+    monkeypatch.setattr(app.DATABASE, "workflow_params", workflow_params)
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    monkeypatch.setattr(
+        app,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(create_workflow_from_request=AsyncMock(return_value=candidate)),
+    )
+
+    result = await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
+        WorkflowCopilotApplyProposedWorkflowRequest(
+            workflow_copilot_chat_id="chat-1",
+            owner_turn_id="turn-owner",
+            revision=2,
+        ),
+        SimpleNamespace(organization_id="org-1"),
+    )
+
+    assert result is candidate
+    release_claim.assert_awaited_once_with(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        expected_owner_turn_id="turn-owner",
+        expected_revision=2,
+        expected_claimed_at=claimed_at,
+        disposition="review_tested",
+    )
 
 
 def _make_pending_turn(turn_id: str, age_seconds: float, **overrides: Any) -> CopilotPendingTurn:
@@ -3763,6 +4106,95 @@ async def test_chat_history_leaves_a_young_pending_turn_alone(monkeypatch: pytes
 
     assert store.assistant_messages == []
     assert "turn-a" in chat.pending_turns
+
+
+@pytest.mark.asyncio
+async def test_interrupted_draft_history_returns_owner_and_exact_run_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = _make_copilot_workflow("Saved", _NOW)
+    proposal = canonical.model_dump(mode="json")
+    proposal["title"] = "Durable candidate"
+    proposal["_copilot_yaml"] = "title: Durable candidate\n"
+    proposal[COPILOT_PROPOSAL_METADATA_KEY] = {
+        "owner_turn_id": "turn-draft",
+        "revision": 2,
+        "canonical_fingerprint": _fingerprint_of(canonical),
+        "disposition": "review_untested",
+        "workflow_run_id": "wr-exact",
+    }
+    chat = _make_persisted_chat([], proposed_workflow=proposal)
+    store, _ = _install_reconcile_store(monkeypatch, chat, canonical=canonical)
+    store.add_message(WorkflowCopilotChatSender.USER, "build the candidate")
+    run = SimpleNamespace(
+        workflow_permanent_id="wpid-1",
+        status=WorkflowRunStatus.completed,
+        failure_reason=None,
+    )
+    output = SimpleNamespace(output_parameter_id="op-metric", value={"metric": "42"})
+    app.DATABASE.workflow_runs = SimpleNamespace(
+        get_workflow_run=AsyncMock(return_value=run),
+        get_workflow_run_output_parameters=AsyncMock(return_value=[output]),
+    )
+
+    response = await _load_history()
+
+    assert response.proposed_workflow is not None
+    assert response.proposed_workflow["_copilot_yaml"] == "title: Durable candidate\n"
+    assert response.proposed_workflow_metadata is not None
+    assert response.proposed_workflow_metadata.owner_turn_id == "turn-draft"
+    assert response.proposed_workflow_metadata.revision == 2
+    assert response.proposed_workflow_run is not None
+    assert response.proposed_workflow_run.workflow_run_id == "wr-exact"
+    assert response.proposed_workflow_run.status == "completed"
+    assert response.proposed_workflow_run.outputs[0].value == {"metric": "42"}
+
+
+@pytest.mark.asyncio
+async def test_interrupted_draft_stale_finalization_does_not_replace_newer_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_proposal = {
+        "title": "Newer candidate",
+        "_copilot_yaml": "title: Newer candidate\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-new",
+            "revision": 1,
+            "canonical_fingerprint": "canonical",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"title": "Old candidate"},
+    )
+    workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=SimpleNamespace(proposed_workflow=current_proposal)),
+        enrich_workflow_copilot_candidate=AsyncMock(),
+        clear_workflow_copilot_candidate=AsyncMock(),
+        update_workflow_copilot_chat=AsyncMock(),
+    )
+    monkeypatch.setattr(app.DATABASE, "workflow_params", workflow_params)
+    stale_result = AgentResult(
+        user_response="draft ready",
+        updated_workflow=_make_copilot_workflow("Old candidate", _NOW),
+        global_llm_context=None,
+        workflow_yaml="title: Old candidate\n",
+        proposal_disposition="review_untested",
+        proposal_owner_turn_id="turn-old",
+        proposal_revision=1,
+        has_staged_proposal=True,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, stale_result, restored=False)
+
+    assert chat.proposed_workflow == current_proposal
+    assert stale_result.updated_workflow is None
+    workflow_params.enrich_workflow_copilot_candidate.assert_not_awaited()
+    workflow_params.clear_workflow_copilot_candidate.assert_not_awaited()
+    workflow_params.update_workflow_copilot_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -5291,3 +5723,226 @@ async def test_restore_records_only_a_rollback_that_landed(
 
     update.assert_awaited_once()
     assert marker[0] is not update_fails
+
+
+@pytest.mark.asyncio
+async def test_a_salvaged_last_good_workflow_replaces_the_candidate_it_is_shown_instead_of(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a later edit fails testing, the turn answers with the last verified shape. The stored
+    candidate has to become that shape too: the card renders what the turn returned, and Accept
+    reparses what was stored."""
+    stored_failing_candidate = {
+        "workflow_id": "wf-1",
+        "_copilot_yaml": "title: Failing edit\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored_failing_candidate,
+        auto_accept=False,
+    )
+    salvaged = MagicMock()
+    salvaged.model_dump = MagicMock(return_value={"workflow_id": "wf-salvaged", "title": "Last verified"})
+    salvaged.title = "Last verified"
+    agent_result = AgentResult(
+        user_response="kept the verified shape",
+        updated_workflow=salvaged,
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        workflow_yaml="title: Last verified\n",
+    )
+    agent_result.proposal_owner_turn_id = "turn-a"
+    agent_result.proposal_revision = 1
+    republished = {
+        **{"workflow_id": "wf-salvaged", "title": "Last verified", "_copilot_yaml": "title: Last verified\n"},
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 2,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    enrich = AsyncMock()
+    publish = AsyncMock(return_value=SimpleNamespace(proposed_workflow=republished))
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(
+                return_value=SimpleNamespace(proposed_workflow=stored_failing_candidate)
+            ),
+            enrich_workflow_copilot_candidate=enrich,
+            publish_workflow_copilot_candidate=publish,
+            update_workflow_copilot_chat=AsyncMock(),
+        ),
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    # Enrichment refuses changed bytes (see the repository scenario test), so the salvaged workflow
+    # has to go through publication and take a revision of its own.
+    enrich.assert_not_awaited()
+    persisted = publish.await_args.kwargs["proposal"]
+    assert persisted["_copilot_yaml"] == "title: Last verified\n"
+    assert persisted["workflow_id"] == "wf-salvaged"
+    # The terminal frame carries this token, so it must name the revision the user will act on.
+    assert agent_result.proposal_revision == 2
+
+
+@pytest.mark.asyncio
+async def test_history_still_shows_a_candidate_whose_accept_died_holding_its_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that dies mid-accept leaves the claim behind for the length of the lease. The ticket
+    requires a retained candidate to stay reviewable when interrupted, so withholding the card for
+    that whole window is the disappearance this store exists to remove."""
+    canonical = _make_copilot_workflow("Base", _NOW)
+    stored = {
+        "workflow_id": "wf-1",
+        "_copilot_yaml": "title: Base\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": _fingerprint_of(canonical),
+            "disposition": "accepting",
+            "claimed_at": _NOW.isoformat(),
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "datetime",
+        SimpleNamespace(now=lambda tz=None: _NOW, fromisoformat=datetime.fromisoformat),
+    )
+
+    proposal, metadata, _run = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+
+    assert proposal is stored
+    assert metadata is not None and metadata.disposition == "accepting"
+
+
+@pytest.mark.asyncio
+async def test_a_large_run_output_is_bounded_before_it_reaches_every_history_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The card renders each output as a single line, and this response is read on every recovery,
+    so an unbounded extraction is pure weight on the path the candidate is recovered through."""
+    canonical = _make_copilot_workflow("Base", _NOW)
+    stored = {
+        "workflow_id": "wf-1",
+        "_copilot_yaml": "title: Base\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": _fingerprint_of(canonical),
+            "disposition": "review_tested",
+            "workflow_run_id": "wr-1",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(
+            get_workflow_run=AsyncMock(
+                return_value=SimpleNamespace(status="completed", failure_reason=None, workflow_permanent_id="wpid-1")
+            ),
+            get_workflow_run_output_parameters=AsyncMock(
+                return_value=[
+                    SimpleNamespace(output_parameter_id="op-small", value={"metric": "42"}),
+                    SimpleNamespace(output_parameter_id="op-large", value={"rows": ["x" * 50] * 500}),
+                ]
+            ),
+        ),
+    )
+
+    _proposal, _metadata, run_facts = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+
+    assert run_facts is not None
+    by_id = {row.output_parameter_id: row.value for row in run_facts.outputs}
+    assert by_id["op-small"] == {"metric": "42"}
+    assert isinstance(by_id["op-large"], str) and "truncated from" in by_id["op-large"]
+
+
+@pytest.mark.asyncio
+async def test_enriching_a_tested_candidate_drops_the_untested_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The marker is only ever added at publication. Left on a candidate that has since been tested,
+    it both understates the card and makes the auto-accept cleanup delete a proposal that earned its
+    test."""
+    stored = {
+        "workflow_id": "wf-1",
+        "_copilot_yaml": "title: Draft\n",
+        "_copilot_unvalidated": True,
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": "fp",
+            "disposition": "review_untested",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    tested = MagicMock()
+    tested.model_dump = MagicMock(return_value={"workflow_id": "wf-1", "title": "Draft"})
+    tested.title = "Draft"
+    agent_result = AgentResult(
+        user_response="tested it",
+        updated_workflow=tested,
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        workflow_yaml="title: Draft\n",
+        proposal_disposition="review_tested",
+    )
+    agent_result.proposal_owner_turn_id = "turn-a"
+    agent_result.proposal_revision = 1
+    enrich = AsyncMock(return_value=SimpleNamespace(proposed_workflow=None))
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(return_value=SimpleNamespace(proposed_workflow=stored)),
+            enrich_workflow_copilot_candidate=enrich,
+            update_workflow_copilot_chat=AsyncMock(),
+        ),
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    assert "_copilot_unvalidated" not in enrich.await_args.kwargs["proposal"]
