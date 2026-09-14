@@ -24,6 +24,7 @@ import time
 import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 
@@ -50,6 +51,7 @@ from skyvern.forge.taskv3.loop import (
     ToolResult,
     ToolSpec,
     record_frame_perception,
+    record_hit_class,
     record_resolve_seconds,
     set_driver_timeout_predicate,
 )
@@ -3028,25 +3030,49 @@ _REACH_PROBE_NEEDED_JS = (
 """
     + _NATIVE_LABEL_JS
     + r"""
+  // Answered as ONE STRING, "<0|1>:<class>", not an object. The decision has to survive the page-realm
+  // fallback, and Playwright's serializer runs in the PAGE's world using bare Object.keys and
+  // Object.prototype.toString: a page that clobbers either turns an object return into {}, into null,
+  // or into truthy junk -- measured, all three -- which moves `needed` in both directions on the leg
+  // this probe exists to be trusted on. A primitive passes through untouched.
+  //
+  // The class reports WHICH case produced the decision, because one boolean collapses seven distinct
+  // conditions -- not found, shadow-rooted, zero-area, self, non-target, null hit, and a throw inside
+  // the rect block -- into four classes. Telemetry only: no branch here reads it.
+  //
+  // `non_target` is named for what it measures -- the centre point hit something that is not the
+  // target -- and NOT for occlusion. A row clipped out of its own scroll container lands here with
+  // nothing painted over it and clicks fine; a pointer-events:none or visibility:hidden target lands
+  // here too and does NOT click, it burns the full actionability wait. Nothing in this probe separates
+  // any of them from a real occluder: a modal scrim drawn as `body::before` hit-tests AS body and
+  // blocks the click. Answering that needs the scroll and composed descent the mature probe pays for.
+  let needed = false;
+  let hitClass = "unknown";
+  const out = () => (needed ? "1:" : "0:") + hitClass;
   const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return false;
-  try { if (Node.prototype.getRootNode.call(el) !== document) return true; } catch (e) { /* fall through */ }
+  if (!el) return out();
+  // A shadow-rooted target returns before any hit test runs, so it is unknown rather than no_hit.
+  try { if (Node.prototype.getRootNode.call(el) !== document) { needed = true; return out(); } } catch (e) { /* fall through */ }
   // The cheap hit-test runs first and exits on an ordinary unoccluded hit; the DOM-wide label scan
-  // only runs for the null/foreign-hit cases where it can actually change the answer.
+  // only runs for the null and non-target hit cases where it can actually change the answer.
   try {
     const rect = el.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
       const cx = rect.left + rect.width / 2;
       const cy = rect.top + rect.height / 2;
       const hit = document.elementFromPoint(cx, cy);
-      if (hit === el || (hit && el.contains(hit))) return false;
+      // Every value names what the hit test RETURNED, never why. A null hit is `no_hit`: it usually
+      // means the point is outside the layout viewport, but that is an inference, and the boundary
+      // between the layout and visual viewports does not agree with it.
+      hitClass = (hit === el || (hit && el.contains(hit))) ? "self" : (hit ? "non_target" : "no_hit");
+      if (hitClass === "self") return out();
       // A sibling <label for=id> drawn OVER its control trips the driver's containment check the same
       // way a slotted label does; a null hit (off-screen target) also earns the probe when labels exist.
       // Skipped when own-label granting is off (no isolated world): the scan only ever earns a bypass.
-      if (arg.allowOwnLabel !== false && (nativeLabelsOf(el).length || (_isLabel(el) && nativeControlOf(el)))) return true;
+      if (arg.allowOwnLabel !== false && (nativeLabelsOf(el).length || (_isLabel(el) && nativeControlOf(el)))) needed = true;
     }
   } catch (e) { /* best-effort */ }
-  return false;
+  return out();
 }"""
 )
 
@@ -7401,6 +7427,45 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> int:
     return len(taken)
 
 
+_HIT_CLASSES = frozenset({"self", "non_target", "no_hit", "unknown"})
+
+
+def _reach_probe_needed(probe_result: Any) -> bool:
+    """The reach probe's decision, from the `"<0|1>:<class>"` answer.
+
+    Anything that is not that shape falls back to the value's own truthiness, which is what the bare
+    boolean did -- so a probe that could not answer decides exactly as it decided before.
+    """
+    if isinstance(probe_result, str) and ":" in probe_result:
+        return probe_result.split(":", 1)[0] == "1"
+    return bool(probe_result)
+
+
+def _reach_hit_class(probe_result: Any) -> str:
+    """Which hit-test case produced the decision. Total by construction: anything unrecognised is
+    `unknown`, never absent, because a row without the facet vanishes from a groupBy instead of
+    bucketing."""
+    if isinstance(probe_result, str) and ":" in probe_result:
+        value = probe_result.split(":", 1)[1]
+        if value in _HIT_CLASSES:
+            return value
+    return "unknown"
+
+
+# Which realm answered the last `_probe_evaluate`. It separates REALMS, not costs, and it must not be
+# read as a cost split: measured medians here are 0.56ms with an isolated world, 0.66ms on a cached
+# miss (no CDP session for the page -- the miss is cached, so later probes fall back doing no CDP work
+# at all), and 233ms when world creation keeps raising and the three-attempt loop runs. `False` spans
+# the cheapest path AND the most expensive one, so it narrows a duration without partitioning it.
+# Recorded because a duration that cannot say which realm answered cannot be compared across pages at
+# all -- the same reason `frame_perception` rides every row carrying a css reading.
+_PROBE_ISOLATED: ContextVar[bool | None] = ContextVar("taskv3_probe_isolated", default=None)
+
+
+def _probe_was_isolated() -> bool | None:
+    return _PROBE_ISOLATED.get()
+
+
 async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, Any]) -> Any:
     """Isolated-world probe, falling back to the realm's OWN world with own-label granting disabled --
     a realm the page can patch must not be able to hand a label a hit-test bypass.
@@ -7409,10 +7474,14 @@ async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, An
     than dropping to the page's: losing isolation is the trade this fallback has always made, but
     answering about the wrong document is not a trade, it is a wrong answer wearing a verdict's clothes.
     """
+    _PROBE_ISOLATED.set(None)
     isolated = await _evaluate_isolated(target, js, selector)
     if isolated is not None:
+        _PROBE_ISOLATED.set(True)
         return isolated
-    return await target.evaluate(js, {**arg, "allowOwnLabel": False})
+    answer = await target.evaluate(js, {**arg, "allowOwnLabel": False})
+    _PROBE_ISOLATED.set(False)
+    return answer
 
 
 def build_browser_tools(
@@ -8785,7 +8854,28 @@ def build_browser_tools(
         # <label for=id>) pays the extra round trip; any other light-DOM click keeps its single one.
         reach_pre = None
         try:
-            if await _probe_evaluate(page, _REACH_PROBE_NEEDED_JS, selector, pre_click_arg):
+            # Timed at the production call site rather than on a bench: a local page.evaluate bounds
+            # only the browser-side half. The FIRST reading per realm also pays isolated-world
+            # construction (~10x locally), so this is the probe CALL's cost, not the marginal round
+            # trip -- read the median, and read it within one `hit_probe_isolated` bucket.
+            probe_started_at = time.monotonic()
+            reach_verdict: Any = None
+            raised = True
+            try:
+                reach_verdict = await _probe_evaluate(page, _REACH_PROBE_NEEDED_JS, selector, pre_click_arg)
+                raised = False
+            finally:
+                # Recorded even when the probe threw: the raise path correlates with re-render, so
+                # dropping it would bias the sample toward the calm cases. Tagged, because a duration
+                # that pools answers with blow-ups is two events under one name.
+                record_hit_class(
+                    _reach_hit_class(reach_verdict),
+                    needed=_reach_probe_needed(reach_verdict),
+                    probe_seconds=time.monotonic() - probe_started_at,
+                    isolated=_probe_was_isolated(),
+                    raised=raised,
+                )
+            if _reach_probe_needed(reach_verdict):
                 reach_pre = await _probe_evaluate(page, _TYPE_TARGET_PROBE_JS, selector, pre_click_arg)
         except Exception:
             reach_pre = None

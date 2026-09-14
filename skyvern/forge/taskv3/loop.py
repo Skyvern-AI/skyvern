@@ -132,11 +132,46 @@ TARGET_KIND_DATA_KEY = "target_kind"
 # definitions with nothing on the record to cut on.
 _RESOLVE_SECONDS: ContextVar[float | None] = ContextVar("taskv3_resolve_seconds", default=None)
 _FRAME_PERCEPTION: ContextVar[bool | None] = ContextVar("taskv3_frame_perception", default=None)
+# Which case behind the click reach-probe's boolean applied, for the one click call this context covers.
+# A context variable rather than a result field because `click` returns from many places, several of
+# them after the probe has already answered -- the same reason `_RESOLVE_SECONDS` lives here.
+_HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", default=None)
 
 
 def record_resolve_seconds(elapsed: float) -> None:
     """Add `elapsed` to this tool call's address-resolution time. Telemetry only."""
     _RESOLVE_SECONDS.set((_RESOLVE_SECONDS.get() or 0.0) + elapsed)
+
+
+def record_hit_class(
+    hit_class: str,
+    *,
+    needed: bool,
+    probe_seconds: float | None = None,
+    isolated: bool | None = None,
+    raised: bool = False,
+) -> None:
+    """Record what this click's reach probe returned, the decision it produced, and what it cost.
+
+    `needed` is on the record because the class alone cannot recover it: a shadow-rooted target
+    answers `unknown` with needed=TRUE, so `unknown` would otherwise pool the rows that bought the
+    second probe with the rows that answered nothing. Every `hit_class` value names what the hit test
+    RETURNED, never why — nothing in that probe tells a real occluder from a hit that fell through,
+    since a modal scrim drawn as `body::before` hit-tests as body and still blocks the click.
+    `isolated` says which realm answered -- realms, not costs, since its `False` side spans both the
+    cheapest fallback and the most expensive retry storm. `raised` marks a probe that threw, whose
+    duration is a blow-up rather than a cost. The RECORDED copies are inert: the click path branches on
+    its own `needed`, never on anything read back from here.
+    """
+    _HIT_CLASS.set(
+        {
+            "hit_class": hit_class,
+            "needed": needed,
+            "probe_seconds": probe_seconds,
+            "isolated": isolated,
+            "raised": raised,
+        }
+    )
 
 
 def record_frame_perception(enabled: bool) -> None:
@@ -1357,6 +1392,11 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "action_key_hash",
         "snapshot_digest",
         "probe_first_time",
+        "hit_class",
+        "hit_needed",
+        "hit_probe_seconds",
+        "hit_probe_isolated",
+        "hit_probe_raised",
     }
 )
 
@@ -2857,6 +2897,7 @@ async def run_agent_tool_loop(
             # Cleared per call, so a value can never carry over from the previous one in the batch.
             _RESOLVE_SECONDS.set(None)
             _FRAME_PERCEPTION.set(None)
+            _HIT_CLASS.set(None)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -2899,6 +2940,29 @@ async def run_agent_tool_loop(
             frame_perception = _FRAME_PERCEPTION.get()
             if frame_perception is not None:
                 cost_fields["frame_perception"] = frame_perception
+            # Every click row carries this, defaulting to `unknown`, because a groupBy DROPS rows
+            # missing a facet -- a partial field would read as a clean result rather than a gap.
+            # Gated on `spec is not None` for the same reason the `tool` field is: an unregistered
+            # tool logs as `unknown_tool`, and such a row must not also carry a click-only facet.
+            if spec is not None and tool_name == "click":
+                hit = _HIT_CLASS.get() or {}
+                cost_fields["hit_class"] = hit.get("hit_class") or "unknown"
+                # Known for every click whether or not the probe ran, so it stays total alongside the
+                # class. The two qualifiers below are NOT total by design: they describe a reading
+                # that happened, and a fabricated `false` would be indistinguishable from a measured
+                # one -- so group them WITHIN a hit_class bucket, never alone.
+
+                # What the probe CALL cost at the production call site. Not the marginal round trip:
+                # the first reading per realm also pays isolated-world construction, which is why the
+                # median within one `hit_probe_isolated` bucket is the readable figure.
+                # Present together, iff the probe was attempted: `hit_class` is the only total one.
+                probe_seconds = hit.get("probe_seconds")
+                if probe_seconds is not None:
+                    cost_fields["hit_probe_seconds"] = probe_seconds
+                    cost_fields["hit_needed"] = bool(hit.get("needed"))
+                    cost_fields["hit_probe_raised"] = bool(hit.get("raised"))
+                if hit.get("isolated") is not None:
+                    cost_fields["hit_probe_isolated"] = hit["isolated"]
             # The action-loop guard's key and the perception ledger's digest, computed here (pure) so
             # their hashes ride the record below; the ledger itself is updated further down, unchanged.
             action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
