@@ -30,13 +30,14 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
+from .banned_blocks import CREDENTIAL_CODE_ACCESSORS, ONE_TIME_CODE_TOTP_TYPES, credential_code_accessors
 
 LOG = structlog.get_logger()
 
@@ -767,12 +768,15 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_type": str(credential.credential_type),
         "tested_url": credential.tested_url,
     }
+    accessors = credential_code_accessors(credential.credential_type, credential.totp_type)
+    if accessors:
+        entry["code"] = {"workflow_parameter_type": "credential_id", "accessors": list(accessors)}
     if credential.username:
         entry["username"] = credential.username
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
         if credential.totp_identifier:
             entry["totp_identifier"] = credential.totp_identifier
-        if credential.totp_type in {TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT}:
+        if credential.totp_type in ONE_TIME_CODE_TOTP_TYPES:
             scouting: dict[str, Any]
             if credential.totp_type == TotpType.AUTHENTICATOR:
                 scouting = {
@@ -788,7 +792,7 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
                 "scouting": scouting,
                 "code": {
                     "workflow_parameter_type": "credential_id",
-                    "accessor": "await <credential_parameter_key>.otp()",
+                    "accessor": CREDENTIAL_CODE_ACCESSORS[CredentialType.PASSWORD].otp,
                 },
             }
     elif credential.card_last4:

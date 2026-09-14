@@ -3,14 +3,43 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, NamedTuple
 
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 
 from ._shared import _parse_workflow_blocks
+
+
+class CredentialCodeAccessors(NamedTuple):
+    fields: tuple[str, ...]
+    otp: str | None = None
+    magic_link: str | None = None
+
+
+# What authored code can read off a bound credential parameter, by the saved record's type;
+# credit-card accessors are not advertised here.
+CREDENTIAL_CODE_ACCESSORS: Mapping[CredentialType, CredentialCodeAccessors] = {
+    CredentialType.PASSWORD: CredentialCodeAccessors(
+        fields=("<key>.username", "<key>.password"),
+        otp="await <key>.otp()",
+        magic_link="await <key>.magic_link(page)",
+    ),
+    CredentialType.SECRET: CredentialCodeAccessors(fields=("<key>.secret_value",)),
+}
+ONE_TIME_CODE_TOTP_TYPES = frozenset({TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT})
+
+
+def credential_code_accessors(credential_type: CredentialType, totp_type: TotpType) -> tuple[str, ...]:
+    accessors = CREDENTIAL_CODE_ACCESSORS.get(credential_type)
+    if accessors is None:
+        return ()
+    if totp_type not in ONE_TIME_CODE_TOTP_TYPES:
+        return accessors.fields
+    return accessors.fields + tuple(name for name in (accessors.otp, accessors.magic_link) if name)
 
 
 class CopilotBlockPolicyStatus(StrEnum):
@@ -272,6 +301,25 @@ def _code_only_browser_validation_guidance() -> str:
     )
 
 
+def _saved_credential_guidance() -> str:
+    accessors = CREDENTIAL_CODE_ACCESSORS[CredentialType.PASSWORD]
+    username, password = accessors.fields
+    otp, magic_link = accessors.otp, accessors.magic_link
+    return (
+        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type "
+        "credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential "
+        f"object. For a `password` credential, read {username} and {password}, use {otp} for authenticator, email, "
+        f"or SMS one-time codes, and use {magic_link} when the scouted page offers an emailed sign-in link; that "
+        "broker navigates the page without exposing the sign-in link to authored code. Never put literal secret "
+        "values in code; scout password-credential fields with fill_credential_field, which does not fill secrets."
+    )
+
+
+def _secret_credential_guidance() -> str:
+    (secret_value,) = CREDENTIAL_CODE_ACCESSORS[CredentialType.SECRET].fields
+    return f"A `secret` credential is read with {secret_value}; it carries no username or password."
+
+
 def _code_only_browser_schema_guidance() -> list[str]:
     return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
@@ -281,7 +329,8 @@ def _code_only_browser_schema_guidance() -> list[str]:
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
-        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, use await <key>.otp() for authenticator, email, or SMS one-time codes, and use await <key>.magic_link(page) when the scouted page offers an emailed sign-in link; that broker navigates the page without exposing the sign-in link to authored code. Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        _saved_credential_guidance(),
+        _secret_credential_guidance(),
         "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
         "The Code runtime provides await clear_browser_data(page) when a site needs a clean session before it will sign in: it drops every cookie in the run's browser and all stored data for the page's current origin, and returns nothing. Read page.url first and navigate back to it afterwards. Browser settings pages (chrome://...) cannot be navigated to; this helper is the way to clear state. A workflow parameter named clear_browser_data shadows the helper in both executors. Before calling the helper in that case, rename the parameter to an unused name, preserve its value/default, and update its block bindings, code/template references, and caller-supplied run input keys.",
         "For file attachment: bind the file as a workflow parameter with workflow_parameter_type file_url, then call await attach_authorized_file(page, <file_parameter>, <observed_selector>). The parameter is a handle, not a path: pass it only to that helper. Attaching puts the file's contents in the page, where page scripts and page.evaluate can read them, so attach it only to the page that should receive it. It accepts only that run's materialized file, uploads at most 10 MB, and returns filename and size.",
