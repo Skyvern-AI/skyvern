@@ -21,12 +21,13 @@ from skyvern.forge.sdk.copilot.ask_user import (
     resolve_question_response,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
-from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_alchemy_db import read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import (
+    CopilotProposalConflictError,
     DatabaseConnectionUnavailableError,
     DuplicateCopilotTurnError,
     NotFoundError,
@@ -65,14 +66,18 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
+    CopilotCandidateDisposition,
     CopilotPendingTurn,
+    CopilotProposalMetadata,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
+    copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -719,18 +724,242 @@ class WorkflowParametersRepository(BaseRepository):
                     select(WorkflowCopilotChatModel)
                     .where(WorkflowCopilotChatModel.organization_id == organization_id)
                     .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
                 )
             ).first()
             if not chat:
                 return None
 
             if proposed_workflow is not _UNSET:
+                # Callers here read the chat before they write it. An owned candidate published in
+                # between owns the row, and only its own compare-and-set may replace it.
+                if copilot_proposal_metadata(chat.proposed_workflow) is not None and (
+                    copilot_proposal_metadata(proposed_workflow) is None
+                ):
+                    raise CopilotProposalConflictError("Copilot proposal is owned by a newer candidate")
                 chat.proposed_workflow = proposed_workflow
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
             if work_plan is not _UNSET:
                 chat.work_plan = work_plan
 
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    async def _locked_copilot_chat(
+        self, session: AsyncSession, organization_id: str, workflow_copilot_chat_id: str
+    ) -> WorkflowCopilotChatModel:
+        chat = (
+            await session.scalars(
+                select(WorkflowCopilotChatModel)
+                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .with_for_update()
+            )
+        ).first()
+        if chat is None:
+            raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
+        return chat
+
+    @staticmethod
+    def _require_candidate_token(
+        proposal: object, expected_owner_turn_id: str | None, expected_revision: int | None
+    ) -> CopilotProposalMetadata | None:
+        current = copilot_proposal_metadata(proposal)
+        if current is None:
+            if isinstance(proposal, Mapping) and COPILOT_PROPOSAL_METADATA_KEY in proposal:
+                raise CopilotProposalConflictError("Copilot proposal metadata is invalid")
+            if expected_owner_turn_id is not None or expected_revision is not None:
+                raise CopilotProposalConflictError("Copilot proposal changed")
+            return None
+        if current.owner_turn_id != expected_owner_turn_id or current.revision != expected_revision:
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        return current
+
+    @db_operation("publish_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def publish_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        proposal: dict[str, Any],
+        owner_turn_id: str,
+        canonical_fingerprint: str,
+        disposition: ProposalDisposition,
+        expected_owner_turn_id: str | None,
+        expected_revision: int | None,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is not None and current.claim_is_live(datetime.now(timezone.utc)):
+                # The accept between its claim and its canonical write is committing bytes it has
+                # already read; replacing them underneath it would make it write a stale workflow.
+                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+            revision = current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1
+            metadata = CopilotProposalMetadata(
+                owner_turn_id=owner_turn_id,
+                revision=revision,
+                canonical_fingerprint=canonical_fingerprint,
+                disposition=disposition,
+            )
+            chat.proposed_workflow = {
+                **proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("enrich_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def enrich_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        proposal: dict[str, Any],
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        disposition: ProposalDisposition,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+            if chat.proposed_workflow.get("_copilot_yaml") != proposal.get("_copilot_yaml"):
+                raise CopilotProposalConflictError("Copilot proposal bytes changed")
+            current_workflow = {
+                key: value for key, value in chat.proposed_workflow.items() if not key.startswith("_copilot_")
+            }
+            proposed_workflow = {key: value for key, value in proposal.items() if not key.startswith("_copilot_")}
+            if current_workflow != proposed_workflow:
+                raise CopilotProposalConflictError("Copilot proposal content changed")
+            metadata = current.model_copy(update={"disposition": disposition})
+            chat.proposed_workflow = {
+                **proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("bind_workflow_copilot_candidate_run", expected_errors=(CopilotProposalConflictError,))
+    async def bind_workflow_copilot_candidate_run(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        expected_workflow_yaml: str,
+        workflow_run_id: str,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+            if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
+                raise CopilotProposalConflictError("Copilot proposal bytes changed")
+            metadata = current.model_copy(update={"workflow_run_id": workflow_run_id})
+            chat.proposed_workflow = {
+                **chat.proposed_workflow,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("claim_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def claim_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if (
+                current is None
+                or not isinstance(chat.proposed_workflow, dict)
+                or current.claim_is_live(datetime.now(timezone.utc))
+            ):
+                raise CopilotProposalConflictError("Copilot proposal changed")
+            metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(timezone.utc)})
+            chat.proposed_workflow = {
+                **chat.proposed_workflow,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("release_workflow_copilot_candidate_claim", expected_errors=(CopilotProposalConflictError,))
+    async def release_workflow_copilot_candidate_claim(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        expected_claimed_at: datetime | None,
+        disposition: ProposalDisposition,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            # The token names the candidate and survives a takeover, so only the claim timestamp
+            # tells one holder's claim from its successor's.
+            if (
+                current is None
+                or not isinstance(chat.proposed_workflow, dict)
+                or current.disposition != "accepting"
+                or current.claimed_at != expected_claimed_at
+            ):
+                raise CopilotProposalConflictError("Copilot proposal claim changed")
+            metadata = current.model_copy(update={"disposition": disposition, "claimed_at": None})
+            chat.proposed_workflow = {
+                **chat.proposed_workflow,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("clear_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def clear_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str | None,
+        expected_revision: int | None,
+        expected_disposition: CopilotCandidateDisposition | None = None,
+        expected_claimed_at: datetime | None = None,
+        auto_accept: bool | None = None,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is not None and (
+                (expected_disposition is None and current.claim_is_live(datetime.now(timezone.utc)))
+                or (expected_disposition is not None and current.disposition != expected_disposition)
+                # A claim the caller named must still be the one it took; see release above.
+                or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
+            ):
+                raise CopilotProposalConflictError("Copilot proposal disposition changed")
+            chat.proposed_workflow = None
+            if auto_accept is not None:
+                chat.auto_accept = auto_accept
             await session.commit()
             await session.refresh(chat)
             return WorkflowCopilotChat.model_validate(chat)

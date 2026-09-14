@@ -1,9 +1,18 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SecretStr, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+)
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
@@ -14,6 +23,66 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
+
+COPILOT_PROPOSAL_METADATA_KEY = "_copilot_proposal"
+CopilotCandidateDisposition = Literal[
+    "no_proposal",
+    "auto_applicable",
+    "review_untested",
+    "review_tested",
+    "accepting",
+]
+
+
+# An accept holds the candidate exclusively between its claim and its canonical write, so nothing
+# can slip a newer candidate underneath the bytes it already read. The claim expires because the
+# same outage that kills an accept mid-flight also kills the write that would release it.
+COPILOT_PROPOSAL_CLAIM_LEASE = timedelta(minutes=5)
+
+
+class CopilotProposalMetadata(BaseModel):
+    """CAS token and exact run ownership for one durable Copilot candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_turn_id: str
+    revision: int = Field(ge=1)
+    canonical_fingerprint: str
+    disposition: CopilotCandidateDisposition
+    workflow_run_id: str | None = None
+    claimed_at: datetime | None = None
+
+    def claim_is_live(self, now: datetime) -> bool:
+        if self.disposition != "accepting":
+            return False
+        if self.claimed_at is None:
+            return False
+        return now - self.claimed_at < COPILOT_PROPOSAL_CLAIM_LEASE
+
+
+class CopilotProposalRunOutput(BaseModel):
+    output_parameter_id: str
+    value: JsonValue
+
+
+class CopilotProposalRunFacts(BaseModel):
+    workflow_run_id: str
+    status: str | None = None
+    available: bool
+    failure_reason: str | None = None
+    outputs: list[CopilotProposalRunOutput] = Field(default_factory=list)
+
+
+def copilot_proposal_metadata(value: object) -> CopilotProposalMetadata | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get(COPILOT_PROPOSAL_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return CopilotProposalMetadata.model_validate(raw)
+    except ValueError:
+        return None
 
 
 class CopilotPendingTurn(BaseModel):
@@ -320,6 +389,8 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
 class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
@@ -328,6 +399,8 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
         False,
         description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
     )
+    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
 class WorkflowCopilotChatHistoryMessage(BaseModel):
@@ -421,6 +494,7 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         False,
         description="True when the backend already committed this terminal workflow proposal.",
     )
+    proposed_workflow_metadata: CopilotProposalMetadata | None = None
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -717,6 +791,8 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
+    proposed_workflow_metadata: CopilotProposalMetadata | None = None
+    proposed_workflow_run: CopilotProposalRunFacts | None = None
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
 
     work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")

@@ -1602,6 +1602,28 @@ def _workflow_parameters(workflow: Workflow | None) -> list[Any]:
 ExecutionSnapshotProvenance = Literal["canonical", "staged"]
 
 
+class _ExecutionSourceFacts(TypedDict):
+    source_kind: ExecutionSnapshotProvenance
+    workflow_id: str
+    block_code_sha256: dict[str, str]
+
+
+def _execution_source_facts(
+    workflow: Workflow,
+    *,
+    provenance: ExecutionSnapshotProvenance,
+) -> _ExecutionSourceFacts:
+    return {
+        "source_kind": provenance,
+        "workflow_id": workflow.workflow_id,
+        "block_code_sha256": {
+            block.label: hashlib.sha256(block.code.encode("utf-8")).hexdigest()
+            for block in get_all_blocks(workflow.workflow_definition.blocks)
+            if isinstance(block, CodeBlock)
+        },
+    }
+
+
 @dataclass(frozen=True)
 class CopilotExecutionSnapshot:
     """One provenance-closed workflow definition and the rows a run binds against."""
@@ -1624,6 +1646,8 @@ class _RunExecution:
     source_at_start: Workflow | None
     unbound_keys: list[str]
     explicit_blank: bool
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
     outcome: RecordedRunOutcome | None = None
     build_outcome: RecordedBuildTestOutcome | None = None
 
@@ -1636,15 +1660,10 @@ class _ExecutionResult(dict[str, Any]):
         super().__init__(result)
         self.execution = execution
         data = self.setdefault("data", {})
-        data["execution_source"] = {
-            "source_kind": execution.snapshot.provenance,
-            "workflow_id": execution.snapshot.workflow.workflow_id,
-            "block_code_sha256": {
-                block.label: hashlib.sha256(block.code.encode("utf-8")).hexdigest()
-                for block in get_all_blocks(execution.snapshot.workflow.workflow_definition.blocks)
-                if isinstance(getattr(block, "code", None), str)
-            },
-        }
+        data["execution_source"] = _execution_source_facts(
+            execution.snapshot.workflow,
+            provenance=execution.snapshot.provenance,
+        )
         if execution.explicit_blank:
             data["browser_start"] = {
                 "kind": "separate_blank_context",
@@ -3052,6 +3071,8 @@ async def _run_blocks_and_collect_debug(
             if execution_snapshot is not None
             else source_at_start
         ),
+        proposal_owner_turn_id=ctx.proposal_owner_turn_id if snapshot.provenance == "staged" else None,
+        proposal_revision=ctx.proposal_revision if snapshot.provenance == "staged" else None,
         unbound_keys=[],
         explicit_blank=explicit_blank,
     )
@@ -3424,6 +3445,45 @@ async def _run_blocks_and_collect_debug(
                 "error": "The prepared run did not retain the requested blank browser; execution was not started.",
             }
 
+        if (
+            ctx.workflow_copilot_chat_id
+            and execution.proposal_owner_turn_id is not None
+            and execution.proposal_revision is not None
+        ):
+            try:
+                async with ctx.proposal_mutation_lock:
+                    await app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run(
+                        organization_id=ctx.organization_id,
+                        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+                        expected_owner_turn_id=execution.proposal_owner_turn_id,
+                        expected_revision=execution.proposal_revision,
+                        expected_workflow_yaml=execution.workflow_yaml,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    if (
+                        ctx.proposal_owner_turn_id == execution.proposal_owner_turn_id
+                        and ctx.proposal_revision == execution.proposal_revision
+                        and execution.source_is_current(ctx)
+                    ):
+                        ctx.proposal_workflow_run_id = workflow_run.workflow_run_id
+            except Exception:  # noqa: BLE001 - any custody failure must stop dispatch.
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason="The Copilot proposal changed before its test run started.",
+                )
+                if dispatch_draft_workflow_id is not None:
+                    await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                    dispatch_draft_workflow_id = None
+                LOG.info(
+                    "copilot candidate run bind lost",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    proposal_owner_turn_id=execution.proposal_owner_turn_id,
+                    proposal_revision=execution.proposal_revision,
+                )
+                return {
+                    "ok": False,
+                    "error": "The pending Copilot proposal changed before the test started; reload and try again.",
+                }
         ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
 
         # The ordinary Track-A producer owns this registry at run creation. Keeping the run id and
@@ -4181,6 +4241,8 @@ async def _get_run_results(
         "action_trace_summary": action_trace_summary,
         "action_observations": action_observations,
     }
+    if run_workflow is not None and workflow_run_id == ctx.proposal_workflow_run_id:
+        result_data["execution_source"] = _execution_source_facts(run_workflow, provenance="staged")
     _attach_block_fact_projection(
         result_data,
         blocks,

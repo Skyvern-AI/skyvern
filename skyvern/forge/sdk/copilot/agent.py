@@ -221,7 +221,10 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     run_workflow_end_to_end,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import hydrate_prior_carried_trajectory
-from skyvern.forge.sdk.copilot.tools.workflow_update import restore_pending_workflow_proposal
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    publish_workflow_candidate,
+    restore_pending_workflow_proposal,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -249,6 +252,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ConnectedAccountChoiceReference,
@@ -2034,6 +2038,9 @@ def _make_agent_result(
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None:
         result.resolved_model = ctx.resolved_model
+        result.proposal_owner_turn_id = ctx.proposal_owner_turn_id
+        result.proposal_revision = ctx.proposal_revision
+        result.proposal_workflow_run_id = ctx.proposal_workflow_run_id
         result.clear_persisted_completion_contract = ctx.clear_persisted_completion_contract
         result.work_plan = ctx.work_plan if ctx.work_plan is None else list(ctx.work_plan)
         if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
@@ -3745,23 +3752,47 @@ async def _translate_to_agent_result(
     # REPLACE_WORKFLOW above; the explicit guard here defends against future
     # refactors that re-emit REPLACE_WORKFLOW post-rendering.
     if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
-        ctx.last_workflow = last_workflow
-        ctx.last_workflow_yaml = last_workflow_yaml
-        ctx.runner_code_block_associations_by_label = runner_code_block_associations(last_workflow_yaml or "")
-        ctx.last_test_ok = None
-        ctx.last_full_workflow_test_ok = False
-        clear_active_run_evidence_on_workflow_edit(ctx)
-        # Inline REPLACE_WORKFLOW is untested by construction; emit a draft
-        # envelope without staging onto ctx so terminal auto-accept can't fire,
-        # and suppress the workflow payload so the canvas does not render it.
-        if last_workflow is not None and ctx.stream is not None:
-            try:
-                await maybe_emit_design_end(ctx.stream, ctx)
-                await emit_workflow_draft(ctx.stream, ctx, last_workflow, include_workflow=False)
-            except Exception as emit_err:
-                LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
-            ctx.design_start_emitted = False
-            ctx.design_end_emitted = False
+        async with ctx.proposal_mutation_lock:
+            publication_conflict: CopilotProposalConflictError | None = None
+            if last_workflow is not None and last_workflow_yaml is not None:
+                try:
+                    last_workflow_yaml = await publish_workflow_candidate(
+                        ctx, workflow=last_workflow, workflow_yaml=last_workflow_yaml
+                    )
+                except CopilotProposalConflictError as conflict:
+                    publication_conflict = conflict
+            if publication_conflict is not None:
+                # Nothing was stored, so the prior candidate stays on ctx and the reply says so
+                # rather than presenting a draft the next turn cannot find.
+                LOG.info(
+                    "copilot_inline_replace_candidate_publication_conflict",
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    error=str(publication_conflict),
+                )
+                user_response = _with_inline_reject_note(
+                    user_response,
+                    "The pending proposal changed while this draft was being saved, so it was not stored. "
+                    "Ask me to make the change again.",
+                )
+                resp_type = "REPLY"
+                last_workflow = ctx.last_workflow
+                last_workflow_yaml = ctx.last_workflow_yaml
+            else:
+                ctx.last_workflow = last_workflow
+                ctx.last_workflow_yaml = last_workflow_yaml
+                ctx.runner_code_block_associations_by_label = runner_code_block_associations(last_workflow_yaml or "")
+                ctx.last_test_ok = None
+                ctx.last_full_workflow_test_ok = False
+                clear_active_run_evidence_on_workflow_edit(ctx)
+                # Inline REPLACE_WORKFLOW is untested by construction; emit only after custody succeeds.
+                if last_workflow is not None and ctx.stream is not None:
+                    try:
+                        await maybe_emit_design_end(ctx.stream, ctx)
+                        await emit_workflow_draft(ctx.stream, ctx, last_workflow, include_workflow=False)
+                    except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort after durable custody.
+                        LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
+                    ctx.design_start_emitted = False
+                    ctx.design_end_emitted = False
 
     # An unverified edit/run sits in ``last_workflow`` after a recorded
     # failure — surface the verified prior shape and skip the failure rewrite
@@ -5110,23 +5141,43 @@ async def _run_copilot_turn_impl(
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
         },
     )
-    await restore_pending_workflow_proposal(ctx)
+    if chat_request.product_action == "diagnose_run":
+        await restore_pending_workflow_proposal(
+            ctx,
+            required_workflow_run_id=chat_request.workflow_run_id,
+        )
+    else:
+        await restore_pending_workflow_proposal(ctx)
     await hydrate_work_plan(ctx)
     chat_request.workflow_yaml = ctx.workflow_yaml
     safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
     # Before the turn acts: a repair opened about a failed run inherits that run's identity and the
     # browser it used, so a tool asked to look at the run has something to look at from the first
     # call rather than only after this turn has run something itself.
-    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=chat_request.workflow_run_id)
+    # The run the caller named wins; a restored candidate's exact run is the fallback.
+    associated_run_id = chat_request.workflow_run_id or ctx.proposal_workflow_run_id
+    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=associated_run_id)
+    if ctx.proposal_workflow_run_id is not None and associated_run_id == ctx.proposal_workflow_run_id:
+        # Exact candidate ownership wins over the generic latest-final-run fallback even when
+        # the run has no retained browser or row details are no longer available.
+        ctx.last_run_blocks_workflow_run_id = associated_run_id
     # The same run, read as the packet a same-turn test would have produced. The route's own
     # rendering of these blocks carries no error code and no failing line. Every message sent from
     # a run page carries that run's id, so this reads the run once it is over — a run that reports
     # success can still be the one the user is complaining about.
-    prior_run_packet = (
-        await hydrate_prior_run_packet(ctx, workflow_run_id=chat_request.workflow_run_id)
-        if repair_origin_binding.finished
-        else None
-    )
+    prior_run_packet = None
+    if associated_run_id and (ctx.proposal_workflow_run_id == associated_run_id or repair_origin_binding.finished):
+        prior_run_packet = await hydrate_prior_run_packet(ctx, workflow_run_id=associated_run_id)
+        if prior_run_packet is None and ctx.proposal_workflow_run_id == associated_run_id:
+            prior_run_packet = {
+                "run": {
+                    "workflow_run_id": associated_run_id,
+                    "status": "unavailable",
+                },
+                "omission_notices": [
+                    "The proposal's exact associated run is unavailable; no other run was substituted."
+                ],
+            }
 
     LOG.info(
         "copilot_block_authoring_policy_resolved",

@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import hashlib
 import hmac
+import json
 import re
 import uuid
 from collections.abc import Iterator
@@ -77,16 +78,24 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_cha
 from skyvern.forge.sdk.copilot.workflow_yaml import with_workflow_yaml_title
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
-from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, DuplicateCopilotTurnError, NotFoundError
+from skyvern.forge.sdk.db.exceptions import (
+    CopilotProposalConflictError,
+    DatabaseConnectionUnavailableError,
+    DuplicateCopilotTurnError,
+    NotFoundError,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
     CopilotPendingTurn,
+    CopilotProposalMetadata,
+    CopilotProposalRunFacts,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotBrowserAblationResponseUpdate,
@@ -107,6 +116,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamResponseUpdate,
     WorkflowYAMLConversionRequest,
     WorkflowYAMLConversionResponse,
+    copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -643,11 +653,41 @@ def _build_recoverable_route_agent_result(
 
 
 async def _clear_proposed_workflow(chat: Any) -> None:
-    await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-        organization_id=chat.organization_id,
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        proposed_workflow=None,
-    )
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    if metadata is not None or (
+        isinstance(chat.proposed_workflow, dict) and COPILOT_PROPOSAL_METADATA_KEY in chat.proposed_workflow
+    ):
+        try:
+            await app.DATABASE.workflow_params.clear_workflow_copilot_candidate(
+                organization_id=chat.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                expected_owner_turn_id=metadata.owner_turn_id if metadata is not None else None,
+                expected_revision=metadata.revision if metadata is not None else None,
+            )
+        except CopilotProposalConflictError:
+            # The row moved on: whatever holds it now is newer than the proposal being cleared,
+            # and clearing is not worth failing the turn the user is waiting on.
+            LOG.info(
+                "copilot_candidate_clear_conflict",
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
+            return
+    else:
+        try:
+            await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+                organization_id=chat.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                proposed_workflow=None,
+            )
+        except CopilotProposalConflictError:
+            # The branch above was chosen from an in-memory read; the row gained an owned
+            # candidate since, and that candidate is newer than the one being cleared.
+            LOG.info(
+                "copilot_candidate_clear_conflict",
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                branch="untyped",
+            )
+            return
     # Keep the in-memory chat in sync — a same-turn recovery retry reads
     # chat.proposed_workflow again and must not see the pre-write value.
     chat.proposed_workflow = None
@@ -676,18 +716,132 @@ def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
     return isinstance(diagnostics, dict) and diagnostics.get("final_output_policy_allowed") is False
 
 
+def _client_sent_no_proposal_token(owner_turn_id: str | None, revision: int | None) -> bool:
+    """Whether the caller predates proposal tokens entirely.
+
+    A frontend deployed before this change never sends them, and one already open in a tab outlives
+    the rollout. Such a client is acting on whatever the chat currently holds, which is how this
+    endpoint behaved before tokens existed; the canonical and claim checks still apply.
+    """
+    return owner_turn_id is None and revision is None
+
+
+async def _proposal_ownership_is_current(chat: Any, agent_result: AgentResult) -> bool:
+    """Whether the candidate this result authored is still the one the chat row holds.
+
+    A turn that lost the candidate must not commit canonical state, so this is asked before the
+    auto-accept write as well as before the proposal write.
+    """
+    if agent_result.proposal_owner_turn_id is None or agent_result.proposal_revision is None:
+        return True
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    if current_chat is None:
+        raise NotFoundError(f"workflow copilot chat {chat.workflow_copilot_chat_id}")
+    chat.proposed_workflow = current_chat.proposed_workflow
+    current_metadata = copilot_proposal_metadata(current_chat.proposed_workflow)
+    return (
+        current_metadata is not None
+        and current_metadata.owner_turn_id == agent_result.proposal_owner_turn_id
+        and current_metadata.revision == agent_result.proposal_revision
+    )
+
+
+def _discard_superseded_proposal(agent_result: AgentResult) -> None:
+    agent_result.updated_workflow = None
+    agent_result.has_staged_proposal = False
+    agent_result.proposal_disposition = "no_proposal"
+    agent_result.clear_proposed_workflow = False
+
+
 async def _persist_proposed_workflow_state(
     chat: Any, agent_result: AgentResult, restored: bool, keep_pending_proposal: bool = False
 ) -> None:
     updated_workflow = agent_result.updated_workflow
+    if not await _proposal_ownership_is_current(chat, agent_result):
+        _discard_superseded_proposal(agent_result)
+        return
     auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
     if not auto_accept_effective and updated_workflow:
         proposed_workflow_data = _build_proposed_workflow_data(updated_workflow, agent_result)
-        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-            organization_id=chat.organization_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            proposed_workflow=proposed_workflow_data,
-        )
+        if agent_result.proposal_owner_turn_id is not None and agent_result.proposal_revision is not None:
+            stored_metadata = copilot_proposal_metadata(chat.proposed_workflow)
+            same_bytes = isinstance(chat.proposed_workflow, dict) and chat.proposed_workflow.get(
+                "_copilot_yaml"
+            ) == proposed_workflow_data.get("_copilot_yaml")
+            if same_bytes:
+                # Same candidate: keep the bytes publication stored and overlay only this turn's
+                # markers. Those bytes carry the resolved title and Accept reparses them as they are.
+                proposed_workflow_data = {
+                    **chat.proposed_workflow,
+                    **{key: value for key, value in proposed_workflow_data.items() if key.startswith("_copilot_")},
+                }
+                if _proposal_disposition(agent_result) != "review_untested":
+                    # The marker is only ever added, so a candidate published untested and since
+                    # tested would keep claiming otherwise — and the auto-accept cleanup deletes
+                    # whatever still carries it.
+                    proposed_workflow_data.pop("_copilot_unvalidated", None)
+            try:
+                if same_bytes or stored_metadata is None:
+                    updated_chat = await app.DATABASE.workflow_params.enrich_workflow_copilot_candidate(
+                        organization_id=chat.organization_id,
+                        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                        proposal=proposed_workflow_data,
+                        expected_owner_turn_id=agent_result.proposal_owner_turn_id,
+                        expected_revision=agent_result.proposal_revision,
+                        disposition=_proposal_disposition(agent_result),
+                    )
+                else:
+                    # The turn's answer is a different workflow — a salvaged last-good shape after a
+                    # later edit failed. That is a new candidate, not a marker update, so it takes a
+                    # revision of its own; enriching would be refused for changing the bytes and
+                    # would leave the failed draft durable behind the card.
+                    updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
+                        organization_id=chat.organization_id,
+                        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                        proposal=proposed_workflow_data,
+                        owner_turn_id=agent_result.proposal_owner_turn_id,
+                        canonical_fingerprint=stored_metadata.canonical_fingerprint,
+                        disposition=_proposal_disposition(agent_result),
+                        expected_owner_turn_id=agent_result.proposal_owner_turn_id,
+                        expected_revision=agent_result.proposal_revision,
+                    )
+                    republished = copilot_proposal_metadata(updated_chat.proposed_workflow)
+                    if republished is not None:
+                        # The terminal frame carries this token, so it has to name the revision the
+                        # user is about to act on.
+                        agent_result.proposal_revision = republished.revision
+            except CopilotProposalConflictError:
+                # Losing this race means the stored candidate is already someone else's and is
+                # already correct. The turn gives up its claim and still delivers its reply.
+                LOG.info(
+                    "copilot_candidate_enrich_conflict",
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    proposal_owner_turn_id=agent_result.proposal_owner_turn_id,
+                    proposal_revision=agent_result.proposal_revision,
+                )
+                _discard_superseded_proposal(agent_result)
+                return
+            stored_proposal = updated_chat.proposed_workflow
+            if stored_proposal is not None:
+                proposed_workflow_data = stored_proposal
+        else:
+            try:
+                await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+                    organization_id=chat.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    proposed_workflow=proposed_workflow_data,
+                )
+            except CopilotProposalConflictError:
+                LOG.info(
+                    "copilot_candidate_enrich_conflict",
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    branch="untyped",
+                )
+                _discard_superseded_proposal(agent_result)
+                return
         # Keep the in-memory chat in sync — a same-turn recovery retry reads
         # chat.proposed_workflow again and must not see the pre-write value.
         chat.proposed_workflow = proposed_workflow_data
@@ -1173,6 +1327,7 @@ async def _persist_cancel_turn(
                     resolved_model=resolved_model,
                     proposal_disposition=proposal_disposition,
                     workflow_applied=workflow_applied,
+                    proposed_workflow_metadata=copilot_proposal_metadata(chat.proposed_workflow),
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
                     turn_id=response_turn_id,
@@ -1208,7 +1363,6 @@ async def _finalise_normal_turn(
     (e.g. proposed_workflow updated but no AI message persisted).
     """
     user_response = agent_result.user_response
-    updated_workflow = agent_result.updated_workflow
     updated_global_llm_context = agent_result.global_llm_context
     idempotency_digest = _copilot_idempotency_digest(
         organization_id,
@@ -1241,6 +1395,10 @@ async def _finalise_normal_turn(
             LOG.warning("copilot restore failed in _finalise_normal_turn", exc_info=True)
             restore_failed = True
 
+    if not await _proposal_ownership_is_current(chat, agent_result):
+        # This turn no longer owns the candidate, so it has no standing to commit canonical state.
+        _discard_superseded_proposal(agent_result)
+
     if _should_commit_staged_workflow(chat.auto_accept, agent_result):
         try:
             await _commit_staged_workflow(
@@ -1267,6 +1425,10 @@ async def _finalise_normal_turn(
         # don't honor keep_pending_proposal against an unverified "nothing changed" state.
         keep_pending_proposal=chat_request.keep_pending_proposal and not restore_failed,
     )
+    # Read after persisting, never before: persisting drops this turn's proposal when a newer
+    # candidate owns the row, and the frame below must not pair a dropped draft with that
+    # candidate's token.
+    updated_workflow = agent_result.updated_workflow
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
@@ -1301,6 +1463,7 @@ async def _finalise_normal_turn(
         "resolved_model": agent_result.resolved_model,
         "proposal_disposition": proposal_disposition,
         "workflow_applied": workflow_applied,
+        "proposed_workflow_metadata": copilot_proposal_metadata(chat.proposed_workflow),
         "output_policy_diagnostics": agent_result.output_policy_diagnostics,
         "turn_id": agent_result.turn_id,
         "narrative_summary": narrative_summary,
@@ -2685,7 +2848,14 @@ async def _restore_canonical_after_interrupted_turn(
     if workflow_content_fingerprint(current.model_dump(mode="json")) != entry.canonical_write_fingerprint:
         return False
 
-    if not (entry.keep_pending_proposal and entry.pre_turn_proposed_workflow is not None):
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    durable_proposal = current_chat.proposed_workflow if current_chat is not None else None
+    if copilot_proposal_metadata(durable_proposal) is not None:
+        chat.proposed_workflow = durable_proposal
+    elif not (entry.keep_pending_proposal and entry.pre_turn_proposed_workflow is not None):
         stashed_draft = current.model_dump(mode="json")
         await app.DATABASE.workflow_params.update_workflow_copilot_chat(
             organization_id=organization_id,
@@ -2813,6 +2983,65 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
             )
 
 
+MAX_PROPOSAL_OUTPUT_VALUE_CHARS = 2000
+
+
+def _bounded_output_value(value: Any) -> Any:
+    """The card renders each output as one line, so a large extraction is only response weight."""
+    try:
+        serialized = json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        return value
+    if len(serialized) <= MAX_PROPOSAL_OUTPUT_VALUE_CHARS:
+        return value
+    return f"{serialized[:MAX_PROPOSAL_OUTPUT_VALUE_CHARS]}… truncated from {len(serialized)} characters"
+
+
+async def _history_proposal_state(
+    chat: WorkflowCopilotChat | None, organization_id: str
+) -> tuple[dict[str, Any] | None, CopilotProposalMetadata | None, CopilotProposalRunFacts | None]:
+    if chat is None or not isinstance(chat.proposed_workflow, dict):
+        return None, None, None
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    if metadata is None:
+        return chat.proposed_workflow, None, None
+    # A live claim is reported, not hidden. A server that dies mid-accept leaves the claim behind
+    # for the length of the lease, and withholding the card for that long is the invisible-work
+    # problem this store exists to remove; Accept meanwhile answers 409 and the client refetches.
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=chat.workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    if (
+        canonical is None
+        or workflow_content_fingerprint(canonical.model_dump(mode="json")) != metadata.canonical_fingerprint
+    ):
+        return None, None, None
+    run_facts = None
+    if metadata.workflow_run_id is not None:
+        run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=metadata.workflow_run_id,
+            organization_id=organization_id,
+        )
+        available = run is not None and run.workflow_permanent_id == chat.workflow_permanent_id
+        output_rows = (
+            await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(metadata.workflow_run_id)
+            if available
+            else []
+        )
+        run_facts = CopilotProposalRunFacts(
+            workflow_run_id=metadata.workflow_run_id,
+            status=str(run.status) if available else None,
+            available=available,
+            failure_reason=run.failure_reason if available else None,
+            outputs=[
+                {"output_parameter_id": row.output_parameter_id, "value": _bounded_output_value(row.value)}
+                for row in output_rows
+            ],
+        )
+    return chat.proposed_workflow, metadata, run_facts
+
+
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
 async def workflow_copilot_chat_history(
     credential_recovery_token: str | None = Header(None, alias="X-Copilot-Credential-Recovery-Token"),
@@ -2848,6 +3077,9 @@ async def workflow_copilot_chat_history(
         )
     else:
         chat_messages = []
+    proposed_workflow, proposed_workflow_metadata, proposed_workflow_run = await _history_proposal_state(
+        chat, organization.organization_id
+    )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=await pending_credential_requests(
             organization.organization_id,
@@ -2885,7 +3117,9 @@ async def workflow_copilot_chat_history(
             None,
         ),
         chat_history=await _history_with_resolved_attachments(chat_messages, organization.organization_id),
-        proposed_workflow=chat.proposed_workflow if chat else None,
+        proposed_workflow=proposed_workflow,
+        proposed_workflow_metadata=proposed_workflow_metadata,
+        proposed_workflow_run=proposed_workflow_run,
         auto_accept=chat.auto_accept if chat else None,
         work_plan=chat.work_plan if chat else [],
     )
@@ -3057,14 +3291,29 @@ async def workflow_copilot_clear_proposed_workflow(
     clear_request: WorkflowCopilotClearProposedWorkflowRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
-    updated_chat = await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-        organization_id=organization.organization_id,
-        workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
-        proposed_workflow=None,
-        auto_accept=clear_request.auto_accept,
-    )
-    if not updated_chat:
+    expected_owner_turn_id = clear_request.owner_turn_id
+    expected_revision = clear_request.revision
+    if _client_sent_no_proposal_token(expected_owner_turn_id, expected_revision):
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
+        )
+        stored = copilot_proposal_metadata(chat.proposed_workflow) if chat is not None else None
+        if stored is not None:
+            expected_owner_turn_id = stored.owner_turn_id
+            expected_revision = stored.revision
+    try:
+        await app.DATABASE.workflow_params.clear_workflow_copilot_candidate(
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
+            expected_owner_turn_id=expected_owner_turn_id,
+            expected_revision=expected_revision,
+            auto_accept=clear_request.auto_accept,
+        )
+    except NotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+    except CopilotProposalConflictError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
 
 
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)
@@ -3083,6 +3332,42 @@ async def workflow_copilot_apply_proposed_workflow(
     proposal = chat.proposed_workflow
     if not proposal:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No proposed workflow to apply")
+
+    metadata = copilot_proposal_metadata(proposal)
+    if isinstance(proposal, dict) and COPILOT_PROPOSAL_METADATA_KEY in proposal and metadata is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Copilot proposal metadata is invalid; reload required",
+        )
+    original_disposition: ProposalDisposition | None = None
+    if metadata is not None:
+        untokenized_client = _client_sent_no_proposal_token(apply_request.owner_turn_id, apply_request.revision)
+        if not untokenized_client and (
+            apply_request.owner_turn_id != metadata.owner_turn_id or apply_request.revision != metadata.revision
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required"
+            )
+        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=chat.workflow_permanent_id,
+            organization_id=organization.organization_id,
+        )
+        if (
+            canonical is None
+            or workflow_content_fingerprint(canonical.model_dump(mode="json")) != metadata.canonical_fingerprint
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal")
+        if metadata.claim_is_live(datetime.now(UTC)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal is already being accepted"
+            )
+        # A lapsed claim is being taken over, so the disposition to restore on failure is the
+        # reviewable one this accept started from, never the dead claim's own marker.
+        original_disposition = (
+            "review_untested"
+            if metadata.disposition == "accepting"
+            else cast(ProposalDisposition, metadata.disposition)
+        )
 
     copilot_yaml = proposal.get("_copilot_yaml") if isinstance(proposal, dict) else None
     if not copilot_yaml:
@@ -3120,22 +3405,63 @@ async def workflow_copilot_apply_proposed_workflow(
             detail=f"Proposed copilot YAML is invalid: {e}",
         )
 
-    new_workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
-        organization=organization,
-        request=yaml_request,
-        workflow_permanent_id=chat.workflow_permanent_id,
-        edited_by="copilot",
-        validate_code_block_templates=False,
-    )
+    claimed_at: datetime | None = None
+    if metadata is not None:
+        try:
+            claimed = await app.DATABASE.workflow_params.claim_workflow_copilot_candidate(
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                expected_owner_turn_id=metadata.owner_turn_id,
+                expected_revision=metadata.revision,
+            )
+            claimed_metadata = copilot_proposal_metadata(claimed.proposed_workflow)
+            claimed_at = claimed_metadata.claimed_at if claimed_metadata is not None else None
+        except CopilotProposalConflictError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required"
+            )
+
+    try:
+        new_workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=organization,
+            request=yaml_request,
+            workflow_permanent_id=chat.workflow_permanent_id,
+            edited_by="copilot",
+            validate_code_block_templates=False,
+        )
+    except Exception:
+        if metadata is not None and original_disposition is not None:
+            with contextlib.suppress(Exception):
+                # A failed release must not replace the create failure the caller needs to see.
+                await app.DATABASE.workflow_params.release_workflow_copilot_candidate_claim(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    expected_owner_turn_id=metadata.owner_turn_id,
+                    expected_revision=metadata.revision,
+                    expected_claimed_at=claimed_at,
+                    disposition=original_disposition,
+                )
+        raise
 
     try:
         # Best-effort: a 500 here would invite a retry that creates a duplicate version.
-        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-            organization_id=organization.organization_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            proposed_workflow=None,
-            auto_accept=apply_request.auto_accept,
-        )
+        if metadata is not None:
+            await app.DATABASE.workflow_params.clear_workflow_copilot_candidate(
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                expected_owner_turn_id=metadata.owner_turn_id,
+                expected_revision=metadata.revision,
+                expected_disposition="accepting",
+                expected_claimed_at=claimed_at,
+                auto_accept=apply_request.auto_accept,
+            )
+        else:
+            await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                proposed_workflow=None,
+                auto_accept=apply_request.auto_accept,
+            )
     except Exception:
         LOG.warning(
             "Failed to clear copilot proposal after applying it; new workflow version was created",
@@ -3143,6 +3469,23 @@ async def workflow_copilot_apply_proposed_workflow(
             new_workflow_id=new_workflow.workflow_id,
             exc_info=True,
         )
+        if metadata is not None and original_disposition is not None:
+            try:
+                await app.DATABASE.workflow_params.release_workflow_copilot_candidate_claim(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    expected_owner_turn_id=metadata.owner_turn_id,
+                    expected_revision=metadata.revision,
+                    expected_claimed_at=claimed_at,
+                    disposition=original_disposition,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to release copilot proposal claim after post-create cleanup failure",
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    new_workflow_id=new_workflow.workflow_id,
+                    exc_info=True,
+                )
 
     return new_workflow
 
