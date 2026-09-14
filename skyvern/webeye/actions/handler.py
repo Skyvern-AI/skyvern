@@ -4012,6 +4012,14 @@ class AutoCompletionResult(BaseModel):
 
 # Upstream HTTP statuses that count as download-failure evidence; adjacent 5xx (501/505/507/...) are excluded.
 _OBSERVED_DOWNLOAD_FAILURE_STATUSES = frozenset({500, 502, 503, 504})
+# Hard cap on the per-action set of xhr/fetch requests eligible for passive status observation. Bounds
+# retained request-object references under a request storm; at the cap we stop tracking new requests
+# (logging once) instead of growing without limit.
+_MAX_STATUS_OBSERVATION_REQUESTS = 64
+# Grace after seal_in_flight_requests() during which a newly initiated xhr/fetch can still enter status
+# observation. Bounds the observation window to the action plus a JS-initiated second hop, so an unrelated
+# heartbeat/poll fired minutes into the long download-wait loop can never stamp download_failure_status.
+_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS = 2.0
 
 
 class ScopedXhrDownloadCapture:
@@ -4030,24 +4038,44 @@ class ScopedXhrDownloadCapture:
         page: Page,
         download_dir: Path,
         timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._page = page
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
+        self._monotonic = monotonic
         self._saved: set[str] = set()
         self._extra_pages: list[Page] = []
         self._capture_responses = False
         self._active = False
         self._accept_new_requests = False
         # Passive, site-agnostic status observation: records only a server 5xx integer status for any
-        # admitted xhr/fetch request during this download action. No URL, host, header, body, or other
-        # request detail is ever retained.
+        # xhr/fetch request initiated during this download action's window. No URL, host, header, body,
+        # or other request detail is ever retained.
         self._observed_download_failure_status: int | None = None
         # Response-body drain count is separate from request-lifecycle tracking for the bounded wait extension.
         self._in_flight = 0
         self._response_tasks: set[asyncio.Task[None]] = set()
         self._in_flight_requests: set[Request] = set()
         self._admitted_requests: set[Request] = set()
+        # Requests initiated during the active window (seen by _on_request after enable), used ONLY to
+        # scope passive status observation. Deliberately independent of _admitted_requests/seal so a
+        # JS-initiated second hop that starts after seal is still observed, while a request already in
+        # flight before this action (never seen by _on_request) is excluded. Bounded by
+        # _MAX_STATUS_OBSERVATION_REQUESTS; never gates wait extension.
+        self._status_observation_requests: set[Request] = set()
+        # Child pages whose bootstrap provenance was established while inside the observation window.
+        # A bootstrap hop on such a page stays observation-eligible after the deadline (proven
+        # action-owned); a child page first seen at/after the deadline is admitted for wait extension
+        # but never grants observation provenance, so its 5xx cannot become action-caused evidence.
+        self._status_observation_child_pages: set[Page] = set()
+        self._status_observation_capped = False
+        # Monotonic deadline for admitting NEW requests into status observation. None until seal, meaning
+        # "the action is still running, admit every xhr/fetch"; set at seal to now + grace so requests that
+        # start after the grace (unrelated heartbeats during the long download wait) are never observed.
+        # Bounds request initiation only: a request admitted before the deadline stays eligible even when
+        # its response lands afterward.
+        self._status_observation_deadline: float | None = None
         self._child_pages_with_bootstrap_allowance: set[Page] = set()
         self._drained = asyncio.Event()
         self._drained.set()
@@ -4060,31 +4088,104 @@ class ScopedXhrDownloadCapture:
     def observed_download_failure_status(self) -> int | None:
         return self._observed_download_failure_status
 
+    def _within_status_observation_window(self) -> bool:
+        deadline = self._status_observation_deadline
+        if deadline is None:
+            return True
+        return self._monotonic() < deadline
+
     def _on_request(self, request: Request) -> None:
-        redirected_from_admitted_request = request.redirected_from in self._admitted_requests
         if not self._active or request.resource_type not in ("xhr", "fetch"):
             return
 
+        redirected_from_admitted_request = request.redirected_from in self._admitted_requests
+
         child_page_has_bootstrap_allowance = False
-        if not self._accept_new_requests and request.redirected_from is None:
+        bootstrap_provenance_in_window = False
+        request_page: Page | None = None
+        if request.redirected_from is None:
             try:
                 request_page = request.frame.page
-                child_page_has_bootstrap_allowance = request_page in self._child_pages_with_bootstrap_allowance
             except Exception:
-                pass
+                request_page = None
+            if request_page is not None and not self._accept_new_requests:
+                child_page_has_bootstrap_allowance = request_page in self._child_pages_with_bootstrap_allowance
+                bootstrap_provenance_in_window = request_page in self._status_observation_child_pages
 
         if child_page_has_bootstrap_allowance:
             self._child_pages_with_bootstrap_allowance.discard(request_page)
 
+        # Status observation is scoped by chain provenance, not the raw deadline. A proven action-owned
+        # descendant -- a redirect off an already-OBSERVED request, or a bootstrap hop on a child page
+        # opened in-window -- stays eligible even when it begins after the deadline. Wait-extension
+        # admission (_admitted_requests) is deliberately broader than observation and is NOT a provenance
+        # proxy: a redirect off an admitted-but-unobserved predecessor is excluded. An otherwise
+        # unattributed request is eligible only as an in-window root; unrelated new roots at/after the
+        # deadline, and redirects off a pre-action/stale/unobserved predecessor, are excluded.
+        self._maybe_observe_request(
+            request,
+            child_page_has_bootstrap_allowance=child_page_has_bootstrap_allowance,
+            bootstrap_provenance_in_window=bootstrap_provenance_in_window,
+        )
+
+        # One-shot: a child page's status-observation provenance is spent by its FIRST root xhr/fetch --
+        # whether that request was observed via the post-deadline bootstrap branch or the general in-window
+        # path -- so a later unrelated root from the same child (e.g. a heartbeat after the 2s grace) cannot
+        # reuse a stale token and be wrongly attributed. Consumed regardless of the 64 cap (fail closed).
+        # The separate wait-extension allowance (_child_pages_with_bootstrap_allowance) is untouched here.
+        if request_page is not None:
+            self._status_observation_child_pages.discard(request_page)
+
         if self._accept_new_requests or redirected_from_admitted_request or child_page_has_bootstrap_allowance:
             self._in_flight_requests.add(request)
             self._admitted_requests.add(request)
+
+    def _is_status_observation_eligible(
+        self,
+        request: Request,
+        *,
+        child_page_has_bootstrap_allowance: bool,
+        bootstrap_provenance_in_window: bool,
+    ) -> bool:
+        if request.redirected_from is not None:
+            return request.redirected_from in self._status_observation_requests
+        if child_page_has_bootstrap_allowance:
+            # Bootstrap provenance is additive: it EXTENDS eligibility to a first bootstrap hop past the
+            # deadline, but a spent token must not strip an otherwise-ordinary in-grace root of its normal
+            # window eligibility.
+            return bootstrap_provenance_in_window or self._within_status_observation_window()
+        return self._within_status_observation_window()
+
+    def _maybe_observe_request(
+        self,
+        request: Request,
+        *,
+        child_page_has_bootstrap_allowance: bool,
+        bootstrap_provenance_in_window: bool,
+    ) -> None:
+        if request in self._status_observation_requests:
+            return
+        if not self._is_status_observation_eligible(
+            request,
+            child_page_has_bootstrap_allowance=child_page_has_bootstrap_allowance,
+            bootstrap_provenance_in_window=bootstrap_provenance_in_window,
+        ):
+            return
+        if len(self._status_observation_requests) < _MAX_STATUS_OBSERVATION_REQUESTS:
+            self._status_observation_requests.add(request)
+        elif not self._status_observation_capped:
+            self._status_observation_capped = True
+            LOG.info(
+                "Status-observation request set hit its cap; further requests are not tracked for 5xx observation",
+                cap=_MAX_STATUS_OBSERVATION_REQUESTS,
+            )
 
     def _on_request_finished(self, request: Request) -> None:
         self._in_flight_requests.discard(request)
 
     def seal_in_flight_requests(self) -> None:
         self._accept_new_requests = False
+        self._status_observation_deadline = self._monotonic() + _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS
 
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
@@ -4115,15 +4216,17 @@ class ScopedXhrDownloadCapture:
         task.add_done_callback(self._on_response_done)
 
     def _observe_download_failure_status(self, response: Response) -> None:
-        """Record a server 5xx status for any admitted xhr/fetch request during this download action.
+        """Record a server 5xx status for an xhr/fetch request initiated during this download action's window.
 
         Runs on Playwright's event loop for every response while the capture is attached, including the
-        CDP-interceptor lane where response-body capture is off. Stores only the integer status and only
-        when the request was admitted for this action window. Retains nothing else — no URL, host, or
-        header — and never raises into the event loop.
+        CDP-interceptor lane where response-body capture is off. Observation is scoped by window
+        membership (_status_observation_requests), NOT by wait-extension admission: a JS-initiated second
+        hop that starts after seal is still observed, while a request already in flight before this action
+        (never seen by _on_request) is excluded so it cannot become action-caused evidence. Stores only
+        the integer status — no URL, host, or header — and never raises into the event loop.
         """
         try:
-            if response.request not in self._admitted_requests:
+            if response.request not in self._status_observation_requests:
                 return
             status = response.status
             if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
@@ -4220,6 +4323,8 @@ class ScopedXhrDownloadCapture:
         if not self._active:
             return
         self._child_pages_with_bootstrap_allowance.add(page)
+        if self._within_status_observation_window():
+            self._status_observation_child_pages.add(page)
         self._attach_page(page)
         self._extra_pages.append(page)
 
@@ -4259,6 +4364,9 @@ class ScopedXhrDownloadCapture:
         self._extra_pages.clear()
         self._child_pages_with_bootstrap_allowance.clear()
         self._in_flight_requests.clear()
+        self._status_observation_requests.clear()
+        self._status_observation_child_pages.clear()
+        self._status_observation_deadline = None
 
 
 class ActionHandler:
