@@ -2103,6 +2103,9 @@ class SkyvernFrame:
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         engine_selection: BrowserEngineSelection | None = None,
     ) -> bytes:
+        """``timeout`` is milliseconds and is one deadline for frame setup, capture, fallback and the scroll restore.
+        Expiry raises TimeoutError; helper cleanup (CDP detach drain, cursor re-show) is separately bounded and may
+        overshoot by that bound."""
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
                 page=page,
@@ -2123,80 +2126,84 @@ class SkyvernFrame:
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
-        skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout / 1000
+        skyvern_frame: SkyvernFrame | None = None
         x: int | None = None
         y: int | None = None
         try:
-            x, y = await skyvern_frame.get_scroll_x_y()
-            async with asyncio.timeout(timeout):
-                screenshots, positions = await _scrolling_screenshots_helper(
-                    page=page,
-                    mode=mode,
-                    max_number=scrolling_number,
-                    engine_selection=engine_selection,
-                )
-                images: list[Image.Image] = []
-                merged_img: Image.Image | None = None
-                buffer: BytesIO | None = None
+            async with asyncio.timeout_at(deadline):
+                skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
                 try:
-                    for screenshot in screenshots:
-                        with Image.open(BytesIO(screenshot)) as img:
-                            img.load()
-                            images.append(img)
-
-                    merged_img = _merge_images_by_position(images, positions)
-
-                    buffer = BytesIO()
-                    merged_img.save(buffer, format="PNG")
-                    buffer.seek(0)
-
-                    img_data = buffer.read()
-                    if file_path is not None:
-                        with open(file_path, "wb") as f:
-                            f.write(img_data)
-
-                    end_time = time.time()
-                    LOG.debug(
-                        "Full page screenshot taking time",
-                        screenshot_time=end_time - start_time,
-                        file_path=file_path,
+                    x, y = await skyvern_frame.get_scroll_x_y()
+                    screenshots, positions = await _scrolling_screenshots_helper(
+                        page=page,
+                        mode=mode,
+                        max_number=scrolling_number,
+                        engine_selection=engine_selection,
                     )
-                    return img_data
-                finally:
-                    # The decoded images, stitched image, and PNG buffer land in reference cycles that
-                    # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
-                    # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
-                    _close_screenshot_stitch_resources(images, merged_img, buffer)
-                    if len(images) > 1:
-                        gc.collect()
-        except ScreenshotTargetClosed:
-            # The fallback below captures the same page, so a closed target can only fail there too.
-            x = None
-            y = None
-            raise
-        except Exception:
-            LOG.warning(
-                "Failed to take full page screenshot, fallback to use playwright full page screenshot",
-                exc_info=True,
-            )
-            # reset x and y to None to avoid the scroll_to_x_y call in finally block
-            x = None
-            y = None
-            return await _current_viewpoint_screenshot_helper(
-                page=page,
-                file_path=file_path,
-                timeout=timeout,
-                full_page=True,
-                engine_selection=engine_selection,
-            )
+                    images: list[Image.Image] = []
+                    merged_img: Image.Image | None = None
+                    buffer: BytesIO | None = None
+                    try:
+                        for screenshot in screenshots:
+                            with Image.open(BytesIO(screenshot)) as img:
+                                img.load()
+                                images.append(img)
+
+                        merged_img = _merge_images_by_position(images, positions)
+
+                        buffer = BytesIO()
+                        merged_img.save(buffer, format="PNG")
+                        buffer.seek(0)
+
+                        img_data = buffer.read()
+                        if file_path is not None:
+                            with open(file_path, "wb") as f:
+                                f.write(img_data)
+
+                        end_time = time.time()
+                        LOG.debug(
+                            "Full page screenshot taking time",
+                            screenshot_time=end_time - start_time,
+                            file_path=file_path,
+                        )
+                        return img_data
+                    finally:
+                        # The decoded images, stitched image, and PNG buffer land in reference cycles that
+                        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
+                        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
+                        _close_screenshot_stitch_resources(images, merged_img, buffer)
+                        if len(images) > 1:
+                            gc.collect()
+                except ScreenshotTargetClosed:
+                    # The fallback below captures the same page, so a closed target can only fail there too.
+                    x = None
+                    y = None
+                    raise
+                except Exception:
+                    LOG.warning(
+                        "Failed to take full page screenshot, fallback to use playwright full page screenshot",
+                        exc_info=True,
+                    )
+                    x = None
+                    y = None
+                    return await _current_viewpoint_screenshot_helper(
+                        page=page,
+                        file_path=file_path,
+                        timeout=timeout,
+                        full_page=True,
+                        engine_selection=engine_selection,
+                    )
         finally:
-            if x is not None and y is not None:
-                # Courtesy restore of the pre-screenshot scroll position, bounded because it runs
-                # while the caller's screenshot budget is already unwinding: an unresponsive page
-                # here would extend that budget by however long the evaluation hangs, and a caller
-                # waiting to publish an established failure would wait with it.
+            if skyvern_frame is not None and x is not None and y is not None:
+                # Courtesy restore of the pre-screenshot scroll position, kept outside the deadline block so a
+                # hung page here cannot discard captured bytes, but given only what remains of the same budget.
+                remaining = max(0.0, deadline - loop.time())
                 with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS / 1000):
+                    async with asyncio.timeout(
+                        min(remaining, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS / 1000)
+                    ):
                         await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod

@@ -8,6 +8,7 @@ _generate_workflow_run_block_description serves identical block configs
 from app.CACHE instead of re-calling the LLM every run.
 """
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from tests.unit.conftest import settle_or_fail, stalled_scrolling_capture
 
 
 def _make_block() -> TaskBlock:
@@ -216,3 +218,55 @@ class TestDescriptionContentHashCache:
             assert (
                 mock_app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["description"] == "fresh summary"
             )
+
+
+class TestPreBlockCaptureBudget:
+    """The optional pre-block capture goes through the real screenshot primitive with a stalled helper."""
+
+    @pytest.mark.asyncio
+    async def test_stalled_optional_capture_settles_in_budget_and_block_executes(self) -> None:
+        block = _make_block()
+        entered = asyncio.Event()
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()) as execute,
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            _setup_mocks(mock_app)
+            mock_app.ARTIFACT_MANAGER.create_workflow_run_block_artifact = AsyncMock()
+            browser_state = MagicMock()
+            browser_state.take_fullpage_screenshot = stalled_scrolling_capture(entered, timeout_ms=200)
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = browser_state
+
+            task, elapsed = await settle_or_fail(block.execute_safe(workflow_run_id="wr_1"))
+
+            assert task.result() is not None
+            assert entered.is_set()
+            assert elapsed < 2, elapsed
+            execute.assert_awaited_once()
+            mock_app.ARTIFACT_MANAGER.create_workflow_run_block_artifact.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_stalled_capture_never_executes_the_block(self) -> None:
+        block = _make_block()
+        entered = asyncio.Event()
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()) as execute,
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            _setup_mocks(mock_app)
+            browser_state = MagicMock()
+            browser_state.take_fullpage_screenshot = stalled_scrolling_capture(entered, timeout_ms=5000)
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = browser_state
+
+            task = asyncio.ensure_future(block.execute_safe(workflow_run_id="wr_1"))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            execute.assert_not_awaited()
+            mock_app.DATABASE.observer.update_workflow_run_block.assert_not_awaited()
