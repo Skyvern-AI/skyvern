@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     _TASK_V3_PURE_BANNED_BLOCK_TYPES,
     _TASK_V3_PURE_TASK_BLOCK_TYPES,
+    CREDENTIAL_CODE_ACCESSORS,
     CopilotBlockPolicyStatus,
     _code_only_browser_authoring_prompt,
     _code_only_browser_schema_guidance,
@@ -582,6 +583,22 @@ def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_proced
     assert "Do not read `email_inbox`" not in guidance
     assert "authenticated-page anchor" not in guidance
     assert "Transient disappearance of the OTP field" not in guidance
+
+
+def test_code_only_schema_guidance_exposes_secret_credential_runtime_accessor() -> None:
+    lines = _code_only_browser_schema_guidance()
+    secret_line = next(line for line in lines if line.startswith("A `secret` credential"))
+    password_line = next(line for line in lines if line.startswith("For saved credentials"))
+
+    assert "<key>.secret_value" in secret_line
+    assert "otp()" not in secret_line
+    assert "magic_link" not in secret_line
+    assert "fill_credential_field" not in secret_line
+    assert "<key>.secret_value" not in password_line
+    assert "fill_credential_field" in password_line
+    for accessors in CREDENTIAL_CODE_ACCESSORS.values():
+        for accessor in (*accessors.fields, accessors.otp, accessors.magic_link):
+            assert accessor is None or accessor in "\n".join(lines)
 
 
 def test_code_only_schema_guidance_states_the_cold_run_starting_condition() -> None:
