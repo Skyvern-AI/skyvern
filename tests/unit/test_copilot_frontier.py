@@ -1120,8 +1120,7 @@ def test_referenced_output_labels_finds_block_form_jinja_refs() -> None:
                 "text_prompt",
                 {
                     "prompt": (
-                        "Summarize {{ extract_article_info.output.extracted_information.abstract }} "
-                        "and {{ extract_article_info.title }}."
+                        "Summarize {{ extract_article_info.output.abstract }} and {{ extract_article_info.title }}."
                     )
                 },
             ),
@@ -1133,7 +1132,96 @@ def test_referenced_output_labels_finds_block_form_jinja_refs() -> None:
     assert refs == {"extract_article_info"}
 
 
-def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run() -> None:
+def test_referenced_output_labels_finds_bare_block_form_jinja_refs() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "Summarize {{ extract_article_info }} in one sentence."},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info"}
+
+
+def test_referenced_output_labels_finds_every_ref_in_one_expression() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock("extract_author", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "{{ extract_article_info.output.title ~ extract_author.output.name }}"},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info", "extract_author"}
+
+
+def test_referenced_output_labels_finds_a_ref_in_a_templated_mapping_key() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_result", "extraction"),
+            _FakeBlock(
+                "report_failure",
+                "text_prompt",
+                # error_code_mapping renders its keys, so a key can carry the only reference.
+                {"error_code_mapping": {"ERR_{{ extract_result.output.code }}": "the run failed"}},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["report_failure"], new)
+
+    assert refs == {"extract_result"}
+
+
+def test_referenced_output_labels_finds_refs_around_a_quoted_jinja_literal() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock("extract_author", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                # The config is serialized as JSON, so these quotes reach the classifier escaped.
+                {"prompt": '{{ extract_article_info.output.title ~ " by " ~ extract_author.output.name }}'},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info", "extract_author"}
+
+
+def test_referenced_output_labels_finds_a_bare_ref_followed_by_an_operator() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "Summarize {{ extract_article_info or {} }} in one sentence."},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info"}
+
+
+def test_plan_frontier_falls_back_to_a_full_run_when_a_bare_ref_has_no_verified_output() -> None:
     old = _FakeDefinition(
         [
             _FakeBlock("open_page", "navigation"),
@@ -1147,12 +1235,35 @@ def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run()
             _FakeBlock(
                 "summarize_article",
                 "text_prompt",
-                {
-                    "prompt": (
-                        "Summarize the main findings from "
-                        "{{ extract_article_info.output.extracted_information.abstract }}."
-                    )
-                },
+                {"prompt": "Summarize {{ extract_article_info }} in one sentence."},
+            ),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page", "extract_article_info"]
+    ctx.verified_block_outputs = {"open_page": "nav_ok"}
+
+    requested = ["open_page", "extract_article_info", "summarize_article"]
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, requested, old, new)
+
+    assert (labels, seed, frontier) == (requested, {}, "open_page")
+
+
+def test_plan_frontier_append_with_block_form_jinja_ref_seeds_the_prefix_output() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": ("Summarize the main findings from {{ extract_article_info.output.abstract }}.")},
             ),
         ]
     )
@@ -1170,9 +1281,12 @@ def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run()
         new,
     )
 
-    assert labels == ["open_page", "extract_article_info", "summarize_article"]
-    assert seed == {}
-    assert frontier == "open_page"
+    assert labels == ["summarize_article"]
+    assert seed == {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
+    assert frontier == "summarize_article"
 
 
 def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -96,7 +96,9 @@ from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associatio
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.services import workflow_service as workflow_service_module
@@ -254,6 +256,134 @@ def test_packet_projects_every_recorded_block_output_in_row_order_and_scrubs_sec
     assert (
         packet.omission_notices.count("registered_outputs redacted 1 item(s) containing registered secret values.") == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> None:
+    write_block = GoogleSheetsWriteBlock(
+        label="write_row",
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="write_row_output",
+            output_parameter_id="op_write_row",
+            workflow_id="w",
+            created_at=datetime.now(UTC),
+            modified_at=datetime.now(UTC),
+        ),
+        spreadsheet_url="https://docs.google.com/spreadsheets/d/sheet-id/edit",
+        values='[["{{ extract_failure_rate.output.extracted_information.failure_rate }}"]]',
+    )
+    run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w",
+        workflow_permanent_id="wpid",
+        workflow_run_id="wr_sheets_available_keys",
+        aws_client=MagicMock(),
+    )
+    run_context.values["extract_failure_rate"] = {
+        "status": "completed",
+        "extracted_information": {"failure_rate": "25.65%"},
+        "output": {"failure_rate": "25.65%"},
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        write_block._render_values_or_raise(run_context)
+
+    with (
+        patch.object(GoogleSheetsWriteBlock, "record_output_parameter_value", AsyncMock()) as record_output,
+        patch.object(GoogleSheetsWriteBlock, "build_block_result", AsyncMock()),
+    ):
+        await write_block._template_format_failure_result(
+            excinfo.value, str(excinfo.value), run_context, "wr_sheets_available_keys", None, None
+        )
+        recorded_output = record_output.await_args.args[2]
+
+    packet = build_test_evidence_packet(
+        _locator_packet_ctx(),
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_sheets_available_keys",
+                "overall_status": "failed",
+                "blocks": [{"label": "write_row", "status": "failed", "output": recorded_output}],
+            },
+        },
+    )
+
+    assert "extract_failure_rate.output.failure_rate" in packet.registered_outputs[0].output["available_keys"]
+
+
+def test_projection_keeps_available_keys_when_the_output_exceeds_the_per_output_cap() -> None:
+    failure_output = {
+        "failure_reason": (
+            "Failed to format jinja template: block `write_row` field `values` references a value no "
+            "upstream block produced: 'dict object' has no attribute 'extracted_information'. Return "
+            "that key from the producing block, or write an explicit default (e.g. "
+            "{{ block_label.field | default('') }}) if an empty cell is intended."
+        ),
+        "available_keys": [
+            *[f"extract_metrics.output.metric_{index:02d}" for index in range(25)],
+            *[f"block_{index:02d}" for index in range(10)],
+        ],
+    }
+
+    projected = project_build_test_packet_for_llm(
+        build_test_evidence_packet(
+            _locator_packet_ctx(),
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_available_keys_cap",
+                    "overall_status": "failed",
+                    "blocks": [{"label": "write_row", "status": "failed", "output": failure_output}],
+                },
+            },
+        )
+    )
+
+    registered = projected.registered_outputs[0]
+    kept = registered.output["available_keys"]
+    assert "extract_metrics.output.metric_00" in kept
+    # Top-level names are the only answer when a root is undefined, so trimming must not empty them first.
+    assert "block_00" in kept
+    assert 0 < len(kept) < 35
+    assert registered.value_complete is False
+    assert any("available_keys on write_row shortened" in notice for notice in projected.omission_notices)
+
+
+def test_projection_keeps_repair_keys_when_the_failure_reason_alone_fills_the_cap() -> None:
+    # A generic Jinja failure quotes the whole template, so the reason alone can exceed the cap, and
+    # build_block_failure_output copies that same text into every errors[].reasoning.
+    long_reason = "Failed to format Jinja style parameter '" + ("{{ verify.x }} " * 90) + "'."
+    failure_output = {
+        "status": "failed",
+        "failure_reason": long_reason,
+        "errors": [
+            {"error_code": "file_parse_failed", "reasoning": long_reason, "confidence_float": 1.0},
+            {"error_code": "template_failed", "reasoning": long_reason, "confidence_float": 1.0},
+        ],
+        "available_keys": ["verify.output.status", "verify.output.detail", "verify", "verify_output"],
+    }
+
+    projected = project_build_test_packet_for_llm(
+        build_test_evidence_packet(
+            _locator_packet_ctx(),
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_long_reason",
+                    "overall_status": "failed",
+                    "blocks": [{"label": "write_row", "status": "failed", "output": failure_output}],
+                },
+            },
+        )
+    )
+
+    registered = projected.registered_outputs[0]
+    assert registered.output["available_keys"], "the repair paths must survive a reason that fills the cap"
+    assert registered.output["failure_reason"].endswith("...")
+    assert [error["reasoning"].endswith("...") for error in registered.output["errors"]] == [True, True]
+    assert registered.value_complete is False
 
 
 def test_recorded_run_block_projection_keeps_falsey_and_null_outputs() -> None:

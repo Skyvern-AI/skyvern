@@ -907,10 +907,14 @@ There are TWO types of references:
 
 IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either raises "dict object has no attribute 'output'" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
 
-* Browser-task blocks (navigation, extraction, goto_url, login, action, file_download):
-  - `{{ label.output }}` — the full TaskOutput envelope.
-  - `{{ label.output.extracted_information }}` — the extracted payload.
-  - Example: `{{ extract_items.output }}` inside a downstream prompt.
+* Browser-task blocks (navigation, extraction, goto_url, login, action):
+  - `{{ label.output }}` — the extracted payload (an alias for extracted_information). Use this in a value field.
+  - `{{ label.extracted_information }}` — the extracted payload (also available).
+  - `{{ label }}` — the full TaskOutput envelope (status, failure_reason, the payload). Use it to inspect what a block returned, not as the value you want to write.
+  - Example: `{{ extract_items.output }}` or `{{ extract_items.extracted_information }}` inside a downstream prompt.
+
+* File download blocks (file_download):
+  - `{{ fetch_report.downloaded_file_urls }}` — the URLs of the downloaded files; `{{ fetch_report.downloaded_files }}` holds the full file records. Use these, NOT `{{ fetch_report.output.downloaded_file_urls }}`: a download has no extracted payload, so `.output` holds nothing to read from and renders blank on its own.
 
 * Non-task blocks (text_prompt, http_request, file_url_parser):
   - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.

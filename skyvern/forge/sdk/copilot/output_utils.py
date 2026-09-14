@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
+from pydantic import JsonValue
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
@@ -68,6 +69,10 @@ _BUILD_TEST_FAILURE_REASON_MAX_CHARS = 1_200
 _BUILD_TEST_LABEL_MAX_ITEMS = 24
 _BUILD_TEST_OUTPUT_MAX_ITEMS = 12
 _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS = 800
+# The share of that cap a failure reason may hold before it starts crowding out available_keys, and
+# the shortest it is worth trimming one to.
+_AVAILABLE_KEYS_REASON_SHARE = 400
+_AVAILABLE_KEYS_REASON_FLOOR = 80
 _BUILD_TEST_DOWNLOAD_MAX_ITEMS = 12
 _BUILD_TEST_UNFINISHED_MAX_ITEMS = 24
 _BUILD_TEST_ACTION_TRACE_MAX_ITEMS = 6
@@ -941,6 +946,82 @@ def _compact_packet_for_aggregate_limit(
     )
 
 
+def _trim_failure_text(fitted: dict[str, Any], limit: int) -> bool:
+    """Trim the failure reason and each copy of it in ``errors[].reasoning`` to ``limit`` characters,
+    reporting whether anything changed."""
+
+    def bounded(text: JsonValue) -> str | None:
+        return text[: limit - 3] + "..." if isinstance(text, str) and len(text) > limit else None
+
+    changed = False
+    trimmed_reason = bounded(fitted.get("failure_reason"))
+    if trimmed_reason is not None:
+        fitted["failure_reason"] = trimmed_reason
+        changed = True
+    errors = fitted.get("errors")
+    if isinstance(errors, list):
+        rebuilt: list[JsonValue] = []
+        for error in errors:
+            trimmed = bounded(error.get("reasoning")) if isinstance(error, dict) else None
+            rebuilt.append(error if trimmed is None else {**error, "reasoning": trimmed})
+            changed = changed or trimmed is not None
+        fitted["errors"] = rebuilt
+    return changed
+
+
+def _bound_failure_text(fitted: dict[str, Any]) -> bool:
+    """Shrink the failure text until the output fits, halving the allowance each pass. One copy bounded
+    to a fixed share is not enough: build_block_failure_output repeats the reason once per error code,
+    so the total is what has to come down."""
+    shortened = False
+    limit = _AVAILABLE_KEYS_REASON_SHARE
+    while True:
+        shortened = _trim_failure_text(fitted, limit) or shortened
+        fits = len(json.dumps(fitted, ensure_ascii=False, separators=(",", ":"))) <= _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS
+        if fits or limit <= _AVAILABLE_KEYS_REASON_FLOOR:
+            return shortened
+        limit //= 2
+
+
+def _fit_available_keys(block_output: JsonValue, label: str | None, notices: list[str]) -> tuple[JsonValue, bool]:
+    """Drop ``available_keys`` entries until the output fits the per-output cap, and report whether any
+    were dropped. Letting the cap stringify the whole dict instead cuts the keys off entirely, and they
+    are the field a failed binding is repaired from."""
+    if not isinstance(block_output, dict) or not isinstance(block_output.get("available_keys"), list):
+        return block_output, False
+    original = block_output["available_keys"]
+    fitted = dict(block_output)
+    over_cap = len(json.dumps(fitted, ensure_ascii=False, separators=(",", ":"))) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS
+    # A failure reason quoting a long template can fill the cap by itself, and build_block_failure_output
+    # copies that same text into every errors[].reasoning, so trimming the keys to nothing would hand the
+    # model an error with no path to repair from. failure.reason keeps a longer copy, so these ones
+    # yield the space instead.
+    reason_shortened = _bound_failure_text(fitted) if over_cap else False
+    if reason_shortened:
+        append_omission_notice(
+            notices,
+            f"failure text on {label or '(unlabeled)'} shortened so available_keys fit; "
+            "a longer copy is in failure.reason.",
+        )
+    # Reference paths answer the failing reference; bare top-level names say what else exists, and for
+    # an undefined root they are the only answer. Trim whichever group is larger so neither empties first.
+    paths = [key for key in original if isinstance(key, str) and ("." in key or "[" in key)]
+    roots = [key for key in original if not (isinstance(key, str) and ("." in key or "[" in key))]
+    while (paths or roots) and len(
+        json.dumps(fitted, ensure_ascii=False, separators=(",", ":"))
+    ) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS:
+        (paths if len(paths) >= len(roots) else roots).pop()
+        fitted["available_keys"] = [*paths, *roots]
+    keys_shortened = len(paths) + len(roots) != len(original)
+    if keys_shortened:
+        append_omission_notice(
+            notices,
+            f"available_keys on {label or '(unlabeled)'} shortened to {len(paths) + len(roots)} of "
+            f"{len(original)} entries.",
+        )
+    return fitted, keys_shortened or reason_shortened
+
+
 def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
     """Return the one bounded model projection of a factual build-test packet."""
     notices = list(packet.omission_notices)
@@ -1052,9 +1133,9 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
 
     registered_outputs: list[BuildTestPacketRegisteredOutput] = []
     for output in packet.registered_outputs[:_BUILD_TEST_OUTPUT_MAX_ITEMS]:
-        rendered_output = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
-        block_output = output.output
-        value_complete = output.value_complete
+        block_output, keys_shortened = _fit_available_keys(output.output, output.label, notices)
+        rendered_output = json.dumps(block_output, ensure_ascii=False, separators=(",", ":"))
+        value_complete = output.value_complete and not keys_shortened
         if len(rendered_output) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS:
             block_output = rendered_output[: _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS - 3] + "..."
             value_complete = False
