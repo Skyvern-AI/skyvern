@@ -44,8 +44,8 @@ SIGINT_TIMEOUT = 5.0
 SIGTERM_TIMEOUT = 2.0
 # Deadline for the bridge's positive `READY` stdout ACK (emitted only after full X/XShm/FFmpeg/signal setup).
 # A miss is a startup REFUSAL (kill + fall back to Playwright), so it must cover trampoline re-exec + interpreter
-# start + ctypes CDLL loads + X handshake + FFmpeg Popen on a loaded worker; the 5s is paid only when wedged.
-STARTUP_ACK_TIMEOUT = 5.0
+# start + ctypes CDLL loads + X handshake + FFmpeg Popen on a loaded worker; the 15s is paid only when wedged.
+STARTUP_ACK_TIMEOUT = 15.0
 
 # The Xvfb screen / base window is 1920x1080; an absent/unparseable/larger-than-screen window falls back to
 # capturing the full screen. Output is bounded by the configured recording profile, aspect-preserved.
