@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,18 @@ def _register_console_listener(log_root: Path, monkeypatch: pytest.MonkeyPatch) 
     return context.console_listener, browser_artifacts
 
 
+def _events(logs: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
+    return [record for record in logs if record.get("event", "").startswith(prefix)]
+
+
 @pytest.mark.asyncio
-async def test_console_listener_survives_a_wiped_log_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A browser context outlives its activity, whose teardown wipes the shared log root. Every
-    console message the page emits after that must be dropped, not raised inside the pyee listener."""
+async def test_console_listener_recreates_a_wiped_log_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Activity teardown and the aged-dir stale sweep both remove the per-day dir under the shared log root
+    while a browser context that outlives its activity still holds a path there. Console output emitted after
+    the wipe must land in a recreated log — not raise inside the pyee listener, not be dropped — and the wipe
+    is reported once per browser, not once per message."""
     log_root = tmp_path / "log"
     listener, browser_artifacts = _register_console_listener(log_root, monkeypatch)
     log_path = browser_artifacts.browser_console_log_path
@@ -50,12 +59,36 @@ async def test_console_listener_survives_a_wiped_log_directory(tmp_path: Path, m
     assert "before teardown" in Path(log_path).read_text()
 
     clean_up_dir(str(log_root))
-    assert not Path(log_path).exists()
+    assert not Path(log_path).parent.exists()
 
     with structlog.testing.capture_logs() as logs:
         for i in range(50):
-            assert await browser_artifacts.append_browser_console_log(f"after teardown {i}\n") == 0
             await listener(_FakeConsoleMessage(f"after teardown {i}"))
 
-    unwritable = [r for r in logs if r.get("event", "").startswith("Browser console log is no longer writable")]
-    assert len(unwritable) == 1, "the loss must be reported once per browser, not once per console message"
+    lines = (await browser_artifacts.read_browser_console_log()).decode().splitlines()
+    retained = {line.split("[log]", 1)[1].split(" url=", 1)[0] for line in lines if "[log]" in line}
+    expected = {f"after teardown {i}" for i in range(50)}
+    assert expected <= retained, f"console output emitted after the wipe was lost: {sorted(expected - retained)}"
+    assert len(lines) == 50, "each post-wipe message must land exactly once"
+    assert len(_events(logs, "Browser console log directory was wiped")) == 1
+    assert not _events(logs, "Browser console log is no longer writable")
+
+
+@pytest.mark.asyncio
+async def test_console_listener_drops_output_when_the_log_directory_cannot_be_recreated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the wiped directory cannot be re-made, the listener still must not raise: the output is dropped
+    and the loss is reported once per browser, not once per console message."""
+    log_root = tmp_path / "log"
+    listener, browser_artifacts = _register_console_listener(log_root, monkeypatch)
+
+    shutil.rmtree(log_root)
+    log_root.write_text("a regular file now squats on the log root")
+
+    with structlog.testing.capture_logs() as logs:
+        for i in range(50):
+            await listener(_FakeConsoleMessage(f"after teardown {i}"))
+
+    assert await browser_artifacts.read_browser_console_log() == b""
+    assert len(_events(logs, "Browser console log is no longer writable")) == 1
