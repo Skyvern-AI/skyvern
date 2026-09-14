@@ -1787,6 +1787,12 @@ function Workspace({
     });
     yamlEntryHadChangesRef.current =
       useWorkflowHasChangesStore.getState().hasChanges;
+    // Freeze the pre-edit canvas as the clean baseline before the draft can
+    // diverge: a baseline captured once the draft is dirty is taken from the
+    // draft itself (effectiveDraft prefers it), baking the uncommitted edit in.
+    if (useWorkflowSnapshotStore.getState().snapshot === null) {
+      useWorkflowSnapshotStore.getState().captureSnapshot();
+    }
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
@@ -1953,7 +1959,15 @@ function Workspace({
           return false;
         }
       }
-      applyWorkflowUpdate(version, { persisted: persist });
+      // A non-persisting commit is a user edit that lands async (the convert
+      // round-trip outruns the canvas gesture window), so mark it — otherwise
+      // the baseline absorbs it as post-load materialization and the save
+      // confirmation sees nothing to confirm. A persisting commit already moved
+      // the baseline the only other way it may move: a successful save.
+      applyWorkflowUpdate(version, {
+        persisted: persist,
+        userDriven: !persist,
+      });
       yamlStore.close();
       return true;
     } catch (error) {
