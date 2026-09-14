@@ -1,5 +1,5 @@
 import { PlusIcon, Cross2Icon } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { nanoid } from "nanoid";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
@@ -41,6 +41,41 @@ function parsePairs(value: Record<string, string> | string | null): KV[] {
   return [];
 }
 
+/** The rows that actually make it into the emitted map: keyed, first-wins. */
+function effectiveEntries(pairs: Array<Pair | KV>): KV[] {
+  const seen = new Set<string>();
+  const entries: KV[] = [];
+  for (const { key, value } of pairs) {
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    entries.push({ key, value });
+  }
+  return entries;
+}
+
+function sameEntries(a: KV[], b: KV[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((entry, index) => {
+      const other = b[index];
+      return other?.key === entry.key && other?.value === entry.value;
+    })
+  );
+}
+
+function serialize(
+  entries: KV[],
+  asString: boolean,
+): Record<string, string> | string | null {
+  if (entries.length === 0) {
+    return asString ? "" : null;
+  }
+  const obj = Object.fromEntries(entries.map(({ key, value }) => [key, value]));
+  return asString ? JSON.stringify(obj) : obj;
+}
+
 function KeyValueInput({
   value,
   onChange,
@@ -52,32 +87,31 @@ function KeyValueInput({
     parsePairs(value).map((p) => ({ id: nanoid(), ...p })),
   );
 
+  // `value` is read at emit time rather than tracked as a dependency: this
+  // component owns the rows once mounted, and re-deriving them from the prop
+  // would fight the parent that renders the value we just emitted.
+  const valueRef = useRef(value);
   useEffect(() => {
-    const obj: Record<string, string> = {};
-    let hasDuplicateKey = false;
+    valueRef.current = value;
+  });
 
-    for (const { key, value } of pairs) {
-      if (!key) {
-        continue;
-      }
-      if (key in obj) {
-        hasDuplicateKey = true;
-        continue;
-      }
-      obj[key] = value;
+  useEffect(() => {
+    const hasDuplicateKey =
+      new Set(pairs.filter((p) => p.key).map((p) => p.key)).size !==
+      pairs.filter((p) => p.key).length;
+    if (hasDuplicateKey) {
+      return;
     }
 
-    if (!hasDuplicateKey) {
-      const output =
-        typeof value === "string"
-          ? Object.keys(obj).length
-            ? JSON.stringify(obj)
-            : ""
-          : Object.keys(obj).length
-            ? obj
-            : null;
-      onChange(output);
+    const entries = effectiveEntries(pairs);
+    // Mounting must not dirty the form. Serializing `{}` to `""` (or `null` to
+    // `null`) and handing that up on mount made merely opening a settings panel
+    // write to the parent's form state, re-rendering every field in it.
+    if (sameEntries(entries, effectiveEntries(parsePairs(valueRef.current)))) {
+      return;
     }
+
+    onChange(serialize(entries, typeof valueRef.current === "string"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairs]);
 
@@ -110,52 +144,47 @@ function KeyValueInput({
    */
   const handleBlurCapture = (e: React.FocusEvent<HTMLDivElement>) => {
     if (
-      e.relatedTarget === null ||
-      (e.currentTarget &&
-        e.relatedTarget &&
-        !e.currentTarget.contains(e.relatedTarget as Node))
+      !(
+        e.relatedTarget === null ||
+        (e.currentTarget &&
+          e.relatedTarget &&
+          !e.currentTarget.contains(e.relatedTarget as Node))
+      )
     ) {
-      const obj: Record<string, string> = {};
-      const reversedPairs = [...pairs].reverse();
-      for (const { key, value } of reversedPairs) {
-        if (!key && !value) {
-          continue;
-        }
-        if (key) {
-          if (key in obj) {
-            const oldValue = value;
-            const newValue = obj[key];
-            toast({
-              variant: "warning",
-              title: `Duplicate Header ('${key}')`,
-              description: `Header '${key}' already existed. It was changed from '${oldValue}' to '${newValue}'.`,
-            });
-            continue;
-          }
-          obj[key] = value;
-        }
+      return;
+    }
+
+    // Resolved before anything is toasted so every loser is reported against
+    // the value that actually survives, and outside the state updater, which
+    // React is free to invoke more than once.
+    const winners = new Map<string, Pair>();
+    for (const pair of pairs) {
+      if (pair.key) {
+        winners.set(pair.key, pair);
       }
+    }
 
-      const reversedObj = Object.fromEntries(Object.entries(obj).reverse());
+    for (const pair of pairs) {
+      const winner = pair.key ? winners.get(pair.key) : undefined;
+      if (!winner || winner === pair) {
+        continue;
+      }
+      toast({
+        variant: "warning",
+        title: `Duplicate Header ('${pair.key}')`,
+        description: `Header '${pair.key}' already existed. It was changed from '${pair.value}' to '${winner.value}'.`,
+      });
+    }
 
-      const output =
-        typeof value === "string"
-          ? Object.keys(reversedObj).length
-            ? JSON.stringify(reversedObj)
-            : ""
-          : Object.keys(reversedObj).length
-            ? reversedObj
-            : null;
-
-      onChange(output);
-
-      setPairs(
-        Object.entries(reversedObj).map(([key, value]) => ({
-          id: nanoid(),
-          key,
-          value,
-        })),
-      );
+    const next = Array.from(winners.values());
+    // Row ids are React keys. Handing back a new array of rows on every
+    // focus-out remounted every input, which drops the caret and — when the
+    // focused input is the one being removed — re-enters this handler.
+    const unchanged =
+      next.length === pairs.length &&
+      next.every((pair, index) => pair.id === pairs[index]?.id);
+    if (!unchanged) {
+      setPairs(next);
     }
   };
 
