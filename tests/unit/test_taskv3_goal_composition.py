@@ -70,6 +70,7 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
     "complete_criterion": (None, "the confirmation page is showing"),
     "terminate_criterion": (None, "the form says the role is closed"),
     "error_code_mapping": (None, {"ROLE_CLOSED": "the posting is no longer accepting submissions"}),
+    "criteria_precedence": (False, True),
     "framing": ("", "This is one block of a larger workflow."),
     "block_context_section": ("", "<workflow_context>\nblocks: one, two\n</workflow_context>"),
 }
@@ -80,7 +81,7 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
 def test_compose_goal_is_byte_identical_to_the_inline_patching_it_replaced(
     navigation_goal: str, mask: tuple[int, ...]
 ) -> None:
-    # Every on/off combination of the seven directives, against both an empty and a non-empty
+    # Every on/off combination of the eight directives, against both an empty and a non-empty
     # navigation goal. The empty one matters: the first directive's .strip() is what decides
     # whether the goal opens with a blank line, and that only shows up when the base is "".
     chosen = {name: options[bit] for (name, options), bit in zip(_DIRECTIVE_VALUES.items(), mask)}
@@ -96,12 +97,14 @@ def _goal_as_agent_py_built_it(
     extracted_information_schema: Any,
     complete_criterion: str | None,
     terminate_criterion: str | None,
+    criteria_precedence: bool,
     error_code_mapping: dict[str, str] | None,
     framing: str,
     block_context_section: str,
 ) -> str:
-    """The goal-patching expressions exactly as `ForgeAgent._execute_task_v3` inlined them before
-    `compose_goal` existed, frozen here as the oracle for the extraction.
+    """The goal-patching expressions as `ForgeAgent._execute_task_v3` inlined them before `compose_goal`
+    existed, frozen here as the oracle for the extraction, plus any directive a later commit deliberately
+    reworded -- the overlap-precedence sentence is one such, so this is no longer a pure historical record.
 
     This is deliberately a duplicate of production wording: it is the only thing that can catch a
     single dropped space or reordered clause in a refactor whose entire acceptance bar is that the
@@ -126,6 +129,15 @@ def _goal_as_agent_py_built_it(
     if terminate_criterion:
         goal = (
             f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {terminate_criterion}"
+        ).strip()
+    if complete_criterion and terminate_criterion and criteria_precedence:
+        # SKY-16193: the one deliberate divergence from what agent.py inlined. Criteria that can hold
+        # at once had no stated precedence, and v3 resolved that the opposite way to the engine they
+        # were authored against. Updated here in the same commit as the production wording, which is
+        # what this oracle's docstring asks of a change that means to reword a directive.
+        goal = (
+            f"{goal}\n\nIf the completion criterion and the termination criterion both hold at once, "
+            "the completion criterion wins: finish with status=completed."
         ).strip()
     if error_code_mapping:
         goal = (
@@ -163,3 +175,93 @@ def test_the_split_modules_stay_one_way_dependent_on_goal_composition() -> None:
         assert not any("goal_composition" in ref for ref in imported), (
             f"{module} imports goal_composition; the responsibilities are re-conflating"
         )
+
+
+def test_two_criteria_that_can_hold_at_once_get_an_explicit_precedence() -> None:
+    """A block whose criteria overlap has no correct answer without a precedence rule, and the two
+    engines frame that choice differently (SKY-16193).
+
+    The measured case: complete was "if no error message is present" and terminate ended "...or if
+    pop up message is not available". On a page with neither an error nor a popup BOTH hold, and
+    nothing told the model which to apply.
+
+    Effect size, arm-resolved, over runs that REACHED the block: v3 terminated there 22/37 = 59.5%
+    of the time against v1's 14/119 = 11.8%. That establishes something costly happens here; it
+    does not establish what. What does is the composition. v1's `decisive-criterion-validate.j2`
+    asks for "only one action" and resolves both criteria inside a single enum rule that names
+    COMPLETE first (`:11`, `:15`); v3 renders the terminate criterion as its own standing interrupt
+    -- "If this becomes true, stop and finish with status=terminated". The criteria were authored
+    against v1, so v3 is the one that has to say which wins.
+
+    And v1 fails this block too, 14 times in three days. Any mechanism proposed for it has to
+    explain a 5x ratio, not a v3-only defect.
+    """
+    both = compose_goal(
+        "Add the store.",
+        GoalDirectives(
+            complete_criterion="no error message is present",
+            terminate_criterion="an error message is present, or the pop up is not available",
+            criteria_precedence=True,
+        ),
+    )
+    assert "the completion criterion wins" in both
+    # Precedence for the OVERLAP only. An earlier draft added "terminate only when the termination
+    # criterion holds", which reads as a ban on every other use of the status -- and `terminated` is
+    # also how this engine reports being blocked, while v1 terminates whenever a complete criterion is
+    # provided and not met. A precedence rule must not narrow the status it mentions.
+    # The flag must add EXACTLY this paragraph and nothing else. An earlier guard asserted only that
+    # ONE paragraph was added containing ONE full stop, which constrains punctuation rather than
+    # content: round 1's prohibition walks straight through it joined by a semicolon, the naming fix
+    # reverts to a demonstrative untouched, and even inverting the prescribed status passes. Asserting
+    # the text verbatim is what makes the intent readable at the one place a reviewer looks.
+    #
+    # What equality buys, precisely: accidental defeat becomes impossible, and a DELIBERATE edit
+    # becomes visible in the diff, because changing the sentence means retyping it here. It does NOT
+    # make a lockstep edit impossible -- the oracle's docstring still invites one, and someone who
+    # updates production, the oracle and this line together will pass. Naming that boundary is the
+    # point; a fourth guard claiming to close it would repeat the error one level up.
+    #
+    # And it cannot see a prohibition appended to a DIFFERENT directive: the delta is between the
+    # gated and ungated renders, so text added to both cancels. That is a property of the oracle
+    # beside it rather than of this flag.
+    #
+    # AND IT IS THE SOLE CATCH FOR A LOCKSTEP EDIT. A lockstep change defeats the byte-identity mask
+    # BY CONSTRUCTION -- production and the oracle agree again -- so all 512 mask cases stay GREEN and
+    # only the assertion below reds. Three defeats are demonstrated against it: a semicolon for the
+    # full stop, the prescribed status inverted to `terminated`, and a demonstrative restored in the
+    # condition. Weaken, move or lose this one assertion in a refactor and all three go invisible
+    # with every other test in the file still green.
+    ungated_for_delta = compose_goal(
+        "Add the store.",
+        GoalDirectives(
+            complete_criterion="no error message is present",
+            terminate_criterion="an error message is present, or the pop up is not available",
+        ),
+    )
+    added = [p for p in both.split("\n\n") if p not in ungated_for_delta.split("\n\n")]
+    assert added == [
+        "If the completion criterion and the termination criterion both hold at once, "
+        "the completion criterion wins: finish with status=completed."
+    ], added
+    # Named rather than implied: the model must be able to tell which of the two it is applying.
+    assert both.index("Consider the goal complete") < both.index("the completion criterion wins")
+
+    # One criterion alone cannot conflict with anything, so it gets no precedence sentence.
+    complete_only = compose_goal(
+        "Add the store.", GoalDirectives(complete_criterion="the store is listed", criteria_precedence=True)
+    )
+    terminate_only = compose_goal(
+        "Add the store.", GoalDirectives(terminate_criterion="the posting closed", criteria_precedence=True)
+    )
+    assert "the completion criterion wins" not in complete_only
+    assert "the completion criterion wins" not in terminate_only
+
+    # And it is OFF unless the caller asks: v1 shows the terminate criterion to a decision-maker only on
+    # validation tasks, so a rule about which criterion wins has no measured meaning anywhere else.
+    ungated = compose_goal(
+        "Add the store.",
+        GoalDirectives(complete_criterion="no error message is present", terminate_criterion="the pop up is missing"),
+    )
+    assert "the completion criterion wins" not in ungated
+    # Worded without "the page": a page-free validation block is told it has no browser tools at all.
+    assert "the page satisfies" not in both
