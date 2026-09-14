@@ -585,7 +585,15 @@ async def _take_workflow_run_block_screenshot(
     if not browser_state:
         LOG.info("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
-        screenshot = await browser_state.take_fullpage_screenshot()
+        try:
+            screenshot = await browser_state.take_fullpage_screenshot()
+        except Exception:
+            LOG.warning(
+                "Failed to take screenshot before executing the block, ignoring the exception",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+            )
+            screenshot = None
         if screenshot:
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                 workflow_run_block=workflow_run_block,
