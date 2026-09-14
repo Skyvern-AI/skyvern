@@ -4,7 +4,7 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -133,6 +133,27 @@ function validateWorkflowForRun(
   }
 
   return getLoginBlocksWithoutCredentials(workflow.workflow_definition.blocks);
+}
+
+/**
+ * Compares the raw form values, not the parsed ones: parsing a json parameter
+ * mints a fresh object every call, so comparing after the parse would report
+ * "changed" on every keystroke for any workflow that has one.
+ */
+function isSameRunParameters(
+  previous: Record<string, unknown> | null,
+  next: Record<string, unknown>,
+): boolean {
+  if (previous === null) {
+    return false;
+  }
+  const previousKeys = Object.keys(previous);
+  return (
+    previousKeys.length === Object.keys(next).length &&
+    previousKeys.every(
+      (key) => key in next && Object.is(previous[key], next[key]),
+    )
+  );
 }
 
 // Utility function to omit specified keys from an object
@@ -683,6 +704,7 @@ function RunWorkflowForm({
     string,
     unknown
   > | null>(null);
+  const rawRunParametersRef = useRef<Record<string, unknown> | null>(null);
   const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
   const [isFormReset, setIsFormReset] = useState(false);
   const cacheKey = workflow?.cache_key ?? "default";
@@ -819,14 +841,18 @@ function RunWorkflowForm({
       "cdpConnectHeaders",
       "cdpAddress",
       "runWith",
+      "aiFallback",
     ]);
 
-    const parsedParameters = parseValuesForWorkflowRun(
-      parameters,
-      workflowParameters,
-    );
+    // A settings-only edit still fires this subscription, and a fresh object
+    // would re-render the whole form (every CodeMirror editor in it included)
+    // for a parameter set that did not move.
+    if (isSameRunParameters(rawRunParametersRef.current, parameters)) {
+      return;
+    }
+    rawRunParametersRef.current = parameters;
 
-    setRunParameters(parsedParameters);
+    setRunParameters(parseValuesForWorkflowRun(parameters, workflowParameters));
   }
 
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
