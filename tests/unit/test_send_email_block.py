@@ -11,6 +11,8 @@
   blocks deliver to every address, and an invalid one fails the block without being echoed.
 - SKY-15919: `body_format: html` on either block sends a multipart/alternative message (generated
   plain-text part + sanitized HTML part); the default `text` path is byte-identical to before.
+- SKY-16062: the subject is exactly what the user wrote — no run id is appended. Users who
+  want it place {{workflow_run_id}} themselves.
 """
 
 from __future__ import annotations
@@ -1102,3 +1104,37 @@ def test_generated_script_emits_body_format_only_when_html() -> None:
     assert "body_format" not in compact(_send_email_block().model_dump())
     legacy_block = {"label": "notify", "sender": "me@example.com", "recipients": [], "subject": "s", "body": "b"}
     assert "body_format" not in compact(legacy_block)
+
+
+@pytest.mark.asyncio
+async def test_subject_carries_only_what_the_user_wrote(offline_address_validation: None) -> None:
+    context = _workflow_run_context({})
+
+    block = _send_email_block(subject="  Your order shipped  ")
+    block.format_potential_template_parameters(context)
+
+    assert (await block._build_email_message(context, "wr_1"))["Subject"] == "Your order shipped"
+
+
+@pytest.mark.asyncio
+async def test_subject_renders_the_run_id_where_the_user_placed_it(offline_address_validation: None) -> None:
+    context = _workflow_run_context({})
+
+    block = _send_email_block(subject="Your Run is Finished {{workflow_run_id}}")
+    block.format_potential_template_parameters(context)
+
+    assert (await block._build_email_message(context, "wr_1"))["Subject"] == "Your Run is Finished wr_1"
+
+
+@pytest.mark.asyncio
+async def test_a_substituted_newline_is_flattened_rather_than_failing_the_send(
+    offline_address_validation: None,
+) -> None:
+    context = _workflow_run_context({"injected": "ok\r\nBcc: attacker@example.com"})
+
+    block = _send_email_block(subject="Report {{injected}}")
+    block.format_potential_template_parameters(context)
+    message = await block._build_email_message(context, "wr_1")
+
+    assert message["Subject"] == "Report okBcc: attacker@example.com"
+    assert message["BCC"] == "sender@example.com"

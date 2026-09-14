@@ -78,7 +78,7 @@ function SendEmailEditorBody({
           nodeId={blockId}
           onChange={(value) => update({ subject: value })}
           value={subject}
-          placeholder="What is the gist?"
+          placeholder="Your Run is Finished {{workflow_run_id}}"
           className="nopan text-xs"
         />
       </div>
