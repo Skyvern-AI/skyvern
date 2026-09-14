@@ -38,9 +38,13 @@ ToolStatus = Literal["ok", "error"]
 FinishStatus = Literal["completed", "failed", "terminated"]
 
 # Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
-# because the whole value of the facet is that it is closed: it is written at ~28 sites across two
-# modules, and a typo or a near-synonym added later would split a cohort silently. mypy runs on both
-# modules, so a value not listed here is rejected at the call site rather than discovered in a chart.
+# because the whole value of the facet is that it is closed: it is written at ~33 literal sites in
+# tools.py, and a typo or a near-synonym added later would split a cohort silently. Enforcement is
+# invocation-shaped: `mypy.ini` sets `follow_imports = skip`, so the annotation binds in tools.py only
+# while THIS module is in the same mypy run. CI's `pre-commit run mypy --all-files` includes it and
+# rejects an undeclared value; checking tools.py alone does not. The AST source census in
+# tests/unit/test_taskv3_loop.py backstops the runs that miss it, and it can only read a value spelled
+# as a literal at the write site.
 ToolErrorClass = Literal[
     # The address did not resolve to what it named.
     "stale_selector",
@@ -58,6 +62,13 @@ ToolErrorClass = Literal[
     "covered",
     "inert",
     "unreachable",
+    # The field resolved and the page cooperated, but the requested VALUE named no single option.
+    # Each of these names only what was READ: an absence claim holds solely over a list read in full,
+    # which is why a declared-but-truncated list gets `rows_unread` rather than `no_matching_row`.
+    "ambiguous_rows",
+    "identical_rows",
+    "no_matching_row",
+    "rows_unread",
     # The handler raised instead of returning; classified by `_raised_error_class`.
     "driver_timeout",
     "timeout_other",

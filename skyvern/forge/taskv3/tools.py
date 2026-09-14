@@ -383,6 +383,9 @@ class _TypeaheadPick(NamedTuple):
     clicked: bool
     declared: bool
     note: str | None = None
+    # How many rows the widget DECLARED beyond the ones it rendered, so a refusal can tell "nothing on
+    # this list is it" from "nothing on the part of it we could read".
+    overflow: int = 0
     # Whether the commit surface already vouched for the chosen label BEFORE the pick click — such a
     # surface proves nothing about the commit and must not vouch for it downstream either.
     pre_surface_hit: bool = False
@@ -555,7 +558,13 @@ def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_du
 
 
 def _ambiguous_rows_error(
-    selector: str, value: str, rows: list[dict[str, Any]], *, next_step: str, note: str | None = None
+    selector: str,
+    value: str,
+    rows: list[dict[str, Any]],
+    *,
+    next_step: str,
+    note: str | None = None,
+    rows_unread: bool = False,
 ) -> ToolResult:
     """The refusal owed a caller when rows reacted and none of them IS the requested value.
 
@@ -566,16 +575,24 @@ def _ambiguous_rows_error(
     shown = rows[:15]
     listing = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
     more = len(rows) - len(shown)
+    # One row that is not the value is a different refusal from several the value cannot choose between:
+    # nothing on the list is it, so there is no pick to make. Same wording fork, same facet fork -- a
+    # single class over both would merge two cohorts the code already tells apart in prose.
+    several = len(rows) > 1
     lead = (
         f"{value!r} matches several rows in {selector}: "
-        if len(rows) > 1
+        if several
         else f"{value!r} is not the one row showing in {selector}: "
     )
     tail = f" ({note})" if note else ""
-    return ToolResult.error(
-        f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled",
-        data={"release_own_list": True},
-    )
+    message = f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+    # Spelled as literal writes rather than one computed error_class: the source census can only read a
+    # literal, and a single-file mypy run does not bind the annotation across the import either.
+    if several:
+        return ToolResult.error(message, data={"release_own_list": True}, error_class="ambiguous_rows")
+    if rows_unread:
+        return ToolResult.error(message, data={"release_own_list": True}, error_class="rows_unread")
+    return ToolResult.error(message, data={"release_own_list": True}, error_class="no_matching_row")
 
 
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
@@ -653,6 +670,7 @@ def _identical_text_rows_error(
         f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
         "is NOT filled",
         data=None if tags_live else {"release_own_list": True},
+        error_class="identical_rows",
     )
 
 
@@ -9564,6 +9582,7 @@ def build_browser_tools(
                 clicked=False,
                 declared=declared_rows,
                 note=note,
+                overflow=overflow,
             )
         best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
         info = await _row_info(idx)
@@ -10023,6 +10042,7 @@ def build_browser_tools(
                 pick.candidates,
                 next_step="call select_combobox with the option's full text",
                 note=pick.note,
+                rows_unread=bool(pick.overflow),
             )
         if pick.suggestion:
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
@@ -10839,7 +10859,12 @@ def build_browser_tools(
                         return _identical_text_rows_error(selector, value, same_text, tags_live=False, note=pick.note)
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return _ambiguous_rows_error(
-                        selector, value, pick.candidates, next_step="pass the option's full text", note=pick.note
+                        selector,
+                        value,
+                        pick.candidates,
+                        next_step="pass the option's full text",
+                        note=pick.note,
+                        rows_unread=bool(pick.overflow),
                     )
                 # No suggestion reacted at all -- but that alone does not say a list never rendered: a
                 # searchable typeahead that filtered to zero and a non-searchable widget that never filters
