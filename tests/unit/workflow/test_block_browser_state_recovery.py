@@ -1254,6 +1254,31 @@ def _crashable_page() -> MagicMock:
     return page
 
 
+def _crashable_context(*pages: MagicMock) -> MagicMock:
+    """A connected context: a renderer crash leaves the browser itself alive."""
+    context = MagicMock(pages=list(pages))
+    context.browser.is_connected = MagicMock(return_value=True)
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    context.new_page = AsyncMock()
+    return context
+
+
+def _replacement_page_opener(context: MagicMock, replacement: MagicMock, order: list[str]) -> AsyncMock:
+    """new_page as Playwright behaves: the new tab joins context.pages before the call returns."""
+
+    async def _open() -> MagicMock:
+        order.append("new_page")
+        context.pages.append(replacement)
+        return replacement
+
+    return AsyncMock(side_effect=_open)
+
+
+async def _reap_crashed_pages(state: RealBrowserState) -> None:
+    async with asyncio.timeout(10):
+        await asyncio.gather(*list(state._detached_teardown_tasks))
+
+
 async def _never_returns() -> None:
     await asyncio.sleep(3600)
 
@@ -1305,6 +1330,340 @@ async def test_a_crashed_page_is_excluded_before_its_close_lands() -> None:
 
 
 @pytest.mark.asyncio
+async def test_closing_the_crashed_only_tab_opens_its_replacement_first() -> None:
+    """A headed Linux Chromium exits with its last tab and takes the CDP endpoint with it, so the
+    replacement must exist before the crashed only-tab closes, and it must be the existing recovery
+    so the next caller resumes on the URL the crashed tab was on (SKY-16016)."""
+    order: list[str] = []
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    crashed.close = AsyncMock(side_effect=lambda: order.append("close"))
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, order)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock(side_effect=lambda page, url: order.append(f"navigate:{url}"))
+
+    state._on_page_crashed(crashed)
+    await _reap_crashed_pages(state)
+
+    assert order == ["new_page", "close", "navigate:https://example.invalid/form"]
+    assert await state.must_get_working_page() is replacement
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_url_restore_does_not_hold_the_crashed_target_open() -> None:
+    """The restore navigation can retry for minutes against an unreachable URL; the dead target
+    must already be closed by then, or every later CDP attach still lands on it."""
+    order: list[str] = []
+    closed = asyncio.Event()
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+
+    async def _close() -> None:
+        order.append("close")
+        closed.set()
+
+    crashed.close = AsyncMock(side_effect=_close)
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, order)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+
+    async def _restore_stalls(**_: object) -> None:
+        order.append("navigate")
+        await _never_returns()
+
+    state.navigate_to_url = AsyncMock(side_effect=_restore_stalls)
+
+    state._on_page_crashed(crashed)
+
+    try:
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        # The event fires inside the close; the stalled navigate may not have started yet.
+        assert order[:2] == ["new_page", "close"]
+    finally:
+        for task in list(state._detached_teardown_tasks):
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_caller_that_wins_the_replacement_closes_the_crashed_target_before_its_restore() -> None:
+    """The caller's own recovery can hold the reopen lock through a restore that retries for minutes;
+    the crashed target must close as soon as that caller's replacement exists, not after the reaper
+    finally gets the lock."""
+    order: list[str] = []
+    gate = asyncio.Event()
+    closed = asyncio.Event()
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+
+    async def _close() -> None:
+        order.append("close")
+        closed.set()
+
+    crashed.close = AsyncMock(side_effect=_close)
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+
+    async def _open_when_released() -> MagicMock:
+        order.append("new_page")
+        await gate.wait()
+        context.pages.append(replacement)
+        return replacement
+
+    context.new_page = AsyncMock(side_effect=_open_when_released)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+
+    async def _restore_stalls(**_: object) -> None:
+        order.append("navigate")
+        await _never_returns()
+
+    state.navigate_to_url = AsyncMock(side_effect=_restore_stalls)
+
+    # The crash mark lands synchronously at crash time; here the caller reacts before the reaper task
+    # runs, so its recovery holds the lock inside new_page() when the reaper queues behind it.
+    state._crashed_pages.add(crashed)
+    caller = asyncio.create_task(state.must_get_working_page())
+    await asyncio.sleep(0)
+    state._on_page_crashed(crashed)
+    gate.set()
+
+    try:
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        assert order[:2] == ["new_page", "close"]
+        assert context.new_page.await_count == 1
+    finally:
+        caller.cancel()
+        for task in list(state._detached_teardown_tasks):
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_consumers_wait_for_the_recovered_page_instead_of_the_blank_replacement() -> None:
+    """While a recovery is restoring the replacement's URL, every consumer waits for the finished
+    page: none is handed about:blank to drive or to navigate away from, and get_or_create_page does
+    not open a tab of its own and close the one being recovered."""
+    order: list[str] = []
+    restore_started = asyncio.Event()
+    restore_gate = asyncio.Event()
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, order)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+
+    async def _restore_when_released(**_: object) -> None:
+        restore_started.set()
+        await restore_gate.wait()
+
+    state.navigate_to_url = AsyncMock(side_effect=_restore_when_released)
+
+    state._on_page_crashed(crashed)
+    await asyncio.wait_for(restore_started.wait(), timeout=1)
+    consumers = [
+        asyncio.create_task(state.get_working_page()),
+        asyncio.create_task(state.must_get_working_page()),
+        asyncio.create_task(state.get_or_create_page()),
+    ]
+    await asyncio.sleep(0)
+    assert not any(consumer.done() for consumer in consumers)
+
+    restore_gate.set()
+    await _reap_crashed_pages(state)
+
+    assert [await consumer for consumer in consumers] == [replacement, replacement, replacement]
+    assert context.new_page.await_count == 1
+    state.navigate_to_url.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_crashed_target_close_does_not_expose_the_blank_replacement() -> None:
+    """The gate closes before the replacement appears, so the crashed-target close that runs ahead of
+    the restore cannot leak the blank tab to a consumer either."""
+    close_started = asyncio.Event()
+    close_gate = asyncio.Event()
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+
+    async def _close_when_released() -> None:
+        close_started.set()
+        await close_gate.wait()
+
+    crashed.close = AsyncMock(side_effect=_close_when_released)
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, [])
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock()
+
+    state._on_page_crashed(crashed)
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    consumer = asyncio.create_task(state.get_working_page())
+    await asyncio.sleep(0)
+    assert not consumer.done()
+
+    close_gate.set()
+    await _reap_crashed_pages(state)
+
+    assert await consumer is replacement
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_recovery_owner_leaves_the_crashed_target_for_the_reaper_to_close() -> None:
+    """A caller whose recovery wins can be cancelled while it awaits a slow close; the target must not
+    stay marked as closing, or the queued reaper skips it and nothing ever retries."""
+    closed = asyncio.Event()
+    attempts: list[int] = []
+
+    async def _hang_then_close() -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            await _never_returns()
+        closed.set()
+
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    crashed.close = AsyncMock(side_effect=_hang_then_close)
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, [])
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock()
+
+    state._crashed_pages.add(crashed)
+    owner = asyncio.create_task(state.must_get_working_page())
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert attempts == [1]
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    state._on_page_crashed(crashed)
+    try:
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        assert crashed.close.await_count == 2
+    finally:
+        for task in list(state._detached_teardown_tasks):
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_new_page_fails_the_recovery_within_the_bound_and_releases_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every consumer waits on the recovery, so a CDP new_page() that never answers must fail it
+    within the bound; the crashed tab is then left open rather than the browser losing its last tab."""
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_PAGE_CLOSE_TIMEOUT", 0.05)
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    context = _crashable_context(crashed)
+    context.new_page = AsyncMock(side_effect=_never_returns)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+
+    state._on_page_crashed(crashed)
+    await asyncio.sleep(0)
+    consumer = asyncio.create_task(state.get_working_page())
+
+    try:
+        assert await asyncio.wait_for(consumer, timeout=1) is None
+        await _reap_crashed_pages(state)
+        crashed.close.assert_not_awaited()
+    finally:
+        for task in list(state._detached_teardown_tasks):
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_caller_that_recovered_first_still_gets_the_crashed_target_closed() -> None:
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    context.new_page = _replacement_page_opener(context, replacement, [])
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock()
+
+    state._crashed_pages.add(crashed)
+    assert await state.must_get_working_page() is replacement
+    state._on_page_crashed(crashed)
+    await _reap_crashed_pages(state)
+
+    crashed.close.assert_awaited_once()
+    assert context.new_page.await_count == 1
+    state.navigate_to_url.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_caller_recovering_during_the_reap_gets_the_reaper_replacement() -> None:
+    """The caller whose action just failed reaches for a page while the reaper is still opening
+    one; it must wait for that page rather than open a second tab."""
+    order: list[str] = []
+    gate = asyncio.Event()
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+
+    async def _open_when_released() -> MagicMock:
+        order.append("new_page")
+        await gate.wait()
+        context.pages.append(replacement)
+        return replacement
+
+    context.new_page = AsyncMock(side_effect=_open_when_released)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock()
+
+    state._on_page_crashed(crashed)
+    caller = asyncio.create_task(state.must_get_working_page())
+    await asyncio.sleep(0)
+    gate.set()
+    await _reap_crashed_pages(state)
+
+    assert await caller is replacement
+    assert context.new_page.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_tab_with_a_live_sibling_closes_without_opening_another() -> None:
+    crashed = _crashable_page()
+    survivor = _crashable_page()
+    context = _crashable_context(crashed, survivor)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+
+    state._on_page_crashed(crashed)
+    await _reap_crashed_pages(state)
+
+    context.new_page.assert_not_awaited()
+    crashed.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_only_tab_stays_open_when_no_replacement_can_be_opened() -> None:
+    crashed = _crashable_page()
+    context = _crashable_context(crashed)
+    context.new_page = AsyncMock(side_effect=RuntimeError("target could not be created"))
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+
+    state._on_page_crashed(crashed)
+    await _reap_crashed_pages(state)
+
+    crashed.close.assert_not_awaited()
+    assert await state.list_valid_pages() == []
+
+
+@pytest.mark.asyncio
 async def test_a_close_that_swallows_cancellation_still_exhausts_its_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1320,7 +1679,7 @@ async def test_a_close_that_swallows_cancellation_still_exhausts_its_attempts(
             return
 
     page.close = AsyncMock(side_effect=_swallow_cancellation)
-    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[page]))
+    state = RealBrowserState(pw=MagicMock(), browser_context=_crashable_context(page))
 
     await state._close_crashed_page(page)
 
@@ -1339,7 +1698,7 @@ async def test_a_timed_out_crashed_page_close_is_retried_once(monkeypatch: pytes
             await _never_returns()
 
     page.close = AsyncMock(side_effect=_hang_once_then_succeed)
-    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[page]))
+    state = RealBrowserState(pw=MagicMock(), browser_context=_crashable_context(page))
 
     await state._close_crashed_page(page)
 
@@ -1354,14 +1713,13 @@ async def test_crashed_page_close_is_bounded_and_never_raises(monkeypatch: pytes
     stubborn.close = AsyncMock(side_effect=RuntimeError("close refused"))
     hanging = _crashable_page()
     hanging.close = AsyncMock(side_effect=_never_returns)
-    context = MagicMock(pages=[crashed, stubborn, hanging])
+    context = _crashable_context(crashed, stubborn, hanging)
     state = RealBrowserState(pw=MagicMock(), browser_context=context)
 
     state._on_page_crashed(crashed)
     state._on_page_crashed(stubborn)
     state._on_page_crashed(hanging)
-    async with asyncio.timeout(10):
-        await asyncio.gather(*list(state._detached_teardown_tasks))
+    await _reap_crashed_pages(state)
 
     crashed.close.assert_awaited_once()
     stubborn.close.assert_awaited_once()

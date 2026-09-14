@@ -100,6 +100,9 @@ class _Browser:
         self.candidate_context = _BrowserContext(self)
         return self.candidate_context
 
+    def is_connected(self) -> bool:
+        return not self.closed
+
     async def close(self) -> None:
         self.closed = True
 
