@@ -95,6 +95,15 @@ class RealBrowserState(BrowserState):
         self._disconnect_listener_browser: Browser | None = None
         self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._crashed_targets_closing: weakref.WeakSet[Page] = weakref.WeakSet()
+        # Cleared while a recovery is producing the working page (opening it, closing crashed targets,
+        # restoring its URL): consumers wait for the finished page instead of driving about:blank or
+        # opening a tab of their own.
+        self._working_page_ready = asyncio.Event()
+        self._working_page_ready.set()
+        # The crash reaper and the caller whose action just failed both reach for a replacement page
+        # at the same moment; single-flight keeps that one page, not one per racer.
+        self._reopen_working_page_lock = asyncio.Lock()
         # Browsers without a persistent-session id cannot use the S3 registry. The state is still
         # the exclusive owner across an in-process remote-driver reconnect, so it retains the
         # trusted registration records until the state itself closes.
@@ -190,25 +199,42 @@ class RealBrowserState(BrowserState):
         # page treats "no page" as fatal, so one of them recovering only relocates the failure.
         if self.browser_context is None or not self.is_connected():
             return None
-        lost_page = self.__page
-        restore_url = lost_page.url if lost_page is not None else ""
-        try:
-            page = await self.browser_context.new_page()
-        except Exception:
-            LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
-            return None
-        await self.set_working_page(page)
-        if restore_url and restore_url not in BLANK_PAGE_URLS:
+        async with self._reopen_working_page_lock:
+            already_reopened = await self.get_working_page()
+            if already_reopened is not None:
+                await self._close_crashed_targets()
+                return already_reopened
+            lost_page = self.__page
+            restore_url = lost_page.url if lost_page is not None else ""
+            # A fresh event per recovery rather than clear(): the browser-API census counts every
+            # .clear() call site as a page sink.
+            ready = self._working_page_ready = asyncio.Event()
             try:
-                await self.navigate_to_url(page=page, url=restore_url)
-            except Exception:
-                LOG.warning(
-                    "Re-opened the working page but could not restore the URL it was on",
-                    url=restore_url,
-                    exc_info=True,
-                )
-        LOG.info("Re-opened the working page after it was lost", url=restore_url)
-        return page
+                # Bounded: every get_working_page consumer waits on this recovery, so a hung CDP call must
+                # fail it within the bound rather than hold them all.
+                try:
+                    async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                        page = await self.browser_context.new_page()
+                except Exception:
+                    LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
+                    return None
+                await self.set_working_page(page)
+                # Whoever opens the replacement closes the crashed targets, and does it before a restore
+                # that can retry for minutes: the reaper may be queued behind this lock.
+                await self._close_crashed_targets()
+                if restore_url and restore_url not in BLANK_PAGE_URLS:
+                    try:
+                        await self.navigate_to_url(page=page, url=restore_url)
+                    except Exception:
+                        LOG.warning(
+                            "Re-opened the working page but could not restore the URL it was on",
+                            url=restore_url,
+                            exc_info=True,
+                        )
+            finally:
+                ready.set()
+            LOG.info("Re-opened the working page after it was lost", url=restore_url)
+            return page
 
     async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
         cur_page = await self.get_working_page()
@@ -424,6 +450,7 @@ class RealBrowserState(BrowserState):
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
 
     async def get_working_page(self) -> Page | None:
+        await self._working_page_ready.wait()
         if self.__page is None or self.browser_context is None:
             return None
 
@@ -668,24 +695,59 @@ class RealBrowserState(BrowserState):
         self._own_detached_task(task, "close_crashed_page")
 
     async def _close_crashed_page(self, page: Page) -> None:
+        self._crashed_pages.add(page)
+        context = self.browser_context
+        if context is None or any(other is not page and other not in self._crashed_pages for other in context.pages):
+            await self._close_crashed_target(page)
+            return
+        # A headed Chromium on Linux exits when its last tab closes, and a persistent-session pod runs
+        # exactly that: closing a crashed only-tab took the whole browser and its CDP endpoint with it,
+        # leaving the pod answering 502 until its timeout. Reopen first so the browser always keeps a
+        # window; the recovery closes the crashed target the moment a replacement exists, whichever
+        # caller opened it. If none can be opened, leave the crashed tab: it is already excluded from
+        # selection, and a stranded tab is recoverable where a dead browser is not.
+        if await self._reopen_lost_working_page() is None:
+            LOG.warning(
+                "Could not open a replacement for the crashed last tab; leaving it open so the browser stays alive",
+                url=page.url,
+            )
+
+    async def _close_crashed_targets(self) -> None:
+        for page in list(self._crashed_pages):
+            await self._close_crashed_target(page)
+
+    async def _close_crashed_target(self, page: Page) -> None:
+        if page in self._crashed_targets_closing:
+            return
+        self._crashed_targets_closing.add(page)
         # The crash event fires once. Excluding the page from selection keeps this process healthy, but
         # only closing the target unblocks later CDP attaches, so a hung close is retried up to
         # CRASHED_PAGE_CLOSE_ATTEMPTS before the target is reported stranded. Bounded by racing the
         # close rather than by asyncio.timeout, for the reason _run_bounded_detachable already
         # documents: a Playwright close can ignore the cancel a timeout delivers, and that would look
         # like success here and skip the retry. A close that raises has finished, so it is not retried.
-        for _ in range(CRASHED_PAGE_CLOSE_ATTEMPTS):
-            closing = asyncio.ensure_future(page.close())
-            done, _pending = await asyncio.wait({closing}, timeout=BROWSER_PAGE_CLOSE_TIMEOUT)
-            if closing not in done:
+        closing: asyncio.Task[None] | None = None
+        try:
+            for _ in range(CRASHED_PAGE_CLOSE_ATTEMPTS):
+                closing = asyncio.ensure_future(page.close())
+                done, _pending = await asyncio.wait({closing}, timeout=BROWSER_PAGE_CLOSE_TIMEOUT)
+                if closing not in done:
+                    closing.cancel()
+                    self._own_detached_task(closing, "close_crashed_page_attempt")
+                    continue
+                error = closing.exception() if not closing.cancelled() else None
+                if error is not None:
+                    LOG.warning("Error while closing a crashed page", url=page.url, error_type=type(error).__name__)
+                return
+            LOG.warning("Timeout closing a crashed page; the target stays stranded", url=page.url)
+        except asyncio.CancelledError:
+            # The owner (a cancelled caller's recovery) leaves mid-close: hand the attempt off and unmark
+            # the target so the next reaper or recovery retries instead of skipping a close nobody drives.
+            if closing is not None and not closing.done():
                 closing.cancel()
                 self._own_detached_task(closing, "close_crashed_page_attempt")
-                continue
-            error = closing.exception() if not closing.cancelled() else None
-            if error is not None:
-                LOG.warning("Error while closing a crashed page", url=page.url, error_type=type(error).__name__)
-            return
-        LOG.warning("Timeout closing a crashed page; the target stays stranded", url=page.url)
+            self._crashed_targets_closing.discard(page)
+            raise
 
     def _on_browser_context_closed(self, context: BrowserContext) -> None:
         if context is not self.browser_context:
