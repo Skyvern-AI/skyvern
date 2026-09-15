@@ -192,7 +192,7 @@ async def test_processor_process_uses_draft_steps_without_compressed_chunks() ->
         )
     ]
 
-    blocks, parameters = await processor.process([], draft_steps=drafts)
+    blocks, parameters, _ = await processor.process([], draft_steps=drafts)
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "wait"
