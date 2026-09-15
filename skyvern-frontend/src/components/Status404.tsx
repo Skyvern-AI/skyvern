@@ -1,6 +1,20 @@
+import { useEffect } from "react";
+
+import { useNotFoundStore } from "@/store/NotFoundStore";
 import "./Status404.css";
 
 function Status404() {
+  const showNotFound = useNotFoundStore((state) => state.showNotFound);
+  const hideNotFound = useNotFoundStore((state) => state.hideNotFound);
+
+  // Full-bleed routes (the studio, the editor) hide the app header, and a run
+  // URL keeps matching them after the run resolves to a 404. Announce the
+  // not-found screen so the shell can bring its chrome back.
+  useEffect(() => {
+    showNotFound();
+    return hideNotFound;
+  }, [showNotFound, hideNotFound]);
+
   return (
     <div
       className="relative z-50 flex w-full items-center justify-center bg-background"
