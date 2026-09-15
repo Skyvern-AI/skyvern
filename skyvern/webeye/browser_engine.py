@@ -470,6 +470,25 @@ REGISTRY.register(RUSTWRIGHT_SPEC)
 REGISTRY.register(SKYCDP_SPEC)
 
 
+def is_any_engine_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the driver-error family of any engine this image could select.
+
+    For a caller that holds a page but not the run's ``BrowserEngineSelection`` and so cannot ask
+    ``is_engine_error``; going through the registry keeps the engine packages named here rather than
+    at the call site. Wider than the pinned check by construction, so it answers yes to a refusal the
+    selected engine would also own, and an engine whose package is absent contributes nothing.
+    """
+    for name in REGISTRY.names():
+        spec = REGISTRY.get(name)
+        try:
+            error_type, _ = spec._load_error_types()
+        except ImportError:
+            continue
+        if isinstance(exc, error_type):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class BrowserEngineContext:
     """Per-run inputs a resolver may use to pick and validate an engine. Available at the browser
