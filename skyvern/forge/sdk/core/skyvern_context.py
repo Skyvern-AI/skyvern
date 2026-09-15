@@ -479,6 +479,12 @@ class SkyvernContext:
     # task/run/persistent-session scope.
     download_popup_claims: dict[str, list[Page]] = field(default_factory=dict)
 
+    # Tasks whose terminal cleanup has already run its download half -- settle, save, and artifact
+    # outcome recording -- so a recovery path can tell "never recorded" from "recorded" without
+    # inferring it from the task row. Keyed per task rather than per stack frame because cleanup is
+    # also entered from callees (``_execute_task_v3``) whose progress a caller-local flag cannot see.
+    cleanup_downloads_recorded_task_ids: set[str] = field(default_factory=builtins.set)
+
     # parallel verification optimization
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
@@ -729,6 +735,12 @@ class SkyvernContext:
 
     def clear_download_popup_claims(self, task_id: str) -> None:
         self.download_popup_claims.pop(task_id, None)
+
+    def mark_cleanup_downloads_recorded(self, task_id: str) -> None:
+        self.cleanup_downloads_recorded_task_ids.add(task_id)
+
+    def cleanup_downloads_recorded(self, task_id: str) -> bool:
+        return task_id in self.cleanup_downloads_recorded_task_ids
 
     def flush_feature_flags(self) -> None:
         if not self.feature_flag_entries:
