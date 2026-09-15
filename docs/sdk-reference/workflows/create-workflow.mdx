@@ -5,6 +5,40 @@ slug: sdk-reference/workflows/create-workflow
 
 Create a new workflow from a JSON or YAML definition.
 
+## Retry policy
+
+Add `retry_policy` inside `workflow_definition` to retry eligible top-level runs. Omit the field, or set it to `null`, to disable retries.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_retries` | `1` | Maximum retries after the initial attempt. Allowed range: `1` to `5`. |
+| `delay_seconds` | `0` | Fixed delay before the next attempt. Allowed range: `0` to `3600`. |
+| `webhook_on_retry` | `final_only` | Use `final_only` for one webhook after the final attempt. Use `every_attempt` for one webhook after each attempt. |
+| `retry_on` | — | One or more rules. Each rule has a terminal `status` and an optional `error_codes` list. The `canceled` status is accepted for forward compatibility. |
+
+A rule matches when the run status matches and any listed error code matches. Omit `error_codes`, or use an empty list, to match any error code for that status. Rules use OR logic. Canceled runs never retry in the current runtime, including explicit API/UI cancels. The policy applies only to top-level runs. Each retry keeps the same `workflow_run_id`. Each attempt uses credits.
+
+The maximum elapsed time limit resets for each attempt, so the total run duration can exceed that limit.
+
+```yaml
+title: Extract Products
+workflow_definition:
+  parameters: []
+  retry_policy:
+    max_retries: 2
+    delay_seconds: 10
+    webhook_on_retry: final_only
+    retry_on:
+      - status: terminated
+        error_codes: [portal_timeout, mfa_failed]
+      - status: failed
+  blocks:
+    - block_type: navigation
+      label: extract_products
+      url: https://example.com/products
+      navigation_goal: Extract the top three products.
+```
+
 <CodeGroup>
 ```python Python
 workflow = await client.create_workflow(

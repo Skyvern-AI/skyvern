@@ -29215,6 +29215,17 @@
             ],
             "title": "Error Code Mapping"
           },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
+          },
           "workflow_system_prompt": {
             "anyOf": [
               {
@@ -29475,6 +29486,17 @@
             ],
             "title": "Error Code Mapping"
           },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
+          },
           "workflow_system_prompt": {
             "anyOf": [
               {
@@ -29707,6 +29729,87 @@
         "type": "object",
         "title": "WorkflowRequest"
       },
+      "WorkflowRetryPolicy": {
+        "properties": {
+          "max_retries": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Max Retries",
+            "description": "Maximum number of retries after the initial attempt",
+            "default": 1
+          },
+          "delay_seconds": {
+            "type": "integer",
+            "maximum": 3600.0,
+            "minimum": 0.0,
+            "title": "Delay Seconds",
+            "description": "Fixed delay before the next attempt, in seconds",
+            "default": 0
+          },
+          "webhook_on_retry": {
+            "type": "string",
+            "enum": [
+              "final_only",
+              "every_attempt"
+            ],
+            "title": "Webhook On Retry",
+            "description": "Whether to send a webhook for every attempt or only the final attempt",
+            "default": "final_only"
+          },
+          "retry_on": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRetryRule"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Retry On",
+            "description": "Terminal status rules that enable retries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "retry_on"
+        ],
+        "title": "WorkflowRetryPolicy"
+      },
+      "WorkflowRetryRule": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "terminated",
+              "canceled",
+              "timed_out"
+            ],
+            "title": "Status",
+            "description": "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+          },
+          "error_codes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Codes",
+            "description": "Optional error codes. The rule matches when any listed code is present."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "WorkflowRetryRule"
+      },
       "WorkflowRun": {
         "properties": {
           "workflow_run_id": {
@@ -29803,6 +29906,39 @@
           },
           "status": {
             "$ref": "#/components/schemas/WorkflowRunStatus"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -30201,6 +30337,121 @@
         ],
         "title": "WorkflowRun"
       },
+      "WorkflowRunAttempt": {
+        "properties": {
+          "attempt_number": {
+            "type": "integer",
+            "title": "Attempt Number",
+            "description": "One-based number of this workflow run attempt"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus",
+            "description": "Status of this workflow run attempt"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason",
+            "description": "Reason for failure, if the attempt failed"
+          },
+          "error_codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Error Codes",
+            "description": "Error codes reported by this attempt"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At",
+            "description": "Timestamp when this attempt started"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At",
+            "description": "Timestamp when this attempt finished"
+          },
+          "retry_decision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Decision",
+            "description": "Retry decision recorded for this attempt"
+          },
+          "decision_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Reason",
+            "description": "Reason recorded for the retry decision"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next attempt is scheduled"
+          },
+          "webhook_sent_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Sent At",
+            "description": "Timestamp when the webhook for this attempt was sent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "attempt_number",
+          "status"
+        ],
+        "title": "WorkflowRunAttempt"
+      },
       "WorkflowRunBlock": {
         "properties": {
           "workflow_run_block_id": {
@@ -30221,6 +30472,17 @@
           "workflow_run_id": {
             "type": "string",
             "title": "Workflow Run Id"
+          },
+          "attempt_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Number"
           },
           "organization_id": {
             "type": "string",
@@ -31568,6 +31830,39 @@
             "title": "Run Type",
             "description": "Type of run - always workflow_run for workflow runs"
           },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
+          },
           "run_with": {
             "type": "string",
             "title": "Run With",
@@ -31659,6 +31954,11 @@
         "properties": {
           "type": {
             "$ref": "#/components/schemas/WorkflowRunTimelineType"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
           },
           "block": {
             "anyOf": [
