@@ -253,12 +253,18 @@ def resolve_copilot_tool_surface(
         # A turn without browser authority advertises no tool that would need one, rather than
         # advertising them and refusing at dispatch.
         selected = [tool for tool in native_tools if tool.name not in BROWSER_BOUND_TOOL_NAMES]
+        selected_aliases = {
+            name: transport_name
+            for name, transport_name in alias_map.items()
+            if not getattr(overlays[name], "requires_browser", False)
+        }
+        selected_overlays = {name: overlays[name] for name in selected_aliases}
         return CopilotToolSurface(
             native_tools=tuple(selected),
-            alias_map={},
-            overlays={},
+            alias_map=selected_aliases,
+            overlays=selected_overlays,
             ordered_native_names=tuple(tool.name for tool in selected),
-            ordered_mcp_names=(),
+            ordered_mcp_names=tuple(selected_aliases),
         )
 
     if mode is None or mode in REPAIR_PROBE_MODES:
