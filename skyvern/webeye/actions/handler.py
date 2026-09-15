@@ -3453,6 +3453,25 @@ def _is_prefix_loss_truncation(*, tag_name: str, intended: str, rendered: str | 
     return intended_cf.endswith(rendered_cf)
 
 
+def _is_same_length_reorder(*, tag_name: str, intended: str, rendered: str | None) -> bool:
+    # The per-character type(tail) path re-focuses the field on every character; a field that resets the caret on
+    # the input event lays the characters down out of order, so the rendered value is the same length as intended
+    # and a permutation of its characters, but not equal. After the permitted textarea CRLF/CR->LF
+    # normalization and case-folding: strict signature = not-equal, equal length, equal character multiset. This
+    # excludes a legitimate normalization (a case/format change alters the multiset), an autocomplete expansion (a
+    # different length), and any arbitrary mismatch (a different multiset) -- none of which is refilled.
+    if rendered is None:
+        return False
+    if tag_name == "textarea":
+        intended = _normalize_textarea_line_endings(intended)
+        rendered = _normalize_textarea_line_endings(rendered)
+    intended_cf = intended.casefold()
+    rendered_cf = rendered.casefold()
+    if len(rendered_cf) != len(intended_cf) or rendered_cf == intended_cf:
+        return False
+    return sorted(rendered_cf) == sorted(intended_cf)
+
+
 async def _observe_input_value(
     *,
     skyvern_element: SkyvernElement,
@@ -3646,36 +3665,59 @@ async def _heal_truncated_freetext_input(
     tag_name: str,
     text: str,
     is_secret_value: bool = False,
+    has_autocomplete_evidence: bool = False,
+    input_type: str | None = None,
+    maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
 ) -> ActionFailure | None:
-    # Preserves the deployed SKY-13631 coverage for the residual per-character seam: after the fill-first
-    # default (SKY-13821) an ordinary native input fills atomically and cannot lose a prefix, but the paths
-    # still typed character-by-character (tel formatting, a combobox/search-bar/in-context input) keep this
-    # observational truncation guard. Only values longer than the split boundary can lose a prefix, so shorter
-    # values and non-free-text tags are skipped without a read-back. Secret values are excluded outright --
-    # their exact length must not reach the logs and an unmasked secret must not be rewritten from this generic
-    # path; _fill_secret_with_readback owns that recovery. On the exact prefix-loss signature, re-enter the
-    # value once with a single atomic fill; a matching or autocomplete-expanded value is left as typed so the
-    # normal keystroke/autocomplete behavior is preserved. The pre-refill read-back is observational only:
-    # bounded and best-effort, an unobtainable read-back detects no truncation and heals nothing. Once a refill
-    # has run, the seam is integrity-gated:
-    # confirmation requires a full case-folded match with the intended value (not merely the absence of the
-    # loss signature). The sole accepted normalization is a textarea's browser-defined CRLF/lone-CR to LF
-    # canonicalization. An unconfirmed or unobservable post-refill value fails closed with a structured
-    # ActionFailure so a persistent partial value is never reported as success or followed by a batched Submit
-    # (SKY-13631). No second write is ever attempted. Logs carry only lengths.
-    if is_secret_value or tag_name not in _NATIVE_FILL_TAGS or len(text) <= TEXT_PRESS_MAX_LENGTH:
+    # Observational read-back guard for the residual per-character seam. An ordinary native input fills
+    # atomically and never reaches here; the paths still typed character-by-character (tel formatting, a
+    # combobox/search-bar/in-context input) do. One bounded read-back covers two corruption signatures a
+    # caret-resetting field produces:
+    #   - prefix loss: the field wipes the atomic leading fill and keeps only the per-character tail, so the
+    #     rendered value is a short proper suffix of the intended text. Only values longer than the split
+    #     boundary can lose a prefix.
+    #   - same-length reorder: the caret reset lays the tail down out of order, so the rendered value is a
+    #     same-length permutation of the intended text. Repaired only on a round-trip-safe input (textarea or an
+    #     exact-value type) with no structural autocomplete/combobox evidence -- an atomic refill on a
+    #     keyboard-driven widget would suppress its option surfacing. tel/number/date/time and maxlength-truncating
+    #     inputs are excluded; a genuine typeahead keeps its keystrokes.
+    # Secret values are excluded outright -- their exact length must not reach the logs and an unmasked secret
+    # must not be rewritten from this generic path; _fill_secret_with_readback owns that recovery. On either
+    # signature, re-enter the value once with a single atomic fill; a matching, autocomplete-expanded, or
+    # otherwise-mismatched value is left as typed. The pre-refill read-back is observational only: bounded and
+    # best-effort, an unobtainable read-back detects nothing and heals nothing.
+    can_prefix_loss = not is_secret_value and tag_name in _NATIVE_FILL_TAGS and len(text) > TEXT_PRESS_MAX_LENGTH
+    normalized_input_type = (input_type or "").strip().lower()
+    round_trip_safe = tag_name == "textarea" or normalized_input_type in _EXACT_VALUE_INPUT_TYPES
+    can_reorder = (
+        not is_secret_value
+        and tag_name in _NATIVE_FILL_TAGS
+        and len(text) > 1
+        and not has_autocomplete_evidence
+        and round_trip_safe
+        and normalized_input_type != "tel"
+        and not _maxlength_truncates_value(text, maxlength)
+    )
+    if not (can_prefix_loss or can_reorder):
         return None
     observed, rendered = await _observe_input_value(
         skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
     )
-    if not observed or not _is_prefix_loss_truncation(tag_name=tag_name, intended=text, rendered=rendered):
+    if not observed:
+        return None
+    lost_prefix = can_prefix_loss and _is_prefix_loss_truncation(tag_name=tag_name, intended=text, rendered=rendered)
+    reordered = can_reorder and _is_same_length_reorder(tag_name=tag_name, intended=text, rendered=rendered)
+    if not (lost_prefix or reordered):
         return None
     LOG.warning(
-        "Free-text input lost its leading fill and kept only a trailing suffix; re-entering atomically",
+        "Free-text input read-back does not match the intended value (prefix loss or same-length reorder); "
+        "re-entering atomically",
         element_id=skyvern_element.get_id(),
         intended_length=len(text),
         rendered_length=len(rendered or ""),
+        lost_prefix=lost_prefix,
+        reordered=reordered,
     )
     await skyvern_element.refresh_locator_if_stale()
     await skyvern_element.input_fill(text=text)
@@ -8881,14 +8923,18 @@ async def _handle_input_text_action(
         # an atomic write emits no key events, so the option tree stays empty and the action reports success
         # with uncommitted display text. Computed once here so it both excludes secret typed-widgets from the
         # first-write transport below and drives the ordinary-branch keeps_typing decision (SKY-13821).
-        is_typed_widget = (
-            (
-                input_or_select_context is not None
-                and bool(input_or_select_context.is_search_bar or input_or_select_context.is_location_input)
-            )
-            or await skyvern_element.is_auto_completion_input()
-            or await _is_combobox_or_typeahead(skyvern_element)
+        # Structural autocomplete identity (role=combobox / aria-autocomplete / autocomplete-class markers) is a
+        # load-time property, so read it once here on the still-attached element rather than re-probing after the
+        # write: the final input event can remount/navigate/detach the control, and a post-write live attribute
+        # read would then raise and turn a successful input into a failure. Computed unconditionally (not behind
+        # the LLM search/location short-circuit) so the reorder heal below can reuse it.
+        structural_autocomplete = await skyvern_element.is_auto_completion_input() or await _is_combobox_or_typeahead(
+            skyvern_element
         )
+        is_typed_widget = (
+            input_or_select_context is not None
+            and bool(input_or_select_context.is_search_bar or input_or_select_context.is_location_input)
+        ) or structural_autocomplete
         # A positive maxlength shorter than the secret is an auto-advancing split field; an atomic write leaves
         # a truncated prefix and, since it cannot round-trip, reports success unverified. Route it to the seam
         # (below) so the per-character focus advance carries the rest to the sibling boxes (SKY-13821).
@@ -8990,13 +9036,20 @@ async def _handle_input_text_action(
                         return [ActionSuccess()]
                 else:
                     await skyvern_element.input_sequentially(text=text)
-                    # The residual per-character seam can still lose a leading prefix on a caret-resetting
-                    # field; preserve the deployed SKY-13631 truncation heal here (SKY-13821).
+                    # The residual per-character seam can lose a leading prefix or lay the value down reordered on a
+                    # caret-resetting field; one read-back here heals both. The reorder repair is gated on the
+                    # structural autocomplete/combobox context read before typing (surfaced-option evidence is not
+                    # available at this seam, so a marker-less option-only autocomplete is treated as
+                    # no-autocomplete here; the strict same-length permutation signature keeps that rare case
+                    # narrow).
                     truncation_failure = await _heal_truncated_freetext_input(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
                         text=text,
                         is_secret_value=is_secret_value,
+                        has_autocomplete_evidence=structural_autocomplete,
+                        input_type=secret_input_type,
+                        maxlength=element_maxlength,
                         engine_selection=engine_selection,
                     )
                     if isinstance(truncation_failure, ActionFailure):
