@@ -101,6 +101,8 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         scouted_credential_field_inventory_by_credential_id={},
         org_credentials_for_turn=None,
         vault_login_uris_by_credential_id={},
+        signed_out_page_observations=[],
+        signed_out_page_observation_attempts=[],
     )
     for key, value in overrides.items():
         setattr(ns, key, value)

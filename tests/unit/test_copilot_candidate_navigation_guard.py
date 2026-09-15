@@ -599,7 +599,7 @@ async def test_candidate_context_swap_arms_crash_reaping_on_the_candidate_contex
     original_page = original.pages[0]
     state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
 
-    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org") as candidate:
+    async with mcp_adapter.service_worker_blocked_context(state, organization_id="org") as candidate:
         candidate_page = candidate.pages[-1]
         assert candidate_page in state._crash_listener_pages
         candidate_page.crash()
@@ -616,7 +616,7 @@ async def test_candidate_context_restore_keeps_crash_reaping_on_the_original_con
     original_page = original.pages[0]
     state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
 
-    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org"):
+    async with mcp_adapter.service_worker_blocked_context(state, organization_id="org"):
         pass
 
     assert state.browser_context is original

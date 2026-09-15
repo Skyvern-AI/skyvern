@@ -406,6 +406,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
+    "signed_out_page_observations",
+    "signed_out_page_observation_attempts",
     "pending_scout_source_url",
     "pending_scout_selector_candidates",
     "pending_scout_input_value",
@@ -1259,7 +1261,7 @@ def _evidence_candidate_url_origin(url: str) -> str | None:
 
 
 @asynccontextmanager
-async def _service_worker_blocked_context(
+async def service_worker_blocked_context(
     browser_state: BrowserState,
     *,
     organization_id: str,
@@ -1370,7 +1372,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             if browser_state is None:
                 retire_browser_session_id(ctx, examined_session_id)
                 raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
-            async with _service_worker_blocked_context(
+            async with service_worker_blocked_context(
                 browser_state,
                 organization_id=ctx.organization_id,
             ) as browser_context:
