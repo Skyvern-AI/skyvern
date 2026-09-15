@@ -6,6 +6,7 @@ import json
 import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
+from itertools import islice
 from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit
 
@@ -118,6 +119,10 @@ _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
 _TEXT_MAX = 180
 _REF_TEXT_MAX = 96
+_RECORDED_BLOCK_OUTCOME_FACT_LIMIT = 12
+_RECORDED_BLOCK_OUTCOME_HEAD_ROWS = 4
+_ExecutedRow = tuple[str, str, Mapping[str, object]]
+_RECORDED_BLOCK_OUTCOME_FIELD_LIMIT = 8
 _VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
 _PAGE_RESULT_REF_MAX_ITEMS = 6
@@ -608,6 +613,23 @@ class CodeSafetyRejectionFact(BaseModel):
         return redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
 
 
+class RecordedBlockOutcomeFact(BaseModel):
+    """One executed run-block row's own recorded output, projected verbatim. ``status`` is the
+    runner's machine word for the row and carries no claim that the step achieved what it was
+    authored for; ``output_fields`` keeps a recorded empty value as an empty string so an empty
+    observation stays distinguishable from one that was never recorded.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    label: str
+    status: str
+    output_recorded: bool
+    output_fields: dict[str, str] = Field(default_factory=dict)
+    fields_omitted: int = 0
+    output_text: str = ""
+
+
 class RecordedBuildTestOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -634,6 +656,8 @@ class RecordedBuildTestOutcome(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
+    recorded_block_outcome_facts: list[RecordedBlockOutcomeFact] = Field(default_factory=list)
+    recorded_block_outcome_rows_omitted: int = 0
     code_safety_rejection_facts: list[CodeSafetyRejectionFact] = Field(default_factory=list)
     page_path_failure: PostRunPagePathFailure | None = None
     failed_operation: BuildTestFailedOperation | None = None
@@ -1615,6 +1639,47 @@ def recorded_outcome_from_run_blocks_result(
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
 ) -> RecordedBuildTestOutcome | None:
+    outcome = _recorded_outcome_from_run_blocks_result(
+        result,
+        page_evidence=page_evidence,
+        recorded_run_outcome=recorded_run_outcome,
+        completion_verification=completion_verification,
+        authored_structure_signature=authored_structure_signature,
+        requested_output_parameter_payloads=requested_output_parameter_payloads,
+        registered_output_parameter_payloads=registered_output_parameter_payloads,
+        declared_goal_path_omissions=declared_goal_path_omissions,
+        unbound_required_parameter_keys=unbound_required_parameter_keys,
+        block_parameter_keys=block_parameter_keys,
+        block_shape_hashes=block_shape_hashes,
+        block_associations_by_label=block_associations_by_label,
+        runtime_failure_class=runtime_failure_class,
+    )
+    if outcome is None:
+        return None
+    facts, rows_omitted = _recorded_block_outcome_facts(_block_dicts(_dict(result.get("data")).get("blocks")))
+    if not facts:
+        return outcome
+    return outcome.model_copy(
+        update={"recorded_block_outcome_facts": facts, "recorded_block_outcome_rows_omitted": rows_omitted}
+    )
+
+
+def _recorded_outcome_from_run_blocks_result(
+    result: Mapping[str, object],
+    *,
+    page_evidence: Mapping[str, object] | None = None,
+    recorded_run_outcome: RecordedRunOutcome | None = None,
+    completion_verification: CompletionVerificationResult | None = None,
+    authored_structure_signature: str | None = None,
+    requested_output_parameter_payloads: Sequence[BuildTestPacketRequestedOutput] | None = None,
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
+    declared_goal_path_omissions: Sequence[Mapping[str, object]] | None = None,
+    unbound_required_parameter_keys: Sequence[str] | None = None,
+    block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
+    block_shape_hashes: Mapping[str, str] | None = None,
+    block_associations_by_label: Mapping[str, str] | None = None,
+    runtime_failure_class: str | None = None,
+) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
@@ -2230,6 +2295,89 @@ def _redacted_terminal_text(value: str | None) -> str | None:
         return None
     redacted = redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
     return redacted or None
+
+
+def _recorded_output_field_text(value: object) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str, separators=(",", ":"))
+    return (_redacted_terminal_text(text) or "")[:_TEXT_MAX]
+
+
+def scrubbed_slice(text: str, limit: int) -> str:
+    """`text` bounded to `limit`, with registered secrets taken out before the bound can cut one.
+
+    A registered value is matched whole, so cutting one leaves a prefix that no later pass knows to
+    redact. The scrub runs whatever the length, because a value that fits here can still be cut once
+    it is escaped: one accented character renders as six.
+    """
+    return scrub_all_registered_from_text(text)[:limit]
+
+
+def _retained_rows(executed: list[_ExecutedRow]) -> tuple[list[_ExecutedRow], int]:
+    """The run's first rows and its last, in run order, with the count dropped between them.
+
+    A long run keeps both ends because that is where the answer is: the step that was to establish
+    the session runs early and the step that failed runs last. Nothing here reads a row to decide
+    which is which; the position is the whole rule.
+    """
+    if len(executed) <= _RECORDED_BLOCK_OUTCOME_FACT_LIMIT:
+        return executed, 0
+    tail = _RECORDED_BLOCK_OUTCOME_FACT_LIMIT - _RECORDED_BLOCK_OUTCOME_HEAD_ROWS
+    retained = executed[:_RECORDED_BLOCK_OUTCOME_HEAD_ROWS] + executed[-tail:]
+    return retained, len(executed) - _RECORDED_BLOCK_OUTCOME_FACT_LIMIT
+
+
+def _disambiguated(key: str, taken: Mapping[str, object]) -> str:
+    """A key that scrubbing or bounding made identical to one already used, numbered so both survive."""
+    if key not in taken:
+        return key
+    suffix = 2
+    while f"{key} ({suffix})" in taken:
+        suffix += 1
+    return f"{key} ({suffix})"
+
+
+def _recorded_block_outcome_facts(
+    blocks: Sequence[Mapping[str, object]],
+) -> tuple[list[RecordedBlockOutcomeFact], int]:
+    """Project each executed row's recorded output without reading its keys. Nothing here
+    interprets what a field means, so a row whose recorded output happens to describe a page the
+    step never got past reaches the model as the row's own words rather than as a verdict.
+    """
+    executed: list[_ExecutedRow] = []
+    for block in blocks:
+        label = _redacted_terminal_text(_safe_str(block.get("label")))
+        status = _safe_str(block.get("status"))
+        if not label or status not in _EXECUTED_BLOCK_STATUSES:
+            continue
+        executed.append((label, status, block))
+    facts: list[RecordedBlockOutcomeFact] = []
+    retained, rows_omitted = _retained_rows(executed)
+    for label, status, block in retained:
+        output = block.get("output")
+        fields: dict[str, str] = {}
+        output_text = ""
+        fields_omitted = 0
+        if isinstance(output, Mapping):
+            fields_omitted = max(0, len(output) - _RECORDED_BLOCK_OUTCOME_FIELD_LIMIT)
+            for key, value in islice(output.items(), _RECORDED_BLOCK_OUTCOME_FIELD_LIMIT):
+                # A key is as free-form as a value, so it gets both passes its value gets before it is
+                # bounded — a generic secret shape cut at 96 characters is no longer a shape — and two keys
+                # that come out alike keep both rows rather than one replacing the other.
+                screened_key = _bounded_ref(_redacted_terminal_text(str(key)) or "")
+                fields[_disambiguated(screened_key, fields)] = _recorded_output_field_text(value)
+        elif output is not None:
+            output_text = _recorded_output_field_text(output)
+        facts.append(
+            RecordedBlockOutcomeFact(
+                label=label,
+                status=status,
+                output_recorded=output is not None,
+                output_fields=fields,
+                output_text=output_text,
+                fields_omitted=fields_omitted,
+            )
+        )
+    return facts, rows_omitted
 
 
 def _bounded_ref(value: object, max_chars: int = _REF_TEXT_MAX) -> str:

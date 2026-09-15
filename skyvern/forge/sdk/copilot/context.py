@@ -372,6 +372,19 @@ class PageObstruction(BaseModel):
     visible_controls: list[PageObstructionControl] = Field(default_factory=list)
 
 
+SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP = 2500
+
+
+class SignedOutPageObservation(BaseModel):
+    """One URL as a browser carrying no cookies or storage renders it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    requested_url: str
+    reached_url: str
+    page_summary: dict[str, Any]
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -1260,6 +1273,8 @@ class CopilotContext(AgentContext):
     last_frontier_start_label: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    signed_out_page_observations: list[SignedOutPageObservation] = field(default_factory=list)
+    signed_out_page_observation_attempts: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None

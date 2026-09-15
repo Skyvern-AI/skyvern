@@ -4,12 +4,13 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Literal, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import structlog
-from playwright.async_api import Download, Page, Response
+from playwright.async_api import BrowserContext, Download, Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     challenge_signal_regressed,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    composition_structured_evidence_expression,
     enclosing_form_submit_controls_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -47,14 +49,18 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    parse_composition_structured,
     post_run_evidence_source_refused,
     stamp_page_evidence_provenance,
 )
+from skyvern.forge.sdk.copilot.context import SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP, SignedOutPageObservation
 from skyvern.forge.sdk.copilot.enforcement import (
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
 )
+from skyvern.forge.sdk.copilot.mcp_adapter import service_worker_blocked_context
+from skyvern.forge.sdk.copilot.output_utils import BLOCK_FACT_URL_MAX_CHARS, screened_recorded_url
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
 from skyvern.forge.sdk.copilot.page_identity import (
@@ -77,7 +83,13 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     screenshot_result_facts,
     stage_screenshot_from_artifact,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+    scrub_secrets_from_text,
+)
+from skyvern.webeye.browser_state import BrowserState
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -93,6 +105,14 @@ LOG = structlog.get_logger()
 # a result may carry into the authoring context, so it must not follow the transcript
 # recent-window cap.
 _SCOUT_RESULT_CHAR_CAP = 2000
+
+_SIGNED_OUT_SETTLE_DELAY_SECONDS = 2.5
+_SIGNED_OUT_OBSERVATION_TIMEOUT_MS = 20000
+_SIGNED_OUT_OBSERVATION_ATTEMPT_LIMIT = 12
+_SIGNED_OUT_OBSERVATION_ORIGIN_LIMIT = 3
+_SIGNED_OUT_MAX_CONTROLS = 8
+_SIGNED_OUT_MAX_SELECTOR_CANDIDATES = 3
+_SIGNED_OUT_TEXT_EXCERPT_CAP = 400
 
 
 def _clear_pending_browser_interaction_observation(ctx: AgentContext) -> None:
@@ -1344,13 +1364,25 @@ _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
 _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
 
 
-def _summary_text(value: Any) -> str:
-    return value.strip()[:_PAGE_SUMMARY_TEXT_CAP] if isinstance(value, str) else ""
+def _scrubbed_to(text: str, limit: int, scrub_values: Sequence[str]) -> str:
+    """`text` bounded to `limit`, with this session's registered values taken out first.
+
+    A registered value is matched whole, so a bound that cuts one leaves a prefix no later pass can
+    recognise. The values are this session's: another session's short value rewriting this page's
+    labels would corrupt the very evidence the reading exists to carry.
+    """
+    for value in scrub_values:
+        text = text.replace(value, REDACTED_SECRET_PLACEHOLDER)
+    return text[:limit]
 
 
-def _summary_field_name(field: dict[str, Any]) -> str:
+def _summary_text(value: Any, scrub_values: Sequence[str] = ()) -> str:
+    return _scrubbed_to(value.strip(), _PAGE_SUMMARY_TEXT_CAP, scrub_values) if isinstance(value, str) else ""
+
+
+def _summary_field_name(field: dict[str, Any], scrub_values: Sequence[str] = ()) -> str:
     for key in ("label", "name", "placeholder", "id"):
-        text = _summary_text(field.get(key))
+        text = _summary_text(field.get(key), scrub_values)
         if text:
             return text
     return ""
@@ -1367,12 +1399,12 @@ def _summary_element_facts(control: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
-def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
+def _summary_disclosure_control(control: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any] | None:
     if not isinstance(control.get("expanded"), bool):
         return None
     summary: dict[str, Any] = {"expanded": control["expanded"]}
     for key in ("text", "controls"):
-        value = _summary_text(control.get(key))
+        value = _summary_text(control.get(key), scrub_values)
         if value:
             summary[key] = value
     summary.update(_summary_element_facts(control))
@@ -1389,7 +1421,7 @@ def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, Any]:
     return {"text": text, **_summary_element_facts(control)}
 
 
-def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
     forms_summary: list[dict[str, Any]] = []
     for form in evidence.get("forms") or []:
         if not isinstance(form, dict):
@@ -1402,14 +1434,14 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
                 "fields": [
                     _summary_entry(name, field)
                     for field, name in (
-                        (field, _summary_field_name(field)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
+                        (field, _summary_field_name(field, scrub_values)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
                     )
                     if name
                 ],
                 "submit_controls": [
                     _summary_entry(text, control)
                     for control, text in (
-                        (control, _summary_text(control.get("text") or control.get("value")))
+                        (control, _summary_text(control.get("text") or control.get("value"), scrub_values))
                         for control in submits[:_PAGE_SUMMARY_MAX_SUBMITS]
                     )
                     if text
@@ -1426,7 +1458,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
                 break
             if not isinstance(control, dict):
                 continue
-            text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"))
+            text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"), scrub_values)
             if text:
                 dismiss_entries.append(_summary_entry(text, control))
     interaction_blocking_layers: list[dict[str, Any]] = []
@@ -1438,7 +1470,9 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             for control, text in (
                 (
                     control,
-                    _summary_text(control.get("text") or control.get("aria_label") or control.get("title")),
+                    _summary_text(
+                        control.get("text") or control.get("aria_label") or control.get("title"), scrub_values
+                    ),
                 )
                 for control in obstruction.get("visible_controls") or []
                 if isinstance(control, dict)
@@ -1475,7 +1509,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
     for control in controls_for_summary:
         if not isinstance(control, dict) or len(disclosure_controls) >= _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS:
             continue
-        summary = _summary_disclosure_control(control)
+        summary = _summary_disclosure_control(control, scrub_values)
         if summary is None:
             continue
         candidate_identity = json.dumps(summary.get("selector_candidates") or [], sort_keys=True)
@@ -1485,14 +1519,15 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         seen_disclosures.add(identity)
         disclosure_controls.append(summary)
     page_summary: dict[str, Any] = {
-        "page_title": _summary_text(evidence.get("page_title")),
+        "page_title": _summary_text(evidence.get("page_title"), scrub_values),
         "forms": forms_summary,
         "navigation_target_count": len(nav_targets),
         "navigation_targets_truncated": evidence.get("navigation_targets_truncated") is True,
         "navigation_targets": [
             _summary_entry(text, target)
             for target, text in (
-                (target, _summary_text(target.get("text"))) for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS]
+                (target, _summary_text(target.get("text"), scrub_values))
+                for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS]
             )
             if text
         ],
@@ -1589,7 +1624,9 @@ def _redact_summary_node(ctx: AgentContext, node: Any) -> Any:
     if isinstance(node, list):
         return [_redact_summary_node(ctx, item) for item in node]
     if isinstance(node, str):
-        redacted_leaf = _redact_codeblock_value(ctx, node)
+        # A page echoes what was typed into it, so the session's registered values come out before
+        # the reading is stored: the generic pass after it matches shapes, not arbitrary secrets.
+        redacted_leaf = _redact_codeblock_value(ctx, scrub_secrets_from_text(ctx, node))
         return redacted_leaf if isinstance(redacted_leaf, str) else ""
     return node
 
@@ -1624,6 +1661,220 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
     except Exception:
         data.pop("page", None)
         LOG.warning("copilot_scout_act_observe_summary_failed")
+
+
+def _signed_out_page_facts(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
+    """Add the page's own clickable controls and visible text to the scout summary. The summary's
+    fields come from `<form>` elements only, so a sign-in card built without one reaches the reader
+    through these two keys or not at all.
+    """
+    facts = _build_scout_page_summary(evidence, scrub_values)
+    controls: list[dict[str, Any]] = []
+    for control in evidence.get("clickable_controls") or []:
+        if len(controls) >= _SIGNED_OUT_MAX_CONTROLS:
+            break
+        if not isinstance(control, dict):
+            continue
+        text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"), scrub_values)
+        if not text:
+            continue
+        entry = _summary_entry(text, control)
+        candidates = entry.get("selector_candidates")
+        if isinstance(candidates, list):
+            # A selector carrying a registered value is dropped later anyway, so it must not take one
+            # of the slots from a candidate that would have survived.
+            usable = [
+                candidate
+                for candidate in candidates
+                if not (
+                    isinstance(candidate, dict)
+                    and isinstance(candidate.get("selector"), str)
+                    and any(value in candidate["selector"] for value in scrub_values)
+                )
+            ]
+            entry["selector_candidates"] = usable[:_SIGNED_OUT_MAX_SELECTOR_CANDIDATES]
+        controls.append(entry)
+    facts["controls"] = controls
+    excerpt = evidence.get("visible_text_excerpt")
+    if isinstance(excerpt, str) and excerpt.strip():
+        facts["visible_text"] = _scrubbed_to(excerpt.strip(), _SIGNED_OUT_TEXT_EXCERPT_CAP, scrub_values)
+    return facts
+
+
+def _bounded_signed_out_page_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    while len(json.dumps(facts)) > SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP:
+        controls = facts.get("controls")
+        if isinstance(controls, list) and len(controls) > 1:
+            controls.pop()
+            continue
+        if facts.pop("visible_text", None) is not None:
+            continue
+        if isinstance(controls, list) and controls:
+            controls.pop()
+            continue
+        if _shed_scout_page_summary_section(facts) is not None:
+            continue
+        return {"page_title": facts.get("page_title", ""), "shed": ["signed_out_page_facts"]}
+    return facts
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_origin(url: str) -> tuple[str, str, int | None] | None:
+    """The origin as a browser reports it back: scheme, lowercased host, and a port only when it is
+    not the scheme's default. `https://Portal.Test:443/x` and `https://portal.test/x` are one origin."""
+    origin = safe_page_origin(url)
+    if not origin:
+        return None
+    parts = urlsplit(origin.rstrip("/"))
+    if not parts.hostname:
+        return None
+    port = parts.port if parts.port != _DEFAULT_PORTS.get(parts.scheme) else None
+    return parts.scheme, parts.hostname.lower(), port
+
+
+def _exact_origin(url: str) -> str | None:
+    """The origin form the deployment's egress guard names, without a path, spelt the way the guard
+    will recognise it."""
+    canonical = _canonical_origin(url)
+    if canonical is None:
+        return None
+    scheme, host, port = canonical
+    return f"{scheme}://{host}:{port}" if port is not None else f"{scheme}://{host}"
+
+
+@asynccontextmanager
+async def _signed_out_navigation_guard(
+    browser_context: BrowserContext, expected_origin: str | None
+) -> AsyncIterator[bool]:
+    """Hold the anonymous probe to the origin it was asked to read, so a redirect meant for
+    signed-out visitors cannot make it fetch somewhere else.
+
+    Yields whether enforcement is actually active. The deployment's guard decides which origins it
+    will cover, and a probe it will not cover is not worth the request.
+    """
+    if expected_origin is None:
+        yield False
+        return
+    async with AsyncExitStack() as stack:
+        try:
+            await stack.enter_async_context(
+                app.AGENT_FUNCTION.copilot_candidate_network_guard(browser_context, expected_origin=expected_origin)
+            )
+        except Exception:
+            # Fail closed on any refusal to enter, not on a list of the ways it has refused so far:
+            # an unenforced probe is the thing this exists to prevent.
+            LOG.info("copilot_signed_out_navigation_guard_unavailable", exc_info=True)
+            yield False
+            return
+        yield True
+
+
+async def capture_signed_out_page_observation(
+    browser_state: BrowserState,
+    *,
+    url: str,
+    organization_id: str,
+    scrub_values: Sequence[str] = (),
+) -> SignedOutPageObservation | None:
+    """Read `url` through a context that carries no cookies or storage, and summarize what it shows.
+
+    Requesting a location is a heavier claim than reporting one, and this is the only place the
+    copilot asks for a URL a page handed it. A location it may not request exactly as recorded — a
+    callback carrying a one-time query, a masked or credential-bearing URL — is not requested at
+    all, rather than requested in a reduced form that addresses a different page.
+    """
+    requestable, withheld = screened_recorded_url(url)
+    if requestable is None or withheld is not None:
+        LOG.info("copilot_signed_out_page_observation_skipped", reason=withheld)
+        return None
+    async with service_worker_blocked_context(browser_state, organization_id=organization_id) as browser_context:
+        page = await browser_state.get_working_page()
+        if page is None:
+            return None
+        async with _signed_out_navigation_guard(browser_context, _exact_origin(url)) as guarded:
+            if not guarded:
+                LOG.info("copilot_signed_out_page_observation_unenforceable")
+                return None
+            await page.goto(url, wait_until="domcontentloaded", timeout=_SIGNED_OUT_OBSERVATION_TIMEOUT_MS)
+            raw = await page.evaluate(composition_structured_evidence_expression())
+            reached_url = page.url
+            # A sign-in card that arrives after DOMContentLoaded is not in the first read, and this
+            # origin gets one attempt. One bounded re-read; the first read stands if the page has
+            # moved on under it by then, which a redirect during the settle would do.
+            await asyncio.sleep(_SIGNED_OUT_SETTLE_DELAY_SECONDS)
+            try:
+                raw = await page.evaluate(composition_structured_evidence_expression())
+                reached_url = page.url
+            except Exception:
+                LOG.info("copilot_signed_out_page_observation_settled_read_failed", exc_info=True)
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(payload, dict):
+        return None
+    if _canonical_origin(reached_url) != _canonical_origin(url):
+        # A reading from somewhere else is not a reading of this page.
+        LOG.info("copilot_signed_out_page_observation_left_its_origin")
+        return None
+    evidence = parse_composition_structured(payload, inspected_url=url, current_url=reached_url)
+    if evidence is None:
+        return None
+    screened_reached, reached_withheld = screened_recorded_url(reached_url)
+    # A registered value can sit in a path, where the recorded-URL screen reads only generic shapes.
+    return SignedOutPageObservation(
+        requested_url=_scrubbed_to(url, BLOCK_FACT_URL_MAX_CHARS, scrub_values),
+        # Where a signed-out visitor is sent may carry a query of its own, and the reading is worth
+        # no less for naming only the route it reached.
+        reached_url=_scrubbed_to(
+            screened_reached if screened_reached is not None else f"(withheld: {reached_withheld})",
+            BLOCK_FACT_URL_MAX_CHARS,
+            scrub_values,
+        ),
+        page_summary=_bounded_signed_out_page_facts(_signed_out_page_facts(evidence, scrub_values)),
+    )
+
+
+async def record_signed_out_page_observation(ctx: AgentContext, url: str) -> None:
+    """Keep one signed-out reading per origin the scout reached, so authoring sees what a cold run starts from."""
+    origin = safe_page_origin(url)
+    recorded = ctx.signed_out_page_observations
+    attempted = ctx.signed_out_page_observation_attempts
+    if not origin or len(recorded) >= _SIGNED_OUT_OBSERVATION_ORIGIN_LIMIT:
+        return
+    if origin in attempted or len(attempted) >= _SIGNED_OUT_OBSERVATION_ATTEMPT_LIMIT:
+        return
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            # No browser to probe with, so nothing was tried: a later action in this turn may find one.
+            return
+        # An origin is spent once a probe can run, whether or not it yields a reading: one that times
+        # out or finds no guard costs seconds, and every later action on the page would pay it again.
+        attempted.append(origin)
+        observation = await capture_signed_out_page_observation(
+            browser_state,
+            url=url,
+            organization_id=ctx.organization_id,
+            scrub_values=registered_scrub_values(ctx),
+        )
+    except Exception:
+        LOG.warning("copilot_signed_out_page_observation_failed", exc_info=True)
+        return
+    if observation is None:
+        return
+    summary = _redact_summary_node(ctx, observation.page_summary)
+    recorded.append(
+        observation.model_copy(update={"page_summary": summary}) if isinstance(summary, dict) else observation
+    )
+    # The one line that says the lever engaged: every failure path above logs, and without this the
+    # claim that the model saw the signed-out page cannot be checked against a run after the fact.
+    LOG.info(
+        "copilot_signed_out_page_observation_recorded",
+        origin=origin,
+        form_count=len(summary.get("forms") or []) if isinstance(summary, dict) else None,
+        control_count=len(summary.get("controls") or []) if isinstance(summary, dict) else None,
+        recorded_origins=len(recorded),
+    )
 
 
 def _page_evidence_names_obstruction(page_evidence: dict[str, Any] | None) -> bool:

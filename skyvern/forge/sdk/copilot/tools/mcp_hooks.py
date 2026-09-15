@@ -125,6 +125,7 @@ from .scouting import (
     _scout_act_observe_page_evidence,
     _scout_session_download_names,
     _shed_scout_page_summary_section,
+    record_signed_out_page_observation,
 )
 
 LOG = structlog.get_logger()
@@ -842,6 +843,7 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         return
 
     if record.verdict == "resolved" and record.candidates:
+        await record_signed_out_page_observation(ctx, url)
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name

@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
-    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, SignedOutPageObservation
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
@@ -483,6 +483,8 @@ class AgentContext:
     last_scout_act_observe_recapture_result: str = ""
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    signed_out_page_observations: list[SignedOutPageObservation] = field(default_factory=list)
+    signed_out_page_observation_attempts: list[str] = field(default_factory=list)
     last_test_non_retriable_nav_error: str | None = None
     last_infrastructure_tool_error: str | None = None
     workflow_persisted: bool = False
