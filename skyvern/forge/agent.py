@@ -2904,6 +2904,11 @@ class ForgeAgent:
         detailed_output: DetailedAgentStepOutput | None = None
         list_files_before: list[str] = download_baseline_files.copy() if download_baseline_files is not None else []
         browser_state: BrowserState | None = None
+        # Set by a handler that ended the task but could not fail the row, so it skipped cleanup;
+        # the outer `finally` then runs that cleanup once. It is the handler's own signal rather
+        # than an inference from the task row, which cannot distinguish it from the unconditional
+        # handlers that clean up on an already-final row too.
+        cleanup_skipped_by_handler = False
         try:
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -3256,6 +3261,7 @@ class ForgeAgent:
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after step termination. NOT clean up the task")
+                cleanup_skipped_by_handler = True
             return step, detailed_output, None
         except FailedToSendWebhook:
             LOG.exception(
@@ -3288,6 +3294,7 @@ class ForgeAgent:
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after navigation failure. NOT clean up the task")
+                cleanup_skipped_by_handler = True
             return step, detailed_output, next_step
         except TaskAlreadyCanceled:
             LOG.info(
@@ -3451,6 +3458,7 @@ class ForgeAgent:
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after browser/session failure. NOT clean up the task")
+                cleanup_skipped_by_handler = True
             return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
@@ -3470,14 +3478,39 @@ class ForgeAgent:
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after unexpected exception. NOT clean up the task")
+                cleanup_skipped_by_handler = True
             return step, detailed_output, None
         finally:
-            # remove the step_id from the context
             context = skyvern_context.ensure_context()
-            context.step_id = None
-            context.task_id = None
-            context.navigation_goal = None
-            context.navigation_payload = None
+            # Placed after the handlers so `fail_task` has already read the live browser and before
+            # the context is cleared; `contained_effect` keeps an ordinary failure here from turning
+            # the handler's return into a raise, while a cancellation still propagates.
+            # It recovers the download half only, so its kwargs are pinned to that scope rather than
+            # inherited from the handler that skipped this cleanup.
+            try:
+                if cleanup_skipped_by_handler and not context.cleanup_downloads_recorded(task.task_id):
+                    with contained_effect("skipped task cleanup recovery", task_id=task.task_id):
+                        LOG.warning(
+                            "Task cleanup was skipped by its exception handler; running it once here",
+                            task_id=task.task_id,
+                        )
+                        await self.clean_up_task(
+                            task=task,
+                            last_step=step,
+                            api_key=api_key,
+                            need_call_webhook=False,
+                            need_final_screenshot=False,
+                            close_browser_on_completion=close_browser_on_completion,
+                            browser_session_id=browser_session_id,
+                            download_suffix=None,
+                        )
+            finally:
+                # A cancellation during the recovery's await propagates by design, so the reset runs
+                # in its own `finally` to keep the context from outliving the task it describes.
+                context.step_id = None
+                context.task_id = None
+                context.navigation_goal = None
+                context.navigation_payload = None
 
     @staticmethod
     def _latest_download_failure_status(steps: list[Step]) -> int | None:
@@ -7421,6 +7454,14 @@ class ForgeAgent:
                                     task_id=task.task_id,
                                     workflow_run_id=task.workflow_run_id,
                                 )
+
+        # Reaching this line means the download half has had its run: the save is wrapped in its own
+        # try that swallows TimeoutError and Exception. Marked here rather than on entry because the
+        # task refresh above raises TaskNotFound before the download half ever starts, and marking on
+        # entry would let that raise suppress the recovery in execute_step and lose the download.
+        _recording_context = skyvern_context.current()
+        if _recording_context is not None:
+            _recording_context.mark_cleanup_downloads_recorded(task.task_id)
 
         # Last point common to every terminal path, and late enough that the screenshot and
         # download work above has already given the billed speculative call time to land.
