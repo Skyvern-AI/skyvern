@@ -1627,6 +1627,33 @@ class Block(BaseModel, abc.ABC):
                         data=screenshot,
                     )
 
+            # Setup awaits can outlive a terminal status write, so re-read the run status right before the block has
+            # any effect; the FOR UPDATE admission read (not a plain get_workflow_run) waits behind an in-flight commit.
+            async with app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch(workflow_run_id) as admitted_run:
+                admitted_status = admitted_run.status
+            if admitted_status.is_final():
+                LOG.info(
+                    "Skipping block execution: workflow run reached a final status during block setup",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    block_type=self.block_type,
+                    workflow_run_status=admitted_status,
+                )
+                await self._invalidate_stale_output_on_failure(
+                    workflow_run_id, current_index, include_missing_value_guard=True
+                )
+                # The run's own outcome is reported so consumers do not treat a failed, terminated, timed-out or
+                # completed run as a cancellation; a block that never ran is skipped, not completed.
+                observed_status = BlockStatus(admitted_status.value)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=None,
+                    status=BlockStatus.skipped if observed_status == BlockStatus.completed else observed_status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    can_continue_after_failure=False,
+                )
+
             LOG.info(
                 "Executing block",
                 sampling=True,
