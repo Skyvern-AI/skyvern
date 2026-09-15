@@ -152,8 +152,9 @@ def test_mixed_eligibility_run_download_gated_validation_block_is_not_eligible(
 async def test_mixed_eligibility_run_pins_whole_run_to_control(scoped_context: SkyvernContext) -> None:
     eligible_1 = _make_block(TaskBlock, label="t1")
     eligible_2 = _make_block(NavigationBlock, label="t2", navigation_goal="Apply to the job")
-    totp_block = _make_block(TaskBlock, label="totp", totp_verification_url="https://example.com/otp")
-    blocks: list[BaseTaskBlock] = [eligible_1, eligible_2, totp_block]
+    ineligible_block = _make_block(TaskBlock, label="unsupported")
+    ineligible_block.block_type = BlockType.WAIT
+    blocks: list[BaseTaskBlock] = [eligible_1, eligible_2, ineligible_block]
 
     assert run_is_eligible_for_v3_ab(blocks, is_script_run=False) is False
 
@@ -162,7 +163,7 @@ async def test_mixed_eligibility_run_pins_whole_run_to_control(scoped_context: S
         scoped_context,
         provider,
         workflow_run_id="wr_mixed",
-        ineligibility_reason=V3AbIneligibleReason.block_totp_verification_url,
+        ineligibility_reason=V3AbIneligibleReason.unsupported_block,
     )
 
     for block in blocks:
@@ -558,7 +559,12 @@ def _download_gated_validation_blocks() -> list[BaseTaskBlock]:
 
 
 def _totp_blocks() -> list[BaseTaskBlock]:
-    return [_make_block(TaskBlock, label="totp", totp_verification_url="https://example.com/otp")]
+    # The multi-block shape the removed gate excluded: a verification-URL block alongside an ordinary
+    # one. v3 carries the verification source per block, so neither block disqualifies the run.
+    return [
+        _make_block(TaskBlock, label="signin", totp_verification_url="https://example.com/otp"),
+        _make_block(NavigationBlock, label="after_signin", navigation_goal="Apply to the job"),
+    ]
 
 
 def _no_reroutable_blocks() -> list[BaseTaskBlock]:
@@ -614,7 +620,7 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
         (_pinned_engine_blocks, False, V3AbIneligibleReason.pinned_engine),
         (_unsupported_block_type_blocks, False, V3AbIneligibleReason.unsupported_block),
         (_download_gated_validation_blocks, False, V3AbIneligibleReason.unsupported_block),
-        (_totp_blocks, False, V3AbIneligibleReason.block_totp_verification_url),
+        (_totp_blocks, False, None),
         (_no_reroutable_blocks, False, V3AbIneligibleReason.no_reroutable_blocks),
         (_eligible_mix_blocks, False, None),
         (_prompt_branch_conditional_only_blocks, False, None),
@@ -627,7 +633,7 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
         "pinned_engine",
         "unsupported_block_type",
         "unsupported_block_validation_download",
-        "block_totp_verification_url",
+        "totp_verification_url_is_admitted",
         "no_reroutable_blocks",
         "eligible",
         "prompt_branch_conditional_is_a_reroutable_surface",

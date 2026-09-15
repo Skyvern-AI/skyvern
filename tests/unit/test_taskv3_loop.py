@@ -16,6 +16,7 @@ import random
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +28,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
+from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
@@ -80,6 +82,7 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from tests.unit.helpers import make_organization, make_task
 
 
 class _ScriptedCaller:
@@ -6322,6 +6325,46 @@ async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
     # probe fired before the recording step that appends it.
     assert outcome.billable_actions == ["click"]
     assert recorded_rounds == [[RoundAction("click", {"selector": "#a"}, True, billable=True)]]
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_is_refused_while_verification_never_delivered() -> None:
+    # The probe is a second path to `completed` that never reaches the finish tool, so it needs the
+    # same verification gate: a file landing after the code source gave up must not read as success.
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), totp_verification_url="https://example.com/otp")
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading"
+
+    gave_up = VerificationState(task=task)
+    gave_up.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    outcome, caller = await _run(
+        [
+            [("click", {"selector": "#a"})],
+            [("finish", {"status": "failed", "reason": "the verification step never completed"})],
+        ],
+        [_billable_tool("click", []), make_finish_tool()],
+        completion_probe=probe,
+        verification_blocker=gave_up.block_finish,
+    )
+    assert outcome.status == "failed", outcome.reason
+    # The refusal has to REACH the model. DOWNLOAD_COMPLETION_GUIDANCE tells it the run ends on its
+    # own and not to call finish(completed), so a silent refusal would leave it acting until a stall
+    # guard terminated the run instead of finishing failed with the verification reason.
+    assert _COMPLETION_BLOCKED in json.dumps(caller.message_history, default=str)
+
+    # Control: the identical landed download still completes when the source never failed, so the
+    # refusal above is the gate firing and not the probe being disabled.
+    healthy = VerificationState(task=task)
+    ok_outcome, _ = await _run(
+        [[("click", {"selector": "#a"})]],
+        [_billable_tool("click", []), make_finish_tool()],
+        completion_probe=probe,
+        verification_blocker=healthy.block_finish,
+    )
+    assert ok_outcome.status == "completed"
+    assert ok_outcome.reason == "a file finished downloading"
 
 
 @pytest.mark.asyncio
