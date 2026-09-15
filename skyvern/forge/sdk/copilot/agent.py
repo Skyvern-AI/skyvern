@@ -196,10 +196,14 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
     close_browser_session_quietly,
+    record_attached_browser_driver,
     resolve_persistent_browser_state,
+    start_browser_driver_release,
+    wait_for_driver_releases,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
@@ -372,7 +376,9 @@ def _manager_can_probe_registered_browser_state() -> bool:
     return app.PERSISTENT_SESSIONS_MANAGER.can_probe_registered_browser_state()
 
 
-async def _registered_browser_state_liveness(session_id: str, organization_id: str) -> BrowserProbeOutcome | None:
+async def _registered_browser_state_liveness(
+    session_id: str, organization_id: str, ctx: AgentContext
+) -> BrowserProbeOutcome | None:
     """None means this manager cannot answer at all, which is a capability, not a liveness verdict."""
     if not _manager_can_probe_registered_browser_state():
         return None
@@ -383,12 +389,16 @@ async def _registered_browser_state_liveness(session_id: str, organization_id: s
     )
     if state is None:
         return BrowserProbeOutcome.positively_unreachable
+    # This probe attaches through the same cache as every other lookup, so the turn owns the driver
+    # it left behind whether or not the turn goes on to use the session.
+    record_attached_browser_driver(ctx, session_id, state)
     return _browser_context_attachability(state.browser_context)
 
 
 async def _resolve_live_browser_session_id(
     chat_request: WorkflowCopilotChatRequest,
     organization_id: str,
+    ctx: AgentContext,
 ) -> str | None:
     """Ownership failures fail closed. A liveness lookup that could not complete keeps the session,
     since failing to reach the browser is not evidence about the browser."""
@@ -435,7 +445,7 @@ async def _resolve_live_browser_session_id(
         has_live_browser = bool(persistent and persistent.is_browser_ready and persistent.cdp_unreachable_at is None)
         registered_liveness: BrowserProbeOutcome | None = None
         if persistent is not None and not is_final_status(persistent.status) and not has_live_browser:
-            registered_liveness = await _registered_browser_state_liveness(requested, organization_id)
+            registered_liveness = await _registered_browser_state_liveness(requested, organization_id, ctx)
         if registered_liveness == BrowserProbeOutcome.could_not_determine:
             LOG.warning(
                 "Copilot browser session health signal unavailable; keeping the supplied session",
@@ -4981,6 +4991,18 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
+                if turn_end_ctx is not None and turn_end_ctx.attached_browser_drivers:
+                    # Concurrently, so one session's wedged detach can neither skip the sessions
+                    # behind it nor stack another cleanup timeout onto the turn's exit.
+                    releases = [
+                        start_browser_driver_release(
+                            organization_id,
+                            attached,
+                            unwinding_operations=turn_end_ctx.admitted_browser_operations.get(attached.session_id),
+                        )
+                        for attached in list(turn_end_ctx.attached_browser_drivers.values())
+                    ]
+                    await wait_for_driver_releases(releases)
     except asyncio.CancelledError:
         if eval_mode == CopilotEvalMode.BROWSER_ABLATION and ctx_sink:
             browser_session_id = ctx_sink[0].browser_session_id
@@ -5135,6 +5157,10 @@ async def _run_copilot_turn_impl(
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
         },
     )
+    # Reading the origin run below can attach a browser driver; the finalizer only releases what it
+    # can see on the sunk context, so expose it before any await that might attach.
+    if ctx_sink is not None:
+        ctx_sink.append(ctx)
     if chat_request.product_action == "diagnose_run":
         await restore_pending_workflow_proposal(
             ctx,
@@ -5190,8 +5216,6 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
-    if ctx_sink is not None:
-        ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
         user_message=chat_request.message,
         workflow_yaml=safe_workflow_yaml,
@@ -5342,7 +5366,7 @@ async def _run_copilot_turn_impl(
         get_skyvern_mcp_alias_map,
     )
 
-    validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
+    validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id, ctx)
     ctx.browser_session_id = validated_browser_session_id
 
     direct_test_handoff = None

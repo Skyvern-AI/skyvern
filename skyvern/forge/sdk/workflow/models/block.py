@@ -143,6 +143,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
@@ -5706,6 +5707,33 @@ async def wrapper({default_args}):
             for_generated_code=True,
         )
 
+    def render_code_with_reference(self, workflow_run_context: WorkflowRunContext) -> str | None:
+        """Render `code` in place and return its inert-slot reference, rendered from a snapshot of the template
+        inputs taken before the real render so a stateful `{% set %}` is not evaluated twice against live data."""
+        persisted_code = self.code
+        try:
+            reference_context: WorkflowRunContext | None = _template_context_snapshot(workflow_run_context)
+        except Exception:
+            reference_context = None
+        self.format_potential_template_parameters(workflow_run_context)
+        if reference_context is None:
+            return None
+        return self.render_code_with_inert_slots(persisted_code, reference_context)
+
+    def render_code_with_inert_slots(self, source: str, workflow_run_context: WorkflowRunContext) -> str | None:
+        """The author's code under this run's template control flow, every value slot replaced by an inert name; None
+        when the slotted template still emits a value or fails to render, which the caller treats as untrusted."""
+        masked_code, masked_comments = mask_jinja_in_python_comments(source)
+        slotted = _JINJA_VALUE_SLOT_RE.sub(rf'{{{{\1 "{INERT_SLOT_NAME}" \2}}}}', masked_code)
+        slotted = _JINJA_PRINT_SLOT_RE.sub(rf'{{%\1 print "{INERT_SLOT_NAME}" \2%}}', slotted)
+        try:
+            if not _template_emits_only_inert_slots(slotted):
+                return None
+            rendered = self.render_templatable_field("code", slotted, workflow_run_context)
+        except Exception:
+            return None
+        return restore_jinja_masked_comments(rendered, masked_comments)
+
     async def _claim_session_download_artifacts(
         self,
         *,
@@ -7877,7 +7905,7 @@ async def wrapper({default_args}):
         )
 
         try:
-            self.format_potential_template_parameters(workflow_run_context)
+            authored_code = self.render_code_with_reference(workflow_run_context)
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
@@ -7996,6 +8024,7 @@ async def wrapper({default_args}):
                 block_label=self.label,
                 browser_session_id=browser_session_id,
                 code=self.code,
+                authored_code=authored_code,
             )
         except CodeBlockRunnerSelectionError as selection_error:
             return await self.build_block_result(
@@ -15796,6 +15825,49 @@ def _align_branch_evaluations(
 
 # Pattern to find Jinja template blocks like {{ variable_name }}
 _JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
+# Value slots only; the delimiters and their whitespace-control markers stay so both renders trim identically.
+_JINJA_VALUE_SLOT_RE = re.compile(r"\{\{(-?).*?(-?)\}\}", re.DOTALL)
+_JINJA_PRINT_SLOT_RE = re.compile(r"\{%(-?)\s*print\b.*?(-?)%\}", re.DOTALL)
+
+
+def _template_context_snapshot(workflow_run_context: WorkflowRunContext) -> WorkflowRunContext:
+    """A context whose list/dict inputs are copies, so a reference render cannot mutate what the real render
+    already consumed (the sandboxed environment lets a `{% set %}` call `pop()` or `update()`)."""
+    snapshot = copy.copy(workflow_run_context)
+    snapshot.values = _isolated_containers(workflow_run_context.values)
+    snapshot.workflow_run_outputs = _isolated_containers(workflow_run_context.workflow_run_outputs)
+    return snapshot
+
+
+def _isolated_containers(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _isolated_containers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_isolated_containers(item) for item in value]
+    return value
+
+
+def _template_emits_only_inert_slots(template_source: str) -> bool:
+    """Jinja's own parse is the authority on what a value can shape: every emitted expression must be the inert
+    constant, and a filter block may transform authored text only with constant arguments."""
+    template = jinja_json_finalize_strict_env.parse(template_source)
+    for output in template.find_all(nodes.Output):
+        for child in output.nodes:
+            if isinstance(child, nodes.TemplateData):
+                continue
+            if not (isinstance(child, nodes.Const) and child.value == INERT_SLOT_NAME):
+                return False
+    for filter_block in template.find_all(nodes.FilterBlock):
+        for applied in (filter_block.filter, *filter_block.filter.find_all(nodes.Filter)):
+            if applied.dyn_args is not None or applied.dyn_kwargs is not None:
+                return False
+            if not all(isinstance(argument, nodes.Const) for argument in applied.args):
+                return False
+            if not all(isinstance(keyword.value, nodes.Const) for keyword in applied.kwargs):
+                return False
+    return True
+
+
 # Marker inserted into rendered expressions when a Jinja variable resolved to
 # an empty/whitespace-only value.  The LLM uses this to reason about emptiness.
 _EMPTY_VALUE_MARKER = "(empty value)"

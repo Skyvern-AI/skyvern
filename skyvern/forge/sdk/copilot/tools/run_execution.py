@@ -153,6 +153,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEvidence,
     browser_page_custody_lock,
     ensure_build_test_browser_session,
+    record_attached_browser_driver,
     record_sensitive_origin_run_taint,
     register_sensitive_origin_run_lease,
     release_sensitive_origin_run_lease,
@@ -2132,6 +2133,7 @@ async def _observe_authored_locators(
             return "run_browser_unavailable"
         if browser_state is None:
             return "run_browser_unavailable"
+        record_attached_browser_driver(ctx, run_session_id, browser_state)
         # Creating one would count every authored selector against a blank page, so a run whose
         # page has since closed would report as a dead locator rather than an unobserved one.
         try:
@@ -2880,6 +2882,7 @@ async def _attach_post_run_browser_enrichment(
                 organization_id=ctx.organization_id,
             )
             if browser_state:
+                record_attached_browser_driver(ctx, run_session_id, browser_state)
                 page = await browser_state.get_or_create_page()
                 if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
                     try:
