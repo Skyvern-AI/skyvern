@@ -9335,7 +9335,8 @@ async def _handle_input_text_action(
         if phone_bearing:
             LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
             return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
-        LOG.exception("Failed to input the value or finish the auto completion")
+        # ActionHandler.handle_action logs this re-raised exception at error when it becomes an ActionFailure.
+        LOG.warning("Failed to input the value or finish the auto completion", exc_info=True)
         raise
     finally:
         if tel_outcome is not None and is_tel and tel_outcome.actual_digit_count is None:
