@@ -287,6 +287,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           workflow_system_prompt:
             saveData.settings.workflowSystemPrompt ?? undefined,
           error_code_mapping: saveData.settings.errorCodeMapping ?? undefined,
+          retry_policy: saveData.settings.retryPolicy ?? null,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,

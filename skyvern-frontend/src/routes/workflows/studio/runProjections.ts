@@ -4,8 +4,9 @@ import {
   ReadableActionTypes,
   Status,
   WorkflowRunStatusApiResponseWithWorkflow,
+  WorkflowRunRetryFields,
 } from "@/api/types";
-import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
+import { statusIsAFailureType } from "@/routes/tasks/types";
 import {
   isBlockItem,
   WorkflowRunBlock,
@@ -13,6 +14,10 @@ import {
 } from "@/routes/workflows/types/workflowRunTypes";
 import { taskV3CallText } from "@/routes/workflows/workflowBlockUtils";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
+import {
+  runIsLogicallyFinal,
+  runIsLogicallyActive,
+} from "../workflowRun/runRetryState";
 import { isRecord } from "@/util/utils";
 import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
 
@@ -59,7 +64,7 @@ export function formatElapsed(
 export function formatRunTimesTooltip(
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
 ): string {
-  const finalized = statusIsFinalized(workflowRun);
+  const finalized = runIsLogicallyFinal(workflowRun);
   return [
     workflowRun.created_at
       ? `Created ${basicLocalTimeFormat(workflowRun.created_at)}`
@@ -79,15 +84,16 @@ export function formatRunTimesTooltip(
 }
 
 export function runOutcomeFromStatus(
-  status: Status | null | undefined,
+  run: ({ status: Status } & WorkflowRunRetryFields) | null | undefined,
 ): RunOutcome {
-  if (!status) {
+  if (!run) {
     return "idle";
   }
-  if (status === Status.Completed) {
+  if (runIsLogicallyActive(run)) return "running";
+  if (run.status === Status.Completed) {
     return "success";
   }
-  if (statusIsAFailureType({ status }) || status === Status.Canceled) {
+  if (statusIsAFailureType(run) || run.status === Status.Canceled) {
     return "failed";
   }
   return "running";
@@ -95,12 +101,12 @@ export function runOutcomeFromStatus(
 
 // Null while the run is in-flight; the tab shows only the terminal status.
 export function finalizedRunStatus(
-  status: Status | null | undefined,
+  run: ({ status: Status } & WorkflowRunRetryFields) | null | undefined,
 ): Status | null {
-  if (status == null) {
+  if (run == null) {
     return null;
   }
-  return statusIsFinalized({ status }) ? status : null;
+  return runIsLogicallyFinal(run) ? run.status : null;
 }
 
 type RunOutputSignals = Pick<

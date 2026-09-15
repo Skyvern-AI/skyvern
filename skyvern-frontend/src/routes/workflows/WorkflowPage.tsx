@@ -10,6 +10,7 @@ import {
 import { Tip } from "@/components/Tip";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
@@ -520,6 +521,11 @@ function WorkflowPage() {
                           <TableCell>
                             <div className="flex items-center gap-2">
                               <StatusBadge status={workflowRun.status} />
+                              <WorkflowRunAttemptChip
+                                attempt={workflowRun.attempt}
+                                retryPending={workflowRun.retry_pending}
+                                nextAttemptAt={workflowRun.next_attempt_at}
+                              />
                               <CredentialFallbackRetryBadge
                                 retriedFromWorkflowRunId={
                                   workflowRun.retried_from_workflow_run_id

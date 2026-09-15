@@ -69,6 +69,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {

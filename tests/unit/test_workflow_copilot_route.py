@@ -2357,6 +2357,98 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "newer_candidate_lands_during_commit",
+    [False, True],
+    ids=["assistant-row-write-fails", "candidate-superseded-then-assistant-row-write-fails"],
+)
+async def test_route_error_after_auto_accept_commit_keeps_the_committed_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    newer_candidate_lands_during_commit: bool,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """Recovery after a successful auto-accept commit must not restore the pre-turn workflow over
+    it. A newer candidate landing during the commit discards this turn's proposal, so recovery
+    then sees a result that no longer carries the draft it committed."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = _make_copilot_workflow("Saved workflow", _NOW)
+    committed = _make_copilot_workflow("Committed draft", _NOW)
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=committed,
+        global_llm_context=None,
+        workflow_yaml="title: Committed draft",
+        proposal_disposition="auto_applicable",
+        has_staged_proposal=True,
+        staged_workflow=committed,
+        narrative_payload=_narrative_payload(),
+    )
+    real_restore = workflow_copilot_route._restore_workflow_definition
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(workflow_copilot_route, "_restore_workflow_definition", real_restore)
+    workflow_params.clear_workflow_copilot_candidate = AsyncMock()
+
+    def candidate(owner_turn_id: str) -> dict[str, Any]:
+        return {
+            "_copilot_yaml": "title: Committed draft",
+            COPILOT_PROPOSAL_METADATA_KEY: {
+                "owner_turn_id": owner_turn_id,
+                "revision": 1,
+                "canonical_fingerprint": "fp",
+                "disposition": "review_tested",
+            },
+        }
+
+    if newer_candidate_lands_during_commit:
+        agent_result.proposal_owner_turn_id = "turn-this"
+        agent_result.proposal_revision = 1
+
+        async def run_agent_publishing_candidate(*args: object, **kwargs: object) -> AgentResult:
+            chat.proposed_workflow = candidate("turn-this")
+            return agent_result
+
+        monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", run_agent_publishing_candidate)
+
+    canonical: dict[str, str] = {original_workflow.workflow_id: original_workflow.title}
+
+    async def update_workflow_definition(**kwargs: Any) -> None:
+        canonical[kwargs["workflow_id"]] = kwargs["title"]
+        if newer_candidate_lands_during_commit and kwargs["title"] == committed.title:
+            chat.proposed_workflow = candidate("turn-newer")
+
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(update_workflow_definition=update_workflow_definition))
+
+    first_assistant_write_failure = [RuntimeError("assistant row write failed")]
+    assistant_rows: list[dict[str, Any]] = []
+
+    async def create_message(**kwargs: Any) -> SimpleNamespace:
+        if kwargs["sender"] == WorkflowCopilotChatSender.AI:
+            if first_assistant_write_failure:
+                raise first_assistant_write_failure.pop()
+            assistant_rows.append(kwargs)
+        return SimpleNamespace(created_at=_NOW)
+
+    workflow_params.create_workflow_copilot_chat_message = AsyncMock(side_effect=create_message)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert [row["turn_outcome"].response_kind for row in assistant_rows] == [ResponseKind.RECOVER]
+    assert canonical == {original_workflow.workflow_id: committed.title}
+
+
+@pytest.mark.asyncio
 async def test_finalise_normal_turn_clears_stale_proposal_when_rollback_itself_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

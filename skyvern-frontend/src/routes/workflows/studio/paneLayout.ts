@@ -16,6 +16,21 @@ export const STUDIO_PANE_DEFAULT_WIDTH = 300;
 // factory defaults (editor+browser, browser+overview).
 export const STUDIO_TWO_PANE_SIDE_BASIS = "35%";
 
+export type PaneBounds = Pick<DOMRect, "left" | "top" | "width" | "height">;
+
+export function paneExpansionKeyframes(
+  from: PaneBounds,
+  to: PaneBounds,
+): Keyframe[] {
+  return [
+    {
+      transform: `translate(${from.left - to.left}px, ${from.top - to.top}px) scale(${from.width / to.width}, ${from.height / to.height})`,
+      transformOrigin: "top left",
+    },
+    { transform: "none", transformOrigin: "top left" },
+  ];
+}
+
 // The browser is the best consumer of free space; the canvas takes over when
 // the browser is closed. With neither open, every open pane flexes equally.
 export function greedyPaneOf(

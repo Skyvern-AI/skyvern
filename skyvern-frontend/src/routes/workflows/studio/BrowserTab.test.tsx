@@ -32,6 +32,11 @@ const mocks = vi.hoisted(() => ({
   timeline: undefined as unknown,
   debugSession: undefined as unknown,
   runs: [] as Array<{ workflow_run_id: string }>,
+  realScreenshot: false,
+}));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ get: async () => ({ data: [] }) }),
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -64,8 +69,15 @@ vi.mock("@/routes/streaming/StreamDiagnostics", () => ({
   StreamModeBadge: ({ mode }: { mode: string }) => (
     <span data-testid="stream-mode-badge">{mode}</span>
   ),
-  StreamStatusPanel: ({ diagnostic }: { diagnostic: { title: string } }) => (
-    <div data-testid="stream-status">{diagnostic.title}</div>
+  StreamStatusPanel: ({
+    diagnostic,
+  }: {
+    diagnostic: { title: string; detail?: string };
+  }) => (
+    <div data-testid="stream-status">
+      <span>{diagnostic.title}</span>
+      <span>{diagnostic.detail}</span>
+    </div>
   ),
 }));
 vi.mock("./runview/HeroRecording", () => ({
@@ -73,14 +85,21 @@ vi.mock("./runview/HeroRecording", () => ({
     <div data-testid="hero-recording" data-count={recordingUrls.length} />
   ),
 }));
-vi.mock("./runview/HeroScreenshot", () => ({
-  HeroScreenshot: ({ selection }: { selection: unknown }) => (
-    <div
-      data-testid="hero-screenshot"
-      data-selection={JSON.stringify(selection)}
-    />
-  ),
-}));
+vi.mock("./runview/HeroScreenshot", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./runview/HeroScreenshot")>();
+  return {
+    HeroScreenshot: (props: Parameters<typeof actual.HeroScreenshot>[0]) =>
+      mocks.realScreenshot ? (
+        <actual.HeroScreenshot {...props} />
+      ) : (
+        <div
+          data-testid="hero-screenshot"
+          data-selection={JSON.stringify(props.selection)}
+        />
+      ),
+  };
+});
 vi.mock("./runview/RunLiveStream", () => ({
   RunLiveStream: (props: {
     workflowRunId: string;
@@ -194,7 +213,7 @@ function seedRun({
 function renderBrowserPane(initialPath: string) {
   const setBrowserStreamSlot = vi.fn();
   const queryClient = new QueryClient();
-  const view = render(
+  const pane = () => (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={0}>
         <StudioShellContext.Provider
@@ -224,9 +243,15 @@ function renderBrowserPane(initialPath: string) {
           </MemoryRouter>
         </StudioShellContext.Provider>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...view, setBrowserStreamSlot };
+  const view = render(pane());
+  return {
+    ...view,
+    setBrowserStreamSlot,
+    queryClient,
+    rerenderPane: () => view.rerender(pane()),
+  };
 }
 
 const STUDIO_PATH = "/workflows/wpid_test/studio?panes=copilot,browser";
@@ -240,6 +265,7 @@ beforeEach(() => {
   mocks.timeline = undefined;
   mocks.debugSession = undefined;
   mocks.runs = [];
+  mocks.realScreenshot = false;
 });
 
 afterEach(() => {
@@ -247,6 +273,109 @@ afterEach(() => {
 });
 
 describe("BrowserTab view machine", () => {
+  it("keeps Live selected during a retry wait and pauses artifact polling until execution resumes", () => {
+    mocks.realScreenshot = true;
+    seedRun({ status: Status.Running });
+    const block = buildBlock({
+      actions: [buildAction({ screenshot_artifact_id: null })],
+    });
+    mocks.timeline = [buildBlockItem(block)];
+    const { queryClient, rerenderPane } = renderBrowserPane(
+      `${STUDIO_PATH}&wr=wr_1`,
+    );
+    const expectLive = () =>
+      expect(
+        screen
+          .getByRole("button", { name: "Live" })
+          .getAttribute("aria-pressed"),
+      ).toBe("true");
+    const expectArtifactPolling = (interval: number | false) => {
+      const queries = queryClient
+        .getQueryCache()
+        .getAll()
+        .filter(
+          (query) => query.queryKey[query.queryKey.length - 1] === "artifacts",
+        );
+      expect(queries).toHaveLength(3);
+      for (const query of queries) {
+        expect(query.observers[0]?.options.refetchInterval).toBe(interval);
+      }
+      expect(
+        queries.find((query) => query.queryKey[0] === "step")?.observers[0]
+          ?.options.enabled,
+      ).toBe(true);
+    };
+
+    expectLive();
+    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+      status: Status.Failed,
+      retry_pending: true,
+    });
+    rerenderPane();
+    expectLive();
+    expect(
+      screen.getByText("The browser reconnects when the next attempt starts."),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expectArtifactPolling(false);
+    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+
+    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+      status: Status.Running,
+      retry_pending: false,
+      attempt: 2,
+    });
+    mocks.timeline = [{ ...buildBlockItem(block), attempt: 2 }];
+    rerenderPane();
+    expectLive();
+    expect(screen.getByTestId("run-live-stream")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expectArtifactPolling(5000);
+  });
+
+  it("keeps historical screenshots and recordings accessible during a retry wait", () => {
+    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+      retry_pending: true,
+      attempt: 2,
+    });
+    mocks.timeline = [
+      {
+        ...buildBlockItem(
+          buildBlock({ workflow_run_block_id: "wrb_historical" }),
+        ),
+        attempt: 1,
+      },
+    ];
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=wrb_historical`);
+
+    const retryMessage = "The browser reconnects when the next attempt starts.";
+    expect(screen.queryByText(retryMessage)).toBeNull();
+    expect(
+      JSON.parse(
+        screen.getByTestId("hero-screenshot").getAttribute("data-selection") ??
+          "{}",
+      ),
+    ).toEqual({
+      kind: "block",
+      workflowRunBlockId: "wrb_historical",
+      blockType: "task",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.getByTestId("hero-recording")).toBeTruthy();
+    expect(screen.queryByText(retryMessage)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
+    expect(screen.queryByText(retryMessage)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+    expect(screen.getByText(retryMessage)).toBeTruthy();
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+  });
+
   it("shows the live debug stream slot with no run history", () => {
     mocks.debugSession = { browser_session_id: "pbs_test" };
     renderBrowserPane(STUDIO_PATH);
@@ -614,3 +743,18 @@ describe("stream-mode badge dev gating", () => {
     expect(screen.queryByTestId("stream-mode-badge")).toBeNull();
   });
 });
+
+it.each([false, true])(
+  "keeps the shared browser visible during a retry wait (recording=%s)",
+  (recording) => {
+    seedRun({ status: Status.Failed, browserSessionId: "pbs_test" });
+    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+      retry_pending: true,
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useRecordingStore.setState({ isRecording: recording });
+    renderBrowserPane(recording ? `${STUDIO_PATH}&wr=wr_1` : STUDIO_PATH);
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+    expect(screen.queryByText("Retry pending")).toBeNull();
+  },
+);

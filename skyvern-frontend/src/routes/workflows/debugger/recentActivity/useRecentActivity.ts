@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { toast } from "@/components/ui/use-toast";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { toDate } from "@/util/utils";
 
@@ -51,7 +51,7 @@ export function useRecentActivity(): RecentActivity {
     debugSessionId: debugSession?.debug_session_id,
   });
 
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : null;
   const isWorkflowRunning = isFinalized !== null && !isFinalized;
 
   const runs = useMemo(

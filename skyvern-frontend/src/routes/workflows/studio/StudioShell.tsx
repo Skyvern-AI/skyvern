@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -8,7 +9,11 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { Cross2Icon } from "@radix-ui/react-icons";
+import {
+  Cross2Icon,
+  EnterFullScreenIcon,
+  ExitFullScreenIcon,
+} from "@radix-ui/react-icons";
 
 import { CopyButton } from "@/components/CopyButton";
 import {
@@ -48,8 +53,10 @@ import {
   clampResizeDelta,
   movePaneBy,
   movePaneTo,
+  paneExpansionKeyframes,
   paneFlex,
   paneResizable,
+  type PaneBounds,
   type PaneWidths,
 } from "./paneLayout";
 import { STUDIO_PANE_META, paneAccessibleName, paneLabel } from "./paneMeta";
@@ -141,6 +148,11 @@ export function StudioPane({
   flex,
   reorder,
   onClose,
+  expanded,
+  expansionTransitioning = false,
+  onToggleExpanded,
+  transitionFromBounds = null,
+  onTransitionEnd,
   headerExtras,
   headerActions,
   iconBadge,
@@ -154,6 +166,11 @@ export function StudioPane({
   flex: string | undefined;
   reorder: PaneReorder;
   onClose: () => void;
+  expanded: boolean;
+  expansionTransitioning?: boolean;
+  onToggleExpanded: () => void;
+  transitionFromBounds?: PaneBounds | null;
+  onTransitionEnd?: () => void;
   // Rendered after the pane label (badges, view pills).
   headerExtras?: ReactNode;
   // Rendered right-aligned, before the close button.
@@ -168,9 +185,46 @@ export function StudioPane({
   // drag hint, and close control take the stable accessible name so a run
   // switch never renames them for screen readers.
   const accessibleLabel = paneAccessibleName(id);
+  const paneRef = useRef<HTMLElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
+  const onTransitionEndRef = useRef(onTransitionEnd);
+  onTransitionEndRef.current = onTransitionEnd;
   const hasChrome = headerExtras != null || headerActions != null;
   const [compact, setCompact] = useState(false);
+  useLayoutEffect(() => {
+    const pane = paneRef.current;
+    if (!pane || transitionFromBounds === null) {
+      return;
+    }
+
+    const finalBounds = pane.getBoundingClientRect();
+    const reducedMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (
+      reducedMotion ||
+      typeof pane.animate !== "function" ||
+      finalBounds.width === 0 ||
+      finalBounds.height === 0
+    ) {
+      onTransitionEndRef.current?.();
+      return;
+    }
+
+    const animation = pane.animate(
+      paneExpansionKeyframes(transitionFromBounds, finalBounds),
+      {
+        duration: 200,
+        easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+        fill: "both",
+      },
+    );
+    animation.onfinish = () => onTransitionEndRef.current?.();
+    return () => {
+      animation.onfinish = null;
+      animation.cancel();
+    };
+  }, [transitionFromBounds]);
   // Layout effect + an immediate measure so a narrow pane never paints one
   // frame of full-width labels before the observer's first callback.
   useLayoutEffect(() => {
@@ -220,12 +274,16 @@ export function StudioPane({
 
   return (
     <section
+      ref={paneRef}
       id={studioPanelId(id)}
       role="region"
       aria-label={accessibleLabel}
       style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
         "relative min-h-0 flex-col overflow-hidden rounded-lg border-2 border-border bg-slate-elevation1",
+        expanded && "absolute inset-3 z-30",
+        transitionFromBounds !== null &&
+          "pointer-events-none z-30 will-change-transform",
         open
           ? "flex duration-200 motion-safe:animate-in motion-safe:fade-in"
           : "hidden",
@@ -314,6 +372,31 @@ export function StudioPane({
             </div>
           ) : null}
         </StudioPaneCompactContext.Provider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => {
+                if (!expansionTransitioning) {
+                  onToggleExpanded();
+                }
+              }}
+              aria-disabled={expansionTransitioning}
+              aria-label={`${expanded ? "Restore" : "Expand"} ${accessibleLabel} pane`}
+              aria-pressed={expanded}
+              className={PANE_HEADER_ICON_BUTTON_CLASS}
+            >
+              {expanded ? (
+                <ExitFullScreenIcon className="size-3.5" />
+              ) : (
+                <EnterFullScreenIcon className="size-3.5" />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {expanded ? "Restore pane" : "Expand to full screen"}
+          </TooltipContent>
+        </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -639,6 +722,14 @@ function StudioStage(props: StudioWorkspaceProps) {
   const [draggingPaneId, setDraggingPaneId] = useState<StudioPaneId | null>(
     null,
   );
+  const [expandedPaneId, setExpandedPaneId] = useState<StudioPaneId | null>(
+    null,
+  );
+  const [paneTransition, setPaneTransition] = useState<{
+    id: StudioPaneId;
+    fromBounds: PaneBounds;
+  } | null>(null);
+  const previousPanesRef = useRef(panes);
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
   );
@@ -661,9 +752,47 @@ function StudioStage(props: StudioWorkspaceProps) {
     null,
   );
 
-  const browserOpen = panes.includes("browser");
-  const editorOpen = panes.includes("editor");
-  const overviewOpen = panes.includes("overview");
+  const activeExpandedPaneId =
+    expandedPaneId !== null && panes.includes(expandedPaneId)
+      ? expandedPaneId
+      : null;
+  // Keep the surrounding layout mounted while the active pane grows over it.
+  // Once the pane covers the stage, hiding the panes underneath is invisible.
+  const visiblePanes =
+    activeExpandedPaneId && paneTransition === null
+      ? [activeExpandedPaneId]
+      : panes;
+  const browserOpen = visiblePanes.includes("browser");
+  const editorOpen = visiblePanes.includes("editor");
+  const overviewOpen = visiblePanes.includes("overview");
+
+  const toggleExpandedPane = (id: StudioPaneId) => {
+    const pane = document.getElementById(studioPanelId(id));
+    if (pane) {
+      const { left, top, width, height } = pane.getBoundingClientRect();
+      if (width > 0 && height > 0) {
+        setPaneTransition({
+          id,
+          fromBounds: { left, top, width, height },
+        });
+      }
+    }
+    setExpandedPaneId((current) => (current === id ? null : id));
+  };
+
+  const restoreExpandedPane = useCallback(() => {
+    setExpandedPaneId(null);
+    setPaneTransition(null);
+  }, []);
+
+  useEffect(() => {
+    const previousPanes = previousPanesRef.current;
+    previousPanesRef.current = panes;
+    if (expandedPaneId !== null && !panesListEqual(previousPanes, panes)) {
+      setExpandedPaneId(null);
+      setPaneTransition(null);
+    }
+  }, [expandedPaneId, panes]);
 
   // Move the persistent stream node into the highest-priority open surface:
   // Browser pane > Overview pane with a live block run (runStreamSlot registers
@@ -701,12 +830,15 @@ function StudioStage(props: StudioWorkspaceProps) {
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
+      restoreExpandedPane,
     }),
-    [copilotPortalEl, panelPortalEl],
+    [copilotPortalEl, panelPortalEl, restoreExpandedPane],
   );
 
   // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
   const closeWithFocus = (id: StudioPaneId) => {
+    setExpandedPaneId((current) => (current === id ? null : current));
+    setPaneTransition((current) => (current?.id === id ? null : current));
     closePane(id, { learn: true });
     document.getElementById(studioTabId(id))?.focus();
   };
@@ -742,29 +874,39 @@ function StudioStage(props: StudioWorkspaceProps) {
     const wasRecording = prevIsRecordingRef.current;
     const wasProcessing = prevProcessingRef.current;
     if (processingRecording && !wasProcessing) {
+      restoreExpandedPane();
       openPane("editor");
     } else if (isRecording && !wasRecording) {
       // Recording or finalizing → live browser + drafts.
+      restoreExpandedPane();
       openPane("copilot");
       openPane("browser");
     } else if (!isRecording && wasRecording && !processingRecording) {
       // Recording ended (commit or discard) → back to the canvas.
+      restoreExpandedPane();
       openPane("editor");
     }
     prevIsRecordingRef.current = isRecording;
     prevProcessingRef.current = processingRecording;
-  }, [isRecording, processingRecording, openPane]);
+  }, [isRecording, processingRecording, openPane, restoreExpandedPane]);
 
   const paneProps = (id: StudioPaneId) => {
     const index = panes.indexOf(id);
     return {
       id,
       runId,
-      open: index >= 0,
+      open: index >= 0 && visiblePanes.includes(id),
       // Panes take even slots and the dividers between them take odd slots.
       order: index >= 0 ? index * 2 : undefined,
       flex: index >= 0 ? paneFlex(id, panes, paneWidths) : undefined,
       onClose: () => closeWithFocus(id),
+      expanded: activeExpandedPaneId === id,
+      expansionTransitioning: paneTransition !== null,
+      onToggleExpanded: () => toggleExpandedPane(id),
+      transitionFromBounds:
+        paneTransition?.id === id ? paneTransition.fromBounds : null,
+      onTransitionEnd: () =>
+        setPaneTransition((current) => (current?.id === id ? null : current)),
       reorder: {
         draggingId: draggingPaneId,
         placement:
@@ -865,17 +1007,21 @@ function StudioStage(props: StudioWorkspaceProps) {
               </StudioPane>
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
-              {panes.slice(1).map((rightId, index) => (
-                <StudioPaneDivider
-                  key={`${panes[index]}:${rightId}`}
-                  leftId={panes[index]!}
-                  rightId={rightId}
-                  order={index * 2 + 1}
-                  panes={panes}
-                  onCommit={setPaneWidths}
-                  onReset={resetPaneWidths}
-                />
-              ))}
+              {activeExpandedPaneId === null || paneTransition !== null
+                ? panes
+                    .slice(1)
+                    .map((rightId, index) => (
+                      <StudioPaneDivider
+                        key={`${panes[index]}:${rightId}`}
+                        leftId={panes[index]!}
+                        rightId={rightId}
+                        order={index * 2 + 1}
+                        panes={panes}
+                        onCommit={setPaneWidths}
+                        onReset={resetPaneWidths}
+                      />
+                    ))
+                : null}
               {panes.length === 0 ? <StudioStageLauncher /> : null}
               <StudioCoachMark />
               <StudioWorkflowPanels />
@@ -900,7 +1046,10 @@ function StudioStage(props: StudioWorkspaceProps) {
             aria-hidden
             className="h-0 w-0 overflow-hidden"
           />
-          {createPortal(<StudioBrowserStream />, streamHostEl)}
+          {createPortal(
+            <StudioBrowserStream visiblePanes={visiblePanes} />,
+            streamHostEl,
+          )}
         </div>
       </TooltipProvider>
     </StudioShellContext.Provider>

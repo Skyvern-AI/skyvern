@@ -729,7 +729,26 @@ export type SplitPdfBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type WorkflowRetryStatus =
+  | "completed"
+  | "failed"
+  | "terminated"
+  | "canceled"
+  | "timed_out";
+export type WorkflowRetryRule = {
+  status: WorkflowRetryStatus;
+  error_codes?: Array<string> | null;
+};
+export type WorkflowRetryWebhookMode = "final_only" | "every_attempt";
+export type WorkflowRetryPolicy = {
+  max_retries: number;
+  delay_seconds: number;
+  webhook_on_retry: WorkflowRetryWebhookMode;
+  retry_on: Array<WorkflowRetryRule>;
+};
+
 export type WorkflowDefinition = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
@@ -783,6 +802,7 @@ export type WorkflowApiResponse = {
 };
 
 export type WorkflowSettings = {
+  retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;

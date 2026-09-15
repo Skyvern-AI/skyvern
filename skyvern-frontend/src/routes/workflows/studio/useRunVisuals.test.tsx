@@ -13,6 +13,7 @@ import type {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { useRunVisuals } from "./useRunVisuals";
+import { resolveBrowserPaneView } from "./browserPaneView";
 
 const { mocks, getClientMock } = vi.hoisted(() => ({
   mocks: {
@@ -161,6 +162,50 @@ afterEach(() => {
 beforeEach(() => useRunViewStore.getState().reset());
 
 describe("useRunVisuals loop-iteration threading", () => {
+  test("keeps the auto browser pane live across a retry delay until the run is final", () => {
+    seedLoopRun();
+    mocks.workflowRun = { status: Status.Running };
+    const { result, rerender } = renderHook(
+      () => {
+        const visuals = useRunVisuals("wr_1");
+        return {
+          ...visuals,
+          view: resolveBrowserPaneView({
+            intent: "auto",
+            recording: false,
+            scrubbing: visuals.scrubbing,
+            inspectingRun: true,
+            blockRunInDebugSession: false,
+            systemFocused: false,
+            running: visuals.running,
+            hasRecording: visuals.recordingUrls.length > 0,
+            failed: visuals.failed,
+          }),
+        };
+      },
+      { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> },
+    );
+
+    expect(result.current.view).toBe("live");
+
+    mocks.workflowRun = { status: Status.Failed, retry_pending: true };
+    rerender();
+    expect(result.current.view).toBe("live");
+    expect(result.current.running).toBe(true);
+    expect(result.current.finalized).toBe(false);
+
+    mocks.workflowRun = { status: Status.Running, attempt: 2 };
+    rerender();
+    expect(result.current.running).toBe(true);
+    expect(result.current.view).toBe("live");
+
+    mocks.workflowRun = { status: Status.Failed, attempt: 2 };
+    rerender();
+    expect(result.current.running).toBe(false);
+    expect(result.current.finalized).toBe(true);
+    expect(result.current.view).toBe("screenshots");
+  });
+
   test("resolves a selected container without an iteration to its first leaf", () => {
     seedLoopRun();
     const { result } = renderHook(() => useRunVisuals("wr_1"), { wrapper });

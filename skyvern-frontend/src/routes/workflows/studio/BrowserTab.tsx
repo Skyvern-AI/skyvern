@@ -1,3 +1,4 @@
+import { runIsRetryWaiting } from "../workflowRun/runRetryState";
 import { useCallback } from "react";
 import { ClockIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
@@ -31,7 +32,7 @@ export function BrowserTab() {
 
   const {
     workflowRun,
-    running,
+    executing,
     provisioning,
     isPaused,
     recordingUrls,
@@ -62,7 +63,15 @@ export function BrowserTab() {
     <div className="relative flex h-full min-h-0 w-full items-center justify-center overflow-hidden bg-slate-950">
       {view === "live" ? (
         showRunStream ? (
-          provisioning ? (
+          workflowRun && runIsRetryWaiting(workflowRun) ? (
+            <StreamStatusPanel
+              diagnostic={{
+                title: "Retry pending",
+                detail: "The browser reconnects when the next attempt starts.",
+                pending: true,
+              }}
+            />
+          ) : provisioning ? (
             // Mounting the stream while the run is still queued opens a
             // socket the backend never feeds; wait until it actually runs.
             <StreamStatusPanel
@@ -75,6 +84,7 @@ export function BrowserTab() {
           ) : (
             <RunLiveStream
               workflowRunId={runId}
+              run={workflowRun}
               browserSessionId={workflowRun?.browser_session_id ?? null}
               interactive={isPaused}
             />
@@ -122,7 +132,7 @@ export function BrowserTab() {
           />
         )
       ) : heroSelection ? (
-        <HeroScreenshot selection={heroSelection} running={running} />
+        <HeroScreenshot selection={heroSelection} running={executing} />
       ) : visuals.finalized ? (
         <StreamStatusPanel
           diagnostic={{

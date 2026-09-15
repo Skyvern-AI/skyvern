@@ -49,6 +49,7 @@ function WorkflowSettingsBlockFormBody({
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
       finallyBlockLabel: data.finallyBlockLabel,
       workflowSystemPrompt: data.workflowSystemPrompt,
+      retryPolicy: data.retryPolicy,
     };
   }, [data]);
 

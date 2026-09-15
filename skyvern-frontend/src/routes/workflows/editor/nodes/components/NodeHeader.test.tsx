@@ -178,3 +178,22 @@ describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () =
     expect(blockActionsAreInert()).toBe(false);
   });
 });
+
+test("a paused block run leaves per-block controls idle", () => {
+  queryClient.setQueryData(["workflowRun", "wf-test", "wr_paused"], {
+    workflow_run_id: "wr_paused",
+    status: Status.Paused,
+  });
+  renderNodeHeader(
+    { blockLabel: "block_1" },
+    { isDebugMode: true, blockRunsEnabled: false },
+    "/agents/wf-test/build?wr=wr_paused&bl=block_1",
+  );
+  expect(
+    screen
+      .getByRole("button", { name: "Block actions" })
+      .closest(".pointer-events-none"),
+  ).toBeNull();
+  expect(screen.getByRole("button", { name: "Run this block" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Stop this block" })).toBeNull();
+});

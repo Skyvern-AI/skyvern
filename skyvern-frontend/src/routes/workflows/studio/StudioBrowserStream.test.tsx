@@ -9,6 +9,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
+import { type StudioPaneId } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 
 const runtimeConfigMock = vi.hoisted(() => ({
@@ -105,7 +106,10 @@ function OpenBrowserPaneButton() {
 }
 
 // The browser pane's visibility comes from ?panes= in the URL.
-function renderStudioBrowserStream(initialPath: string) {
+function renderStudioBrowserStream(
+  initialPath: string,
+  visiblePanes?: readonly StudioPaneId[],
+) {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
       <Routes>
@@ -113,7 +117,7 @@ function renderStudioBrowserStream(initialPath: string) {
           path="/workflows/:workflowPermanentId/studio"
           element={
             <>
-              <StudioBrowserStream />
+              <StudioBrowserStream visiblePanes={visiblePanes} />
               <OpenBrowserPaneButton />
             </>
           }
@@ -307,6 +311,14 @@ describe("StudioBrowserStream block-run co-drive", () => {
   it("keeps other surfaces view-only while the Browser pane is closed", () => {
     mockWorkflowRun(Status.Running, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_CLOSED_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("withdraws control when fullscreen hides an otherwise open Browser pane", () => {
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH, ["editor"]);
 
     expect(controlButtonsAttr("emit vnc frame")).toBe("no");
     expect(screen.queryByRole("status")).toBeNull();
