@@ -69,7 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.proxy_pinning import redact_proxy_location
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse, read_browser_type
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
@@ -632,6 +632,7 @@ def convert_to_workflow(
         extra_http_headers=workflow_model.extra_http_headers,
         cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
+        browser_type=read_browser_type(workflow_model),
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
@@ -698,6 +699,7 @@ def convert_to_workflow_run(
         if workflow_run_model.script_run
         else None,
         run_with=workflow_run_model.run_with,
+        browser_type=read_browser_type(workflow_run_model),
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),

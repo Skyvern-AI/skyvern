@@ -225,6 +225,7 @@ from skyvern.schemas.runs import (
     RunType,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    read_browser_type,
     resolve_start_fresh,
     should_suppress_memory_write,
 )
@@ -273,6 +274,11 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
+from skyvern.webeye.real_browser_manager import (
+    SelectedBrowserTypeUnsupportedError,
+    ensure_runtime_supports_browser_type,
+    to_persistent_session_browser_type,
+)
 from skyvern.webeye.session_cookies import (
     persist_session_cookies,
     read_persisted_session_cookies,
@@ -319,6 +325,19 @@ _T6 = TypeVar("_T6")
 
 
 _USER_DEFINED_ERROR_KEYS = {"error_code", "reasoning", "confidence_float", "error_type"}
+
+
+def partition_reuse_bound_key_by_browser_type(reuse_bound_key: str, persistent_browser_type_value: str) -> str:
+    """Fold an explicit persistent browser type into a real reuse identity.
+
+    A run that pins an engine must never adopt a live session created for a different engine (or an
+    untyped session), and two runs sharing the same identity and the same engine must still reuse.
+    The raw identity is hashed into the composite so no credential/profile reuse key leaks; the
+    result is deterministic and index-safe (short, fixed-length). Callers must only reach here with a
+    real reuse identity (never an admission-off sentinel) and a recognized explicit engine.
+    """
+    composite = f"{reuse_bound_key}\x00bt={persistent_browser_type_value}".encode()
+    return f"bt:{persistent_browser_type_value}:sha256:{sha256(composite).hexdigest()}"
 
 
 def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
@@ -2566,6 +2585,8 @@ class WorkflowService:
         copilot_session_id: str | None = None,
         resolved_workflow_id: str | None = None,
         tag_write_context: TagWriteContext | None = None,
+        shares_parent_browser: bool = False,
+        server_owned_browser_type: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -2626,6 +2647,28 @@ class WorkflowService:
                 )
             if workflow_request.run_with is None:
                 workflow_request.run_with = workflow.run_with
+            # Attachment ownership wins: an attached browser (a live session or a remote
+            # browser_address) already owns its engine, so never inherit the workflow's browser_type
+            # onto an attached run — it must persist None, or the browser_type+session/address
+            # validators would reject the response/retry reconstruction. A synchronous trigger child
+            # that shares the parent's (in-memory) browser is the same case: the child runs in the
+            # parent's engine, so a per-child selection is meaningless and inheriting a stale workflow
+            # default would report an engine the child never uses. Only an unattached, non-shared run
+            # inherits the workflow default (explicit run browser_type > workflow default > null).
+            #
+            # server_owned_browser_type is an explicit provenance signal from the caller (the sync
+            # WorkflowTriggerBlock) that it provisioned a FRESH server-owned session seeded to that
+            # engine for this run: the child truly executes in that engine, so persist it despite the
+            # browser_session_id. Never inferred from the session id, and never set for a caller-supplied
+            # session/address or a parent-shared browser — a server-assigned session is excused from the
+            # attach-conflict validators on reconstruction.
+            if workflow_request.browser_type is None:
+                if server_owned_browser_type is not None:
+                    workflow_request.browser_type = server_owned_browser_type
+                elif not shares_parent_browser and not (
+                    workflow_request.browser_session_id or workflow_request.browser_address
+                ):
+                    workflow_request.browser_type = read_browser_type(workflow)
 
             # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
             # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -3890,6 +3933,7 @@ class WorkflowService:
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
         proxy_location: ProxyLocationInput = None,
+        browser_type: str | None = None,
     ) -> PersistentBrowserSession | None:
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
@@ -3902,12 +3946,17 @@ class WorkflowService:
             timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
             timeout_seconds = sum(timeouts) + 60 * 60
 
+            mapped_browser_type = to_persistent_session_browser_type(browser_type)
+            browser_type_kwargs: dict[str, Any] = (
+                {"browser_type": mapped_browser_type} if mapped_browser_type is not None else {}
+            )
             browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=organization_id,
                 timeout_minutes=timeout_seconds // 60,
                 browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
                 inherit_profile_proxy=True,
+                **browser_type_kwargs,
             )
 
             return browser_session
@@ -4048,6 +4097,14 @@ class WorkflowService:
                     parameter_values,
                     persisted_selections,
                 )
+                resolved_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
+                if resolved_browser_type is not None:
+                    # Partition the reuse identity by the pinned engine so Chrome and Edge (and
+                    # untyped) runs never adopt each other's live session. Null/default keeps the
+                    # exact legacy key for backward compatibility.
+                    reuse_bound_key = partition_reuse_bound_key_by_browser_type(
+                        reuse_bound_key, resolved_browser_type.value
+                    )
             except Exception:
                 LOG.warning(
                     "Reusable browser identity is unresolvable; using a fresh browser for this run",
@@ -4546,6 +4603,10 @@ class WorkflowService:
         last_unusable_session_id: str | None = None
         for _ in range(2):
             try:
+                mapped_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
+                browser_type_kwargs: dict[str, Any] = (
+                    {"browser_type": mapped_browser_type} if mapped_browser_type is not None else {}
+                )
                 browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=organization_id,
                     timeout_minutes=30,
@@ -4554,6 +4615,7 @@ class WorkflowService:
                     inherit_profile_proxy=True,
                     bound_workflow_permanent_id=workflow_permanent_id,
                     bound_key=bound_key,
+                    **browser_type_kwargs,
                 )
             except IntegrityError:
                 browser_session = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
@@ -5166,6 +5228,7 @@ class WorkflowService:
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
                 proxy_location=workflow_run.proxy_location,
+                browser_type=read_browser_type(workflow_run),
             )
 
         if browser_session:
@@ -8469,6 +8532,7 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
+        browser_type: str | None = None,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
@@ -8512,6 +8576,7 @@ class WorkflowService:
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
+                browser_type=browser_type,
                 cache_key=cache_key,
                 ai_fallback=True if ai_fallback is None else ai_fallback,
                 run_sequentially=run_sequentially,
@@ -9474,6 +9539,7 @@ class WorkflowService:
                     browser_address=workflow_request.browser_address,
                     sequential_key=sequential_key,
                     run_with=workflow_request.run_with,
+                    **({"browser_type": _bt} if (_bt := read_browser_type(workflow_request)) is not None else {}),
                     debug_session_id=debug_session_id,
                     ai_fallback=workflow_request.ai_fallback,
                     code_gen=code_gen,
@@ -9547,6 +9613,15 @@ class WorkflowService:
                     browser_session = None
                 else:
                     try:
+                        mapped_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
+                        # This forced session is created before the run context is installed, so pass
+                        # the run id explicitly alongside an explicit engine — otherwise the manager
+                        # cannot see a workflow_run_id and its workflow-owned first-party guard never
+                        # fires. Null/default keeps the exact legacy call shape (no extra kwargs).
+                        browser_type_kwargs: dict[str, Any] = {}
+                        if mapped_browser_type is not None:
+                            browser_type_kwargs["browser_type"] = mapped_browser_type
+                            browser_type_kwargs["workflow_run_id"] = workflow_run.workflow_run_id
                         browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                             organization_id=organization_id,
                             proxy_location=workflow_request.proxy_location,
@@ -9554,6 +9629,7 @@ class WorkflowService:
                             runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
                             browser_profile_id=forced_browser_profile_id,
                             inherit_profile_proxy=True,
+                            **browser_type_kwargs,
                         )
                         browser_session_id = browser_session.persistent_browser_session_id
                         LOG.info(
@@ -9599,6 +9675,7 @@ class WorkflowService:
             browser_address=workflow_request.browser_address,
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
+            **({"browser_type": _bt} if (_bt := read_browser_type(workflow_request)) is not None else {}),
             debug_session_id=debug_session_id,
             ai_fallback=workflow_request.ai_fallback,
             code_gen=code_gen,
@@ -11091,6 +11168,7 @@ class WorkflowService:
             task_v2=capped_task_v2(task_v2) if cap_output_values else task_v2,
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,
+            browser_type=read_browser_type(workflow_run),
             script_run=workflow_run.script_run,
             script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
@@ -11756,6 +11834,7 @@ class WorkflowService:
                 totp_identifier=workflow_run.totp_identifier,
                 start_fresh_browser=bool(workflow_run.start_fresh_browser),
                 reuse_browser_session=workflow_run.reuse_browser_session,
+                browser_type=read_browser_type(workflow_run),
             ),
             errors=workflow_run_status_response.errors,
             step_count=workflow_run_status_response.total_steps,
@@ -12230,6 +12309,7 @@ class WorkflowService:
             extra_http_headers=runtime_workflow.extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             run_with=runtime_workflow.run_with,
+            browser_type=read_browser_type(runtime_workflow),
             ai_fallback=runtime_workflow.ai_fallback,
             cache_key=runtime_workflow.cache_key,
             code_version=runtime_workflow.code_version,
@@ -12339,6 +12419,7 @@ class WorkflowService:
             is_saved_task=request.is_saved_task,
             status=request.status,
             run_with=request.run_with,
+            browser_type=read_browser_type(request),
             cache_key=request.cache_key,
             ai_fallback=request.ai_fallback,
             run_sequentially=request.run_sequentially,
@@ -12439,6 +12520,14 @@ class WorkflowService:
         validate_code_block_templates: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
+        # Fail fast before any persistence path (idempotent, update, or initial create): a browser_type
+        # this runtime cannot honor is rejected at ingress with a 4xx instead of a 200-on-save that
+        # then fails at every launch. Only an explicitly-requested selection is checked, so an update
+        # that omits the field (and inherits the stored value) is untouched.
+        try:
+            ensure_runtime_supports_browser_type(read_browser_type(request))
+        except SelectedBrowserTypeUnsupportedError as e:
+            raise SkyvernHTTPException(str(e), HTTPStatus.BAD_REQUEST) from e
         title = resolved_title
         if title is None:
             title = await self.resolve_workflow_creation_title(organization_id, request)
@@ -12569,6 +12658,14 @@ class WorkflowService:
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
+                    # A save that omits browser_type inherits the stored engine (the editor's payload
+                    # omits it); an explicit value — including null to clear — is honored. Mirrors the
+                    # pin_saved_session_ip / code_version siblings above.
+                    browser_type=(
+                        request.browser_type
+                        if "browser_type" in request.model_fields_set
+                        else read_browser_type(existing_latest_workflow)
+                    ),
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,

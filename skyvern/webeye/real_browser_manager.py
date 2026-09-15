@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -17,6 +18,7 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStateForBrowserSession,
     MissingOrganizationForBrowserSession,
+    SkyvernException,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
@@ -30,7 +32,7 @@ from skyvern.forge.sdk.streaming.registries import (
     stream_ref_active,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, read_browser_type
 from skyvern.webeye.browser_artifacts import DownloadBinding, RecordingPrefixSnapshot, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineBootstrapError,
@@ -55,7 +57,63 @@ from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserType
+
 LOG = structlog.get_logger()
+
+
+def to_persistent_session_browser_type(browser_type_value: str | None) -> PersistentBrowserType | None:
+    """Adapter at the persistent-session runtime boundary.
+
+    Maps the independent workflow/run ``BrowserType`` value into the PBS ``PersistentBrowserType``
+    runtime representation for persistent-session allocation. This is the one sanctioned conversion
+    point: the workflow/run domain never references ``PersistentBrowserType`` as its own type — it
+    passes its value through here. An unknown value or ``None`` returns ``None`` so the session keeps
+    the current routing behavior. The two enums stay distinct (value parity is guarded by tests).
+    """
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserType
+
+    if not browser_type_value:
+        return None
+    return PersistentBrowserType.from_source_browser_type(str(browser_type_value))
+
+
+# The cloud-only registry key under which the dynamic-browser creator is registered. Its presence is
+# the runtime capability that can actually honor a workflow/run browser_type selection (cloud dynamic
+# lane, or a cloud fixed-worker whose compliance wrapper reroutes there). Absent on OSS/self-host.
+_CLOUD_DYNAMIC_BROWSER_TYPE = "dynamic-browser"
+
+
+def runtime_supports_browser_type_selection() -> bool:
+    """Whether this runtime can honor an explicit workflow/run browser_type selection — i.e. the
+    cloud dynamic-browser creator is registered (cloud dynamic lane, or a cloud fixed-worker whose
+    compliance wrapper reroutes there). False on OSS/self-host. Reads the registry without mutating it;
+    it is the single source of truth for both the fail-closed guard and the options endpoint."""
+    return BrowserContextFactory._creators.get(_CLOUD_DYNAMIC_BROWSER_TYPE) is not None
+
+
+class SelectedBrowserTypeUnsupportedError(SkyvernException):
+    """A recognized workflow/run browser_type was selected on a runtime with no dynamic-browser
+    capability to honor it (OSS/self-host). Fail closed instead of silently launching the fixed
+    global browser and ignoring the selection."""
+
+    def __init__(self, browser_type: str) -> None:
+        super().__init__(
+            f"browser_type={browser_type!r} is not supported by this runtime: it has no dynamic-browser "
+            "capability to honor an explicit engine selection. Remove the browser_type setting or run on "
+            "Skyvern Cloud."
+        )
+
+
+def ensure_runtime_supports_browser_type(browser_type: str | None) -> None:
+    """Fail fast at API ingress: reject a browser_type this runtime cannot honor before any workflow or
+    run is persisted, instead of accepting it and only raising SelectedBrowserTypeUnsupportedError at
+    launch (200-on-create, then every run fails). No-op when unset or when the runtime supports an
+    explicit selection — the same predicate the launch-time guard and the options endpoint use."""
+    if browser_type is not None and not runtime_supports_browser_type_selection():
+        raise SelectedBrowserTypeUnsupportedError(str(browser_type))
+
 
 _WORKFLOW_RUN_KEY_PREFIX = f"{WORKFLOW_RUN_PREFIX}_"
 
@@ -592,7 +650,19 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
+        user_browser_type: str | None = None,
     ) -> BrowserState:
+        # Fail closed before any driver/browser launch: a recognized engine selection can only be
+        # honored where the cloud dynamic-browser creator is registered (cloud dynamic lane, or a
+        # cloud fixed-worker whose compliance wrapper reroutes there). On OSS/self-host that creator
+        # is absent, so the base factory would launch settings.BROWSER_TYPE and silently ignore the
+        # selection — refuse instead. Null/unrecognized selections keep the existing legacy behavior.
+        if (
+            to_persistent_session_browser_type(user_browser_type) is not None
+            and not runtime_supports_browser_type_selection()
+        ):
+            raise SelectedBrowserTypeUnsupportedError(str(user_browser_type))
+
         run_key = engine_run_key or canonical_run_key(
             workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
         )
@@ -650,6 +720,7 @@ class RealBrowserManager(BrowserManager):
                     browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                     browser_profile_id=browser_profile_id,
                     browser_session_id=browser_session_id,
+                    user_browser_type=user_browser_type,
                     engine_selection=selection,
                     _reconcile_persistent_init_scripts=browser_session_id is not None,
                 )
@@ -1145,6 +1216,7 @@ class RealBrowserManager(BrowserManager):
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
                 browser_session_id=browser_session_id,
+                user_browser_type=read_browser_type(workflow_run),
             )
 
             if browser_session_id:

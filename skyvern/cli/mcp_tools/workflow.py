@@ -526,6 +526,7 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "pin_saved_session_ip",
     "browser_profile_id",
     "browser_profile_key",
+    "browser_type",
     "model",
     "is_saved_task",
     "max_screenshot_scrolls",

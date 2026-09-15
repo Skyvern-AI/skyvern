@@ -25,7 +25,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.emails import EmailBodyFormat
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.utils.templating import replace_jinja_reference
@@ -1661,6 +1661,12 @@ class WorkflowCreateYAMLRequest(BaseModel):
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
+    browser_type: str | None = Field(
+        default=None,
+        description="Browser engine for runs of this workflow, one of the supported browser types "
+        "(e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. "
+        "Null means the system default.",
+    )
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
@@ -1683,6 +1689,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
 
     @field_validator("browser_profile_key", mode="before")
     @classmethod

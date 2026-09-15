@@ -65,7 +65,7 @@ from opentelemetry import trace as otel_trace
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
-from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -105,6 +105,7 @@ from skyvern.exceptions import (
     TaskNotFound,
     UnexpectedTaskStatus,
     UnresolvableHost,
+    WorkflowNotFound,
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
@@ -256,7 +257,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 )
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.emails import EmailBodyFormat
-from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_ENTRIES,
@@ -16906,6 +16907,14 @@ class WorkflowTriggerBlock(Block):
         #    session; for async (fire-and-forget), let the child's Temporal worker
         #    handle its own browser.
         created_fresh_session = False
+        # Set when the sync branch pre-resolves the target workflow's version to seed the child's
+        # engine into its session; reused by setup below so the workflow is resolved only once.
+        resolved_target_workflow_id: str | None = None
+        # Domain BrowserType of the fresh server-owned session this trigger provisions to match the
+        # target workflow's engine (kept separate from its mapped PersistentBrowserType). Passed to
+        # setup_workflow_run so the child run persists that engine despite carrying a browser_session_id;
+        # stays None for caller-supplied sessions and parent-shared browsers.
+        child_effective_browser_type: str | None = None
         if self.browser_session_id:
             resolved_browser_session_id = self.browser_session_id
         elif self.use_parent_browser_session and browser_session_id:
@@ -16920,11 +16929,42 @@ class WorkflowTriggerBlock(Block):
             # its own persistent session to avoid sharing the parent's browser.
             parent_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
             proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
+            # This session is provisioned before the child inherits the target workflow's browser_type
+            # in setup below, so resolve the target's default engine now and seed it into the session.
+            # An explicit engine is passed as a workflow-owned selection (with the parent run id) so the
+            # session manager's first-party guard fires; null keeps the current default. The resolved
+            # version is reused by setup so the target workflow is loaded only once.
+            # Lazy import: real_browser_manager pulls block back in at module load (circular).
+            from skyvern.webeye.real_browser_manager import to_persistent_session_browser_type
+
+            child_session_kwargs: dict[str, Any] = {}
+            # Production get_workflow_by_permanent_id is async; some legacy cleanup/fence tests inject a
+            # plain (non-async) MagicMock whose call result is not awaitable. Pre-resolve the target
+            # workflow only when the result is actually awaitable — otherwise fall back to the legacy
+            # null/default path (no engine seeding, no version pin) so existing failure/cleanup behavior
+            # proceeds. This pre-resolution runs before the setup handler below, so a target-lookup
+            # failure (workflow deleted -> WorkflowNotFound, or a DB error) is routed to the same _fail
+            # path rather than escaping execute; unrelated exceptions still propagate.
+            try:
+                maybe_target_workflow = app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                    resolved_workflow_permanent_id, organization_id=organization_id
+                )
+                if inspect.isawaitable(maybe_target_workflow):
+                    target_workflow = await maybe_target_workflow
+                    resolved_target_workflow_id = target_workflow.workflow_id
+                    child_effective_browser_type = read_browser_type(target_workflow)
+                    child_mapped_browser_type = to_persistent_session_browser_type(child_effective_browser_type)
+                    if child_mapped_browser_type is not None:
+                        child_session_kwargs["browser_type"] = child_mapped_browser_type
+                        child_session_kwargs["workflow_run_id"] = workflow_run_id
+            except (WorkflowNotFound, SQLAlchemyError) as e:
+                return await _fail(f"Failed to resolve triggered workflow: {get_user_facing_exception_message(e)}")
             try:
                 child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
                 created_fresh_session = True
@@ -16977,6 +17017,14 @@ class WorkflowTriggerBlock(Block):
                             parent_workflow_run_id=workflow_run_id,
                             ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                             trigger_type=inherited_trigger_type,
+                            resolved_workflow_id=resolved_target_workflow_id,
+                            # A child sharing the parent's browser runs in the parent's engine, so it
+                            # must not inherit the target workflow's browser_type (which it would never use).
+                            shares_parent_browser=self.use_parent_browser_session,
+                            # The fresh server-owned session provisioned above was seeded to the target
+                            # workflow's engine, so persist that engine on the child run for fidelity even
+                            # though it carries a browser_session_id. None for caller-supplied/parent-shared.
+                            server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)

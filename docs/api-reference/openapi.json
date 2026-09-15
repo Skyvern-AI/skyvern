@@ -1390,6 +1390,63 @@
         "x-fern-sdk-method-name": "delete_folder"
       }
     },
+    "/v1/browser_types": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "List selectable browser types",
+        "description": "List the selectable browser engines for the workflow/run browser_type setting. The list is runtime-capability aware: a runtime that can honor an explicit engine (the cloud dynamic-browser capability) returns all supported engines, while a runtime without it (OSS/self-host) returns an empty list rather than advertising selections the server would reject.",
+        "operationId": "get_browser_types_v1_browser_types_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully listed selectable browser types",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserTypeOption"
+                  },
+                  "title": "Response Get Browser Types V1 Browser Types Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_types"
+      }
+    },
     "/v1/runs/{workflow_run_id}/tags": {
       "post": {
         "tags": [
@@ -10913,6 +10970,24 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "BrowserTypeOption": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "BrowserTypeOption"
       },
       "BulkCancelRunsRequest": {
         "properties": {
@@ -28438,6 +28513,17 @@
             "title": "Run With",
             "default": "agent"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
@@ -28804,6 +28890,18 @@
             "type": "string",
             "title": "Run With",
             "default": "agent"
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for runs of this workflow, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. Null means the system default."
           },
           "ai_fallback": {
             "type": "boolean",
@@ -29910,6 +30008,17 @@
             ],
             "title": "Run With"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
           "script_run": {
             "anyOf": [
               {
@@ -30835,6 +30944,21 @@
               "code"
             ]
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
+            ]
+          },
           "run_metadata": {
             "anyOf": [
               {
@@ -31117,6 +31241,21 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
             ]
           },
           "run_metadata": {
