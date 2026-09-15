@@ -244,7 +244,23 @@ def resolve_copilot_tool_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
     registered_mcp_tools: Sequence[Any] | None = None,
+    browser_tools_available: bool = True,
 ) -> CopilotToolSurface:
+    if not browser_tools_available:
+        # Local import: tools/__init__ reaches this leaf back through CopilotContext.
+        from skyvern.forge.sdk.copilot.tools import BROWSER_BOUND_TOOL_NAMES
+
+        # A turn without browser authority advertises no tool that would need one, rather than
+        # advertising them and refusing at dispatch.
+        selected = [tool for tool in native_tools if tool.name not in BROWSER_BOUND_TOOL_NAMES]
+        return CopilotToolSurface(
+            native_tools=tuple(selected),
+            alias_map={},
+            overlays={},
+            ordered_native_names=tuple(tool.name for tool in selected),
+            ordered_mcp_names=(),
+        )
+
     if mode is None or mode in REPAIR_PROBE_MODES:
         selected = [
             tool

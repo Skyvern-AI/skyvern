@@ -1724,3 +1724,16 @@ NATIVE_TOOLS = [
     fill_credential_field_tool,
     request_credential_tool,
 ]
+
+# Native tools that cannot do their job without a browser: they dispatch a run, drive the
+# scouting tab, or read a live page. Membership is by hand because FunctionTool carries no
+# capability metadata; a new tool that touches a browser belongs here.
+BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
+    {
+        "discover_workflow_entrypoint",
+        "search_web",
+        "inspect_page_for_composition",
+        LOCATOR_INSPECTION_TOOL_NAME,
+        "fill_credential_field",
+    }
+)

@@ -43,6 +43,27 @@ afterEach(() => {
 });
 
 describe("useCreateWorkflowMutation", () => {
+  it("sends raw YAML to the legacy workflow endpoint", async () => {
+    mockPost.mockResolvedValue({ data: { workflow_permanent_id: "wpid_x" } });
+    const { result } = renderHook(() => useCreateWorkflowMutation(), {
+      wrapper,
+    });
+
+    act(() => {
+      result.current.mutate({
+        title: "New Agent",
+        workflow_definition: { version: 2, blocks: [], parameters: [] },
+      } as never);
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mockPost).toHaveBeenCalledWith(
+      "/workflows",
+      expect.stringContaining("title: New Agent"),
+      { headers: { "Content-Type": "text/plain" } },
+    );
+  });
+
   it("emits onboarding flow_completed when the creation came from the onboarding template path", async () => {
     mockPost.mockResolvedValue({ data: { workflow_permanent_id: "wpid_x" } });
     const { result } = renderHook(() => useCreateWorkflowMutation(), {

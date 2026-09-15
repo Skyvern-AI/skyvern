@@ -219,15 +219,26 @@ function readCopilotProductAction(value: unknown): CopilotProductAction | null {
   if (!value || typeof value !== "object") {
     return null;
   }
-  const candidate = value as Partial<CopilotProductAction>;
-  return candidate.kind === "diagnose_run" &&
-    typeof candidate.workflowRunId === "string" &&
-    typeof candidate.nonce === "string"
-    ? {
-        kind: candidate.kind,
-        workflowRunId: candidate.workflowRunId,
-        nonce: candidate.nonce,
-      }
+  const candidate = value as {
+    kind?: unknown;
+    workflowRunId?: unknown;
+    nonce?: unknown;
+  };
+  if (typeof candidate.nonce !== "string") {
+    return null;
+  }
+  if (
+    candidate.kind === "diagnose_run" &&
+    typeof candidate.workflowRunId === "string"
+  ) {
+    return {
+      kind: "diagnose_run",
+      workflowRunId: candidate.workflowRunId,
+      nonce: candidate.nonce,
+    };
+  }
+  return candidate.kind === "refine_recording"
+    ? { kind: "refine_recording", nonce: candidate.nonce }
     : null;
 }
 
@@ -578,6 +589,11 @@ function Workspace({
       setIsCopilotOpen(true);
     }
   }, [copilotPendingBuild]);
+  useEffect(() => {
+    if (initialCopilotAction) {
+      setIsCopilotOpen(true);
+    }
+  }, [initialCopilotAction]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<

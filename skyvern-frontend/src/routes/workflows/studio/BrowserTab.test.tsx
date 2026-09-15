@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -98,6 +99,7 @@ vi.mock("./runview/RunLiveStream", () => ({
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRunViewState = useRunViewStore.getState();
 const initialRecordingState = useRecordingStore.getState();
+const initialRecordingLauncherState = useRecordingLauncherStore.getState();
 
 function buildBlock(
   overrides: Partial<WorkflowRunBlock> = {},
@@ -233,6 +235,7 @@ beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
   useRunViewStore.setState(initialRunViewState, true);
   useRecordingStore.setState(initialRecordingState, true);
+  useRecordingLauncherStore.setState(initialRecordingLauncherState, true);
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.debugSession = undefined;
@@ -421,6 +424,19 @@ describe("BrowserTab view machine", () => {
     expect(useRecordingStore.getState().finishRequested).toBe(true);
   });
 
+  it("starts a browser recording from the studio browser header", () => {
+    const startRecording = vi.fn();
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useRecordingLauncherStore.setState({
+      startRecordingAtEnd: startRecording,
+    });
+    renderBrowserPane(STUDIO_PATH);
+
+    fireEvent.click(screen.getByRole("button", { name: "Record browser" }));
+
+    expect(startRecording).toHaveBeenCalledOnce();
+  });
+
   it("a pinned Recording view without a recording shows the empty state", () => {
     seedRun({ status: Status.Completed });
     mocks.debugSession = { browser_session_id: "pbs_test" };
@@ -496,10 +512,12 @@ describe("BrowserTab pills and selection sync", () => {
   it("disables debug-browser actions while the run's own stream is shown", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
+    useRecordingLauncherStore.setState({ startRecordingAtEnd: vi.fn() });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
     for (const name of [
+      "Record browser",
       "Reconnect browser stream",
       "Open browser in new tab",
       "Turn off browser",

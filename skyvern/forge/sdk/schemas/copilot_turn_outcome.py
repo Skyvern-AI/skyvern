@@ -27,8 +27,6 @@ class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
     UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
     CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
-    UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
-    MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
     INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"

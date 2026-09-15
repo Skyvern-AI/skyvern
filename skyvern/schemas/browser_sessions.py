@@ -10,6 +10,7 @@ from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTEND
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
+from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
 from skyvern.services.browser_recording.types import RecordingDraftStep
 from skyvern.utils.url_validators import validate_url
 
@@ -162,6 +163,13 @@ class ProcessBrowserSessionRecordingResponse(BaseModel):
     parameters: list[WorkflowDefinitionYamlParametersItem] = Field(
         default=[],
         description="List of workflow parameters generated from the processed browser session recording.",
+    )
+    evidence: RecordingEvidencePacket | None = Field(
+        default=None,
+        description=(
+            "Observation-only projection of the recorded actions, returned for code-first "
+            "processing so a refinement request can reuse it instead of re-uploading the recording."
+        ),
     )
 
 

@@ -28,6 +28,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
@@ -126,6 +127,9 @@ export function BrowserPaneActions() {
   const isRecording = useRecordingStore((s) => s.isRecording);
   const manualCapturePaused = useRecordingStore((s) => s.manualCapturePaused);
   const finishRequested = useRecordingStore((s) => s.finishRequested);
+  const startRecordingAtEnd = useRecordingLauncherStore(
+    (s) => s.startRecordingAtEnd,
+  );
   // These act on the debug browser; while the pane streams the run's own
   // browser instead, they'd hit an invisible session — disable with a reason.
   const debugHidden = liveSurface === "run";
@@ -218,7 +222,30 @@ export function BrowserPaneActions() {
               stopButton
             );
           })()
-        : null}
+        : (() => {
+            const disabled =
+              !browserSessionId || debugHidden || !startRecordingAtEnd;
+            const tooltip = debugHidden
+              ? blockedTitle
+              : startRecordingAtEnd
+                ? "Record browser interactions"
+                : "Recording is available when the editor is ready";
+            return (
+              <ControlTooltip content={tooltip} blocked={disabled}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
+                  aria-label="Record browser"
+                  disabled={disabled}
+                  onClick={() => startRecordingAtEnd?.()}
+                >
+                  <span className="h-2 w-2 rounded-full bg-red-500" />
+                  {compact ? null : "Record"}
+                </Button>
+              </ControlTooltip>
+            );
+          })()}
       <ControlTooltip
         content={debugHidden ? blockedTitle : "Reconnect"}
         blocked={!browserSessionId || debugHidden}

@@ -28,8 +28,15 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
+from skyvern.forge.sdk.copilot.runtime import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    AgentContext,
+    ensure_browser_session,
+    mcp_browser_context,
+    mcp_to_copilot,
+)
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -120,6 +127,14 @@ def _make_ctx(*, api_key: str | None = "test-api-key") -> AgentContext:
         stream=stream,
         api_key=api_key,
     )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_browser_authority_is_told_so_not_that_creation_failed() -> None:
+    ctx = _make_ctx()
+    ctx.copilot_config = CopilotConfig(browser_tools_available=False)
+
+    assert await ensure_browser_session(ctx) == {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
 
 
 def _admit_mock_browser_operations(manager: MagicMock) -> None:

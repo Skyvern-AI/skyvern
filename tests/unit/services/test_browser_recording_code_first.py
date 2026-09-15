@@ -428,8 +428,8 @@ async def test_process_binds_credentials_only_for_a_caller_that_substitutes_toke
     )
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
 
-    unsupported_blocks, _ = await processor.process(["chunk"], draft_steps=drafts, code_first=True)
-    supported_blocks, _ = await processor.process(
+    unsupported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts, code_first=True)
+    supported_blocks, _, _ = await processor.process(
         ["chunk"], draft_steps=drafts, code_first=True, supports_credential_tokens=True
     )
 
@@ -440,8 +440,12 @@ async def test_process_binds_credentials_only_for_a_caller_that_substitutes_toke
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_returns_code_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    actions: list[Action] = [make_click(1000, selector="#submit", accessible_name="Go")]
+async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    typed_value = "hunter2-distinct"
+    actions: list[Action] = [
+        make_input(1000, typed_value, selector="#query", input_type="text"),
+        make_click(2000, selector="#submit", accessible_name="Go"),
+    ]
     monkeypatch.setattr(Processor, "compressed_chunks_to_events", lambda self, chunks: [])
     monkeypatch.setattr(
         Processor,
@@ -449,12 +453,18 @@ async def test_process_code_first_returns_code_blocks(monkeypatch: pytest.Monkey
         lambda self, events, machines=None, initial_actions=None: actions,
     )
 
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, parameters = await processor.process(["chunk"], code_first=True)
+    processor = Processor(PBS_ID, ORG_ID, WP_ID, recording_attempt_id="rra_test")
+    blocks, _, evidence = await processor.process(["chunk"], code_first=True)
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"
-    assert parameters == []
+    assert typed_value not in blocks[0].code
+    # Refinement consumes this packet instead of re-uploading the recording, so it must cover the
+    # same actions the code blocks came from and still carry no typed values.
+    assert evidence is not None
+    assert len(evidence.actions) == len(actions)
+    assert evidence.recording.recording_attempt_id == "rra_test"
+    assert typed_value not in evidence.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -464,7 +474,7 @@ async def test_process_code_first_falls_back_to_legacy_when_synthesis_empty(
     monkeypatch.setattr(Processor, "compressed_chunks_to_events", lambda self, chunks: [])
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, parameters = await processor.process(["chunk"], code_first=True)
+    blocks, parameters, _ = await processor.process(["chunk"], code_first=True)
 
     assert blocks == []
     assert parameters == []
@@ -484,7 +494,7 @@ async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
     )
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)], code_first=True)
+    blocks, _, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)], code_first=True)
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"

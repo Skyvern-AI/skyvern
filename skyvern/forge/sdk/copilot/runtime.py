@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.secret_scrub import (
     origin_runs_bound_to_scrubber,
@@ -504,6 +504,7 @@ class AgentContext:
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     effective_workflow_proxy_location: Any | None = None
 
@@ -821,6 +822,8 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
     """
     return _CALL_BROWSER_SESSION_ID.get() or ctx.browser_session_id
 
+
+BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
 
 SENSITIVE_ORIGIN_PAGE_ERROR = (
     "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
@@ -1342,6 +1345,8 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
 
 def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
+    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
+        return {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
     if failure.state == "billing_credit_admission_refusal":
         return {
             "ok": False,
@@ -1370,6 +1375,14 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     failure fact, so a failed adoption aborts the turn rather than degrading to a normal
     tool-level error. Callers must let it propagate.
     """
+    # Belt and braces: the tool surface already withholds every browser tool on such a turn.
+    if ctx.copilot_config is not None and not ctx.copilot_config.browser_tools_available:
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
+        )
+
     if ctx.turn_origin == TurnOrigin.runtime_self_heal:
         browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id

@@ -5,7 +5,10 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { MemoryRouter, useLocation } from "react-router-dom";
+
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   useRecordingStore,
   type OptimisticStep,
@@ -19,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   captureRecordBrowser: vi.fn(),
   markRecordBrowserProcessed: vi.fn(),
   post: vi.fn(),
+  useFeatureFlagEnabled: vi.fn(() => false),
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -32,7 +36,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => false,
+  useFeatureFlagEnabled: mocks.useFeatureFlagEnabled,
 }));
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
@@ -45,9 +49,13 @@ function wrapper({ children }: { children: ReactNode }) {
     defaultOptions: { mutations: { retry: false } },
   });
   return (
-    <WorkflowPermanentIdContext.Provider value="wpid-1">
-      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-    </WorkflowPermanentIdContext.Provider>
+    <MemoryRouter initialEntries={["/agents/wpid-1/edit"]}>
+      <WorkflowPermanentIdContext.Provider value="wpid-1">
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      </WorkflowPermanentIdContext.Provider>
+    </MemoryRouter>
   );
 }
 
@@ -74,6 +82,8 @@ describe("useProcessRecordingMutation telemetry", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     vi.clearAllMocks();
+    mocks.useFeatureFlagEnabled.mockReturnValue(false);
+    useRecordingRefinementEvidenceStore.setState({ armed: null });
     useRecordingStore.getState().reset();
     useRecordingStore.getState().setRecordingTransport("cdp");
     useRecordingStore.getState().setIsRecording(true);
@@ -114,6 +124,44 @@ describe("useProcessRecordingMutation telemetry", () => {
         optimistic_step_count: 1,
       },
     );
+  });
+
+  it("arms the refine_recording copilot turn with the response evidence packet", async () => {
+    mocks.useFeatureFlagEnabled.mockReturnValue(true);
+    const evidence = {
+      schema_version: 1,
+      recording: { browser_session_id: "pbs-1" },
+      actions: [{ action_id: "a001" }, { action_id: "a002" }],
+      deleted_action_ids: [],
+      truncated_action_count: 0,
+      provenance: { source: "browser_recording" },
+    };
+    mocks.post.mockResolvedValue({
+      data: { blocks: [{ label: "code" }], parameters: [], evidence },
+    });
+    const { result } = renderHook(
+      () => ({
+        mutation: useProcessRecordingMutation({ browserSessionId: "pbs-1" }),
+        locationState: useLocation().state,
+      }),
+      { wrapper },
+    );
+
+    act(() => result.current.mutation.mutate({ draftSteps: [draftStep] }));
+
+    await waitFor(() => expect(result.current.mutation.isSuccess).toBe(true));
+    const armed = useRecordingRefinementEvidenceStore.getState().armed;
+    expect(armed?.evidence).toEqual(evidence);
+    // Route state carries only the nonce, so it has to name the packet the copilot
+    // turn will take back out of the store.
+    await waitFor(() =>
+      expect(result.current.locationState).toEqual({
+        copilotAction: { kind: "refine_recording", nonce: armed!.nonce },
+      }),
+    );
+    expect(
+      useRecordingRefinementEvidenceStore.getState().take(armed!.nonce),
+    ).toEqual(evidence);
   });
 
   it("sends the recording correlation ids used by live interpretation", async () => {

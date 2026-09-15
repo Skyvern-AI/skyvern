@@ -154,6 +154,25 @@ from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 from tests.unit.copilot_test_helpers import passing_run, two_page_login_yaml
 
+
+def test_build_user_context_preserves_structured_evidence_after_redacting_secret() -> None:
+    evidence = json.dumps(
+        {
+            "actions": [
+                {"action_id": "a001", "url": "https://example.com/?token=private-value"},
+                {"action_id": "a002", "url": "https://example.com/next"},
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+    context = agent_module._build_user_context("", "", "", "", "refine", untrusted_evidence=evidence)
+
+    assert "private-value" not in context
+    assert "[REDACTED_SECRET]" in context
+    assert "a002" in context
+
+
 _COVERED_DRAFT_YAML = """title: Draft
 workflow_definition:
   parameters: []
@@ -4192,65 +4211,30 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "review_untested"
 
-    def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
+    def test_informational_reply_about_workflow_status_survives_without_a_proposal(self) -> None:
+        reply = (
+            "This workflow runs as generated code, which is why the editor shows it that way. "
+            "This explanation does not mean the workflow is complete. "
+            "Earlier I said the workflow is ready; that was before the test failed."
+        )
         ctx = _ctx(last_test_ok=None)
-        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        result = _fake_run_result({"type": "REPLY", "user_response": reply})
         agent_result = asyncio.run(
             agent_module._translate_to_agent_result(
                 result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
             )
         )
 
-        assert "here's the workflow" not in agent_result.user_response.lower()
-        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-        assert "provide the missing details" not in agent_result.user_response
-        assert "couldn't identify which details were missing" in agent_result.user_response
+        assert agent_result.user_response == reply
+        assert agent_result.response_type == "REPLY"
+        diagnostics = agent_result.output_policy_diagnostics or {}
+        assert diagnostics["final_output_kind"] == "informational_answer"
+        assert diagnostics["soft_rewrite_reason_codes"] == []
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
-        assert agent_result.response_type == "ASK_QUESTION"
-
-    def test_unbacked_workflow_claim_renders_diagnosis_missing_context_labels(self) -> None:
-        ctx = _ctx(
-            last_test_ok=None,
-            latest_diagnosis_repair_contract=DiagnosisRepairContract(
-                diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
-                diagnosis_result=DiagnosisResult(missing_context=["workflow_run_id", "block_results"]),
-                repair_decision=RepairDecision(),
-                verification_result=VerificationResult(),
-            ),
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert "Required context was unavailable: the workflow run ID and the block run results." in (
-            agent_result.user_response
-        )
-        assert "workflow_run_id" not in agent_result.user_response
-        assert "block_results" not in agent_result.user_response
-
-    def test_initial_part_workflow_claim_is_rewritten_without_proposal(self) -> None:
-        ctx = _ctx(last_test_ok=None)
-        result = _fake_run_result(
-            {
-                "type": "REPLY",
-                "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
-            }
-        )
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert "initial part of your workflow" not in agent_result.user_response.lower()
-        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-        assert "provide the missing details" not in agent_result.user_response
-        assert agent_result.updated_workflow is None
-        assert agent_result.workflow_yaml is None
+        assert agent_result.workflow_was_persisted is False
+        assert agent_result.proposal_disposition == "no_proposal"
+        assert agent_result.clear_proposed_workflow is False
 
     def test_clean_test_keeps_the_models_reply_without_a_judge_cosign(self) -> None:
         """A clean test is the evidence; a separate judge's reading of the same run does not

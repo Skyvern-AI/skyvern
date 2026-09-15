@@ -7,6 +7,7 @@ import re
 import typing as t
 import zlib
 from urllib.parse import urlparse, urlunparse
+from uuid import uuid4
 
 import structlog
 
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
+from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
 from skyvern.services.browser_recording.redact import is_secret_field, redact_console_event, texts_are_labels
 from skyvern.services.browser_recording.types import (
     Action,
@@ -1099,17 +1101,17 @@ class Processor:
         draft_steps: list[RecordingDraftStep] | None = None,
         code_first: bool = False,
         supports_credential_tokens: bool = False,
-    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem]]:
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem], RecordingEvidencePacket | None]:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
-        blocks, parameters, _, _ = await self.process_with_evidence(
+        blocks, parameters, _, _, evidence = await self.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             code_first=code_first,
             supports_credential_tokens=supports_credential_tokens,
         )
-        return blocks, parameters
+        return blocks, parameters, evidence
 
     async def process_with_evidence(
         self,
@@ -1122,13 +1124,24 @@ class Processor:
         list[WorkflowDefinitionYamlParametersItem],
         list[dict[str, t.Any]],
         dict[str, t.Any],
+        RecordingEvidencePacket | None,
     ]:
         events = self.compressed_chunks_to_events(compressed_chunks)
         actions = self.events_to_actions(events)
+        refinement_evidence: RecordingEvidencePacket | None = None
 
         if code_first:
             # Code-first always re-derives selector-bearing actions from raw events;
             # draft steps carry no locators and act only as an edit overlay.
+            # Built from the actions this pass already derived so refinement never re-uploads
+            # or re-derives the recording.
+            refinement_evidence = build_recording_evidence(
+                actions,
+                draft_steps,
+                browser_session_id=self.browser_session_id,
+                workflow_permanent_id=self.workflow_permanent_id,
+                recording_attempt_id=self.recording_attempt_id or f"rra_{uuid4().hex}",
+            )
             code_first_result = actions_to_code_first_blocks(
                 actions, draft_steps, bind_credentials=supports_credential_tokens
             )
@@ -1153,6 +1166,7 @@ class Processor:
                         code_first=True,
                         interpretation_session_id=self.interpretation_session_id,
                     ),
+                    refinement_evidence,
                 )
             LOG.warning(
                 "record_browser.code_first_fallback_to_legacy",
@@ -1181,6 +1195,7 @@ class Processor:
                     code_first=code_first,
                     interpretation_session_id=self.interpretation_session_id,
                 ),
+                refinement_evidence,
             )
 
         LOG.info(
@@ -1204,6 +1219,7 @@ class Processor:
                 code_first=code_first,
                 interpretation_session_id=self.interpretation_session_id,
             ),
+            refinement_evidence,
         )
 
 
@@ -1219,7 +1235,12 @@ class BrowserSessionRecordingService:
         supports_credential_tokens: bool = False,
         recording_attempt_id: str | None = None,
         interpretation_session_id: str | None = None,
-    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem], str | None]:
+    ) -> tuple[
+        list[ProcessedBlock],
+        list[WorkflowDefinitionYamlParametersItem],
+        str | None,
+        RecordingEvidencePacket | None,
+    ]:
         """
         Process compressed browser session recording events into workflow definition blocks.
         """
@@ -1231,14 +1252,14 @@ class BrowserSessionRecordingService:
             interpretation_session_id=interpretation_session_id,
         )
 
-        blocks, parameters, evidence, metadata = await processor.process_with_evidence(
+        blocks, parameters, evidence, metadata, refinement_evidence = await processor.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             code_first=code_first,
             supports_credential_tokens=supports_credential_tokens,
         )
         if not blocks:
-            return blocks, parameters, None
+            return blocks, parameters, None, refinement_evidence
 
         recording = await app.DATABASE.browser_recordings.create_recording(
             organization_id=organization_id,
@@ -1248,7 +1269,7 @@ class BrowserSessionRecordingService:
             evidence=evidence,
             metadata=metadata,
         )
-        return blocks, parameters, recording.recording_id
+        return blocks, parameters, recording.recording_id, refinement_evidence
 
 
 async def smoke() -> None:

@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 
 type StreamBody = {
   code_block?: boolean | null;
@@ -16,6 +17,7 @@ type StreamBody = {
   mode?: string | null;
   workflow_run_id?: string | null;
   product_action?: string | null;
+  recording_evidence?: unknown;
 };
 type StreamCall = {
   body: StreamBody;
@@ -24,42 +26,53 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-const { streamCalls, postStreaming, cancelPost, historyResponse, routeParams } =
-  vi.hoisted(() => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: StreamBody,
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as unknown[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    const params = {
-      current: {
-        workflowPermanentId: "wpid_1",
-        workflowRunId: undefined as string | undefined,
-      },
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-      routeParams: params,
-    };
-  });
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyGet,
+  historyResponse,
+  routeParams,
+  toast,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const post = vi.fn().mockResolvedValue({});
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: StreamBody,
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as unknown[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  const get = vi.fn().mockImplementation(() => Promise.resolve(history));
+  const toastFn = vi.fn();
+  const params = {
+    current: {
+      workflowPermanentId: "wpid_1",
+      workflowRunId: undefined as string | undefined,
+    },
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    historyGet: get,
+    historyResponse: history,
+    routeParams: params,
+    toast: toastFn,
+  };
+});
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -67,7 +80,7 @@ vi.mock("@/api/sse", () => ({
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn().mockResolvedValue({
-    get: vi.fn().mockImplementation(() => Promise.resolve(historyResponse)),
+    get: historyGet,
     post: cancelPost,
   }),
 }));
@@ -76,7 +89,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
+vi.mock("@/components/ui/use-toast", () => ({ toast }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-router-dom")>();
@@ -155,6 +168,7 @@ type ChatProps = {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   liveBrowserSessionId?: string | null;
+  onInitialMessageConsumed?: () => void;
 };
 
 function chatUi(props: ChatProps) {
@@ -184,6 +198,9 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  historyGet.mockReset();
+  historyGet.mockImplementation(() => Promise.resolve(historyResponse));
+  toast.mockClear();
   historyResponse.data = {
     workflow_copilot_chat_id: null,
     chat_history: [],
@@ -196,9 +213,11 @@ beforeEach(() => {
   };
   BOOLEAN_FLAGS.WORKFLOW_COPILOT_CODE_BLOCK_MODE = false;
   BOOLEAN_FLAGS.CODE_BLOCK_ACCESS = false;
+  useRecordingRefinementEvidenceStore.setState({ armed: null });
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
 });
 
@@ -239,6 +258,44 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     expect(streamCalls[0]?.body.message.trim()).not.toBe("");
     const echoed = screen.getByText(streamCalls[0]!.body.message);
     expect(echoed.closest('[role="status"]')).not.toBeNull();
+  });
+
+  it("keeps refinement evidence until the server accepts the turn", async () => {
+    const evidence = {
+      schema_version: 1,
+      recording: { browser_session_id: "pbs-1" },
+      actions: [{ action_id: "a001" }],
+      deleted_action_ids: [],
+      truncated_action_count: 0,
+      provenance: { source: "browser_recording" },
+    };
+    useRecordingRefinementEvidenceStore
+      .getState()
+      .set({ nonce: "n-refine", evidence });
+    const consumed = vi.fn();
+
+    await renderChat({
+      initialAction: { kind: "refine_recording", nonce: "n-refine" },
+      onInitialMessageConsumed: consumed,
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.recording_evidence).toEqual(evidence);
+    expect(useRecordingRefinementEvidenceStore.getState().armed).not.toBeNull();
+    expect(consumed).not.toHaveBeenCalled();
+
+    await act(async () => {
+      streamCalls[0]?.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+    });
+
+    expect(useRecordingRefinementEvidenceStore.getState().armed).toBeNull();
+    expect(consumed).toHaveBeenCalledTimes(1);
   });
 
   it("keeps code authoring enabled for a typed diagnose action on a code workflow", async () => {
@@ -294,6 +351,64 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     expect(streamCalls[1]?.body.workflow_run_id).toBe("wr_2");
     expect(streamCalls[1]?.body.product_action).toBe("diagnose_run");
+  });
+
+  it("retries history and posts a product action that arrives after initial readiness failed", async () => {
+    historyGet
+      .mockRejectedValueOnce(new Error("workflow is not ready yet"))
+      .mockRejectedValueOnce(new Error("workflow is not ready yet"));
+    const view = await renderChat();
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    const callsBeforeAction = historyGet.mock.calls.length;
+
+    view.rerender(
+      chatUi({
+        initialAction: {
+          kind: "diagnose_run",
+          workflowRunId: "wr_late",
+          nonce: "n-late",
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeAction),
+    );
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.product_action).toBe("diagnose_run");
+    expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_late");
+  });
+
+  it("does not consume a refine action when history readiness keeps failing", async () => {
+    vi.useFakeTimers();
+    historyGet.mockRejectedValue(new Error("workflow is not ready yet"));
+    const consumed = vi.fn();
+    const view = render(chatUi({ onInitialMessageConsumed: consumed }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(historyGet).toHaveBeenCalled();
+    const callsBeforeAction = historyGet.mock.calls.length;
+
+    view.rerender(
+      chatUi({
+        initialAction: { kind: "refine_recording", nonce: "n-refine" },
+        onInitialMessageConsumed: consumed,
+      }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeAction);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(consumed).not.toHaveBeenCalled();
+    expect(toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Could not auto-send message" }),
+    );
   });
 
   it("still posts the typed action when the live browser was not ready yet", async () => {

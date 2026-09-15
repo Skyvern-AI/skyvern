@@ -6,10 +6,10 @@ import yaml
 from skyvern.forge.sdk.copilot.code_block_steps import fill_code_block_error_code_mappings_in_yaml
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.tools.run_execution import _workflow_from_prior_draft
+from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _ensure_copilot_workflow_yaml,
     _prior_copilot_workflow_yaml,
-    _workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
@@ -79,7 +79,7 @@ def _chat_request(workflow_yaml: str) -> WorkflowCopilotChatRequest:
 
 
 def test_workflow_to_copilot_yaml_keeps_saved_blocks_without_runtime_fields() -> None:
-    persisted_yaml = _workflow_to_copilot_yaml(_saved_workflow())
+    persisted_yaml = workflow_to_copilot_yaml(_saved_workflow())
     parsed = yaml.safe_load(persisted_yaml)
 
     blocks = parsed["workflow_definition"]["blocks"]

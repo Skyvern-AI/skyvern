@@ -4,11 +4,28 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai" | "product";
-export type CopilotProductAction = {
-  kind: "diagnose_run";
-  workflowRunId: string;
-  nonce: string;
+/**
+ * Mirrors `RecordingEvidencePacket` in skyvern/services/browser_recording/evidence.py.
+ * The frontend only counts actions; the rest is opaque payload it forwards verbatim.
+ */
+export type RecordingEvidencePacket = {
+  schema_version: number;
+  recording: Record<string, unknown>;
+  actions: Array<Record<string, unknown>>;
+  deleted_action_ids: Array<string>;
+  truncated_action_count: number;
+  provenance: Record<string, string | number>;
 };
+export type CopilotProductAction =
+  | {
+      kind: "diagnose_run";
+      workflowRunId: string;
+      nonce: string;
+    }
+  | {
+      kind: "refine_recording";
+      nonce: string;
+    };
 export type ProposalDisposition =
   | "no_proposal"
   | "auto_applicable"
@@ -127,7 +144,14 @@ export interface WorkflowCopilotChatRequest {
   // sent — context for "this block" references, never a directive.
   selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
-  product_action?: "test_end_to_end" | "diagnose_run" | null;
+  product_action?:
+    | "test_end_to_end"
+    | "diagnose_run"
+    | "refine_recording"
+    | null;
+  // Required by the refine_recording action; reaches the model as untrusted
+  // evidence, never as the turn's message.
+  recording_evidence?: RecordingEvidencePacket | null;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;

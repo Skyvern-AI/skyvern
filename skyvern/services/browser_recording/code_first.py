@@ -166,21 +166,38 @@ def transfer_focus_click_credentials(pairs: list[ActionDraftPair]) -> list[Actio
     return transferred
 
 
+def attribute_click_navigations(pairs: list[ActionDraftPair]) -> dict[int, int]:
+    """Index of the url_change each interaction caused, for the interactions that caused one.
+
+    One navigation per interaction: a later url_change inside the same window is a genuine
+    user navigation.
+    """
+    caused_by: dict[int, int] = {}
+    last_interactive: int | None = None
+
+    for index, (action, _) in enumerate(pairs):
+        if isinstance(action, ActionUrlChange):
+            if (
+                last_interactive is not None
+                and action.timestamp_start - pairs[last_interactive][0].timestamp_end <= CLICK_NAVIGATION_WINDOW_MS
+            ):
+                caused_by[last_interactive] = index
+                last_interactive = None
+            continue
+        if isinstance(action, (ActionClick, ActionInputText, ActionPressKey)):
+            last_interactive = index
+
+    return caused_by
+
+
 def segment_actions(pairs: list[ActionDraftPair]) -> list[RecordingSegment]:
     """Split at user-initiated navigations; click-caused navigations stay inside their segment."""
+    caused_navigations = set(attribute_click_navigations(pairs).values())
     segments = [RecordingSegment()]
-    last_interactive_end: float | None = None
 
-    for action, draft in pairs:
+    for index, (action, draft) in enumerate(pairs):
         if isinstance(action, ActionUrlChange):
-            caused_by_interaction = (
-                last_interactive_end is not None
-                and action.timestamp_start - last_interactive_end <= CLICK_NAVIGATION_WINDOW_MS
-            )
-            if caused_by_interaction:
-                # One navigation per interaction: a later url_change inside the same
-                # window is a genuine user navigation and must start a new segment.
-                last_interactive_end = None
+            if index in caused_navigations:
                 continue
             url = ((draft.url or "").strip() if draft else "") or action.url
             if segments[-1].pairs:
@@ -188,9 +205,6 @@ def segment_actions(pairs: list[ActionDraftPair]) -> list[RecordingSegment]:
             else:
                 segments[-1].source_url = url
             continue
-
-        if isinstance(action, (ActionClick, ActionInputText, ActionPressKey)):
-            last_interactive_end = action.timestamp_end
 
         segments[-1].pairs.append((action, draft))
 
