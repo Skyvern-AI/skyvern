@@ -100,14 +100,17 @@ def _redact_input_values(value: str | None, input_values: list[str]) -> str | No
     if value is None:
         return None
     redacted = value
-    variants = {
-        variant
-        for input_value in input_values
-        if input_value
-        for variant in (input_value, quote(input_value, safe=""), quote_plus(input_value, safe=""))
-    }
-    for variant in sorted(variants, key=len, reverse=True):
-        redacted = redacted.replace(variant, _REDACTED_INPUT)
+    variants: dict[str, bool] = {}
+    for input_value in input_values:
+        if not input_value:
+            continue
+        for variant in (input_value, quote(input_value, safe=""), quote_plus(input_value, safe="")):
+            variants[variant] = variants.get(variant, False) or len(input_value) >= 3
+    for variant, replace_anywhere in sorted(variants.items(), key=lambda item: len(item[0]), reverse=True):
+        if replace_anywhere:
+            redacted = redacted.replace(variant, _REDACTED_INPUT)
+        else:
+            redacted = re.sub(rf"(?<![\w.-]){re.escape(variant)}(?![\w.-])", _REDACTED_INPUT, redacted)
     return redacted
 
 
