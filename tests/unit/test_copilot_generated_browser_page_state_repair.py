@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_user_context,
     _code_authoring_repair_context_prompt,
     _prior_run_debug_text,
+    _recorded_build_test_outcome_prompt,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _declared_path_returned_empty_scalar,
@@ -842,3 +843,39 @@ def test_scope_class_needs_the_failing_name_and_line_to_land_in_the_helper(
     assert pending.reason_code == "runtime_block_failure"
     assert pending.runtime_failure_class is None
     assert "wrapper" not in pending.repair_instruction
+
+
+def test_a_completed_sibling_row_keeps_its_page_facts_beside_a_failed_rows_page_state() -> None:
+    result = _generated_browser_failure()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks.insert(
+        0,
+        {
+            "workflow_run_block_id": "wrb_sign_in",
+            "label": "sign_in",
+            "block_type": "code",
+            "status": "completed",
+            "output": {"current_url": "https://analytics.fixture.test/login", "page_evidence": ""},
+        },
+    )
+    evidence = data["post_run_page_evidence"]
+    assert isinstance(evidence, dict)
+
+    outcome = recorded_outcome_from_run_blocks_result(result, page_evidence=evidence)
+    assert outcome is not None
+
+    ctx = _copilot_context()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.latest_recorded_build_test_outcome = outcome
+    rows = [line for line in _recorded_build_test_outcome_prompt(ctx).splitlines() if line.startswith("- label=")]
+
+    assert rows == [
+        (
+            "- label=sign_in; status=completed; output.current_url=https://analytics.fixture.test/login; "
+            "output.page_evidence=(empty)"
+        ),
+        "- label=read_visitors; status=failed; recorded_output=(none recorded)",
+    ]

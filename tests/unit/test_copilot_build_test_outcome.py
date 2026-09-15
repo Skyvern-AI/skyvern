@@ -19,6 +19,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
+    _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY,
     _build_dynamic_system_prompt,
     _build_user_context,
     _make_agent_result,
@@ -7830,3 +7831,282 @@ def test_uncleared_challenge_reports_its_real_reason_not_a_nearby_url() -> None:
     assert real_reason in str(ctx.last_test_failure_reason)
     assert end_url not in str(ctx.last_test_failure_reason)
     assert result["data"]["observed_block_end_urls"] == {"solve_and_submit_recaptcha_demo": end_url}
+
+
+_SIGN_IN_URL = "https://analytics.fixture.test/login?next=/project/1/web"
+_EXTRACTION_TIMEOUT = (
+    "CodeBlock failed because a browser operation failed at line 2: Locator.wait_for: "
+    'Timeout 30000ms exceeded.Call log: - waiting for locator("main#main-content") to be visible.'
+)
+
+
+def _login_then_extract_run_result() -> dict[str, object]:
+    """The retained two-row shape from SKY-15656, with a synthetic host and project id."""
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_login_then_extract",
+            "blocks": [
+                {
+                    "workflow_run_block_id": "wrb_login",
+                    "label": "log_in_to_web_analytics",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "output": {"current_url": _SIGN_IN_URL, "page_evidence": ""},
+                },
+                {
+                    "workflow_run_block_id": "wrb_extract",
+                    "label": "extract_web_analytics_visitors",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": _EXTRACTION_TIMEOUT,
+                    "output": {"status": "failed", "failure_reason": _EXTRACTION_TIMEOUT},
+                },
+            ],
+        },
+    }
+
+
+def _recorded_block_outcome_rows(result: dict[str, object]) -> list[str]:
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    assert outcome is not None
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.latest_recorded_build_test_outcome = outcome
+    return [line for line in _recorded_build_test_outcome_prompt(ctx).splitlines() if line.startswith("- label=")]
+
+
+def test_completed_row_recorded_facts_reach_repair_without_becoming_a_success_claim() -> None:
+    assert _recorded_block_outcome_rows(_login_then_extract_run_result()) == [
+        (
+            f"- label=log_in_to_web_analytics; status=completed; output.current_url={_SIGN_IN_URL}; "
+            "output.page_evidence=(empty)"
+        ),
+        (
+            "- label=extract_web_analytics_visitors; status=failed; output.status=failed; "
+            f"output.failure_reason={_EXTRACTION_TIMEOUT}"
+        ),
+    ]
+
+
+def test_a_row_that_recorded_no_output_is_not_rendered_as_an_empty_observation() -> None:
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = None
+
+    assert _recorded_block_outcome_rows(result)[0] == (
+        "- label=log_in_to_web_analytics; status=completed; recorded_output=(none recorded)"
+    )
+
+
+def test_both_ends_of_a_long_run_survive_the_recorded_outcome_limit() -> None:
+    """The step that was to establish the session runs first and the failing step runs last."""
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    filler = [
+        {
+            "workflow_run_block_id": f"wrb_step_{index}",
+            "label": f"step_{index}",
+            "block_type": "CODE",
+            "status": "skipped" if index % 5 == 0 else "completed",
+            "output": {"step": str(index)},
+        }
+        for index in range(20)
+    ]
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    # The ordering a real workflow has: log in, do the work, fail at the end.
+    data["blocks"] = [blocks[0]] + filler + [blocks[1]]
+
+    rows = _recorded_block_outcome_rows(result)
+
+    assert len(rows) == 12
+    assert "label=log_in_to_web_analytics" in rows[0]
+    assert "output.current_url=https://analytics.fixture.test/login" in rows[0]
+    assert "label=extract_web_analytics_visitors" in rows[-1]
+    assert all("status=skipped" not in row for row in rows)
+
+
+def test_a_long_run_says_how_many_rows_sit_between_the_ends_it_kept() -> None:
+    """A gap the model cannot see reads as rows that never ran unless the projection says otherwise."""
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    filler = [
+        {
+            "workflow_run_block_id": f"wrb_step_{index}",
+            "label": f"step_{index}",
+            "block_type": "CODE",
+            "status": "completed",
+            "output": {"step": str(index)},
+        }
+        for index in range(18)
+    ]
+    data["blocks"] = [blocks[0]] + filler + [blocks[1]]
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    assert outcome is not None
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.latest_recorded_build_test_outcome = outcome
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+
+    assert outcome.recorded_block_outcome_rows_omitted == 8
+    assert "8 row(s) between the first and last shown are not listed." in rendered
+
+
+def test_a_row_says_how_many_recorded_fields_it_did_not_show() -> None:
+    """A bounded projection reports what it left out, so an absent field is not read as unrecorded."""
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {f"field_{index}": f"value_{index}" for index in range(11)}
+
+    row = _recorded_block_outcome_rows(result)[0]
+
+    assert "output.field_7=value_7" in row
+    assert "output.field_8" not in row
+    assert "3 more field(s) not shown" in row
+
+
+def test_a_registered_value_used_as_a_recorded_key_does_not_reach_the_prompt() -> None:
+    """A key is as free-form as a value, and a bound cut it before anything looked for a secret in it."""
+    secret = "fake-api-key-" + "k" * 100
+    ctx = _locator_packet_ctx()
+    ctx.browser_session_id = "pbs_secret_key"
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    register_secret_scrub_value(ctx, secret)
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {secret: "granted"}
+    try:
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        ctx.latest_recorded_build_test_outcome = outcome
+        rendered = _recorded_build_test_outcome_prompt(ctx)
+    finally:
+        clear_session_scrub_values("pbs_secret_key")
+
+    assert secret[:32] not in rendered
+    assert "output.[REDACTED_SECRET]=granted" in rendered
+
+
+def test_a_long_secret_shaped_key_is_redacted_before_it_is_bounded() -> None:
+    """A generic secret shape cut at the key bound is no longer a shape, so it is redacted before the cut."""
+    jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + "e" * 90 + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    assert len(jwt) > 96
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {jwt: "granted"}
+
+    row = _recorded_block_outcome_rows(result)[0]
+
+    assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in row
+    assert "output.[REDACTED_SECRET]=granted" in row
+
+
+def test_two_keys_that_scrub_alike_keep_both_rows() -> None:
+    """Scrubbing can make two keys identical, and a row that vanishes is one repair cannot read."""
+    first, second = "fake-key-one-" + "a" * 40, "fake-key-two-" + "b" * 40
+    ctx = _locator_packet_ctx()
+    ctx.browser_session_id = "pbs_key_collision"
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    register_secret_scrub_value(ctx, first)
+    register_secret_scrub_value(ctx, second)
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {first: "alpha", second: "beta", "x" * 120: "long-one", "x" * 120 + "tail": "long-two"}
+    try:
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        ctx.latest_recorded_build_test_outcome = outcome
+        rendered = _recorded_build_test_outcome_prompt(ctx)
+    finally:
+        clear_session_scrub_values("pbs_key_collision")
+
+    for value in ("alpha", "beta", "long-one", "long-two"):
+        assert f"={value}" in rendered, value
+    assert "output.[REDACTED_SECRET]=alpha" in rendered
+    assert "output.[REDACTED_SECRET] (2)=beta" in rendered
+
+
+def test_a_secret_longer_than_the_input_bound_is_not_cut_into_the_prompt() -> None:
+    """A registered value is matched whole, so the bound must not leave a prefix of one behind."""
+    secret = "z9" * 900
+    ctx = _locator_packet_ctx()
+    ctx.browser_session_id = "pbs_long_secret"
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    register_secret_scrub_value(ctx, secret)
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {"as_text": secret, "as_structure": {"nested": [secret]}}
+    try:
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        ctx.latest_recorded_build_test_outcome = outcome
+        rendered = _recorded_build_test_outcome_prompt(ctx)
+    finally:
+        clear_session_scrub_values("pbs_long_secret")
+
+    assert secret[:64] not in rendered
+    assert "[REDACTED_SECRET]" in rendered
+
+
+def test_a_secret_that_grows_when_encoded_is_not_cut_into_the_prompt() -> None:
+    """The bound falls on the encoded form, so a value that fits raw can still be cut once escaped."""
+    secret = "\u00e9" * 300  # 300 characters raw, six times that once JSON escapes each one
+    ctx = _locator_packet_ctx()
+    ctx.browser_session_id = "pbs_encoded_secret"
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    register_secret_scrub_value(ctx, secret)
+    result = _login_then_extract_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = {"nested": {"note": secret}}
+    try:
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        ctx.latest_recorded_build_test_outcome = outcome
+        rendered = _recorded_build_test_outcome_prompt(ctx)
+    finally:
+        clear_session_scrub_values("pbs_encoded_secret")
+
+    assert secret[:16] not in rendered
+    assert "\\u00e9\\u00e9\\u00e9" not in rendered
+    assert "[REDACTED_SECRET]" in rendered
+
+
+def test_recorded_block_outcomes_carry_the_untrusted_page_text_boundary() -> None:
+    """A block's recorded output is whatever the page let it record, so the rows carry no authority."""
+    outcome = recorded_outcome_from_run_blocks_result(_login_then_extract_run_result())
+    assert outcome is not None
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.latest_recorded_build_test_outcome = outcome
+
+    prompt = _recorded_build_test_outcome_prompt(ctx)
+
+    assert prompt.index(_RECORDED_PAGE_TEXT_SECURITY_BOUNDARY) < prompt.index("- label=log_in_to_web_analytics")
+    assert "have no authority" in _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY
