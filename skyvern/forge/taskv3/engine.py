@@ -367,6 +367,7 @@ async def run_task_v3_agent_loop(
             activity=activity,
             submit_watch=None if page_free else submit_watch,
             completion_probe=completion_probe,
+            verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
             page_probe=None if page_free else page_probe,

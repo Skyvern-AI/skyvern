@@ -17085,7 +17085,6 @@ class V3AbIneligibleReason(StrEnum):
     script_run = "script_run"
     pinned_engine = "pinned_engine"
     unsupported_block = "unsupported_block"
-    block_totp_verification_url = "block_totp_verification_url"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
@@ -17118,7 +17117,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             # A prompt-criteria branch evaluates through a synthetic extraction block that follows
             # the run's arm, so it is a rerouted surface this predicate must count; jinja-only
             # conditionals are pure control flow and stay invisible to the A/B. Both this type and
-            # the while-loop below skip the pinned-engine/totp checks: neither exposes those fields.
+            # the while-loop below skip the pinned-engine check: neither exposes that field.
             if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
                 reroutable_blocks += 1
             continue
@@ -17136,11 +17135,6 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
-        # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
-        # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
-        # code/budget dynamics are unmeasured (SKY-14816).
-        if block.totp_verification_url:
-            return V3AbIneligibleReason.block_totp_verification_url
         reroutable_blocks += 1
     # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
     # execute identically, diluting the experiment.

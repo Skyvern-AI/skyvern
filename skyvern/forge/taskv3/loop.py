@@ -1942,6 +1942,11 @@ class LoopState:
     page_state_ever_judged: bool = False
     page_state_nudge_delivered: bool = False
     page_state_nudge_due: bool = False
+    # The download-completion probe refused by the verification gate. The model was told the run
+    # auto-completes on download, so a silent refusal leaves it acting blindly until a stall guard
+    # terminates it; this hands it the reason once so it can finish failed instead.
+    verification_refusal_nudge: str | None = None
+    verification_refusal_nudged: bool = False
     # The last fingerprint sample from the PREVIOUS batch: a delayed render can land between one
     # batch's after-sample and the next batch's before-sample, so movement is checked across
     # batches, not only within them.
@@ -2039,6 +2044,7 @@ async def run_agent_tool_loop(
     submit_watch: SubmitWatch | None = None,
     telemetry_salt: str | None = None,
     completion_probe: CompletionProbe | None = None,
+    verification_blocker: VerificationBlocker | None = None,
     staged_downloads: set[str] | None = None,
     initial_navigation_status: int | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
@@ -2247,6 +2253,26 @@ async def run_agent_tool_loop(
             return None
         if not completion_reason:
             return None
+        # The probe is the second path to a completed outcome, and it never reaches the finish tool.
+        # Without this the verification gate would hold only one of the two, so a run whose code
+        # never arrived could still end `completed` on a file that happened to land.
+        if verification_blocker is not None:
+            try:
+                verification_message = await verification_blocker("completed")
+            except Exception:
+                # Fail closed, as the finish tool's completed side does: a broken gate must not let
+                # a blank verification step read as done.
+                LOG.warning("taskv3 completion probe verification gate failed; failing closed", exc_info=True)
+                return None
+            if verification_message:
+                LOG.info(
+                    "taskv3 loop completion probe refused by the verification gate",
+                    tool=tool_name,
+                    turn=st.turns,
+                )
+                if not st.verification_refusal_nudged:
+                    st.verification_refusal_nudge = verification_message
+                return None
         LOG.info("taskv3 loop completion probe fired", tool=tool_name, turn=st.turns)
         # No tracker-wide clear here: the probe firing is download progress for the COMPLETING
         # touch only, and its call site drops that one target's pending rungs — a whole-generation
@@ -3411,6 +3437,10 @@ async def run_agent_tool_loop(
             st.page_state_nudge_delivered = True
             LOG.info("taskv3 loop page state stall nudged", rounds=st.trailing_page_state_stall_rounds, turn=st.turns)
             nudge_parts.append(_page_state_nudge_text(st.trailing_page_state_stall_rounds))
+        if st.outcome is None and st.verification_refusal_nudge is not None:
+            nudge_parts.append(st.verification_refusal_nudge)
+            st.verification_refusal_nudge = None
+            st.verification_refusal_nudged = True
         if st.outcome is None and action_nudges_due:
             # Deliver only warnings whose streak survived the batch AND spans turns: a later call in
             # the same batch (an observe showing the page changed, a download) may have cleared it,
