@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+from itertools import count
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -14,9 +17,13 @@ import pytest
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot import agent as copilot_agent
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
+from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -25,11 +32,15 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
 )
+from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
+from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -701,3 +712,225 @@ def remove_sensitive_disclosure_prerequisite(ctx: Any, arm: str) -> None:
         record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_earlier", session_id=ctx.browser_session_id)
     else:
         raise AssertionError(f"unknown arm {arm}")
+
+
+TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")
+
+
+async def run_turn_to_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    exit_path: str,
+    session_id: str | None = "pbs_turn",
+    browser_state: MagicMock | None = None,
+    resolve_session_id: str | None = None,
+    eval_mode: CopilotEvalMode | None = None,
+    turn_origin: TurnOrigin = TurnOrigin.interactive,
+    attach_through: str = "resolve",
+    on_attached: Callable[[CopilotContext], Awaitable[None]] | None = None,
+    get_browser_state: AsyncMock | None = None,
+) -> tuple[AgentResult | None, BaseException | None]:
+    """Drive one real ``run_copilot_agent`` turn to ``exit_path`` against ``manager``, attaching
+    through the real resolve funnel so the finalizer releases only what that funnel recorded."""
+    manager.get_browser_state = get_browser_state or AsyncMock(return_value=browser_state)
+    if turn_origin == TurnOrigin.runtime_self_heal and browser_state is not None:
+        browser_state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    async def _exit(ctx: CopilotContext) -> None:
+        if on_attached is not None:
+            await on_attached(ctx)
+        if exit_path == "model_error":
+            raise RuntimeError("model stream failed")
+        if exit_path == "deadline":
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=901.0, iteration=1)
+            raise CopilotTotalTimeoutError()
+        if exit_path == "cancel":
+            raise asyncio.CancelledError()
+
+    async def fake_turn(**kwargs: Any) -> SimpleNamespace:
+        ctx = kwargs["ctx"]
+        ctx.browser_session_id = session_id
+        ctx.turn_origin = turn_origin
+        ctx.injected_browser_state = browser_state
+        ctx.heal_workflow_run_id = "wr_heal"
+        if attach_through == "liveness_probe":
+            assert session_id is not None
+            await copilot_agent._registered_browser_state_liveness(session_id, ctx.organization_id, ctx)
+        elif attach_through == "resolve":
+            await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=resolve_session_id)
+        await _exit(ctx)
+        return SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[])
+
+    stub_copilot_agent_loop(monkeypatch, fake_turn)
+    workflow_run_id: str | None = None
+    if attach_through == "prior_run_hydration":
+        assert session_id is not None
+        workflow_run_id = "wr_origin"
+        origin = RepairOriginBinding(
+            workflow_run_id=workflow_run_id,
+            browser_session_id=session_id,
+            refusal=None,
+            status=WorkflowRunStatus.failed,
+        )
+        monkeypatch.setattr(copilot_agent, "seed_repair_origin_run", AsyncMock(return_value=origin))
+
+        async def hydrate_and_exit(ctx: CopilotContext, *, workflow_run_id: str | None) -> None:
+            await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=session_id)
+            await _exit(ctx)
+
+        monkeypatch.setattr(copilot_agent, "hydrate_prior_run_packet", hydrate_and_exit)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(copilot_runtime, "app", mock_app)
+    monkeypatch.setattr(copilot_agent, "_manager_can_probe_registered_browser_state", lambda: True)
+
+    try:
+        result = await run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                workflow_permanent_id="wfp-1",
+                workflow_id="wf-1",
+                workflow_copilot_chat_id="chat-1",
+                message="read the page title and tell me what it is",
+                workflow_yaml="",
+                workflow_run_id=workflow_run_id,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            eval_mode=eval_mode,
+        )
+    except BaseException as exc:
+        return None, exc
+    return result, None
+
+
+async def run_concurrent_turns_on_one_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_states: tuple[MagicMock, MagicMock],
+    exit_order: tuple[int, int] = (0, 1),
+    after_first_exit: Callable[[], None] = lambda: None,
+) -> None:
+    """Two turns attached to one session, each on its own generation, released in ``exit_order``;
+    ``after_first_exit`` is the point where only the earlier turn's release has run."""
+    attached = (asyncio.Event(), asyncio.Event())
+    may_exit = (asyncio.Event(), asyncio.Event())
+    arrivals = count()
+
+    async def _gate() -> None:
+        index = next(arrivals)
+        attached[index].set()
+        await may_exit[index].wait()
+
+    def _turn(index: int) -> asyncio.Task[tuple[AgentResult | None, BaseException | None]]:
+        return asyncio.ensure_future(
+            run_turn_to_exit(
+                monkeypatch,
+                manager=manager,
+                exit_path="normal",
+                browser_state=browser_states[index],
+                on_attached=lambda _ctx: _gate(),
+            )
+        )
+
+    first = _turn(0)
+    await asyncio.wait_for(attached[0].wait(), 5)
+    second = _turn(1)
+    await asyncio.wait_for(attached[1].wait(), 5)
+    turns = (first, second)
+
+    may_exit[exit_order[0]].set()
+    await turns[exit_order[0]]
+    after_first_exit()
+    may_exit[exit_order[1]].set()
+    await turns[exit_order[1]]
+
+
+async def run_turn_attaching_during_release(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_states: tuple[MagicMock, MagicMock],
+    lookup_already_in_flight: bool = False,
+) -> None:
+    """A second turn resolves the session while the first turn's exit evict is still in flight.
+    The manager hands out the first generation until that evict completes and the second after.
+    With ``lookup_already_in_flight`` the second turn's lookup was issued before the release began
+    and only answers once the evict is under way."""
+    first_attached, evicting, evicted, contested = (asyncio.Event() for _ in range(4))
+
+    async def _evict(*_args: object, **_kwargs: object) -> bool:
+        if evicted.is_set():
+            return True
+        evicting.set()
+        with suppress(TimeoutError):
+            await asyncio.wait_for(contested.wait(), 1.0)
+        evicted.set()
+        return True
+
+    async def _current_generation(**_kwargs: object) -> MagicMock:
+        first_attached.set()
+        if evicting.is_set() and not evicted.is_set():
+            contested.set()
+        return browser_states[1] if evicted.is_set() else browser_states[0]
+
+    async def _generation_answered_mid_release(**kwargs: object) -> MagicMock:
+        await asyncio.wait_for(evicting.wait(), 5)
+        return await _current_generation(**kwargs)
+
+    manager.evict_cached_browser_state = AsyncMock(side_effect=_evict)
+    first = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=browser_states[0],
+            get_browser_state=AsyncMock(side_effect=_current_generation),
+        )
+    )
+    second_lookup = _current_generation
+    if lookup_already_in_flight:
+        await asyncio.wait_for(first_attached.wait(), 5)
+        second_lookup = _generation_answered_mid_release
+    else:
+        await asyncio.wait_for(evicting.wait(), 5)
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        browser_state=browser_states[1],
+        get_browser_state=AsyncMock(side_effect=second_lookup),
+    )
+    await first
+
+
+async def run_turn_cancelled_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_state: MagicMock,
+    evicting: asyncio.Event,
+    on_attached: Callable[[CopilotContext], Awaitable[None]] | None = None,
+) -> tuple[AgentResult | None, BaseException | None]:
+    """Cancel the turn once its exit release has reached the manager, which is the only window in
+    which a cancel can land on the finalizer rather than on the turn's own work."""
+    turn = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=browser_state,
+            on_attached=on_attached,
+        )
+    )
+    await asyncio.wait_for(evicting.wait(), 5)
+    turn.cancel()
+    return await turn

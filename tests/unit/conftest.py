@@ -149,6 +149,21 @@ def reset_collapse_xp_assignment_memo():
 
 
 @pytest.fixture(autouse=True)
+def reset_copilot_driver_ledgers() -> Iterator[None]:
+    # A holder count leaked by one test makes a later test's turn-exit release silently skip its evict.
+    def _clear() -> None:
+        runtime = sys.modules.get("skyvern.forge.sdk.copilot.runtime")
+        if runtime is not None:
+            runtime._ATTACHED_TURNS_PER_SESSION.clear()
+            runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
+            runtime._DRIVER_RELEASE_EPOCHS.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def restore_interpreter_traceback_hooks() -> Iterator[None]:
     """setup_logger() replaces the three interpreter hooks process-wide.
 
