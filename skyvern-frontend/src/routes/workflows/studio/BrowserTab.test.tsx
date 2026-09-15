@@ -6,8 +6,9 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -114,7 +115,6 @@ vi.mock("./runview/RunLiveStream", () => ({
     />
   ),
 }));
-
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRunViewState = useRunViewStore.getState();
 const initialRecordingState = useRecordingStore.getState();
@@ -236,6 +236,7 @@ function renderBrowserPane(initialPath: string) {
                       <BrowserPaneActions />
                     </div>
                     <BrowserTab />
+                    <LocationProbe />
                   </>
                 }
               />
@@ -252,6 +253,11 @@ function renderBrowserPane(initialPath: string) {
     queryClient,
     rerenderPane: () => view.rerender(pane()),
   };
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-search">{location.search}</div>;
 }
 
 const STUDIO_PATH = "/workflows/wpid_test/studio?panes=copilot,browser";
@@ -273,6 +279,64 @@ afterEach(() => {
 });
 
 describe("BrowserTab view machine", () => {
+  it("keeps the recording view synchronized with the URL", async () => {
+    seedRun({
+      status: Status.Completed,
+      recordingUrl: "https://example.com/recording.webm",
+    });
+    renderBrowserPane("/workflows/wpid_test/studio?wr=wr_1&view=recording");
+
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "Recording" })
+          .getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).not.toContain(
+        "view=recording",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toContain(
+        "view=recording",
+      );
+      expect(screen.getByTestId("location-search").textContent).toContain(
+        "panes=browser,overview",
+      );
+    });
+  });
+
+  it("keeps a recording deep link pinned when frame hydration updates", async () => {
+    seedRun({ status: Status.Failed });
+    renderBrowserPane(
+      "/workflows/wpid_test/studio?wr=wr_1&active=wrb_1&view=recording",
+    );
+
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "Recording" })
+          .getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+
+    act(() => useRunViewStore.getState().pinFrame("wrb_1"));
+
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "Recording" })
+          .getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+  });
+
   it("keeps Live selected during a retry wait and pauses artifact polling until execution resumes", () => {
     mocks.realScreenshot = true;
     seedRun({ status: Status.Running });
@@ -573,6 +637,18 @@ describe("BrowserTab view machine", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Recording" }));
     expect(screen.getByText("No recording for this run")).toBeTruthy();
+  });
+
+  it("opens the recording requested by a legacy deep link", () => {
+    seedRun({
+      status: Status.Failed,
+      recordingUrl: "https://r.test/1.mp4",
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&view=recording`);
+
+    expect(screen.getByTestId("hero-recording")).toBeTruthy();
+    expect(useStudioBrowserStore.getState().view).toBe("recording");
   });
 
   it("flags a queued block run on the live debug stream", () => {

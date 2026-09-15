@@ -25,10 +25,6 @@ export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
 export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
 
-// Opt-in (0% base rollout) preview gating the redesigned workflow studio.
-// Not enrolled reads as disabled, so the default stays the legacy editor.
-export const WORKFLOW_STUDIO_FLAG = "workflow_studio_v2";
-
 // Gates the optional, server-confirmed onboarding details step.
 export const ONBOARDING_QUESTIONNAIRE_FLAG = "onboarding_questionnaire_v1";
 
@@ -37,9 +33,6 @@ export const ONBOARDING_QUESTIONNAIRE_FLAG = "onboarding_questionnaire_v1";
 // showing the editor to other orgs would promise a retry that never fires. Server-evaluated via
 // /customer (see FeatureFlagProvider), keyed on organization_id like the backend gate.
 export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
-
-// Opt-in preview (0% base): recordings synthesize code blocks instead of agent blocks.
-export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
 
 export const ONBOARDING_PROGRESS_FLAG = "onboarding_progress_v1";
 

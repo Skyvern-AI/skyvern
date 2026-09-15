@@ -786,6 +786,7 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
   run_with: string; // 'agent' or 'code'
+  browser_type?: string | null; // BrowserType value; null = system default
   cache_key: string | null;
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
@@ -816,6 +817,7 @@ export type WorkflowSettings = {
   extraHttpHeaders: string | null;
   cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'
+  browserType?: string | null; // BrowserType value; null = system default
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;

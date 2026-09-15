@@ -130,7 +130,79 @@ describe("useRecordingMessageChannel", () => {
       socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
     ).toEqual([
       expect.objectContaining({ kind: "begin-exfiltration" }),
-      { kind: "end-exfiltration" },
+      { kind: "end-exfiltration", discard: true },
+    ]);
+  });
+
+  it("preserves finalized actions when Done ends exfiltration", async () => {
+    useRecordingStore.setState({
+      isRecording: true,
+      finishRequested: false,
+    });
+    const { rerender } = renderHook(
+      ({ exfiltrate }) =>
+        useRecordingMessageChannel({
+          browserSessionId: "pbs-1",
+          enabled: true,
+          exfiltrate,
+          workflowPermanentId: "workflow-1",
+          clipboard: "none",
+        }),
+      { initialProps: { exfiltrate: true } },
+    );
+    const socket = await openSocket();
+    socket.send.mockClear();
+
+    act(() => useRecordingStore.setState({ finishRequested: true }));
+    rerender({ exfiltrate: false });
+
+    expect(
+      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
+    ).toContainEqual(
+      expect.objectContaining({ kind: "end-exfiltration", discard: false }),
+    );
+  });
+
+  it("purges finalized actions when Discard follows Done", async () => {
+    useRecordingStore.setState({
+      isRecording: true,
+      finishRequested: false,
+      interpretationSessionId: "interpretation-1",
+    });
+    const { rerender, unmount } = renderHook(
+      ({ exfiltrate }) =>
+        useRecordingMessageChannel({
+          browserSessionId: "pbs-1",
+          enabled: true,
+          exfiltrate,
+          workflowPermanentId: "workflow-1",
+          clipboard: "none",
+        }),
+      { initialProps: { exfiltrate: true } },
+    );
+    const socket = await openSocket();
+    socket.send.mockClear();
+
+    act(() => useRecordingStore.setState({ finishRequested: true }));
+    rerender({ exfiltrate: false });
+    act(() => useRecordingStore.getState().reset());
+    unmount();
+
+    expect(
+      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
+    ).toEqual([
+      {
+        kind: "end-exfiltration",
+        discard: false,
+        interpretation_session_id: "interpretation-1",
+        workflow_permanent_id: "workflow-1",
+      },
+      {
+        kind: "end-exfiltration",
+        discard: true,
+        interpretation_session_id: "interpretation-1",
+        workflow_permanent_id: "workflow-1",
+      },
     ]);
   });
 

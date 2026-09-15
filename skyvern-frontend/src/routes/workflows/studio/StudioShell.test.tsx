@@ -9,7 +9,65 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type StudioPaneId } from "./panes";
 import { paneAccessibleName } from "./paneMeta";
 import { paneExpansionKeyframes } from "./paneLayout";
-import { StudioPane } from "./StudioShell";
+import { panesAfterRecordingTransition } from "./recordingPaneLifecycle";
+import { EmbeddedBrowserOverlays, StudioPane } from "./StudioShell";
+
+vi.mock("./useRunVisuals", () => ({
+  useRunVisuals: () => ({
+    recordingArchived: true,
+    recordingUrls: [],
+  }),
+}));
+vi.mock("../workflowRun/WorkflowRunVerificationCodeForm", () => ({
+  WorkflowRunVerificationCodeForm: ({
+    workflowRunId,
+  }: {
+    workflowRunId: string | undefined;
+  }) => <div data-testid="verification-form">{workflowRunId}</div>,
+}));
+
+describe("EmbeddedBrowserOverlays", () => {
+  test("keeps verification available in screenshot-only browser views", () => {
+    render(
+      <EmbeddedBrowserOverlays runId="wr_1" showArchivedRecording={false} />,
+    );
+
+    expect(screen.getByTestId("verification-form").textContent).toBe("wr_1");
+    expect(screen.queryByText("Recording archived")).toBeNull();
+  });
+});
+
+describe("panesAfterRecordingTransition", () => {
+  test("replaces the Editor with Browser and Copilot when recording starts", () => {
+    expect(
+      panesAfterRecordingTransition(["overview", "editor"], "started"),
+    ).toEqual(["overview", "copilot", "browser"]);
+  });
+
+  test("replaces Browser with Editor when a recording starts processing", () => {
+    expect(
+      panesAfterRecordingTransition(
+        ["overview", "copilot", "browser"],
+        "processing",
+      ),
+    ).toEqual(["overview", "copilot", "editor"]);
+  });
+
+  test("restores Editor but leaves Browser open when recording ends without processing", () => {
+    expect(
+      panesAfterRecordingTransition(["copilot", "browser"], "ended"),
+    ).toEqual(["copilot", "browser", "editor"]);
+  });
+
+  test("does not duplicate panes already in the requested layout", () => {
+    expect(
+      panesAfterRecordingTransition(
+        ["copilot", "browser", "editor"],
+        "started",
+      ),
+    ).toEqual(["copilot", "browser"]);
+  });
+});
 
 describe("paneExpansionKeyframes", () => {
   test("grows from the pane's current bounds into its final bounds", () => {

@@ -114,6 +114,7 @@ function WorkflowEditor() {
       ? JSON.stringify(workflow.cdp_connect_headers)
       : null,
     runWith: workflow.run_with ?? "agent",
+    browserType: workflow.browser_type ?? null,
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,

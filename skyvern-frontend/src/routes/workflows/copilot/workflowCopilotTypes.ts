@@ -170,9 +170,11 @@ export interface WorkflowCopilotCancelRequest {
 export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
+  turn_id?: string | null;
   audio_artifact_id?: string | null;
   attached_files?: CopilotAttachedFile[];
   created_at: string;
+  modified_at?: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.
   turn_outcome?:
@@ -193,6 +195,7 @@ export interface WorkflowCopilotChatHistoryResponse {
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
+  request_turn_id?: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
   proposed_workflow_metadata?: CopilotProposalMetadata | null;

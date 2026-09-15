@@ -1719,6 +1719,7 @@ function Workspace({
         ? JSON.stringify(workflowData.cdp_connect_headers)
         : null,
       runWith: workflowData.run_with ?? "agent",
+      browserType: workflowData.browser_type ?? null,
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
@@ -2062,6 +2063,7 @@ function Workspace({
         ? JSON.stringify(selectedVersion.cdp_connect_headers)
         : null,
       runWith: selectedVersion.run_with ?? "agent",
+      browserType: selectedVersion.browser_type ?? null,
       codeVersion: selectedVersion.code_version ?? null,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
@@ -3076,6 +3078,7 @@ function Workspace({
               modified_at: new Date().toISOString(),
               deleted_at: null,
               run_with: saveData.settings.runWith,
+              browser_type: saveData.settings.browserType ?? null,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
               enable_self_healing: saveData.settings.enableSelfHealing ?? false,

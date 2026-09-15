@@ -158,6 +158,7 @@ function getWorkflowElements(version: WorkflowVersion) {
       ? JSON.stringify(version.cdp_connect_headers)
       : null,
     runWith: version.run_with ?? "agent",
+    browserType: version.browser_type ?? null,
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,

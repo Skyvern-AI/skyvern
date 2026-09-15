@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   Cross2Icon,
@@ -16,6 +17,7 @@ import {
 } from "@radix-ui/react-icons";
 
 import { CopyButton } from "@/components/CopyButton";
+import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 import {
   Tooltip,
   TooltipContent,
@@ -31,6 +33,7 @@ import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
+import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
@@ -68,6 +71,7 @@ import {
 } from "./panes";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+import { panesAfterRecordingTransition } from "./recordingPaneLifecycle";
 import {
   StudioPaneCompactContext,
   StudioShellContext,
@@ -78,6 +82,7 @@ import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
+import { useRunVisuals } from "./useRunVisuals";
 
 // Below this header width, pane header chrome (view pills, badges) collapses
 // to icons — same idea as the run hero, measured per pane, not per viewport.
@@ -156,6 +161,7 @@ export function StudioPane({
   headerExtras,
   headerActions,
   iconBadge,
+  chromeless = false,
   children,
 }: {
   id: StudioPaneId;
@@ -177,6 +183,7 @@ export function StudioPane({
   headerActions?: ReactNode;
   // Presence-badge overlay on the pane icon (e.g. the Copilot active dot).
   iconBadge?: ReactNode;
+  chromeless?: boolean;
   children: ReactNode;
 }) {
   const { icon: Icon } = STUDIO_PANE_META[id];
@@ -189,7 +196,8 @@ export function StudioPane({
   const headerRef = useRef<HTMLDivElement>(null);
   const onTransitionEndRef = useRef(onTransitionEnd);
   onTransitionEndRef.current = onTransitionEnd;
-  const hasChrome = headerExtras != null || headerActions != null;
+  const hasChrome =
+    !chromeless && (headerExtras != null || headerActions != null);
   const [compact, setCompact] = useState(false);
   useLayoutEffect(() => {
     const pane = paneRef.current;
@@ -280,7 +288,8 @@ export function StudioPane({
       aria-label={accessibleLabel}
       style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
-        "relative min-h-0 flex-col overflow-hidden rounded-lg border-2 border-border bg-slate-elevation1",
+        "relative min-h-0 flex-col overflow-hidden bg-slate-elevation1",
+        !chromeless && "rounded-lg border-2 border-border",
         expanded && "absolute inset-3 z-30",
         transitionFromBounds !== null &&
           "pointer-events-none z-30 will-change-transform",
@@ -335,7 +344,10 @@ export function StudioPane({
           event.preventDefault();
           reorder.onMove(event.key === "ArrowLeft" ? -1 : 1);
         }}
-        className="flex h-11 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing"
+        className={cn(
+          "flex h-11 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing",
+          chromeless && "hidden",
+        )}
       >
         {/* The drag hint lives on the grip (icon + label) only, so the header's
             buttons keep their own tooltips instead of inheriting this one. */}
@@ -694,8 +706,43 @@ function WorkflowDeletedPaneNotice() {
   );
 }
 
+export function EmbeddedBrowserOverlays({
+  runId,
+  showArchivedRecording,
+}: {
+  runId: string | undefined;
+  showArchivedRecording: boolean;
+}) {
+  const visuals = useRunVisuals(runId);
+  const archived =
+    showArchivedRecording &&
+    visuals.recordingArchived &&
+    visuals.recordingUrls.length === 0;
+
+  return (
+    <>
+      {archived ? (
+        <div className="absolute inset-0 z-[1] flex items-center justify-center bg-slate-950">
+          <StreamStatusPanel
+            diagnostic={{
+              title: "Recording archived",
+              detail: "To request restoration, contact support@skyvern.com.",
+            }}
+          />
+        </div>
+      ) : null}
+      <div className="absolute inset-x-0 top-0 z-10">
+        <WorkflowRunVerificationCodeForm workflowRunId={runId} />
+      </div>
+    </>
+  );
+}
+
 function StudioStage(props: StudioWorkspaceProps) {
-  const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
+  const [searchParams] = useSearchParams();
+  const embedded = searchParams.get("embed") === "true";
+  const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
+    useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
   const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
@@ -859,15 +906,17 @@ function StudioStage(props: StudioWorkspaceProps) {
   };
 
   // Recording lives in the Browser pane (the live stream is there) with the
-  // live-drafts panel taking over the Copilot pane. Once a commit is in flight
-  // or its blocks are landing, reveal the Editor pane (it shows the loading
-  // overlay). Gated on lifecycle transitions so manual pane changes made
+  // live-drafts panel taking over the Copilot pane. The Editor is not useful
+  // during capture, and the Browser is not useful while the recording is being
+  // applied. Gated on lifecycle transitions so manual pane changes made
   // mid-recording are preserved.
+  const finishRequested = useRecordingStore((s) => s.finishRequested);
   const isCommitting = useRecordingStore((s) => s.isCommitting);
   const recordedBlocksPending = useRecordedBlocksStore(
     (s) => (s.blocks?.length ?? 0) > 0,
   );
-  const processingRecording = isCommitting || recordedBlocksPending;
+  const processingRecording =
+    finishRequested || isCommitting || recordedBlocksPending;
   const prevIsRecordingRef = useRef(false);
   const prevProcessingRef = useRef(false);
   useEffect(() => {
@@ -875,26 +924,40 @@ function StudioStage(props: StudioWorkspaceProps) {
     const wasProcessing = prevProcessingRef.current;
     if (processingRecording && !wasProcessing) {
       restoreExpandedPane();
-      openPane("editor");
+      if (finishRequested || isCommitting || wasRecording) {
+        setOpenPanes(panesAfterRecordingTransition(panes, "processing"));
+      } else {
+        // Other block imports share this loading state but are not recordings.
+        openPane("editor");
+      }
     } else if (isRecording && !wasRecording) {
-      // Recording or finalizing → live browser + drafts.
+      // Recording → live browser + Copilot guidance.
       restoreExpandedPane();
-      openPane("copilot");
-      openPane("browser");
+      setOpenPanes(panesAfterRecordingTransition(panes, "started"));
     } else if (!isRecording && wasRecording && !processingRecording) {
-      // Recording ended (commit or discard) → back to the canvas.
+      // Discarded recording → restore the canvas without closing Browser.
       restoreExpandedPane();
-      openPane("editor");
+      setOpenPanes(panesAfterRecordingTransition(panes, "ended"));
     }
     prevIsRecordingRef.current = isRecording;
     prevProcessingRef.current = processingRecording;
-  }, [isRecording, processingRecording, openPane, restoreExpandedPane]);
+  }, [
+    isRecording,
+    finishRequested,
+    isCommitting,
+    openPane,
+    panes,
+    processingRecording,
+    restoreExpandedPane,
+    setOpenPanes,
+  ]);
 
   const paneProps = (id: StudioPaneId) => {
     const index = panes.indexOf(id);
     return {
       id,
       runId,
+      chromeless: embedded,
       open: index >= 0 && visiblePanes.includes(id),
       // Panes take even slots and the dividers between them take odd slots.
       order: index >= 0 ? index * 2 : undefined,
@@ -937,7 +1000,7 @@ function StudioStage(props: StudioWorkspaceProps) {
           only affects Radix tooltips inside the shell. */}
       <TooltipProvider delayDuration={200} skipDelayDuration={300}>
         <div className="flex h-full w-full flex-col">
-          <StudioTopBar />
+          {embedded ? null : <StudioTopBar />}
           <div className="flex min-h-0 min-w-0 flex-1">
             {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
               stream slots); the CSS order carries the layout order instead, so
@@ -946,7 +1009,10 @@ function StudioStage(props: StudioWorkspaceProps) {
               the stream singleton never remount. */}
             <div
               ref={registerStageElement}
-              className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden p-3"
+              className={cn(
+                "relative flex min-h-0 min-w-0 flex-1 overflow-hidden",
+                embedded ? "p-0" : "p-3",
+              )}
             >
               <StudioPane
                 {...paneProps("copilot")}
@@ -980,10 +1046,10 @@ function StudioStage(props: StudioWorkspaceProps) {
                 headerExtras={<EditorPaneModeToggle />}
                 headerActions={<EditorPaneBlockSearch />}
               >
-                {/* The embedded Workspace boots debug sessions, copilot chats
-                    and block-script queries against the workflow — none of
-                    which exist once the agent is deleted, so it never mounts. */}
-                {workflowDeleted ? (
+                {/* Embedded run views never mount the authoring canvas: aside
+                    from doing unnecessary work, its data-tour targets can
+                    launch the editor onboarding overlay over the iframe. */}
+                {embedded ? null : workflowDeleted ? (
                   <WorkflowDeletedPaneNotice />
                 ) : (
                   <EditorTab {...props} />
@@ -997,6 +1063,14 @@ function StudioStage(props: StudioWorkspaceProps) {
                 headerActions={<BrowserPaneActions />}
               >
                 <BrowserTab />
+                {embedded ? (
+                  <EmbeddedBrowserOverlays
+                    runId={runId}
+                    showArchivedRecording={
+                      searchParams.get("view") === "recording"
+                    }
+                  />
+                ) : null}
               </StudioPane>
               <StudioPane
                 {...paneProps("overview")}
@@ -1022,9 +1096,9 @@ function StudioStage(props: StudioWorkspaceProps) {
                       />
                     ))
                 : null}
-              {panes.length === 0 ? <StudioStageLauncher /> : null}
-              <StudioCoachMark />
-              <StudioWorkflowPanels />
+              {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
+              {embedded ? null : <StudioCoachMark />}
+              {embedded ? null : <StudioWorkflowPanels />}
               {/* Overlay target for Workspace-wired panels (pointer-events off
                   while empty so the stage stays clickable). */}
               <div

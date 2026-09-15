@@ -4,6 +4,7 @@ import {
   runIsLogicallyFinal,
 } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   ActivityLogIcon,
   CodeIcon,
@@ -41,11 +42,17 @@ import { cn } from "@/util/utils";
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
+import { WorkflowRunStatusAlert } from "../../workflowRun/WorkflowRunStatusAlert";
 import { studioPanelId } from "../constants";
 import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
 import { useStudioPanes } from "../useStudioPanes";
 import { ViewToggle } from "../ViewToggle";
+import {
+  parsePanesParam,
+  STUDIO_PANES_PARAM,
+  toReadableSearch,
+} from "../panes";
 
 /**
  * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs
@@ -61,9 +68,11 @@ export function RunPaneViewToggles() {
     useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const view = useRunPaneViewStore((s) => s.view);
   const setView = useRunPaneViewStore((s) => s.setView);
+  const location = useLocation();
+  const navigate = useNavigate();
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
-  const { openPane } = useStudioPanes();
+  const { openPane, resolveLivePanes } = useStudioPanes();
   const cacheKey = workflowRun?.workflow?.cache_key ?? "";
   const codeGenerating = useIsGeneratingCode({
     cacheKey,
@@ -72,13 +81,27 @@ export function RunPaneViewToggles() {
       workflow: workflowRun?.workflow,
       workflowRun,
     }),
-    // Same guard as the legacy run page: script queries 404 once the source
-    // agent is deleted.
+    // Script queries 404 once the source agent is deleted.
     workflowPermanentId: workflowRun?.workflow?.deleted_at
       ? undefined
       : workflowPermanentId,
     workflowRunId: runId,
   });
+  const selectView = useCallback(
+    (nextView: Parameters<typeof setView>[0]) => {
+      setView(nextView);
+      const next = new URLSearchParams(location.search);
+      next.set("view", nextView);
+      const panes =
+        parsePanesParam(next.get(STUDIO_PANES_PARAM)) ?? resolveLivePanes();
+      next.set(
+        STUDIO_PANES_PARAM,
+        ["overview", ...panes.filter((pane) => pane !== "overview")].join(","),
+      );
+      navigate({ search: toReadableSearch(next) }, { replace: true });
+    },
+    [location.search, navigate, resolveLivePanes, setView],
+  );
 
   const focusBrowserPane = useCallback(() => {
     // An explicit "watch live": unpin back to the live edge and hand the
@@ -117,21 +140,21 @@ export function RunPaneViewToggles() {
       >
         <ViewToggle
           active={view === "timeline"}
-          onClick={() => setView("timeline")}
+          onClick={() => selectView("timeline")}
           compact={compact}
           label="Timeline"
           icon={<ActivityLogIcon className="h-3 w-3" />}
         />
         <ViewToggle
           active={view === "inputs"}
-          onClick={() => setView("inputs")}
+          onClick={() => selectView("inputs")}
           compact={compact}
           label="Inputs"
           icon={<ListBulletIcon className="h-3 w-3" />}
         />
         <ViewToggle
           active={view === "outputs"}
-          onClick={() => setView("outputs")}
+          onClick={() => selectView("outputs")}
           compact={compact}
           label="Outputs"
           icon={<FileTextIcon className="h-3 w-3" />}
@@ -173,7 +196,7 @@ export function RunPaneViewToggles() {
               menu reads as part of the toggle cluster, not a full-size menu. */}
           <DropdownMenuContent align="start" sideOffset={6} className="min-w-0">
             <DropdownMenuItem
-              onSelect={() => setView("code")}
+              onSelect={() => selectView("code")}
               className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-xs font-medium text-muted-foreground focus:text-foreground"
             >
               <CodeIcon className="h-3 w-3" />
@@ -222,21 +245,28 @@ export function RunPaneActions() {
   const compact = useStudioPaneCompact();
   const apiCredential = useApiCredential();
   const { runId } = useStudioInspectedRun();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
-    workflowRunId: runId,
-  });
+  const { data: workflowRun, isError: statusUnavailable } =
+    useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const [replayOpen, setReplayOpen] = useState(false);
   if (!workflowRun) {
     return null;
   }
-  // Legacy parity: the menu re-runs the workflow via API, which is gone with
-  // the source agent.
-  if (workflowRun.workflow?.deleted_at) {
-    return null;
-  }
   const finalized = runIsLogicallyFinal(workflowRun);
+  const statusAlert = (
+    <WorkflowRunStatusAlert
+      run={workflowRun}
+      title={workflowRun.workflow?.title}
+      visible={!statusUnavailable && !finalized}
+    />
+  );
+  // Legacy parity: the menu re-runs the workflow via API, which is gone with
+  // the source agent. Status notifications still apply to its in-flight run.
+  if (workflowRun.workflow?.deleted_at) {
+    return statusAlert;
+  }
   return (
     <>
+      {statusAlert}
       <ApiWebhookActionsMenu
         triggerTooltip={compact ? "API & Webhooks" : undefined}
         trigger={

@@ -44,6 +44,7 @@ function WorkflowSettingsBlockFormBody({
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
+      browserType: data.browserType,
       extraHttpHeaders: data.extraHttpHeaders,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,

@@ -1,27 +1,14 @@
-import * as env from "@/util/env";
-
 /**
- * Where "open the editor" links point. With the studio preview on, the editor
- * lives at /studio; off, it is the legacy /build debugger surface.
+ * Where "open the editor" links point.
  */
 export function workflowEditorPath(
   workflowPermanentId: string,
-  studioEnabled: boolean,
+  _studioEnabled: boolean,
   search = "",
 ): string {
-  const leaf = studioEnabled ? "studio" : "build";
-  return `/agents/${workflowPermanentId}/${leaf}${search}`;
+  return `/agents/${workflowPermanentId}/studio${search}`;
 }
 
-/**
- * Legacy (studio-off) destination for viewing a finished workflow run, honoring
- * the existing useNewRunsUrl split between the global and per-workflow pages.
- */
-export function legacyRunDetailPath(
-  workflowPermanentId: string,
-  workflowRunId: string,
-): string {
-  return env.useNewRunsUrl
-    ? `/runs/${workflowRunId}`
-    : `/agents/${workflowPermanentId}/${workflowRunId}/overview`;
+export function workflowRunDetailPath(workflowRunId: string): string {
+  return `/runs/${workflowRunId}`;
 }

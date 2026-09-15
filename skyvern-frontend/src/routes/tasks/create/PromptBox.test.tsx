@@ -160,7 +160,7 @@ function renderPromptBox(
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
-  studioState.enabled = false;
+  studioState.enabled = true;
   mockNavigate.mockReset();
   mockPost.mockReset();
   mockSetAutoplay.mockReset();
@@ -302,44 +302,8 @@ describe("PromptBox", () => {
     await submitPrompt("Visit the docs");
 
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledTimes(1));
-    expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_empty/build");
+    expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_empty/studio");
     expect(mockSetAutoplay).not.toHaveBeenCalled();
-  });
-
-  test("hands Discover prompts to the legacy build path via route state only", async () => {
-    mockPost.mockResolvedValue({
-      data: {
-        workflow_permanent_id: "wpid_copilot",
-        workflow_definition: { blocks: [] },
-      },
-    });
-
-    renderPromptBox(true);
-
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
-      target: { value: "Build this workflow" },
-    });
-    fireEvent.click(screen.getByLabelText("submit-prompt"));
-
-    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
-    const call = mockPost.mock.calls[0];
-    expect(call).toBeDefined();
-    const [path, yaml] = call!;
-
-    expect(path).toBe("/workflows");
-    expect(yaml).toContain("run_with: agent");
-    expect(yaml).not.toContain("run_with: code");
-    expect(mockNavigate).toHaveBeenCalledWith(
-      "/agents/wpid_copilot/build?via=discover",
-      {
-        state: { copilotMessage: "Build this workflow" },
-      },
-    );
-    // The legacy /build (Debugger) surface never mounts the recovery hook, so
-    // no session-scoped copy is written — writing one would strand a dead entry.
-    expect(
-      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_copilot"),
-    ).toBeNull();
   });
 
   test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {

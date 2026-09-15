@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   captureRecordBrowser: vi.fn(),
   markRecordBrowserProcessed: vi.fn(),
   post: vi.fn(),
-  useFeatureFlagEnabled: vi.fn(() => false),
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -33,10 +32,6 @@ vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(async () => "test-token"),
-}));
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: mocks.useFeatureFlagEnabled,
 }));
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
@@ -82,7 +77,6 @@ describe("useProcessRecordingMutation telemetry", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     vi.clearAllMocks();
-    mocks.useFeatureFlagEnabled.mockReturnValue(false);
     useRecordingRefinementEvidenceStore.setState({ armed: null });
     useRecordingStore.getState().reset();
     useRecordingStore.getState().setRecordingTransport("cdp");
@@ -127,7 +121,6 @@ describe("useProcessRecordingMutation telemetry", () => {
   });
 
   it("arms the refine_recording copilot turn with the response evidence packet", async () => {
-    mocks.useFeatureFlagEnabled.mockReturnValue(true);
     const evidence = {
       schema_version: 1,
       recording: { browser_session_id: "pbs-1" },
@@ -184,10 +177,37 @@ describe("useProcessRecordingMutation telemetry", () => {
     expect(mocks.post).toHaveBeenCalledWith(
       "/browser_sessions/pbs-1/process_recording",
       expect.objectContaining({
+        code_first: true,
+        supports_credential_tokens: true,
         recording_attempt_id: "attempt-1",
         interpretation_session_id: "interpretation-1",
       }),
     );
+  });
+
+  it("keeps the finalized recording identity available for a retry", async () => {
+    mocks.post.mockRejectedValue(new Error("temporary processing failure"));
+    useRecordingStore.setState({
+      finishRequested: true,
+      recordingAttemptId: "attempt-1",
+      interpretationSessionId: "interpretation-1",
+    });
+    const { result } = renderHook(
+      () =>
+        useProcessRecordingMutation({
+          browserSessionId: "pbs-1",
+        }),
+      { wrapper },
+    );
+
+    act(() => result.current.mutate({ draftSteps: [draftStep] }));
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(useRecordingStore.getState()).toMatchObject({
+      finishRequested: true,
+      recordingAttemptId: "attempt-1",
+      interpretationSessionId: "interpretation-1",
+    });
   });
 
   it("keeps the durable recording id for the workflow save that follows", async () => {
