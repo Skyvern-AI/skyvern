@@ -485,6 +485,9 @@ def build_auth_tools(
     # lives on `state` so the finish gate can see what is left of it. Re-derived here rather than
     # taken from the state's default because a caller may have built the state before the setting was
     # read, and the budget must be the one in force where it is actually drawn down.
+    # Scope is this task, so each block of a workflow run draws its own budget. Deliberate, not
+    # emergent: v1's poll sites start a fresh full window on every invocation (`poll_otp_value`
+    # callers pass no `max_wait_seconds`), so a per-run cap here would be stricter than v1.
     state.budget_seconds = settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS * 60.0
     # A value one tool resolved that the other tool owns (the webhook source does not filter by type).
     cached_otp_value: OTPValue | None = None
