@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright._impl._errors import Error as PlaywrightError
 
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction, KeypressAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.handler_utils import keys_include_enter, should_stop_batch_after_dropdown_select
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -150,3 +151,146 @@ async def test_plain_search_input_does_not_stop_batch() -> None:
     results = await _run_search_bar_input(stop_flag=True, incremental=[])
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     assert not results[0].skip_remaining_actions
+
+
+# --------------------------------------------------------------------------- #
+# Caller wiring for the single heal call after input_sequentially: at that seam the caller computes the live
+# structural autocomplete gate (is_auto_completion_input / _is_combobox_or_typeahead) and passes it into the one
+# heal call. A marker-less field with no autocomplete evidence and a reordered read-back gets one atomic refill
+# (then continues); a structurally genuine autocomplete is left typed. (The reorder detection/gating itself is
+# unit-tested in test_freetext_truncation_selfheal.)
+# --------------------------------------------------------------------------- #
+async def _run_reorder_scenario(
+    *, is_combobox: bool, incremental: list[dict], post_fill_value: str
+) -> tuple[list, MagicMock]:
+    el = make_input_element_mock(element_id="AADC")  # no type attr -> round-trip-safe ""
+    el.is_auto_completion_input = AsyncMock(return_value=False)
+    state = {"filled": False}
+
+    async def _fill(*_a: object, **_k: object) -> None:
+        state["filled"] = True
+
+    el.input_fill = AsyncMock(side_effect=_fill)
+
+    async def _read(*_a: object, **_k: object) -> str:
+        return post_fill_value if state["filled"] else "654321"  # sequential seam left a reordered read-back
+
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=incremental)
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"AADC": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=True, is_location_input=False)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(side_effect=_read)),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value="123456"
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._is_combobox_or_typeahead", new=AsyncMock(return_value=is_combobox)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=AsyncMock()),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=AsyncMock()),
+    ):
+        results = await handle_input_text_action(
+            action=_input(), page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+    return results, el
+
+
+@pytest.mark.asyncio
+async def test_reorder_repaired_when_no_autocomplete_evidence() -> None:
+    # Marker-less, no options, reordered read-back -> caller computes has_autocomplete_evidence=False and the
+    # reorder-repair call refills the intended value, then continues (ActionSuccess).
+    results, el = await _run_reorder_scenario(is_combobox=False, incremental=[], post_fill_value="123456")
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with(text="123456")
+
+
+@pytest.mark.asyncio
+async def test_reorder_not_repaired_when_structural_combobox() -> None:
+    # A structurally genuine combobox -> has_autocomplete_evidence=True -> no reorder refill (typed preserved).
+    results, el = await _run_reorder_scenario(is_combobox=True, incremental=[], post_fill_value="123456")
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_fail_closed_when_unconfirmed() -> None:
+    # The refill does not restore the value -> batch-terminal ActionFailure from the helper.
+    results, el = await _run_reorder_scenario(is_combobox=False, incremental=[], post_fill_value="654321")
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].skip_remaining_actions is True
+
+
+@pytest.mark.asyncio
+async def test_post_type_autocomplete_probe_failure_does_not_fail_successful_input() -> None:
+    # The control is a marker-less field pre-typing (structural probe returns False), but the final input event
+    # detaches/remounts it, so a structural autocomplete probe run AFTER input_sequentially would raise a live
+    # element-lifecycle error. That must not convert a successfully-typed-and-healed value into a failure: the
+    # autocomplete gate is taken from the pre-typing (attached) evidence, so the reordered read-back is repaired
+    # and the action continues (ActionSuccess). The probe raises with a message not in the incremental handler's
+    # tolerated navigation substrings, so on the pre-fix head it is re-raised and fails the action.
+    el = make_input_element_mock(element_id="AADC")  # no type attr -> round-trip-safe ""
+    state = {"typed": False, "filled": False}
+
+    async def _type(*_a: object, **_k: object) -> None:
+        state["typed"] = True
+
+    el.input_sequentially = AsyncMock(side_effect=_type)
+
+    async def _fill(*_a: object, **_k: object) -> None:
+        state["filled"] = True
+
+    el.input_fill = AsyncMock(side_effect=_fill)
+
+    async def _auto_completion(*_a: object, **_k: object) -> bool:
+        if state["typed"]:
+            raise PlaywrightError("element is not attached to the DOM")  # detached by the final input event
+        return False  # attached pre-typing: no structural autocomplete markers
+
+    el.is_auto_completion_input = AsyncMock(side_effect=_auto_completion)
+
+    async def _read(*_a: object, **_k: object) -> str:
+        return "123456" if state["filled"] else "654321"  # reordered read-back until the heal refills
+
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=[])
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"AADC": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=True, is_location_input=False)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(side_effect=_read)),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value="123456"
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        # Structural combobox probe stays False throughout -- isolates the new post-type probe (which calls
+        # is_auto_completion_input) from the unrelated pre-existing settle-block combobox probe.
+        patch("skyvern.webeye.actions.handler._is_combobox_or_typeahead", new=AsyncMock(return_value=False)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=AsyncMock()),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=AsyncMock()),
+    ):
+        results = await handle_input_text_action(
+            action=_input(), page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with(text="123456")  # pre-typing evidence -> reorder repaired, not failed
