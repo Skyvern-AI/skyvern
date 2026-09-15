@@ -8,6 +8,7 @@ Verifies that the CodeBlock safety layer:
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
@@ -20,13 +21,18 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
 from skyvern.forge.sdk.workflow.code_block_safety import (
     ALWAYS_DENIED_BUILTINS,
     SANDBOX_ONLY_BUILTINS,
     is_safe_script_code,
     safe_builtins,
 )
-from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    InsecureCodeDetected,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
     BranchEvaluationContext,
@@ -3064,3 +3070,154 @@ class TestClearBrowserDataHelperBinding:
             ("DOMStorage.clear", {"storageId": {"securityOrigin": expected_origin, "isLocalStorage": False}}),
         ]
         assert session.detached
+
+
+class TestInertSlotRenderIsTheSpliceReference:
+    """The gate compares the real render against the same template rendered with inert value slots, so a slot may
+    hold a literal and nothing else; no template shape or value can cancel that out."""
+
+    def _block(self, code: str) -> CodeBlock:
+        now = datetime.now(UTC)
+        return CodeBlock(
+            label="read",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="read_output",
+                description="",
+                output_parameter_id="op_read",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    _EXFIL = "await page.context.cookies()"
+
+    @pytest.mark.parametrize(
+        ("template", "values", "expect_refused"),
+        [
+            pytest.param("jar = {{ exfil }}\nresult = jar\n", {"exfil": _EXFIL}, True, id="single-line-slot"),
+            pytest.param("jar = {{\nexfil\n}}\nresult = jar\n", {"exfil": _EXFIL}, True, id="multiline-slot"),
+            pytest.param("jar = {{- exfil }}\nresult = jar\n", {"exfil": _EXFIL}, True, id="whitespace-control-slot"),
+            pytest.param(
+                "total = {{- count -}}\n + 1\n", {"count": 41}, False, id="trim-markers-apply-to-both-renders"
+            ),
+            pytest.param("result = {% print exfil %}\n", {"exfil": _EXFIL}, True, id="print-statement-slot"),
+            pytest.param("result = {%- print exfil -%}\n", {"exfil": _EXFIL}, True, id="print-statement-trim-slot"),
+            pytest.param("result = {% print count %}\n", {"count": 7}, False, id="print-statement-literal"),
+            pytest.param(
+                '{% filter replace("SLOT", payload) %}result = SLOT{% endfilter %}\n',
+                {"payload": _EXFIL},
+                True,
+                id="filter-block-with-value-argument",
+            ),
+            pytest.param(
+                '{% filter replace(old="SLOT", new=payload) %}result = SLOT{% endfilter %}\n',
+                {"payload": _EXFIL},
+                True,
+                id="filter-block-with-value-keyword",
+            ),
+            pytest.param(
+                '{% filter replace("SLOT", "7") | upper %}RESULT = SLOT\n{% endfilter %}',
+                {},
+                False,
+                id="filter-block-with-constant-arguments",
+            ),
+            pytest.param(
+                "{% macro emit(v) %}result = {{ v }}{% endmacro %}{{ emit(payload) }}\n",
+                {"payload": _EXFIL},
+                True,
+                id="macro-emitting-a-value",
+            ),
+            pytest.param(
+                "{% macro wrap() %}result = {{ caller() }}{% endmacro %}{% call wrap() %}{{ payload }}{% endcall %}\n",
+                {"payload": _EXFIL},
+                True,
+                id="call-block-emitting-a-value",
+            ),
+            pytest.param(
+                "{% set n %}{{ count }}{% endset %}result = {{ n }}\n",
+                {"count": 7},
+                False,
+                id="set-block-then-literal-slot",
+            ),
+            pytest.param(
+                "{% if flag %}page.context.set_default_timeout(1)\n{% endif %}jar = {{ exfil }}\n",
+                {"flag": False, "exfil": _EXFIL},
+                True,
+                id="false-branch-decoy",
+            ),
+            pytest.param(
+                "ctx = page.context\nresult = {{ payload }}\n",
+                {"payload": "await ctx.cookies()"},
+                True,
+                id="authored-alias-consumed-by-value",
+            ),
+            pytest.param(
+                "__skyvern_slot__ = page.context\nresult = await {{ alias }}.cookies()\n",
+                {"alias": "__skyvern_slot__"},
+                True,
+                id="value-equal-to-the-inert-marker",
+            ),
+            pytest.param(
+                "x = {{ payload }}; page.context.set_default_timeout(1)\n",
+                {"payload": f"{_EXFIL} or None #"},
+                True,
+                id="value-comments-out-authored-statement",
+            ),
+            pytest.param("total = {{ count }} + 1\n", {"count": 41}, False, id="number-slot"),
+            pytest.param('url = "{{ base }}/x"\n', {"base": "https://a.example"}, False, id="slot-inside-string"),
+            pytest.param("flag = {{ on }}\n", {"on": True}, False, id="bool-slot"),
+            pytest.param(
+                "rows = []\n{% for r in items %}rows.append({{ r }})\n{% endfor %}",
+                {"items": [{"a": 1}, {"a": "b"}]},
+                False,
+                id="json-literal-per-loop-iteration",
+            ),
+            pytest.param(
+                "# note {{ exfil }}\nresult = 1\n", {"exfil": _EXFIL}, False, id="slot-inside-comment-is-masked"
+            ),
+            pytest.param("result = await page.context.cookies()\n", {}, False, id="no-slots-authored-read"),
+        ],
+    )
+    def test_slots_may_hold_literals_only(self, template: str, values: dict[str, object], expect_refused: bool) -> None:
+        block = self._block(template)
+
+        authored = block.render_code_with_reference(FakeWorkflowRunContext(values=values))
+
+        errors = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
+        assert bool(errors) is expect_refused, (authored, block.code)
+
+    def test_reference_render_does_not_consume_what_the_real_render_consumed(self) -> None:
+        block = self._block("{% set item = items.pop() %}result = {{ item }}\n")
+        context = FakeWorkflowRunContext(values={"items": [7]})
+
+        authored = block.render_code_with_reference(context)
+
+        assert block.code.strip() == "result = 7"
+        assert authored is not None
+        assert (
+            rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code) == []
+        )
+        assert context.values["items"] == []
+
+    def test_template_that_pulls_in_another_template_fails_before_the_gate(self) -> None:
+        block = self._block('{% include "other" %}result = 1\n')
+
+        with pytest.raises(FailedToFormatJinjaStyleParameter):
+            block.format_potential_template_parameters(FakeWorkflowRunContext(values={}))
+
+    def test_slot_form_the_rewrite_misses_is_rejected_by_the_parse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(block_module, "_JINJA_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
+        block = self._block("result = {% print exfil %}\n")
+
+        assert block.render_code_with_inert_slots(block.code, FakeWorkflowRunContext(values={"exfil": "1"})) is None
+
+    def test_prompt_and_error_mapping_still_render_after_code(self) -> None:
+        block = self._block("result = 1\n")
+        block.prompt = "hello {{ name }}"
+
+        block.format_potential_template_parameters(FakeWorkflowRunContext(values={"name": "world"}))
+
+        assert block.prompt == "hello world"

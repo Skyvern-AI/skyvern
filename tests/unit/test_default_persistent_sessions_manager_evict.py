@@ -149,3 +149,64 @@ async def test_cache_transition_retires_the_active_generation(
         assert "pbs_local" not in manager._browser_sessions
     else:
         assert manager._browser_sessions["pbs_local"].browser_state is fresh_state
+
+
+@pytest.mark.asyncio
+async def test_evict_reports_whether_a_live_entry_was_dropped(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    browser_state = MagicMock()
+    browser_state.detach_remote_driver = AsyncMock()
+    manager._browser_sessions["pbs_local"] = BrowserSession(browser_state=browser_state)
+
+    assert (
+        await manager.evict_cached_browser_state(
+            "pbs_local", "org_local", expected=browser_state, detach_remote_driver=True
+        )
+        is True
+    )
+    assert await manager.evict_cached_browser_state("pbs_local", "org_local", detach_remote_driver=True) is False
+
+    manager._browser_sessions["pbs_local"] = BrowserSession(browser_state=browser_state)
+
+    assert (
+        await manager.evict_cached_browser_state(
+            "pbs_local", "org_local", expected=MagicMock(), detach_remote_driver=True
+        )
+        is False
+    )
+    assert "pbs_local" in manager._browser_sessions
+
+
+@pytest.mark.asyncio
+async def test_idle_only_evict_leaves_a_generation_a_concurrent_operation_is_driving(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    browser_state = MagicMock()
+    browser_state.detach_remote_driver = AsyncMock()
+    manager._browser_sessions["pbs_local"] = BrowserSession(browser_state=browser_state)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold() -> str:
+        async with manager.browser_operation("pbs_local", browser_state) as operation:
+            if isinstance(operation, BrowserOperationRejected):
+                return "rejected"
+            entered.set()
+            await release.wait()
+        return "completed"
+
+    holder = asyncio.ensure_future(_hold())
+    await entered.wait()
+
+    assert (
+        await manager.evict_cached_browser_state(
+            "pbs_local", "org_local", expected=browser_state, detach_remote_driver=True, only_if_unleased=True
+        )
+        is False
+    )
+    release.set()
+
+    assert await holder == "completed"
+    assert manager._browser_sessions["pbs_local"].browser_state is browser_state
+    browser_state.detach_remote_driver.assert_not_awaited()

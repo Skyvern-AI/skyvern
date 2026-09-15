@@ -281,7 +281,10 @@ async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reco
     monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
 
     ctx = SimpleNamespace(
-        organization_id="o_test", browser_session_id="pbs_copilot", turn_origin=TurnOrigin.interactive
+        organization_id="o_test",
+        browser_session_id="pbs_copilot",
+        turn_origin=TurnOrigin.interactive,
+        attached_browser_drivers={},
     )
 
     current_url, page_title = await _fallback_page_info(ctx)
@@ -315,7 +318,10 @@ async def test_fallback_page_info_bounds_a_title_that_never_resolves_and_keeps_t
     monkeypatch.setattr(_shared, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
 
     ctx = SimpleNamespace(
-        organization_id="o_test", browser_session_id="pbs_copilot", turn_origin=TurnOrigin.interactive
+        organization_id="o_test",
+        browser_session_id="pbs_copilot",
+        turn_origin=TurnOrigin.interactive,
+        attached_browser_drivers={},
     )
 
     current_url, page_title = await asyncio.wait_for(_fallback_page_info(ctx), timeout=5)

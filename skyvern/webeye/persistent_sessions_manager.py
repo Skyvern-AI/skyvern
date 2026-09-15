@@ -284,8 +284,10 @@ class PersistentSessionsManager(Protocol):
         expected: BrowserState | None = None,
         *,
         detach_remote_driver: bool = False,
-    ) -> None:
-        """Drop any in-process cache entry so the next lookup reconnects.
+        only_if_unleased: bool = False,
+    ) -> bool:
+        """Drop any in-process cache entry so the next lookup reconnects, reporting whether a
+        live entry was actually evicted.
 
         When ``expected`` is provided the eviction is race-safe: callers can pass the
         stale BrowserState they just navigated against, and the manager skips eviction
@@ -296,6 +298,8 @@ class PersistentSessionsManager(Protocol):
         ``detach_remote_driver`` is for a known local CDP-client loss while the remote
         persistent browser remains healthy. It stops only the adopted Playwright driver
         instead of closing the remote context that another proxy client may still use.
+        ``only_if_unleased`` refuses the eviction while an admitted operation or a run on this
+        process still leases the cached generation, since retiring it would cut that work off.
         """
         ...
 

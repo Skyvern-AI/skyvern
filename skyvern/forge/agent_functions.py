@@ -1176,6 +1176,7 @@ class AgentFunction:
         block_label: str | None,
         browser_session_id: str | None,
         code: str | None = None,
+        authored_code: str | None = None,
     ) -> bool:
         """Whether a workflow CodeBlock run should execute in the secure runner.
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -125,6 +125,16 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
+_ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
+# Per session: attached turns in this process, and the newest generation any of them attached.
+# Only the last one out releases, and it retires that newest generation rather than its own.
+_ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
+# in that window would record the generation the evict is about to retire.
+_DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
+# Bumped per session when a release starts, so a lookup can tell one began and finished while it
+# was out. Never pruned: one int per session id this process has ever released.
+_DRIVER_RELEASE_EPOCHS: dict[str, int] = {}
 # How long a superseded run's owner gets to drop the lease. The worker releases only after its own
 # cooperative cancel check, so a cleared runnable_id is the evidence its browser work stopped.
 _SUPERSEDE_RELEASE_WAIT_SECONDS = 15.0
@@ -368,6 +378,12 @@ class ScoutedInteraction(TypedDict):
     element_fingerprint_probed: NotRequired[str]
 
 
+@dataclass(frozen=True)
+class AttachedBrowserDriver:
+    session_id: str
+    browser_state: BrowserState
+
+
 @dataclass
 class AgentContext:
     organization_id: str
@@ -383,6 +399,12 @@ class AgentContext:
     work_plan: list[str] | None = None
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
+    # Keyed by session id, so a later rebind of ``browser_session_id`` cannot aim the turn-exit
+    # release at a session this turn never attached. ``dataclasses.replace`` shares this dict.
+    attached_browser_drivers: dict[str, AttachedBrowserDriver] = field(default_factory=dict)
+    # Tool tasks this turn has inside an admitted browser operation. A cancelled turn reaches its
+    # finalizer before those tasks finish unwinding, and the manager refuses to retire a busy generation.
+    admitted_browser_operations: dict[str, set[asyncio.Task[object]]] = field(default_factory=dict)
     heal_workflow_run_id: str | None = None
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
@@ -967,7 +989,7 @@ async def resolve_browser_state_for_context(
         return None
     if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
         try:
-            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            _resolved_session_id, injected_state, _ = await _resolve_self_heal_browser_state(ctx)
             if _resolved_session_id != resolved_session_id:
                 LOG.info(
                     "Resolved self-heal browser session id differs from requested",
@@ -975,13 +997,18 @@ async def resolve_browser_state_for_context(
                     resolved_session_id=_resolved_session_id,
                     organization_id=ctx.organization_id,
                 )
-            return browser_state
+            return injected_state
         except HealAdoptionFailed:
             return None
-    return await resolve_persistent_browser_state(
+    browser_state = await resolve_persistent_browser_state(
         session_id=resolved_session_id,
         organization_id=ctx.organization_id,
     )
+    if browser_state is not None:
+        # Only this branch's state lives in the pod's cache; the self-heal branch above returns the
+        # healer's injected state, which the turn-exit release would look for and never find.
+        record_attached_browser_driver(ctx, resolved_session_id, browser_state)
+    return browser_state
 
 
 def _abandonable_browser_state_resolve(session_id: str, organization_id: str) -> asyncio.Task[BrowserState | None]:
@@ -1021,7 +1048,62 @@ async def resolve_persistent_browser_state(
     Every caller still issues its OWN lookup. A determination that is merely stuck must never be
     inherited by a later attach, which is the oracle and has to be free to answer on its own.
     """
-    return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
+    while True:
+        release_in_flight = _DRIVER_RELEASES_IN_FLIGHT.get(session_id)
+        if release_in_flight is not None:
+            await release_in_flight.wait()
+        epoch_before_lookup = _DRIVER_RELEASE_EPOCHS.get(session_id, 0)
+        resolve = _abandonable_browser_state_resolve(session_id, organization_id)
+        try:
+            browser_state = await asyncio.shield(resolve)
+        except asyncio.CancelledError:
+            _release_driver_attached_after_abandonment(resolve, session_id, organization_id)
+            raise
+        # A release that began while this lookup was out may have retired the generation it
+        # returned; the caller records synchronously after this returns, so re-issuing is enough.
+        if _DRIVER_RELEASE_EPOCHS.get(session_id, 0) == epoch_before_lookup:
+            return browser_state
+
+
+def _release_driver_attached_after_abandonment(
+    resolve: asyncio.Task[BrowserState | None], session_id: str, organization_id: str
+) -> None:
+    """A caller cancelled mid-resolve never records what the shielded lookup went on to attach, so
+    without this the driver it leaves in the pod's cache has no owner left to release it."""
+
+    def _release(finished: asyncio.Task[BrowserState | None]) -> None:
+        if finished.cancelled() or finished.exception() is not None:
+            return
+        browser_state = finished.result()
+        if browser_state is None:
+            return
+        _hold_attached_browser_driver(session_id, browser_state, new_holder=True)
+        start_browser_driver_release(organization_id, AttachedBrowserDriver(session_id, browser_state))
+
+    resolve.add_done_callback(_release)
+
+
+def start_browser_driver_release(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> asyncio.Task[None]:
+    """The release runs as its own task so a cancel landing on the caller's await cannot stop it
+    before it hands back the attach count; a stuck count skips every later release on that session."""
+    release = asyncio.ensure_future(
+        release_browser_driver_quietly(organization_id, attached, unwinding_operations=unwinding_operations)
+    )
+    _ABANDONED_DRIVER_RELEASES.add(release)
+    release.add_done_callback(_discard_finished_driver_release)
+    return release
+
+
+async def wait_for_driver_releases(releases: Iterable[asyncio.Task[None]]) -> None:
+    """Bounded here, not in the release: a slow unwind delays the detach, never the turn's exit."""
+    pending = [release for release in releases if not release.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
 
 
 async def close_browser_session_quietly(
@@ -1039,6 +1121,100 @@ async def close_browser_session_quietly(
         )
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
+
+
+def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
+    _ABANDONED_DRIVER_RELEASES.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+def _hold_attached_browser_driver(session_id: str, browser_state: BrowserState, *, new_holder: bool) -> None:
+    turns, _ = _ATTACHED_TURNS_PER_SESSION.get(session_id, (0, browser_state))
+    _ATTACHED_TURNS_PER_SESSION[session_id] = (turns + 1 if new_holder else turns, browser_state)
+
+
+def record_attached_browser_driver(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    _hold_attached_browser_driver(session_id, browser_state, new_holder=session_id not in ctx.attached_browser_drivers)
+    ctx.attached_browser_drivers[session_id] = AttachedBrowserDriver(session_id, browser_state)
+
+
+async def release_browser_driver_quietly(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> None:
+    """Detach the driver this turn attached, leaving the persistent session itself running. The
+    evict is shielded because it pops the cache entry before awaiting the detach, so a cancelled
+    wait would strand the popped driver."""
+    # The manager refuses to retire a generation with an admitted operation, and this turn's own
+    # tool task can still be unwinding one; a refusal taken as done would leave the driver cached.
+    # Unbounded on purpose: an operation that never ends is still using the driver, and this task
+    # runs off the turn, whose exit is bounded by its caller.
+    pending = {task for task in unwinding_operations or () if task is not asyncio.current_task() and not task.done()}
+    if pending:
+        await asyncio.wait(pending)
+    turns, latest_browser_state = _ATTACHED_TURNS_PER_SESSION.get(attached.session_id, (1, attached.browser_state))
+    still_attached = turns - 1
+    if still_attached > 0:
+        _ATTACHED_TURNS_PER_SESSION[attached.session_id] = (still_attached, latest_browser_state)
+        LOG.info(
+            "copilot_browser_driver_released",
+            session_id=attached.session_id,
+            had_cached_driver=False,
+            concurrent_turns_still_attached=still_attached,
+        )
+        return
+    _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    manager = app.PERSISTENT_SESSIONS_MANAGER
+    if not manager.supports_evict_and_reconnect():
+        # This process drives the browser itself; detaching its driver would strand the browser
+        # and leave the session uncacheable for the rest of its life.
+        return
+    evict: asyncio.Task[bool] | None = None
+    try:
+        evict = asyncio.ensure_future(
+            manager.evict_cached_browser_state(
+                attached.session_id,
+                organization_id,
+                expected=latest_browser_state,
+                detach_remote_driver=True,
+                only_if_unleased=True,
+            )
+        )
+        _ABANDONED_DRIVER_RELEASES.add(evict)
+        evict.add_done_callback(_discard_finished_driver_release)
+        # The marker must outlive this wait: a resolve admitted after a timed-out wait but before
+        # the evict pops the entry would still be handed the generation being retired.
+        _DRIVER_RELEASE_EPOCHS[attached.session_id] = _DRIVER_RELEASE_EPOCHS.get(attached.session_id, 0) + 1
+        releasing = asyncio.Event()
+        _DRIVER_RELEASES_IN_FLIGHT[attached.session_id] = releasing
+
+        def _release_marker(_task: asyncio.Task[bool]) -> None:
+            if _DRIVER_RELEASES_IN_FLIGHT.get(attached.session_id) is releasing:
+                del _DRIVER_RELEASES_IN_FLIGHT[attached.session_id]
+            releasing.set()
+
+        evict.add_done_callback(_release_marker)
+        had_cached_driver = await asyncio.wait_for(asyncio.shield(evict), timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
+    except (asyncio.CancelledError, Exception) as exc:
+        LOG.warning(
+            "Failed to release browser driver",
+            session_id=attached.session_id,
+            error_type=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        # A cancel the evict did not raise itself is this turn being cancelled mid-cleanup, and
+        # swallowing it would report a task that finished when the caller asked it to stop.
+        if isinstance(exc, asyncio.CancelledError) and (evict is None or not evict.cancelled()):
+            raise
+        return
+    LOG.info(
+        "copilot_browser_driver_released",
+        session_id=attached.session_id,
+        had_cached_driver=had_cached_driver,
+    )
 
 
 def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
@@ -1251,6 +1427,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             raise CopilotBrowserGenerationRetired(browser_session_id, operation.reason)
         if operation_task is None:
             raise RuntimeError("A Copilot browser context requires an asyncio task")
+        ctx.admitted_browser_operations.setdefault(browser_session_id, set()).add(operation_task)
         scope_token = _ACTIVE_MCP_BROWSER_CONTEXT.set(
             _ActiveMcpBrowserContext(
                 task=operation_task,
@@ -1274,6 +1451,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             _raise_if_browser_generation_retired(operation_task, operation.retirement, browser_session_id)
         finally:
             _ACTIVE_MCP_BROWSER_CONTEXT.reset(scope_token)
+            ctx.admitted_browser_operations.get(browser_session_id, set()).discard(operation_task)
 
 
 async def _attach_current_browser_generation(ctx: AgentContext) -> None:
@@ -1438,6 +1616,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                     organization_id=ctx.organization_id,
                 )
                 if state and _browser_context_is_attachable(state.browser_context):
+                    record_attached_browser_driver(ctx, ctx.browser_session_id, state)
                     break
                 await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 

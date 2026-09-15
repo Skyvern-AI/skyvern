@@ -1,12 +1,6 @@
 """Deterministic AST denylist over Copilot-synthesized code blocks, enforced at authoring and at runtime pre-dispatch.
-
-`page.request` and `page.context` remain denied at both seams because they reach the live browser session's HTTP
-client and its BrowserContext (cookies, `storage_state`, new pages, route interception), so prompt-injected
-synthesized code could exfiltrate session credentials out of band. Retaining them does not mitigate exfiltration
-through `page.evaluate`, which can read page-visible data and egress it directly from in-page JS; this module is a
-guardrail on one code path, not a sandbox, and Copilot code still executes in-process with credentials resolved
-before the run until out-of-process isolation lands.
-"""
+Denies `page.request`, `page.context` and the dynamic attribute/namespace builtins that reach the live session's
+credentials; a guardrail on one code path, not a sandbox, and it does not cover exfiltration through `page.evaluate`."""
 
 from __future__ import annotations
 
@@ -24,6 +18,9 @@ _RUNTIME_ATTR_REASONS = {
     "request": "RUNTIME_PAGE_REQUEST",
     "context": "RUNTIME_PAGE_CONTEXT",
 }
+_DYNAMIC_ATTRIBUTE_BUILTINS = frozenset({"getattr", "setattr", "delattr", "vars", "globals", "locals"})
+_AUTHOR_DYNAMIC_ATTRIBUTE_REASON = "AUTHOR_DYNAMIC_ATTRIBUTE"
+_RUNTIME_DYNAMIC_ATTRIBUTE_REASON = "RUNTIME_DYNAMIC_ATTRIBUTE"
 
 
 @dataclass(frozen=True)
@@ -58,7 +55,7 @@ def author_time_code_security_errors(*, label: str, code: str) -> list[CodeBlock
         tree = ast.parse(code)
     except SyntaxError:
         return [_error(label, "AUTHOR_SYNTAX_ERROR")]
-    return _security_errors_for_tree(label, tree, _AUTHOR_ATTR_REASONS)
+    return _security_errors_for_tree(label, tree, _AUTHOR_ATTR_REASONS, _AUTHOR_DYNAMIC_ATTRIBUTE_REASON)
 
 
 def runtime_code_security_errors(
@@ -76,18 +73,96 @@ def runtime_code_security_errors(
         except SyntaxError:
             errors.append(_error(block.label, "RUNTIME_SYNTAX_ERROR"))
             continue
-        errors.extend(_security_errors_for_tree(block.label, tree, _RUNTIME_ATTR_REASONS))
+        errors.extend(
+            _security_errors_for_tree(block.label, tree, _RUNTIME_ATTR_REASONS, _RUNTIME_DYNAMIC_ATTRIBUTE_REASON)
+        )
     return errors
 
 
-def _security_errors_for_tree(label: str, tree: ast.AST, attr_reasons: dict[str, str]) -> list[CodeBlockSecurityError]:
+INERT_SLOT_NAME = "__skyvern_slot__"
+_PARAMETER_CODE_REASON = "RUNTIME_PARAMETER_CODE"
+
+
+def rendering_introduced_security_errors(
+    *, label: str, authored_code: str | None, rendered_code: str
+) -> list[CodeBlockSecurityError]:
+    """Refuse a render whose parameter values contributed anything but literals. `authored_code` is the same template
+    rendered under the same control flow with every value slot replaced by `INERT_SLOT_NAME`; None fails closed.
+    Byte equality of the two renders is never a pass: a value equal to the marker produces identical text."""
+    try:
+        rendered_tree = ast.parse(rendered_code)
+    except SyntaxError:
+        return []
+    if authored_code is None:
+        return [_error(label, _PARAMETER_CODE_REASON)]
+    try:
+        authored_tree = ast.parse(authored_code)
+    except SyntaxError:
+        return [_error(label, _PARAMETER_CODE_REASON)]
+    if _slots_hold_only_literals(authored_tree, rendered_tree):
+        return []
+    return [_error(label, _PARAMETER_CODE_REASON)]
+
+
+def _slots_hold_only_literals(authored: ast.AST, rendered: ast.AST) -> bool:
+    if isinstance(authored, ast.Name) and authored.id == INERT_SLOT_NAME:
+        return _is_literal(rendered)
+    if isinstance(authored, ast.Constant) and isinstance(authored.value, str) and INERT_SLOT_NAME in authored.value:
+        return isinstance(rendered, ast.Constant) and isinstance(rendered.value, str)
+    if type(authored) is not type(rendered):
+        return False
+    for field, authored_value in ast.iter_fields(authored):
+        rendered_value = getattr(rendered, field, None)
+        if isinstance(authored_value, ast.AST):
+            if not isinstance(rendered_value, ast.AST) or not _slots_hold_only_literals(authored_value, rendered_value):
+                return False
+        elif isinstance(authored_value, list):
+            if not isinstance(rendered_value, list) or len(authored_value) != len(rendered_value):
+                return False
+            for authored_item, rendered_item in zip(authored_value, rendered_value, strict=True):
+                if isinstance(authored_item, ast.AST):
+                    if not isinstance(rendered_item, ast.AST) or not _slots_hold_only_literals(
+                        authored_item, rendered_item
+                    ):
+                        return False
+                elif authored_item != rendered_item:
+                    return False
+        elif authored_value != rendered_value:
+            return False
+    return True
+
+
+def _is_literal(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_literal(element) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and _is_literal(key) for key in node.keys) and all(
+            _is_literal(value) for value in node.values
+        )
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _is_literal(node.operand)
+    return False
+
+
+def _security_errors_for_tree(
+    label: str, tree: ast.AST, attr_reasons: dict[str, str], dynamic_attribute_reason: str
+) -> list[CodeBlockSecurityError]:
     errors: list[CodeBlockSecurityError] = []
     seen: set[str] = set()
     for node in ast.walk(tree):
-        # This AST layer catches direct attribute access. The sandbox's private-attribute
-        # and builtins restrictions remain the backstop for dynamic forms.
+        reasons: list[str] = []
         if isinstance(node, ast.Attribute) and node.attr in attr_reasons:
-            reason = attr_reasons[node.attr]
+            reasons.append(attr_reasons[node.attr])
+        # A class pattern reads `page.context` through getattr with no ast.Attribute node.
+        elif isinstance(node, ast.MatchClass):
+            reasons.extend(attr_reasons[attr] for attr in node.kwd_attrs if attr in attr_reasons)
+        # The sandbox's getattr/vars wrappers strip only private names and globals() exposes the
+        # builtins dict, so a string-built public name would reach the denied members.
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in _DYNAMIC_ATTRIBUTE_BUILTINS:
+            reasons.append(dynamic_attribute_reason)
+        for reason in reasons:
             if reason not in seen:
                 errors.append(_error(label, reason))
                 seen.add(reason)
@@ -111,10 +186,19 @@ def _surface_for_reason(reason_code: str) -> str:
         return "page.context"
     if reason_code.endswith("PAGE_EVALUATE"):
         return "page.evaluate"
+    if reason_code.endswith("DYNAMIC_ATTRIBUTE"):
+        return f"dynamic attribute access ({'/'.join(sorted(_DYNAMIC_ATTRIBUTE_BUILTINS))})"
+    if reason_code == _PARAMETER_CODE_REASON:
+        return "code from a parameter value"
     return "python_ast"
 
 
 def _message_for_reason(*, label: str, reason_code: str, surface: str) -> str:
+    if reason_code == _PARAMETER_CODE_REASON:
+        return (
+            f"Code block `{label}` was blocked before browser dispatch: a parameter value contributes code; "
+            "only a literal value (string, number, boolean, null, or JSON list/object) may be rendered into code."
+        )
     if reason_code == "AUTHOR_SYNTAX_ERROR":
         return f"Code block `{label}` failed the Copilot code security check: the code does not parse as Python."
     if reason_code.startswith("AUTHOR_"):

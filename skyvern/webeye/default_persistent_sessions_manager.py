@@ -564,19 +564,22 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected: BrowserState | None = None,
         *,
         detach_remote_driver: bool = False,
-    ) -> None:
+        only_if_unleased: bool = False,
+    ) -> bool:
         cached = self._browser_sessions.get(session_id)
         if cached is None:
-            return
+            return False
         if expected is not None and cached.browser_state is not expected:
-            return
+            return False
+        if only_if_unleased and cached.active_browser_operations:
+            return False
         cached = self._retire_browser_session(
             session_id,
             expected=cached,
             reason=BrowserRetirementReason.session_ending,
         )
         if cached is None:
-            return
+            return False
         try:
             if detach_remote_driver:
                 await cached.browser_state.detach_remote_driver()
@@ -593,6 +596,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 session_id=session_id,
                 exc_info=True,
             )
+        return True
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
