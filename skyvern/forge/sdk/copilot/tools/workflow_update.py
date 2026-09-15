@@ -40,6 +40,8 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
+    WRAPPER_SCOPE_GLOBAL_REASON_CODE,
+    CodeBlockPreflightDiagnostic,
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
 )
@@ -66,6 +68,7 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 )
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
+    code_block_available_contracts_by_label,
     declared_string_workflow_parameter_keys,
     declared_workflow_parameter_keys,
 )
@@ -758,16 +761,21 @@ def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_y
     return changed
 
 
-def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[str, list[str]]:
-    """Labels per advisory message, computed from every changed block rather than the
+def _advisory_labels_by_diagnostic(
+    changed_code_blocks: Mapping[str, str], accepted_yaml: str
+) -> dict[CodeBlockPreflightDiagnostic, list[str]]:
+    """Labels per advisory diagnostic, computed from every changed block rather than the
     budget-truncated ``stored_code`` so an oversized block still gets its note."""
-    labels_by_message: dict[str, list[str]] = {}
+    contracts = code_block_available_contracts_by_label(accepted_yaml)
+    labels_by_diagnostic: dict[CodeBlockPreflightDiagnostic, list[str]] = {}
     for label, code in sorted(changed_code_blocks.items()):
-        for diagnostic in advisory_code_block_diagnostics(code):
-            labels = labels_by_message.setdefault(diagnostic.message, [])
+        contract = contracts.get(label)
+        parameter_keys = contract.parameter_keys if contract is not None else ()
+        for diagnostic in advisory_code_block_diagnostics(code, parameter_keys=parameter_keys):
+            labels = labels_by_diagnostic.setdefault(diagnostic, [])
             if label not in labels:
                 labels.append(label)
-    return labels_by_message
+    return labels_by_diagnostic
 
 
 async def _scanner_advisory_labels_by_message(
@@ -3786,6 +3794,12 @@ _PERSISTENCE_MESSAGES: dict[PersistenceDisposition, str] = {
 }
 
 
+READINESS_WAIT_ADVISORY_REASON_CODE = "code_block_readiness_wait_advisory"
+# A nested `global` fails every run, but the run reports NameError at the use site and cannot
+# report that the block body is compiled inside a wrapper function the author never sees.
+WRAPPER_SCOPE_ADVISORY_REASON_CODE = "code_block_wrapper_scope_advisory"
+
+
 def persistence_disposition(ctx: AgentContext) -> PersistenceDisposition:
     return "staged_auto_apply" if ctx.auto_accept is True else "staged"
 
@@ -3816,7 +3830,7 @@ def _author_time_findings(
     *,
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
-    code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    code_block_diagnostics: Mapping[CodeBlockPreflightDiagnostic, list[str]] | None = None,
     scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
@@ -3841,18 +3855,20 @@ def _author_time_findings(
                 "summary": "\n".join(str(violation) for violation in metadata_violations),
             }
         )
-    # A contentless readiness wait is intermittent by construction: it passes on every run where the
-    # page happens to settle, so a green test-run cannot tell the author the wait encodes nothing.
-    if code_block_diagnostics:
-        findings.append(
-            {
-                "reason_code": "code_block_readiness_wait_advisory",
-                "summary": "\n".join(
-                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
-                    for message, labels in code_block_diagnostics.items()
-                ),
-            }
+    # Neither defect is visible to a green test-run: a contentless readiness wait passes whenever the
+    # page happens to settle, and a write-only wrapper-scope `global` silently drops the update.
+    summaries_by_reason_code: dict[str, list[str]] = {}
+    for diagnostic, labels in (code_block_diagnostics or {}).items():
+        reason_code = (
+            WRAPPER_SCOPE_ADVISORY_REASON_CODE
+            if diagnostic.code == WRAPPER_SCOPE_GLOBAL_REASON_CODE
+            else READINESS_WAIT_ADVISORY_REASON_CODE
         )
+        summaries_by_reason_code.setdefault(reason_code, []).append(
+            f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {diagnostic.message}"
+        )
+    for reason_code, summaries in summaries_by_reason_code.items():
+        findings.append({"reason_code": reason_code, "summary": "\n".join(summaries)})
     # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
     # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
     if scanner_diagnostics:
@@ -4480,7 +4496,7 @@ async def _update_workflow(
         # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
         # crafted block code must never turn a successful update into a failed turn.
         try:
-            advisory_labels = _advisory_labels_by_message(changed_code_blocks)
+            advisory_labels = _advisory_labels_by_diagnostic(changed_code_blocks, workflow_yaml)
         except Exception as advisory_err:
             LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
             advisory_labels = {}

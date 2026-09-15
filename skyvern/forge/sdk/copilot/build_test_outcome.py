@@ -1613,6 +1613,7 @@ def recorded_outcome_from_run_blocks_result(
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
+    runtime_failure_class: str | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
@@ -1894,7 +1895,7 @@ def recorded_outcome_from_run_blocks_result(
     failure_type = _safe_str(data.get("failure_type"))
     failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
-    runtime_failure_identity = _runtime_failure_identity(failed_block)
+    runtime_failure_identity = _runtime_failure_identity(failed_block, runtime_failure_class)
     failed_operation_identity = (
         _stable_hash(
             {
@@ -2289,10 +2290,14 @@ def _referenced_unbound_input_keys(
     return [key for key in dict.fromkeys(unbound_required_parameter_keys) if key in referenced_set]
 
 
-def _runtime_failure_identity(failed_block: Mapping[str, object] | None) -> str:
+def _runtime_failure_identity(
+    failed_block: Mapping[str, object] | None, runtime_failure_class: str | None = None
+) -> str:
     if failed_block is None:
         return ""
-    return _locator_wait_failure_identity(failed_block) or _code_execution_failure_identity(failed_block)
+    return _locator_wait_failure_identity(failed_block) or _code_execution_failure_identity(
+        failed_block, runtime_failure_class
+    )
 
 
 def _attempted_call_ref(failed_block: Mapping[str, object] | None) -> str:
@@ -2327,27 +2332,27 @@ def _runner_authored_reason(failure_reason: str) -> str:
     return failure_reason.split(": ", 1)[0].strip()
 
 
-def _code_execution_failure_identity(failed_block: Mapping[str, object]) -> str:
-    """Identity of a generated-code execution failure: the runner's typed error codes and the
-    account of the failure the runner itself authored.
-
-    Without this a raised exception carries no identity at all, so two different exceptions in the
-    same block are indistinguishable and a run whose only evidence is the raise records nothing.
-    """
+def _code_execution_failure_identity(
+    failed_block: Mapping[str, object], runtime_failure_class: str | None = None
+) -> str:
+    """Identity of a generated-code execution failure: the runner's typed error codes plus either the
+    classifier's ``runtime_failure_class`` or, absent one, the runner's own account of the raise."""
     if not _is_code_block_failure(failed_block):
         return ""
     error_codes = _clean_list(_string_list(failed_block.get("error_codes")))
     if not error_codes or any(code in _NOT_AUTHORED_CODE_ERROR_CODES for code in error_codes):
         return ""
-    return _stable_hash(
-        {
-            "source": "generated_code_execution",
-            "error_codes": error_codes,
-            "runner_reason": _runner_authored_reason(_safe_str(failed_block.get("failure_reason"))),
-            "block_label": _safe_str(failed_block.get("label")),
-            "block_status": _safe_str(failed_block.get("status")),
-        }
-    )
+    payload: dict[str, object] = {
+        "source": "generated_code_execution",
+        "error_codes": error_codes,
+        "block_label": _safe_str(failed_block.get("label")),
+        "block_status": _safe_str(failed_block.get("status")),
+    }
+    if runtime_failure_class:
+        payload["failure_class"] = _bounded_ref(runtime_failure_class)
+    else:
+        payload["runner_reason"] = _runner_authored_reason(_safe_str(failed_block.get("failure_reason")))
+    return _stable_hash(payload)
 
 
 def _locator_wait_failure_identity(failed_block: Mapping[str, object]) -> str:

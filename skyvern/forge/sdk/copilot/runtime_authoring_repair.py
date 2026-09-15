@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     is_carrier_backed_category_entry,
     typed_challenge_kind,
 )
+from skyvern.forge.sdk.copilot.code_block_preflight import wrapper_scope_facts
 from skyvern.forge.sdk.copilot.composition_evidence import (
     MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
@@ -25,7 +26,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     model_visible_composition_evidence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.output_extraction_plan import candidate_relations_from_packet, page_value_binding_text
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
@@ -55,8 +56,21 @@ OBSTRUCTION_SUMMARY_MAX_CHARS = 1200
 # A runner denial names its sanctioned replacement after the denied call (a listener denial runs to
 # ~600 characters); a bound below that hands the repair turn the refusal without the route.
 RUNTIME_FAILURE_REASON_MAX_CHARS = 640
+REPAIR_INSTRUCTION_MAX_CHARS = 260
 _NO_DISMISS_CONTROL_SUMMARY = "obstruction present, no dismiss control found in page evidence"
 _KEY_ERROR_RE = re.compile(r"KeyError(?:\s*:|\()\s*['\"]([^'\"]+)['\"]")
+# The runner's own reason format ("CodeBlock failed with <Class> at line N: <message>") and the
+# interpreter's quoted name in a NameError / UnboundLocalError message.
+_RUNNER_NAME_FAILURE_RE = re.compile(
+    r"CodeBlock failed with (?P<cls>NameError|UnboundLocalError) at line (?P<line>\d+): (?P<message>.*)"
+)
+_QUOTED_NAME_RE = re.compile(r"'(?P<name>[^']+)'")
+WRAPPER_SCOPE_FAILURE_CLASS = "wrapper_scope_name_resolution"
+WRAPPER_SCOPE_REPAIR_INSTRUCTION = (
+    "the block body is a wrapper function's body, so top-level names are locals `global` cannot reach; "
+    "NameError and UnboundLocalError there are one scope defect. Use a flat top-level loop, or in the "
+    "helper `nonlocal`, a return value, or a list/dict accumulator."
+)
 
 
 def is_runtime_authoring_repair_context(repair_context: object) -> TypeGuard[CodeAuthoringRepairContext]:
@@ -89,14 +103,13 @@ def _missing_key_from_key_error(reason: str) -> str | None:
 
 def _missing_output_dependency_context(
     *,
-    copilot_ctx: Any,
+    workflow_yaml: str | None,
     block_label: str,
     failed_block_status: str | None,
     failure_reason: str,
     run_id: str,
 ) -> CodeAuthoringRepairContext | None:
     missing_key = _missing_key_from_key_error(failure_reason)
-    workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     if not missing_key or not isinstance(workflow_yaml, str) or not workflow_yaml.strip():
         return None
     contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
@@ -132,6 +145,41 @@ def _missing_output_dependency_context(
             "parameter for this missing output key."
         ),
     )
+
+
+def _wrapper_scope_failure_class(workflow_yaml: str | None, block_label: str, failure_reason: str) -> str | None:
+    """NameError on a nested ``global`` for a block-bound name, or UnboundLocalError where a helper
+    declaring neither ``global`` nor ``nonlocal`` reads that name while rebinding it: one defect, the
+    block body being a wrapper function's body rather than a module. A helper that merely initializes
+    a same-named local on some paths and reads it on others has a local bug, not a scope one."""
+    match = _RUNNER_NAME_FAILURE_RE.search(failure_reason)
+    if match is None:
+        return None
+    name_match = _QUOTED_NAME_RE.search(match.group("message"))
+    if name_match is None:
+        return None
+    contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
+    if contract is None:
+        return None
+    facts = wrapper_scope_facts(contract.code, parameter_keys=contract.parameter_keys)
+    if facts is None:
+        return None
+    name = name_match.group("name")
+    line = int(match.group("line"))
+    if name not in facts.bound_names:
+        return None
+    if match.group("cls") == "NameError":
+        if any(name in hit.names and hit.helper.contains_line(line) for hit in facts.globals):
+            return WRAPPER_SCOPE_FAILURE_CLASS
+        return None
+    helper = facts.innermost_helper_at(line)
+    if helper is None:
+        return None
+    if name in helper.global_names or name in helper.nonlocal_names:
+        return None
+    if (name, line) not in helper.read_write_bindings:
+        return None
+    return WRAPPER_SCOPE_FAILURE_CLASS
 
 
 def _origin_from_runtime_url(value: Any) -> str | None:
@@ -547,7 +595,11 @@ def _newest_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, Any]) -> None:
+def record_pending_runtime_authoring_repair_context(
+    copilot_ctx: CopilotContext, result: dict[str, Any], *, workflow_yaml: str | None = None
+) -> None:
+    """``workflow_yaml`` is the snapshot the run executed; the context's copy can already be a
+    later draft by the time the result lands."""
     if bool(result.get("ok", False)):
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
@@ -574,10 +626,12 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if not block_label or not failure_reason:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
-    if is_runtime_authoring_repair_context(getattr(copilot_ctx, "last_code_authoring_repair_context", None)):
+    if is_runtime_authoring_repair_context(copilot_ctx.last_code_authoring_repair_context):
         copilot_ctx.last_code_authoring_repair_context = None
+    if workflow_yaml is None:
+        workflow_yaml = copilot_ctx.workflow_yaml
     missing_output_context = _missing_output_dependency_context(
-        copilot_ctx=copilot_ctx,
+        workflow_yaml=workflow_yaml,
         block_label=block_label,
         failed_block_status=failed_block_status or None,
         failure_reason=failure_reason,
@@ -586,16 +640,21 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if missing_output_context is not None:
         copilot_ctx.pending_code_authoring_runtime_repair_context = missing_output_context
         return
+    failure_class = _wrapper_scope_failure_class(workflow_yaml, block_label, failure_reason)
+    repair_instruction = (
+        "adapt the next code block to the observed page state and do not re-emit the same failing selector "
+        "or name path."
+    )
+    if failure_class == WRAPPER_SCOPE_FAILURE_CLASS:
+        repair_instruction = WRAPPER_SCOPE_REPAIR_INSTRUCTION
     copilot_ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
         block_label=block_label,
         reason_code=_RUNTIME_AUTHORING_REASON_CODE,
         runtime_failure_reason=failure_reason,
+        runtime_failure_class=failure_class,
         failed_block_status=failed_block_status or None,
         workflow_run_id=run_id,
-        repair_instruction=(
-            "adapt the next code block to the observed page state and do not re-emit the same failing selector "
-            "or name path."
-        ),
+        repair_instruction=repair_instruction,
     )
 
 

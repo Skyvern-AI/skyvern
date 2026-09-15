@@ -295,9 +295,8 @@ def _code_only_browser_unavailable_summary() -> str:
 
 def _code_only_browser_validation_guidance() -> str:
     return (
-        "Use validate_block only for allowed non-browser helper blocks. Do not use validate_block for `code` "
-        "blocks, dummy/probe code blocks, or browser/page native block types; validate real code blocks through "
-        "update_and_run_blocks."
+        "validate_block is only for allowed non-browser helper blocks, never for `code` blocks, dummy/probe "
+        "code blocks, or browser/page native block types; validate real code blocks through update_and_run_blocks."
     )
 
 
@@ -337,6 +336,12 @@ def _code_only_browser_schema_guidance() -> list[str]:
     ]
 
 
+WRAPPER_SCOPE_RUNTIME_FACT = """\
+- The body runs inside a wrapper function: identifier parameter keys and top-level names are
+  its locals, so `global` never reaches them. Accumulate in a flat loop; a nested helper
+  updates one with `nonlocal`, a return value, or a mutable accumulator."""
+
+
 def _code_only_browser_authoring_prompt() -> str:
     pending = "\n".join(f"- {detail}" for detail in _code_only_browser_pending_details())
     return f"""
@@ -345,13 +350,10 @@ ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 {_code_only_browser_unavailable_summary()}
 
 Rules:
-- Browser/page/session durable steps must be focused `code` blocks.
-- In code-only browser mode, before authoring the first `code` block this turn,
-  call `get_block_schema` with `block_type: code` and follow its returned field
-  names and nesting exactly; do not guess the YAML shape from memory.
-- Allowed non-browser helper blocks remain available: `conditional`, `for_loop`,
-  `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file
-  parsers, and triggers.
+- Before authoring the first `code` block this turn, call `get_block_schema` with `block_type: code`
+  and follow its returned field names and nesting exactly; do not guess the YAML shape.
+- Non-browser helper blocks stay available: `conditional`, `for_loop`, `while_loop`,
+  `send_email`, `human_interaction`, S3/Google Sheets helpers, file parsers, and triggers.
 - {_code_only_browser_validation_guidance()}
 
 Code-native capabilities still pending plumbing:
@@ -359,17 +361,18 @@ Code-native capabilities still pending plumbing:
 
 Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
-- The runtime pre-injects its helper namespaces; do not write `import` statements and do
-  not access dunder (`__name__`) names or attributes.
-- Valid Python identifier parameter keys are local variables; normalize values before page inputs.
+- Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names
+  or attributes.
+{WRAPPER_SCOPE_RUNTIME_FACT}
+- Normalize parameter values before page inputs.
 - Use deterministic, bounded Playwright calls and selectors observed while scouting.
 - For browser reads, prefer visible anchors, locator text, block outputs, and
   MCP/scout evidence gathered before authoring.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
-- For an extraction-intent `code` block, derive a typed `extraction_schema` (named
-  fields with types) from the goal and the scouted page, carry it as
-  `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.
+- For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal
+  and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and
+  conform the block's `return` to it.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 

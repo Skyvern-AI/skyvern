@@ -106,6 +106,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, interim_run_start_outcome
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTION_MAX_CHARS
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -914,6 +915,22 @@ workflow_definition:
         prompt = agent_module._code_authoring_repair_context_prompt(ctx)
 
         assert replacement in prompt
+
+    def test_the_repair_instruction_renders_to_the_shared_instruction_budget(self) -> None:
+        instruction = "adapt the next code block: " + "w" * (2 * REPAIR_INSTRUCTION_MAX_CHARS)
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="collect_rows",
+                reason_code="runtime_block_failure",
+                repair_instruction=instruction,
+            ),
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert instruction[:REPAIR_INSTRUCTION_MAX_CHARS] in prompt
+        assert instruction[: REPAIR_INSTRUCTION_MAX_CHARS + 1] not in prompt
 
     def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
         long_reason = "missing requested output child paths " + ("x" * 700)
@@ -4507,7 +4524,7 @@ class TestCredentialRefusalReachesAgent:
         assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in prompt
         assert "credential-typed code" in prompt
         assert "download registration" in prompt
-        assert "Use validate_block only for allowed non-browser helper blocks" in prompt
+        assert "validate_block is only for allowed non-browser helper blocks" in prompt
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
 

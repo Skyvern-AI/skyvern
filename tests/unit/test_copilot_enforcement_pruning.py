@@ -415,6 +415,8 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_run_blocks_block_labels=[],
         last_run_outcome=None,
         narrative_block_attempts={},
+        last_code_authoring_repair_context=None,
+        pending_code_authoring_runtime_repair_context=None,
     )
 
 

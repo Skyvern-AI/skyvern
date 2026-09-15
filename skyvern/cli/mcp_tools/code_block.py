@@ -72,7 +72,10 @@ async def skyvern_code_block_lint(
     code_safety_errors = _code_safety_errors(code)
     security_errors = author_time_code_security_errors(label=label, code=code)
     preflight = preflight_code_block(code, parameter_keys=keys)
-    author_time = [*author_time_code_block_diagnostics(code), *await scanner_advisory_diagnostics(code)]
+    author_time = [
+        *author_time_code_block_diagnostics(code, parameter_keys=keys),
+        *await scanner_advisory_diagnostics(code),
+    ]
 
     # Author-time diagnostics stay advisory and are deliberately excluded from ok.
     ok = not (code_safety_errors or security_errors or preflight)

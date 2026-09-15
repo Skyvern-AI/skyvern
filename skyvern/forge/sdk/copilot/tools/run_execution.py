@@ -162,6 +162,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     build_test_page_state_from_evidence,
     inject_runtime_authoring_repair_context,
+    is_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
     repair_page_evidence_is_admissible,
@@ -4767,7 +4768,11 @@ def _record_run_blocks_result(
     copilot_ctx.post_run_page_observation_workflow_run_id = None
     copilot_ctx.post_run_page_observation_after_failed_test = False
     copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
-    record_pending_runtime_authoring_repair_context(copilot_ctx, result)
+    record_pending_runtime_authoring_repair_context(
+        copilot_ctx,
+        result,
+        workflow_yaml=result.execution.workflow_yaml if isinstance(result, _ExecutionResult) else None,
+    )
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot_match, empty_data_blocks, failure_categories, goal_path_omissions = _analyze_run_blocks(
@@ -5018,6 +5023,21 @@ def _record_executed_block_labels(copilot_ctx: CopilotContext, result: dict[str,
                 copilot_ctx.executed_block_fingerprints.setdefault(label, set()).update(block_fingerprints)
 
 
+def _same_run_runtime_failure_class(copilot_ctx: CopilotContext, workflow_run_id: str | None) -> str | None:
+    """The classifier's verdict on this run's failure, whether it is still pending or already
+    finalized with page evidence, so an in-turn regrade keys the same identity as the first record;
+    a later read whose turn contexts are already cleared has no verdict left to key on."""
+    if not workflow_run_id:
+        return None
+    for repair_context in (
+        copilot_ctx.pending_code_authoring_runtime_repair_context,
+        copilot_ctx.last_code_authoring_repair_context,
+    ):
+        if is_runtime_authoring_repair_context(repair_context) and repair_context.workflow_run_id == workflow_run_id:
+            return repair_context.runtime_failure_class
+    return None
+
+
 def _build_recorded_build_test_outcome(
     copilot_ctx: CopilotContext,
     result: dict[str, Any],
@@ -5068,6 +5088,9 @@ def _build_recorded_build_test_outcome(
     return recorded_outcome_from_run_blocks_result(
         result,
         page_evidence=result_page_evidence or copilot_ctx.composition_page_evidence,
+        runtime_failure_class=_same_run_runtime_failure_class(
+            copilot_ctx, _packet_string(result_data.get("workflow_run_id"))
+        ),
         recorded_run_outcome=recorded_run_outcome,
         completion_verification=None,
         authored_structure_signature=authored_structure_signature_from_workflow(

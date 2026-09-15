@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import textwrap
+from collections.abc import Generator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import yaml
 
 from skyvern.forge.sdk.copilot.agent import (
     _build_user_context,
@@ -17,21 +24,32 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.output_utils import (
     _compact_packet_for_aggregate_limit,
     project_build_test_packet_for_llm,
     project_direct_test_handoff_packet_for_llm,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    REPAIR_INSTRUCTION_MAX_CHARS,
+    WRAPPER_SCOPE_FAILURE_CLASS,
+    WRAPPER_SCOPE_REPAIR_INSTRUCTION,
     finalize_runtime_authoring_repair_context_from_page_observation,
     record_pending_runtime_authoring_repair_context,
     repair_page_evidence_is_admissible,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    CopilotExecutionSnapshot,
+    _build_recorded_build_test_outcome,
+    _ExecutionResult,
     _failure_action_trace_summary,
     _newest_failed_result,
+    _record_run_blocks_result,
+    _RunExecution,
     build_test_evidence_packet,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recorder import CODE_BLOCK_FILENAME, user_code_line_from_exception
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 _RUN_ID = "wr_analytics_scalar"
 _RUN_BROWSER_SESSION_ID = "pbs_run_visible"
@@ -43,6 +61,9 @@ _OVERLAY_ID = "notice-overlay"
 _RESTOCK_NOTICE_TEXT = "We will let you know when this option is available again."
 _COMPLETED_PATH = "visitors"
 _CONSENT_PACKET_PATH = Path(__file__).resolve().parent / "fixtures/copilot/consent_cover_repair/packet.json"
+_WRAPPER_SCOPE_PACKET_DIR = Path(__file__).resolve().parent / "fixtures/copilot/wrapper_scope_exception"
+_WRAPPER_SCOPE_LABEL = "open_and_play_catalog_items"
+_WRAPPER_SCOPE_GLOBAL_LINE = "global items_completed, items_started"
 _CONSENT_BLOCK_LABEL = "extract_order_documents"
 _CONSENT_LAYER_TEXT = "Terms of Service"
 _CANDIDATE_RUN_ID = "wr_candidate_price_scope"
@@ -536,3 +557,288 @@ def test_runtime_repair_context_names_the_failure_the_run_stopped_on() -> None:
     pending = ctx.pending_code_authoring_runtime_repair_context
     assert pending is not None
     assert pending.block_label == "select_first_result"
+
+
+class _StubPage:
+    """Every attribute is another stub, every call returns one, and awaiting one yields one, so
+    the block runs to its scope failure without a browser."""
+
+    url = "https://example.com/items/1"
+
+    def __getattr__(self, name: str) -> _StubPage:
+        return _StubPage()
+
+    def __call__(self, *args: Any, **kwargs: Any) -> _StubPage:
+        return _StubPage()
+
+    def __await__(self) -> Generator[None, None, _StubPage]:
+        yield from ()
+        return _StubPage()
+
+    def __index__(self) -> int:
+        return 1
+
+    def __contains__(self, item: object) -> bool:
+        return True
+
+    def __add__(self, other: object) -> str:
+        return self.url
+
+    def __radd__(self, other: object) -> str:
+        return self.url
+
+
+def _runner_reason_from_executing(code: str) -> str:
+    """The runner's reason for this block, from actually running it as the runtime does: the
+    block body as the body of a wrapper function, under the runner's filename and line offset."""
+    full_code = "\nasync def wrapper():\n" + textwrap.indent(textwrap.dedent(code), "    ") + "\n"
+    namespace: dict[str, Any] = {"page": _StubPage(), "setup_only": True}
+    exec(compile(full_code, CODE_BLOCK_FILENAME, "exec"), namespace, namespace)  # noqa: S102
+    try:
+        asyncio.run(namespace["wrapper"]())
+    except Exception as exc:
+        return f"CodeBlock failed with {type(exc).__name__} at line {user_code_line_from_exception(exc)}: {exc}."
+    raise AssertionError("the wrapped block ran without raising")
+
+
+def _wrapper_scope_packet(name: str) -> dict[str, Any]:
+    return json.loads((_WRAPPER_SCOPE_PACKET_DIR / name).read_text(encoding="utf-8"))
+
+
+def _wrapper_scope_result(failure_reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_wrapper_scope_fixture",
+            "overall_status": "failed",
+            "blocks": [{"label": _WRAPPER_SCOPE_LABEL, "status": "failed", "failure_reason": failure_reason}],
+        },
+    }
+
+
+def _pending_after(result: dict[str, Any], workflow_yaml: str) -> CodeAuthoringRepairContext:
+    ctx = _copilot_context()
+    record_pending_runtime_authoring_repair_context(ctx, result, workflow_yaml=workflow_yaml)
+    pending = ctx.pending_code_authoring_runtime_repair_context
+    assert pending is not None
+    return pending
+
+
+def _with_block_code(workflow_yaml: str, code: str) -> str:
+    document = yaml.safe_load(workflow_yaml)
+    block = next(b for b in document["workflow_definition"]["blocks"] if b["label"] == _WRAPPER_SCOPE_LABEL)
+    assert block["code"] != code
+    block["code"] = code
+    edited = yaml.safe_dump(document, sort_keys=False)
+    assert code_block_available_contracts_by_label(edited)[_WRAPPER_SCOPE_LABEL].code == code
+    return edited
+
+
+def _as_second_run(result: dict[str, Any]) -> dict[str, Any]:
+    second = copy.deepcopy(result)
+    second["data"]["workflow_run_id"] = "wr_wrapper_scope_fixture_second"
+    return second
+
+
+def _record_run(ctx: CopilotContext, result: dict[str, Any], workflow_yaml: str) -> tuple[str, object]:
+    ctx.workflow_yaml = workflow_yaml
+    _record_run_blocks_result(ctx, result)
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None and outcome.reason_code == "runtime_block_failure"
+    return outcome.structural_failure_identity, ctx.recorded_build_test_outcome_history[-1]["structural_key"]
+
+
+def test_name_error_then_unbound_local_error_on_the_same_counter_are_one_scope_defect() -> None:
+    name_error = _wrapper_scope_packet("packet-name-error.json")
+    unbound = _wrapper_scope_packet("packet-unbound-local-error.json")
+    code_with_global = code_block_available_contracts_by_label(name_error["workflow_yaml"])[_WRAPPER_SCOPE_LABEL].code
+    code_without_global = code_block_available_contracts_by_label(unbound["workflow_yaml"])[_WRAPPER_SCOPE_LABEL].code
+    assert _WRAPPER_SCOPE_GLOBAL_LINE in code_with_global and _WRAPPER_SCOPE_GLOBAL_LINE not in code_without_global
+    assert (
+        _runner_reason_from_executing(code_with_global) == name_error["result"]["data"]["blocks"][0]["failure_reason"]
+    )
+    executed_reason = _runner_reason_from_executing(code_without_global)
+    assert executed_reason.startswith("CodeBlock failed with UnboundLocalError at line 47: ")
+    assert executed_reason == unbound["result"]["data"]["blocks"][0]["failure_reason"]
+
+    first = _pending_after(name_error["result"], name_error["workflow_yaml"])
+    second = _pending_after(_wrapper_scope_result(executed_reason), unbound["workflow_yaml"])
+
+    assert first.runtime_failure_class == WRAPPER_SCOPE_FAILURE_CLASS
+    assert second.runtime_failure_class == WRAPPER_SCOPE_FAILURE_CLASS
+    assert first.repair_instruction == second.repair_instruction == WRAPPER_SCOPE_REPAIR_INSTRUCTION
+    assert len(WRAPPER_SCOPE_REPAIR_INSTRUCTION) <= REPAIR_INSTRUCTION_MAX_CHARS
+
+
+def test_the_second_scope_exception_records_the_same_outcome_identity_as_the_first() -> None:
+    name_error = _wrapper_scope_packet("packet-name-error.json")
+    unbound = _wrapper_scope_packet("packet-unbound-local-error.json")
+    ctx = _copilot_context()
+
+    first_identity, first_key = _record_run(ctx, name_error["result"], name_error["workflow_yaml"])
+    second_identity, second_key = _record_run(ctx, _as_second_run(unbound["result"]), unbound["workflow_yaml"])
+
+    assert first_identity and first_identity == second_identity
+    assert first_key is not None and first_key == second_key
+    assert len(ctx.recorded_build_test_outcome_history) == 2
+
+
+def test_a_regrade_after_the_repair_context_is_finalized_keeps_the_first_identity() -> None:
+    name_error = _wrapper_scope_packet("packet-name-error.json")
+    ctx = _copilot_context()
+    first_identity, _ = _record_run(ctx, name_error["result"], name_error["workflow_yaml"])
+    ctx.last_code_authoring_repair_context = ctx.pending_code_authoring_runtime_repair_context
+    ctx.pending_code_authoring_runtime_repair_context = None
+
+    regraded = _build_recorded_build_test_outcome(ctx, name_error["result"], None)
+
+    assert regraded is not None and regraded.structural_failure_identity == first_identity
+
+
+def test_an_unrelated_name_error_keeps_its_own_outcome_identity() -> None:
+    name_error = _wrapper_scope_packet("packet-name-error.json")
+    unbound = _wrapper_scope_packet("packet-unbound-local-error.json")
+    ctx = _copilot_context()
+    typo = copy.deepcopy(name_error["result"])
+    typo["data"]["blocks"][0]["failure_reason"] = (
+        "CodeBlock failed with NameError at line 48: name 'typo' is not defined."
+    )
+
+    typo_identity, typo_key = _record_run(ctx, typo, name_error["workflow_yaml"])
+    scope_identity, scope_key = _record_run(ctx, _as_second_run(unbound["result"]), unbound["workflow_yaml"])
+
+    assert typo_identity != scope_identity
+    assert typo_key != scope_key
+
+
+def test_an_inner_helpers_global_does_not_hide_the_outer_helpers_scope_defect() -> None:
+    packet = _wrapper_scope_packet("packet-name-error.json")
+    code = textwrap.dedent(
+        """\
+        count = 0
+
+        async def outer():
+            async def inner():
+                global count
+                count = 5
+
+            await inner()
+            count += 1
+
+        await outer()
+        return {"count": count}
+        """
+    )
+    reason = _runner_reason_from_executing(code)
+    assert reason.startswith("CodeBlock failed with UnboundLocalError at line 9: ")
+
+    pending = _pending_after(_wrapper_scope_result(reason), _with_block_code(packet["workflow_yaml"], code))
+
+    assert pending.runtime_failure_class == WRAPPER_SCOPE_FAILURE_CLASS
+
+
+def test_executed_snapshot_yaml_outranks_the_context_draft_for_scope_classification() -> None:
+    packet = _wrapper_scope_packet("packet-name-error.json")
+    fixed_yaml = _with_block_code(packet["workflow_yaml"], 'items_started = 0\nreturn {"items_started": 0}\n')
+    ctx = _copilot_context()
+    ctx.workflow_yaml = fixed_yaml
+
+    record_pending_runtime_authoring_repair_context(ctx, packet["result"])
+    from_draft = ctx.pending_code_authoring_runtime_repair_context
+    record_pending_runtime_authoring_repair_context(ctx, packet["result"], workflow_yaml=packet["workflow_yaml"])
+    from_snapshot = ctx.pending_code_authoring_runtime_repair_context
+
+    assert from_draft is not None and from_draft.runtime_failure_class is None
+    assert from_snapshot is not None and from_snapshot.runtime_failure_class == WRAPPER_SCOPE_FAILURE_CLASS
+
+
+def _execution_result(result: dict[str, Any], executed_workflow_yaml: str) -> _ExecutionResult:
+    workflow = Workflow.model_construct(workflow_id="wf_fixture", workflow_definition=SimpleNamespace(blocks=[]))
+    execution = _RunExecution(
+        snapshot=CopilotExecutionSnapshot(
+            provenance="staged",
+            workflow=workflow,
+            workflow_parameters=(),
+            output_parameters=(),
+            workflow_yaml=executed_workflow_yaml,
+        ),
+        workflow_yaml=executed_workflow_yaml,
+        metadata={},
+        associations={},
+        source_at_start=None,
+        unbound_keys=[],
+        explicit_blank=False,
+    )
+    return _ExecutionResult(result, execution)
+
+
+def test_recording_an_execution_result_classifies_against_the_snapshot_it_ran_not_the_context_draft() -> None:
+    packet = _wrapper_scope_packet("packet-name-error.json")
+    ctx = _copilot_context()
+    ctx.workflow_yaml = _with_block_code(packet["workflow_yaml"], 'items_started = 0\nreturn {"items_started": 0}\n')
+
+    _record_run_blocks_result(ctx, _execution_result(packet["result"], packet["workflow_yaml"]))
+
+    pending = ctx.pending_code_authoring_runtime_repair_context
+    assert pending is not None and pending.runtime_failure_class == WRAPPER_SCOPE_FAILURE_CLASS
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None and outcome.reason_code == "runtime_block_failure"
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "code_edit"),
+    [
+        ("CodeBlock failed with NameError at line 48: name 'typo' is not defined.", None),
+        (
+            "CodeBlock failed with NameError at line 48: name 'typo_total' is not defined.",
+            ("    global items_completed, items_started\n", "    global items_completed, items_started, typo_total\n"),
+        ),
+        ("CodeBlock failed with NameError at line 12: name 'items_started' is not defined.", None),
+        (
+            "CodeBlock failed with NameError at line 48: name 'never_bound' is not defined.",
+            ("    global items_completed, items_started\n", "    global never_bound\n"),
+        ),
+        (
+            "CodeBlock failed with UnboundLocalError at line 47: cannot access local variable 'items_started' "
+            "where it is not associated with a value.",
+            ("    global items_completed, items_started\n", "    nonlocal items_completed, items_started\n"),
+        ),
+        (
+            "CodeBlock failed with UnboundLocalError at line 47: cannot access local variable 'never_bound' "
+            "where it is not associated with a value.",
+            None,
+        ),
+        (
+            "CodeBlock failed with UnboundLocalError at line 29: cannot access local variable 'pages_visited' "
+            "where it is not associated with a value.",
+            (
+                "    global items_completed, items_started\n",
+                "    if link_count:\n        pages_visited = 1\n    print(pages_visited)\n",
+            ),
+        ),
+    ],
+    ids=[
+        "unrelated_name_with_dormant_global",
+        "never_bound_name_sharing_a_global_with_a_bound_one",
+        "name_error_outside_the_helper",
+        "never_bound_name",
+        "nonlocal_present",
+        "unbound_local_on_a_never_bound_name",
+        "conditionally_initialized_local_sharing_a_top_level_name",
+    ],
+)
+def test_scope_class_needs_the_failing_name_and_line_to_land_in_the_helper(
+    failure_reason: str, code_edit: tuple[str, str] | None
+) -> None:
+    packet = _wrapper_scope_packet("packet-name-error.json")
+    workflow_yaml = packet["workflow_yaml"]
+    if code_edit is not None:
+        code = code_block_available_contracts_by_label(workflow_yaml)[_WRAPPER_SCOPE_LABEL].code
+        assert code_edit[0] in code
+        workflow_yaml = _with_block_code(workflow_yaml, code.replace(code_edit[0], code_edit[1]))
+
+    pending = _pending_after(_wrapper_scope_result(failure_reason), workflow_yaml)
+
+    assert pending.reason_code == "runtime_block_failure"
+    assert pending.runtime_failure_class is None
+    assert "wrapper" not in pending.repair_instruction

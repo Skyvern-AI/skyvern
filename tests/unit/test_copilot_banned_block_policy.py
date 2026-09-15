@@ -536,7 +536,7 @@ async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validat
     out = await _get_block_schema_post_hook(result, raw={}, ctx=code_only_ctx)
 
     assert "Browser/page workflow block types are unavailable" in out["data"]["code_only_note"]
-    assert "validate_block only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
+    assert "validate_block is only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
     assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
 
 
