@@ -31,6 +31,7 @@ from skyvern.webeye.actions.handler import (
     _freetext_mismatch_failure,
     _heal_truncated_freetext_input,
     _is_prefix_loss_truncation,
+    _is_same_length_reorder,
     _static_declared_constraint_evidence,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult
@@ -131,11 +132,18 @@ def _assert_fails_closed(result: ActionResult | None, *, intended_length: int = 
 
 
 async def _run_heal(
-    intended: str, rendered: str | None, tag_name: str = "input", is_secret_value: bool = False
+    intended: str,
+    rendered: str | None,
+    tag_name: str = "input",
+    is_secret_value: bool = False,
+    has_autocomplete_evidence: bool = False,
+    input_type: str | None = None,
+    maxlength: str | None = None,
 ) -> tuple[AsyncMock, ActionResult | None]:
     element = make_input_element_mock(element_id="EL1")
+    read_back = AsyncMock(return_value=rendered)
     with (
-        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value=rendered)),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=read_back),
         patch(_STATIC_PATCH, new=AsyncMock(return_value=None)),
     ):
         result = await _heal_truncated_freetext_input(
@@ -143,13 +151,22 @@ async def _run_heal(
             tag_name=tag_name,
             text=intended,
             is_secret_value=is_secret_value,
+            has_autocomplete_evidence=has_autocomplete_evidence,
+            input_type=input_type,
+            maxlength=maxlength,
             engine_selection=None,
         )
+    element._read_back = read_back
     return element, result
 
 
 async def _run_heal_capture(
-    intended: str, readbacks: list[str | None], tag_name: str = "input"
+    intended: str,
+    readbacks: list[str | None],
+    tag_name: str = "input",
+    has_autocomplete_evidence: bool = False,
+    input_type: str | None = None,
+    maxlength: str | None = None,
 ) -> tuple[AsyncMock, MagicMock, ActionResult | None]:
     element = make_input_element_mock(element_id="EL1")
     with (
@@ -158,7 +175,13 @@ async def _run_heal_capture(
         patch("skyvern.webeye.actions.handler.LOG") as log,
     ):
         result = await _heal_truncated_freetext_input(
-            skyvern_element=element, tag_name=tag_name, text=intended, engine_selection=None
+            skyvern_element=element,
+            tag_name=tag_name,
+            text=intended,
+            has_autocomplete_evidence=has_autocomplete_evidence,
+            input_type=input_type,
+            maxlength=maxlength,
+            engine_selection=None,
         )
     return element, log, result
 
@@ -260,13 +283,15 @@ async def test_heal_is_noop_for_autocomplete_expansion() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heal_skips_short_values_without_reading_back() -> None:
-    short_value = "a" * TEXT_PRESS_MAX_LENGTH  # not longer than the split boundary: no prefix to lose
+async def test_heal_skips_short_value_ineligible_for_both_signatures_without_reading_back() -> None:
+    # A short value cannot lose a prefix (not longer than the split boundary), and a non-round-trip-safe type
+    # (tel) is excluded from reorder repair -- so neither signature applies and the read-back is skipped.
+    short_value = "a" * TEXT_PRESS_MAX_LENGTH
     element = make_input_element_mock(element_id="EL1")
     read_back = AsyncMock(return_value="a")
     with patch("skyvern.webeye.actions.handler.get_input_value", new=read_back):
         result = await _heal_truncated_freetext_input(
-            skyvern_element=element, tag_name="input", text=short_value, engine_selection=None
+            skyvern_element=element, tag_name="input", text=short_value, input_type="tel", engine_selection=None
         )
     read_back.assert_not_awaited()
     element.input_fill.assert_not_awaited()
@@ -1036,3 +1061,128 @@ async def test_heal_does_not_run_static_when_post_refill_unobservable() -> None:
     element.press_fill.assert_not_called()
     assert isinstance(result, ActionFailure)
     assert "unlikely to succeed" in (result.exception_message or "")
+
+
+# --------------------------------------------------------------------------- #
+# Same-length reorder repair — the single heal call also repairs a strict same-length permutation on a
+# round-trip-safe input, gated on no autocomplete evidence. A markerless option-only autocomplete (one that
+# surfaces options without a structural aria-autocomplete/combobox marker) is not distinguishable at this
+# read-back seam, so the strict permutation signature is what keeps that rare case narrow.
+# --------------------------------------------------------------------------- #
+_R_INTENDED = "abcdef"
+_R_REORDER = "fabcde"  # same length, same multiset, not equal -> strict reorder signature
+
+
+@pytest.mark.parametrize(
+    "intended, rendered, expected",
+    [
+        (_LONG, _LONG[1:] + _LONG[:1], True),  # rotation
+        (_LONG, _LONG[::-1], True),  # reversal
+        (_R_INTENDED, _R_REORDER, True),  # short rotation
+        ("AbcDef", "FEDCAB", True),  # casefold before compare
+        (_R_INTENDED, _R_INTENDED, False),  # exact echo
+        (_LONG, _LONG.upper(), False),  # case-only
+        (_R_INTENDED, "abcdefg", False),  # different length (expansion)
+        (_R_INTENDED, "abcde", False),  # different length (truncation)
+        (_R_INTENDED, "abcdeg", False),  # same length, different multiset (arbitrary mismatch)
+        (_R_INTENDED, "", False),  # empty
+        (_R_INTENDED, None, False),  # unobservable
+    ],
+)
+def test_is_same_length_reorder_predicate(intended: str, rendered: str | None, expected: bool) -> None:
+    assert _is_same_length_reorder(tag_name="input", intended=intended, rendered=rendered) is expected
+
+
+def test_is_same_length_reorder_textarea_normalizes_newlines() -> None:
+    # After the permitted CRLF/CR->LF normalization the value is fully present -> not a reorder.
+    assert _is_same_length_reorder(tag_name="textarea", intended="ab\r\ncd", rendered="ab\ncd") is False
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_heals_and_continues() -> None:
+    # No autocomplete evidence + a same-length reorder read-back -> one atomic refill, exact confirm, then the
+    # existing helper contract: return None so the caller continues normally.
+    element, log, result = await _run_heal_capture(_R_INTENDED, readbacks=[_R_REORDER, _R_INTENDED], input_type="text")
+    element.input_fill.assert_awaited_once_with(text=_R_INTENDED)
+    assert log.info.call_args.kwargs["refill_confirmed"] is True
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_fail_closed_on_persistent_reorder() -> None:
+    element, log, result = await _run_heal_capture(_R_INTENDED, readbacks=[_R_REORDER, _R_REORDER], input_type="text")
+    element.input_fill.assert_awaited_once_with(text=_R_INTENDED)
+    assert log.info.call_args.kwargs["refill_confirmed"] is False
+    _assert_fails_closed(result, intended_length=len(_R_INTENDED))
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_skips_when_autocomplete_evidence_present() -> None:
+    element, result = await _run_heal(
+        _R_INTENDED, rendered=_R_REORDER, has_autocomplete_evidence=True, input_type="text"
+    )
+    element._read_back.assert_not_awaited()  # gated out before any read-back
+    element.input_fill.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_skips_non_reorder_mismatch() -> None:
+    # Arbitrary (different-multiset) mismatch must not refill.
+    element, result = await _run_heal(_R_INTENDED, rendered="abcdeg", input_type="text")
+    element.input_fill.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.parametrize("input_type", ["number", "date", "datetime-local", "time", "tel"])
+@pytest.mark.asyncio
+async def test_reorder_repair_skips_ineligible_input_types(input_type: str) -> None:
+    element, result = await _run_heal(_R_INTENDED, rendered=_R_REORDER, input_type=input_type)
+    element._read_back.assert_not_awaited()
+    element.input_fill.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_skips_maxlength_truncating() -> None:
+    element, result = await _run_heal(_R_INTENDED, rendered=_R_REORDER, input_type="text", maxlength="3")
+    element._read_back.assert_not_awaited()
+    element.input_fill.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_skips_secret_value() -> None:
+    element, result = await _run_heal(_R_INTENDED, rendered=_R_REORDER, input_type="text", is_secret_value=True)
+    element._read_back.assert_not_awaited()
+    element.input_fill.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.parametrize("input_type", ["", "text", "search", "url", "email", "password"])
+@pytest.mark.asyncio
+async def test_reorder_repair_eligible_exact_value_types(input_type: str) -> None:
+    element, log, result = await _run_heal_capture(
+        _R_INTENDED, readbacks=[_R_REORDER, _R_INTENDED], input_type=input_type
+    )
+    element.input_fill.assert_awaited_once_with(text=_R_INTENDED)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_repair_eligible_textarea() -> None:
+    element, log, result = await _run_heal_capture(
+        _R_INTENDED, readbacks=[_R_REORDER, _R_INTENDED], tag_name="textarea", input_type=""
+    )
+    element.input_fill.assert_awaited_once_with(text=_R_INTENDED)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_single_call_evaluates_both_prefix_loss_and_reorder() -> None:
+    # The one heal call after input_sequentially evaluates BOTH signatures: a long round-trip-safe value whose
+    # read-back is a same-length permutation (not a lost-prefix suffix) is still detected and repaired.
+    element, log, result = await _run_heal_capture(_LONG, readbacks=[_LONG[1:] + _LONG[:1], _LONG], input_type="text")
+    element.input_fill.assert_awaited_once_with(text=_LONG)
+    assert log.info.call_args.kwargs["refill_confirmed"] is True
+    assert result is None

@@ -835,6 +835,89 @@ class ScreenshotMode(StrEnum):
     DETAILED = "detailed"
 
 
+class ScreenshotArm(StrEnum):
+    CONTROL = "control"
+    TREATMENT = "treatment"
+
+
+class ScreenshotPrimitive(StrEnum):
+    PLAYWRIGHT = "playwright"
+    CDP_RESCUE = "cdp_rescue"
+
+
+class ScreenshotStage(StrEnum):
+    ATTACH = "attach"
+    GEOMETRY = "geometry"
+    CAPTURE = "capture"
+    VALIDATION = "validation"
+    DETACH = "detach"
+    TERMINAL = "terminal"
+    UNKNOWN = "unknown"
+
+
+class ScreenshotOutcome(StrEnum):
+    SUCCESS = "success"
+    TIMEOUT = "timeout"
+    TARGET_CLOSED = "target_closed"
+    DECLINED = "declined"
+    ERROR = "error"
+
+
+class ScreenshotEligibility(StrEnum):
+    ELIGIBLE = "eligible"
+    INELIGIBLE_FULL_PAGE = "ineligible_full_page"
+    INELIGIBLE_ENGINE = "ineligible_engine"
+    INELIGIBLE_BROWSER = "ineligible_browser"
+
+
+def _screenshot_observation_fields(
+    *,
+    arm: ScreenshotArm,
+    primitive: ScreenshotPrimitive,
+    stage: ScreenshotStage,
+    outcome: ScreenshotOutcome,
+    elapsed_ms: float | None = None,
+    timeout_budget_ms: float | None = None,
+    eligibility: ScreenshotEligibility | None = None,
+) -> dict[str, Any]:
+    """Fixed, bounded, low-cardinality screenshot telemetry for Datadog aggregation.
+
+    Enum-typed keys keep cardinality bounded; numeric measures are clamped non-negative and integral.
+    No page-derived token crosses this boundary.
+    """
+    fields: dict[str, Any] = {
+        "screenshot.arm": arm.value,
+        "screenshot.primitive": primitive.value,
+        "screenshot.stage": stage.value,
+        "screenshot.outcome": outcome.value,
+    }
+    if elapsed_ms is not None:
+        fields["screenshot.elapsed_ms"] = max(0, int(elapsed_ms))
+    if timeout_budget_ms is not None:
+        fields["screenshot.timeout_budget_ms"] = max(0, int(timeout_budget_ms))
+    if eligibility is not None:
+        fields["screenshot.eligibility"] = eligibility.value
+    return fields
+
+
+def _cdp_rescue_eligibility(
+    *,
+    full_page: bool,
+    engine_selection: BrowserEngineSelection | None,
+    page: Page,
+) -> ScreenshotEligibility:
+    """Classify why the raw-CDP rescue path is (in)eligible. Mirrors the gate in ``_page_screenshot_helper``
+    without changing it; used only for telemetry."""
+    if full_page:
+        return ScreenshotEligibility.INELIGIBLE_FULL_PAGE
+    if engine_selection is not None and engine_selection.name == SKYCDP_ENGINE_NAME:
+        return ScreenshotEligibility.INELIGIBLE_ENGINE
+    browser = page.context.browser
+    if browser is None or browser.browser_type.name != "chromium":
+        return ScreenshotEligibility.INELIGIBLE_BROWSER
+    return ScreenshotEligibility.ELIGIBLE
+
+
 async def _restore_invalid_viewport_before_screenshot(page: Page) -> None:
     viewport = page.viewport_size
     if not isinstance(viewport, dict):
@@ -886,12 +969,19 @@ async def _page_screenshot_helper(
             raise
         if page.is_closed():
             raise
-        if (
-            not full_page
-            and (engine_selection is None or engine_selection.name != SKYCDP_ENGINE_NAME)
-            and (browser := page.context.browser) is not None
-            and browser.browser_type.name == "chromium"
-        ):
+        eligibility = _cdp_rescue_eligibility(full_page=full_page, engine_selection=engine_selection, page=page)
+        LOG.info(
+            "Screenshot playwright attempt timed out; evaluating raw CDP rescue eligibility",
+            **_screenshot_observation_fields(
+                arm=ScreenshotArm.CONTROL,
+                primitive=ScreenshotPrimitive.PLAYWRIGHT,
+                stage=ScreenshotStage.CAPTURE,
+                outcome=ScreenshotOutcome.TIMEOUT,
+                timeout_budget_ms=timeout,
+                eligibility=eligibility,
+            ),
+        )
+        if eligibility == ScreenshotEligibility.ELIGIBLE:
             # A failed rescue ends this attempt; scaled viewports retain the animation retry.
             rescued = await _cdp_rescue_screenshot(page=page, file_path=file_path)
             if page.is_closed():
@@ -943,6 +1033,7 @@ async def _current_viewpoint_screenshot_helper(
     except Exception:
         viewport_info = "unknown"
 
+    capture_start = time.time()
     try:
         if mode == ScreenshotMode.DETAILED:
             await _wait_for_screenshot_load_state(
@@ -972,12 +1063,21 @@ async def _current_viewpoint_screenshot_helper(
             "Screenshot taking time",
             screenshot_time=end_time - start_time,
             file_path=file_path,
+            **_screenshot_observation_fields(
+                arm=ScreenshotArm.CONTROL,
+                primitive=ScreenshotPrimitive.PLAYWRIGHT,
+                stage=ScreenshotStage.TERMINAL,
+                outcome=ScreenshotOutcome.SUCCESS,
+                elapsed_ms=(end_time - capture_start) * 1000,
+                timeout_budget_ms=timeout,
+            ),
         )
         skyvern_context.record_browser_success()
         return screenshot
     except Exception as e:
         if engine_selection is not None and not _is_engine_error(e, engine_selection):
             raise
+        terminal_elapsed_ms = (time.time() - capture_start) * 1000
         if page.is_closed() or _is_screenshot_target_closed(e, engine_selection):
             LOG.info(
                 "Skipping screenshot because target closed during capture",
@@ -985,6 +1085,14 @@ async def _current_viewpoint_screenshot_helper(
                 viewport=viewport_info,
                 full_page=full_page,
                 mode=mode.value if hasattr(mode, "value") else str(mode),
+                **_screenshot_observation_fields(
+                    arm=ScreenshotArm.CONTROL,
+                    primitive=ScreenshotPrimitive.PLAYWRIGHT,
+                    stage=ScreenshotStage.TERMINAL,
+                    outcome=ScreenshotOutcome.TARGET_CLOSED,
+                    elapsed_ms=terminal_elapsed_ms,
+                    timeout_budget_ms=timeout,
+                ),
             )
             raise ScreenshotTargetClosed(error_message=str(e)) from e
         if is_engine_timeout(e, engine_selection):
@@ -998,6 +1106,14 @@ async def _current_viewpoint_screenshot_helper(
                 mode=mode.value if hasattr(mode, "value") else str(mode),
                 screenshot_stage=_extract_playwright_screenshot_stage(e),
                 error=str(e),
+                **_screenshot_observation_fields(
+                    arm=ScreenshotArm.CONTROL,
+                    primitive=ScreenshotPrimitive.PLAYWRIGHT,
+                    stage=ScreenshotStage.TERMINAL,
+                    outcome=ScreenshotOutcome.TIMEOUT,
+                    elapsed_ms=terminal_elapsed_ms,
+                    timeout_budget_ms=timeout,
+                ),
             )
             raise FailedToTakeScreenshot(error_message=str(e)) from e
         LOG.error(
@@ -1007,6 +1123,14 @@ async def _current_viewpoint_screenshot_helper(
             full_page=full_page,
             error=str(e),
             exc_info=True,
+            **_screenshot_observation_fields(
+                arm=ScreenshotArm.CONTROL,
+                primitive=ScreenshotPrimitive.PLAYWRIGHT,
+                stage=ScreenshotStage.TERMINAL,
+                outcome=ScreenshotOutcome.ERROR,
+                elapsed_ms=terminal_elapsed_ms,
+                timeout_budget_ms=timeout,
+            ),
         )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
@@ -1024,11 +1148,29 @@ class _RescueDeclined:
 _RESCUE_DECLINED = _RescueDeclined()
 
 
-async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | _RescueDeclined | None:
+async def _cdp_rescue_screenshot(
+    page: Page,
+    file_path: str | None,
+    *,
+    arm: ScreenshotArm = ScreenshotArm.CONTROL,
+) -> bytes | _RescueDeclined | None:
     """Return PNG bytes, a scaled-viewport decline, or None after a failed rescue."""
     session = None
+    stage = ScreenshotStage.ATTACH
+    start = time.time()
+
+    def _fields(reached: ScreenshotStage, outcome: ScreenshotOutcome) -> dict[str, Any]:
+        return _screenshot_observation_fields(
+            arm=arm,
+            primitive=ScreenshotPrimitive.CDP_RESCUE,
+            stage=reached,
+            outcome=outcome,
+            elapsed_ms=(time.time() - start) * 1000,
+        )
+
     try:
         session = await asyncio.wait_for(page.context.new_cdp_session(page), timeout=CDP_RESCUE_SESSION_TIMEOUT_SECONDS)
+        stage = ScreenshotStage.GEOMETRY
         async with asyncio.timeout(CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS):
             # The renderer round-trip shares the capture budget and can still time out on a stuck renderer.
             geometry = await session.send(
@@ -1041,24 +1183,66 @@ async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | _
             )
             if geometry["result"]["value"] != {"deviceScaleFactor": 1, "viewportScale": 1}:
                 # A scaled CDP clip can reset Chromium's emulated DPR, so leave scaled captures to Playwright.
+                LOG.info(
+                    "Raw CDP rescue screenshot declined scaled viewport",
+                    **_fields(ScreenshotStage.GEOMETRY, ScreenshotOutcome.DECLINED),
+                )
                 return _RESCUE_DECLINED
+            stage = ScreenshotStage.CAPTURE
             result = await session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
+        stage = ScreenshotStage.VALIDATION
         data = base64.b64decode(result.get("data", ""), validate=False)
         if data[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE:
-            LOG.warning("Raw CDP rescue screenshot returned a non-PNG payload", payload_bytes=len(data))
+            LOG.warning(
+                "Raw CDP rescue screenshot returned a non-PNG payload",
+                payload_bytes=len(data),
+                **_fields(ScreenshotStage.VALIDATION, ScreenshotOutcome.ERROR),
+            )
             return None
         if file_path is not None:
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
             Path(file_path).write_bytes(data)
+        LOG.info(
+            "Raw CDP rescue screenshot captured",
+            **_fields(ScreenshotStage.VALIDATION, ScreenshotOutcome.SUCCESS),
+        )
         return data
-    except Exception:
-        LOG.warning("Raw CDP rescue screenshot failed", exc_info=True)
+    except Exception as exc:
+        LOG.warning(
+            "Raw CDP rescue screenshot failed",
+            exc_info=True,
+            **_fields(
+                stage,
+                ScreenshotOutcome.TIMEOUT
+                if isinstance(exc, TimeoutError) or is_driver_timeout_error(exc)
+                else ScreenshotOutcome.ERROR,
+            ),
+        )
         return None
     finally:
         if session is not None:
-            detach_task = asyncio.create_task(
-                asyncio.wait_for(session.detach(), timeout=CDP_RESCUE_DETACH_TIMEOUT_SECONDS)
-            )
+
+            async def detach_with_observation() -> None:
+                detach_start = time.time()
+                try:
+                    await asyncio.wait_for(session.detach(), timeout=CDP_RESCUE_DETACH_TIMEOUT_SECONDS)
+                except Exception as exc:
+                    LOG.warning(
+                        "Raw CDP rescue screenshot detach failed",
+                        **_screenshot_observation_fields(
+                            arm=arm,
+                            primitive=ScreenshotPrimitive.CDP_RESCUE,
+                            stage=ScreenshotStage.DETACH,
+                            outcome=ScreenshotOutcome.TIMEOUT
+                            if isinstance(exc, TimeoutError) or is_driver_timeout_error(exc)
+                            else ScreenshotOutcome.ERROR,
+                            elapsed_ms=(time.time() - detach_start) * 1000,
+                            timeout_budget_ms=CDP_RESCUE_DETACH_TIMEOUT_SECONDS * 1000,
+                        ),
+                    )
+                    raise
+
+            detach_task = asyncio.create_task(detach_with_observation())
             with contextlib.suppress(Exception):
                 try:
                     await asyncio.shield(detach_task)
