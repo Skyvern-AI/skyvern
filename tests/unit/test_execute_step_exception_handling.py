@@ -24,6 +24,7 @@ passes — only a change in behavior fails.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -55,7 +56,8 @@ from skyvern.exceptions import (
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -330,15 +332,23 @@ async def test_cleanup_handler_pins_webhook_screenshot_and_fail_task(
 async def test_cleanup_gating_when_fail_task_reports_not_failed(
     monkeypatch: pytest.MonkeyPatch, case: CleanupHandlerCase
 ) -> None:
-    """Pin whether clean_up_task is skipped when fail_task reports the task was NOT failed.
-
-    Only three handlers (step-termination, failed-to-navigate, generic Exception) gate
-    cleanup on that result; the rest clean up unconditionally.
+    """Cleanup runs exactly once on every handler, whatever fail_task reports: the gated handlers
+    skip their own ``clean_up_task`` and the outer ``finally`` runs it, while the unconditional
+    handlers reach it directly and keep their own webhook/screenshot decisions. The recovery must
+    not add a second call on top of either.
     """
     outcome = await _drive_execute_step(monkeypatch, case.exc_factory(), fail_task_result=False)
 
     assert outcome.raised is None
-    assert outcome.cleanup_called is not case.cleanup_gated_on_fail_task
+    assert outcome.clean_up_task.await_count == 1
+    if case.cleanup_gated_on_fail_task:
+        # The recovery's call, not the handler's. It recovers the download half only: the row was
+        # finalized by someone else who webhooks itself, and the browser may not be usable.
+        assert outcome.effective_webhook is False
+        assert outcome.effective_final_screenshot is False
+    else:
+        assert outcome.effective_webhook is case.effective_webhook
+        assert outcome.effective_final_screenshot is case.effective_final_screenshot
 
 
 @pytest.mark.asyncio
@@ -542,3 +552,271 @@ async def test_execute_step_releases_scraped_page_before_recursion(monkeypatch: 
     assert fail_fast_spy.await_args.kwargs["scraped_page"] is scraped_page
     if path == "execute_all_steps":
         assert handle_completed_step.await_args.kwargs["scraped_page"] is scraped_page
+
+
+# These drive the REAL ``fail_task`` and ``clean_up_task``, because mocking exactly those two hides
+# that most handlers clean up unconditionally. Only the browser, storage and webhook edges are faked,
+# and ``fail_task`` genuinely returns False because the row it is handed is already final.
+
+
+@dataclass
+class RealCleanupOutcome:
+    raised: BaseException | None
+    saves: AsyncMock
+    cleanup_entries: list[dict[str, Any]]
+    downloads_recorded: bool
+    context_cleared: bool
+
+
+async def _drive_execute_step_real_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    in_try: Callable[[ForgeAgent, Task, Step, dict[str, bool]], Any],
+    task_block: Any = None,
+    cleanup_raises: BaseException | None = None,
+) -> RealCleanupOutcome:
+    """Run ``execute_step`` against an already-final task row with real fail_task/clean_up_task.
+
+    ``in_try`` replaces the first in-``try`` await, standing in for whatever the try body did before
+    raising -- including entering ``clean_up_task`` itself, which is the shape ``_execute_task_v3``
+    has: its last statement before returning is a ``clean_up_task`` call. Its fourth argument is a
+    knob dict; setting ``knobs["db_down"]`` makes the task-refresh read fail.
+    """
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-0", status=StepStatus.running, order=0, output=None)
+    # The already-final row: Task.validate_update refuses completed -> failed with
+    # InvalidTaskStatusTransition, which is what makes the real fail_task return False.
+    final_task = make_task(now, organization, status=TaskStatus.completed, extracted_information="done")
+    knobs: dict[str, bool] = {"db_down": False}
+
+    async def get_task(*_args: Any, **_kwargs: Any) -> Task:
+        if knobs["db_down"]:
+            raise RuntimeError("database unavailable")
+        return final_task
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", get_task)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task_steps", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock(return_value=final_task))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_step", AsyncMock(return_value=step))
+    monkeypatch.setattr("skyvern.forge.agent.save_step_logs", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", MagicMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        MagicMock(return_value=[]),
+    )
+    # The browser, storage and webhook edges clean_up_task reaches out to, all downstream of the
+    # download save this suite asserts on.
+    monkeypatch.setattr("skyvern.forge.agent.app.BROWSER_MANAGER.get_for_task", MagicMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.analytics.capture", MagicMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.drain_speculative_persist_tasks", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.uploaded_file_service.delete_files_attached_to_run", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.wait_for_upload_aiotasks", AsyncMock())
+    agent.async_operation_pool.remove_task = AsyncMock()  # type: ignore[method-assign]
+    agent.cleanup_browser_and_create_artifacts = AsyncMock()  # type: ignore[method-assign]
+    agent.execute_task_webhook = AsyncMock()  # type: ignore[method-assign]
+    # The observation point: the download save clean_up_task performs, which is the work the ticket
+    # exists to stop losing.
+    saves = AsyncMock(return_value=None)
+    monkeypatch.setattr("skyvern.forge.agent.app.STORAGE.save_downloaded_files", saves)
+
+    # A spy, not a mock: it counts entries and calls straight through, so the real clean_up_task --
+    # and therefore the real marker -- still runs.
+    cleanup_entries: list[dict[str, Any]] = []
+    real_cleanup = agent.clean_up_task
+
+    async def counting_cleanup(**kwargs: Any) -> None:
+        cleanup_entries.append(kwargs)
+        if cleanup_raises is not None:
+            raise cleanup_raises
+        return await real_cleanup(**kwargs)
+
+    agent.clean_up_task = counting_cleanup  # type: ignore[method-assign]
+
+    async def first_in_try_await(*_args: Any, **_kwargs: Any) -> None:
+        await in_try(agent, task, step, knobs)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.validate_step_execution", first_in_try_await)
+
+    context = SkyvernContext(
+        organization_id=organization.organization_id,
+        task_id=task.task_id,
+        step_id=None,
+        tz_info=ZoneInfo("UTC"),
+    )
+    skyvern_context.set(context)
+    raised: BaseException | None = None
+    try:
+        await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            api_key="api-key",
+            task_block=task_block,
+            download_baseline_files=[],
+        )
+    except BaseException as caught:  # noqa: BLE001 - propagation is part of what is characterized
+        raised = caught
+    finally:
+        downloads_recorded = context.cleanup_downloads_recorded(task.task_id)
+        context_cleared = (
+            context.step_id is None
+            and context.task_id is None
+            and context.navigation_goal is None
+            and context.navigation_payload is None
+        )
+        skyvern_context.reset()
+
+    return RealCleanupOutcome(
+        raised=raised,
+        saves=saves,
+        cleanup_entries=cleanup_entries,
+        downloads_recorded=downloads_recorded,
+        context_cleared=context_cleared,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handler_that_cannot_fail_the_task_still_records_its_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ticket's case: the row is already final, so the real fail_task returns False and the
+    gated handler skips cleanup. The download half must still run, exactly once.
+
+    RED against origin/main, where nothing recovers the skipped cleanup and the save never happens.
+    """
+
+    async def raise_against_a_final_row(*_args: Any) -> None:
+        raise RuntimeError("failed after the task row was finalized")
+
+    outcome = await _drive_execute_step_real_cleanup(monkeypatch, in_try=raise_against_a_final_row)
+
+    assert outcome.raised is None
+    assert len(outcome.cleanup_entries) == 1
+    assert outcome.saves.await_count == 1
+    assert outcome.downloads_recorded is True
+    # The recovery takes the download half and declines the rest: the external finalizer that made
+    # this row terminal webhooks itself, and finalizing without that caller's baseline would rename
+    # files belonging to another block.
+    recovery = outcome.cleanup_entries[0]
+    assert recovery["need_call_webhook"] is False
+    assert recovery["need_final_screenshot"] is False
+    assert recovery["download_suffix"] is None
+    assert "list_files_before" not in recovery
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_rerun_a_cleanup_that_already_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly once, not at least once.
+
+    ``_execute_task_v3``'s last statement before returning is a ``clean_up_task`` call, so a raise
+    just after it reaches the handlers with the downloads already recorded. A second pass would not
+    duplicate the DOWNLOAD row -- ``save_downloaded_files`` dedupes on ``{base_uri}/{file}`` plus
+    checksum, and the recovery does not rename -- but it would spend another settle-and-checksum
+    budget on a teardown path and record the download outcome a second time.
+    """
+
+    async def clean_up_then_raise(agent: ForgeAgent, task: Task, step: Step, _knobs: dict[str, bool]) -> None:
+        await agent.clean_up_task(task=task, last_step=step)
+        raise RuntimeError("raised after cleanup had already recorded the downloads")
+
+    outcome = await _drive_execute_step_real_cleanup(monkeypatch, in_try=clean_up_then_raise)
+
+    assert outcome.raised is None
+    # One entry, from the try body: the recovery saw the downloads recorded and stood down.
+    assert len(outcome.cleanup_entries) == 1
+    assert outcome.saves.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_that_died_before_the_download_half_does_not_claim_it_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup that dies before the download half must leave the recovery free to run.
+
+    ``clean_up_task``'s task refresh converts any db failure into ``TaskNotFound`` and raises it
+    long before the download half starts. Recording the marker on entry would let that raise
+    suppress the recovery and lose the download outright, so the marker records the download half
+    having run rather than the function having been entered.
+
+    Scope: this drives the cleanup that dies from inside the ``try`` body, which is the shape
+    ``_execute_task_v3`` has. A ``clean_up_task`` that dies the same way from inside a *handler*
+    propagates out of ``execute_step`` instead of returning, and is not recovered here -- a
+    pre-existing gap shared by all sixteen handlers, called out in the PR rather than fixed.
+    """
+
+    async def clean_up_with_a_dead_db(agent: ForgeAgent, task: Task, step: Step, knobs: dict[str, bool]) -> None:
+        knobs["db_down"] = True
+        try:
+            await agent.clean_up_task(task=task, last_step=step)
+        finally:
+            knobs["db_down"] = False
+
+    outcome = await _drive_execute_step_real_cleanup(monkeypatch, in_try=clean_up_with_a_dead_db)
+
+    assert outcome.raised is None
+    # Two entries: the one that died at the refresh, and the recovery that actually recorded.
+    assert len(outcome.cleanup_entries) == 2
+    assert outcome.saves.await_count == 1
+    assert outcome.downloads_recorded is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_rename_a_block_download_to_its_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recovery must not carry the block's ``download_suffix`` into cleanup's finalize.
+
+    Finalizing renames every file the baseline did not already list. The baseline that makes that
+    safe is built by the caller that ran the loop -- ``_execute_task_v3`` augments one with the
+    files its own ``file_upload`` tool staged, and never receives this frame's. Finalizing against
+    this frame's raw pre-step listing would rename staged inputs, and any earlier block's downloads,
+    to this block's suffix. Leaving the download under the site's own name is the lesser outcome.
+
+    Also the only test here that drives a gated handler other than the generic ``except Exception``.
+    """
+    task_block = MagicMock()
+    task_block.download_suffix = "block-suffix"
+    task_block.complete_on_download = False
+
+    async def fail_to_navigate(*_args: Any) -> None:
+        raise FailedToNavigateToUrl("https://example.com", "boom")
+
+    outcome = await _drive_execute_step_real_cleanup(monkeypatch, in_try=fail_to_navigate, task_block=task_block)
+
+    assert outcome.raised is None
+    assert len(outcome.cleanup_entries) == 1
+    assert outcome.saves.await_count == 1
+    assert outcome.cleanup_entries[0]["download_suffix"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_inside_the_recovery_still_clears_the_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation during the recovery must propagate and still leave the context cleared.
+
+    The recovery added an await to a ``finally`` that previously had none, so a ``CancelledError``
+    -- a ``BaseException``, which ``contained_effect`` deliberately does not contain -- would
+    otherwise exit before the context reset and leave the run describing a task that is over.
+    """
+
+    async def raise_against_a_final_row(*_args: Any) -> None:
+        raise RuntimeError("failed after the task row was finalized")
+
+    outcome = await _drive_execute_step_real_cleanup(
+        monkeypatch,
+        in_try=raise_against_a_final_row,
+        cleanup_raises=asyncio.CancelledError(),
+    )
+
+    assert isinstance(outcome.raised, asyncio.CancelledError)
+    assert outcome.context_cleared is True
