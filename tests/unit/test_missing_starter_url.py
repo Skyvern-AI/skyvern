@@ -257,7 +257,7 @@ async def test_create_task_rejects_about_blank_url_inherited_from_later_block() 
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager
@@ -311,7 +311,7 @@ async def test_create_task_uses_latest_non_blank_page_for_inherited_marker_url()
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager

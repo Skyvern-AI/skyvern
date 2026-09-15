@@ -104,6 +104,7 @@ async def prepare_workflow(
     copilot_session_id: str | None = None,
     resolved_workflow_id: str | None = None,
     tag_write_context: TagWriteContext | None = None,
+    block_scoped: bool = False,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -135,6 +136,7 @@ async def prepare_workflow(
         copilot_session_id=copilot_session_id,
         resolved_workflow_id=resolved_workflow_id,
         tag_write_context=tag_write_context,
+        block_scoped=block_scoped,
     )
 
     if resolved_workflow_id is not None:
@@ -248,6 +250,10 @@ async def get_workflow_run_response(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
         status=RunStatus(workflow_run.status),
+        attempt=workflow_run_resp.attempt,
+        retry_pending=workflow_run_resp.retry_pending,
+        next_attempt_at=workflow_run_resp.next_attempt_at,
+        attempts=workflow_run_resp.attempts,
         output=workflow_run_resp.outputs,
         downloaded_files=workflow_run_resp.downloaded_files,
         recording_url=workflow_run_resp.recording_url,

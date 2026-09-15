@@ -946,6 +946,8 @@ class Settings(BaseSettings):
     """How often the OSS/local scheduler scans for due workflow schedules."""
     WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
+    RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
+    """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

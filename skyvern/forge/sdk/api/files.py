@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
@@ -32,6 +33,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.signing import parse_artifact_content_url
+from skyvern.forge.sdk.artifact.storage.base import is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
@@ -62,6 +64,19 @@ LOG = structlog.get_logger()
 
 # Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
 _UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+_LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
+
+
+def register_local_download_root(download_root: str) -> None:
+    _LOCAL_DOWNLOAD_ROOTS.add(os.path.realpath(download_root))
+
+
+def local_file_requires_organization(file_url: str) -> bool:
+    scheme = urlparse(file_url).scheme
+    if scheme not in ("", "file"):
+        return False
+    path = parse_uri_to_path(file_url) if scheme == "file" else file_url
+    return not Path(path).resolve().is_relative_to((Path(REPO_ROOT_DIR) / "downloads").resolve())
 
 
 def is_uploaded_file_id(value: str) -> bool:
@@ -368,8 +383,8 @@ async def fetch_file_bytes(
     raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
 
 
-def _resolve_legacy_download_path(candidate_path: str) -> str:
-    """Resolve a legacy file:// path and confirm it is inside the repository downloads directory.
+def _resolve_legacy_download_path(candidate_path: str, *, organization_id: str | None = None) -> str:
+    """Resolve a legacy file:// path inside repository downloads or registered download snapshots.
 
     Containment is checked on the realpath with commonpath, so dot segments, percent-decoded dot
     segments, symlinks, and sibling directories such as ``downloads-evil`` cannot escape.
@@ -377,18 +392,36 @@ def _resolve_legacy_download_path(candidate_path: str) -> str:
     allowed_dir = os.path.realpath(os.path.join(REPO_ROOT_DIR, "downloads"))
     resolved_path = os.path.realpath(candidate_path)
     try:
-        inside_allowed_dir = os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir
+        if os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir:
+            return resolved_path
     except ValueError:
-        inside_allowed_dir = False
-    if not inside_allowed_dir:
-        LOG.warning(
-            "Legacy local file path traversal blocked",
-            candidate_path=candidate_path,
-            resolved_path=resolved_path,
-            allowed_dir=allowed_dir,
-        )
-        raise PermissionError("Local file path is outside the downloads directory")
-    return resolved_path
+        pass
+    if (
+        organization_id
+        and organization_id not in (".", "..")
+        and not os.path.isabs(organization_id)
+        and "/" not in organization_id
+        and "\\" not in organization_id
+    ):
+        for root in _LOCAL_DOWNLOAD_ROOTS:
+            root = os.path.realpath(root)
+            try:
+                organization_root = os.path.realpath(os.path.join(root, settings.ENV, organization_id))
+                if (
+                    os.path.commonpath((root, organization_root)) == root
+                    and os.path.commonpath((root, resolved_path)) == root
+                    and os.path.commonpath((organization_root, resolved_path)) == organization_root
+                ):
+                    return resolved_path
+            except ValueError:
+                continue
+    LOG.warning(
+        "Legacy local file path traversal blocked",
+        candidate_path=candidate_path,
+        resolved_path=resolved_path,
+        allowed_dir=allowed_dir,
+    )
+    raise PermissionError("Local file path is outside the downloads directory")
 
 
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
@@ -436,7 +469,7 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
 
             # Validate the file path is within allowed directories
             try:
-                _resolve_legacy_download_path(parse_uri_to_path(url))
+                _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
                 return True
             except (ValueError, PermissionError):
                 return False
@@ -525,7 +558,7 @@ async def download_file(
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            local_path = _resolve_legacy_download_path(parse_uri_to_path(url))
+            local_path = _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
             LOG.info("Downloading file from local file system", url=url)
             return local_path
 
@@ -973,10 +1006,15 @@ def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: s
     return fallback_run_id
 
 
-def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
+def list_files_in_directory(
+    directory: Path, recursive: bool = False, *, attempt_started_at: datetime | None = None
+) -> list[str]:
     listed_files: list[str] = []
     for root, dirs, files in os.walk(directory):
-        listed_files.extend([os.path.join(root, file) for file in files])
+        for file in files:
+            path = os.path.join(root, file)
+            if attempt_started_at is None or is_file_from_retry_attempt(path, attempt_started_at):
+                listed_files.append(path)
         if not recursive:
             break
 
@@ -1019,11 +1057,11 @@ def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:
 
 
 def list_downloading_files_in_directory(
-    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
+    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX, *, attempt_started_at: datetime | None = None
 ) -> list[str]:
     # check if there's any file is still downloading
     downloading_files: list[str] = []
-    for file in list_files_in_directory(directory):
+    for file in list_files_in_directory(directory, attempt_started_at=attempt_started_at):
         path = Path(file)
         if path.suffix == downloading_suffix:
             downloading_files.append(file)
@@ -1065,9 +1103,11 @@ async def check_downloading_files_and_wait_for_download_to_complete(
     organization_id: str,
     browser_session_id: str | None = None,
     timeout: float = BROWSER_DOWNLOAD_TIMEOUT,
+    *,
+    attempt_started_at: datetime | None = None,
 ) -> None:
     # check if there's any file is still downloading
-    downloading_files = list_downloading_files_in_directory(download_dir)
+    downloading_files = list_downloading_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
     if browser_session_id:
         files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
             organization_id=organization_id, browser_session_id=browser_session_id

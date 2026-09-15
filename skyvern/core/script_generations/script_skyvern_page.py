@@ -37,9 +37,11 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_path_for_workflow_download_directory,
     list_files_in_directory,
+    resolve_run_download_id,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
@@ -205,6 +207,8 @@ class ScriptSkyvernPage(SkyvernPage):
         self,
         download_dir: Path,
         browser_session_id: str | None = None,
+        *,
+        attempt_started_at: datetime | None = None,
     ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id:
@@ -222,6 +226,7 @@ class ScriptSkyvernPage(SkyvernPage):
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             timeout=download_timeout,
+            attempt_started_at=attempt_started_at,
         )
 
     async def _decorate_call(
@@ -261,13 +266,16 @@ class ScriptSkyvernPage(SkyvernPage):
         downloaded_files: list[str] | None = None
         files_before: list[str] = []
         download_dir: Path | None = None
+        attempt_started_at: datetime | None = None
 
         # Capture files before click action for download detection
         if action == ActionType.CLICK and context and context.workflow_run_id:
             try:
+                download_run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id)
+                attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
                 download_dir = get_path_for_workflow_download_directory(context.workflow_run_id)
                 if download_dir.exists():
-                    files_before = list_files_in_directory(download_dir)
+                    files_before = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                 if context.browser_session_id and context.organization_id:
                     browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
                         organization_id=context.organization_id,
@@ -341,8 +349,9 @@ class ScriptSkyvernPage(SkyvernPage):
                         await self._ensure_download_to_complete(
                             download_dir=download_dir,
                             browser_session_id=context.browser_session_id,
+                            attempt_started_at=attempt_started_at,
                         )
-                        files_after = list_files_in_directory(download_dir)
+                        files_after = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                         if context.browser_session_id and context.organization_id:
                             browser_session_downloaded_files = (
                                 await app.STORAGE.list_downloaded_files_in_browser_session(

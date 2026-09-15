@@ -1,26 +1,52 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.models import (
+    BrowserProfileModel,
+    CredentialModel,
+    WorkflowModel,
+    WorkflowRunAttemptModel,
+    WorkflowRunCredentialSelectionModel,
+    WorkflowRunModel,
+)
+from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import BrowserSessionCloseReason
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
     build_workflow_browser_session_storage_key,
 )
 from skyvern.forge.sdk.workflow.models.block import BlockType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import (
+    RETRY_DECISION_FINAL,
+    RETRY_DECISION_RETRY,
+    RETRY_DECISION_REVOKED,
+    RetryDecision,
+)
 from skyvern.forge.sdk.workflow.service import (
     WorkflowBrowserCleanupResult,
     WorkflowService,
 )
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, WorkflowRetryPolicy
+from skyvern.webeye.real_browser_manager import RealBrowserManager
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _workflow(browser_profile_key: str | None = None) -> SimpleNamespace:
@@ -46,7 +72,7 @@ def _workflow_run(browser_profile_id: str | None = None) -> SimpleNamespace:
     )
 
 
-def _execute_workflow() -> SimpleNamespace:
+def _execute_workflow(*, retry_policy: object | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=True,
@@ -60,6 +86,7 @@ def _execute_workflow() -> SimpleNamespace:
             parameters=[],
             finally_block_label=None,
             blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+            retry_policy=retry_policy,
         ),
     )
 
@@ -73,6 +100,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         organization_id="o_test",
         browser_session_id=None,
         browser_profile_id="bp_managed",
+        browser_seed_source=BrowserSeedSource.own_memory,
         browser_address=None,
         start_fresh_browser=None,
         reuse_browser_session=None,
@@ -80,11 +108,14 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         failure_reason=None,
         ignore_inherited_workflow_system_prompt=False,
         parent_workflow_run_id=None,
+        depends_on_workflow_run_id=None,
         proxy_location=None,
         max_elapsed_time_minutes=1,
         started_at=now,
         created_at=now,
-        code_gen=False,
+        code_gen=None,
+        debug_session_id=None,
+        copilot_session_id=None,
         run_with="agent",
     )
 
@@ -130,7 +161,9 @@ def _patch_execute_workflow_deps(
             update_workflow_run_if_not_final=AsyncMock(return_value=refreshed_run),
             get_workflow_runs_by_parent_workflow_run_id=AsyncMock(return_value=[]),
         ),
+        debug=SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False)),
         artifacts=SimpleNamespace(claim_session_download_artifacts_for_run=AsyncMock(return_value=0)),
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
     )
 
     monkeypatch.setattr(service_module.app, "WORKFLOW_CONTEXT_MANAGER", workflow_context_manager)
@@ -147,9 +180,10 @@ def _patch_execute_workflow_deps(
     monkeypatch.setattr(service_module, "is_adaptive_caching", lambda _workflow, _workflow_run: False)
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
-    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
     monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
+    monkeypatch.setattr(service_module, "mark_attempt_started", AsyncMock(return_value=True))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
@@ -423,6 +457,869 @@ async def test_execute_workflow_persists_managed_profile_before_final_status(
 
 
 @pytest.mark.asyncio
+async def test_execute_workflow_with_attempt_row_still_records_final_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(
+        svc,
+        "_persist_workflow_browser_session_if_needed",
+        AsyncMock(side_effect=lambda **_kwargs: order.append("store")),
+    )
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
+    webhook = AsyncMock(side_effect=lambda *a, **k: order.append("webhook"))
+    monkeypatch.setattr(svc, "execute_workflow_webhook", webhook)
+
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL)
+    service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "claim_attempt_side_effects",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "get_recorded_decision",
+        AsyncMock(return_value=RetryDecision(False, 1, 0, True, RETRY_DECISION_FINAL)),
+    )
+    result = await _run_execute_workflow(svc)
+
+    assert result is completed_run
+    assert order == ["teardown", "store", "finalize", "video", "webhook"]
+    webhook.assert_awaited_once_with(
+        completed_run,
+        None,
+        claim_kind="final",
+        skip_side_effects_lease_check=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_replaced", [False, True], ids=["claim_current", "claim_replaced"])
+async def test_execute_workflow_with_retries_stops_when_its_dispatch_claim_was_replaced(
+    monkeypatch: pytest.MonkeyPatch, claim_replaced: bool
+) -> None:
+    """The sweep releases a stale dispatch claim and re-issues it to another dispatch. The superseded
+    dispatch must neither run blocks nor fail the run its new owner is executing."""
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    final_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, final_run)
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", AsyncMock())
+    _patch_finalize(monkeypatch, svc, order, final_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock())
+    monkeypatch.setattr(svc, "_run_terminal_side_effects_with_retries", AsyncMock())
+    monkeypatch.setattr(service_module, "mark_attempt_started", AsyncMock(return_value=False))
+    claimed_at = datetime.now(UTC).replace(tzinfo=None)
+    row_started_at = claimed_at + timedelta(seconds=1) if claim_replaced else claimed_at
+    attempt = SimpleNamespace(
+        attempt_number=1, retry_decision=None, started_at=row_started_at, pinned_browser_session_id=None
+    )
+    service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "claim_attempt_side_effects",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "get_recorded_decision",
+        AsyncMock(return_value=RetryDecision(False, 1, 0, True, RETRY_DECISION_FINAL)),
+    )
+    fail_run = AsyncMock()
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed_if_not_final", fail_run)
+
+    result = await svc.execute_workflow_with_retries(
+        workflow_run_id="wr_test",
+        api_key=None,
+        organization=SimpleNamespace(organization_id="o_test"),
+        prepared_attempt_claimed=True,
+        dispatch_claim_started_at=claimed_at,
+    )
+
+    if claim_replaced:
+        # The superseded owner hands back the run as currently read, untouched.
+        assert result is svc.get_workflow_run.return_value
+        assert svc._execute_workflow_blocks.await_count == 0
+    else:
+        assert result is final_run
+        assert svc._execute_workflow_blocks.await_count == 1
+    fail_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempt", "expected_block_runs"),
+    [
+        (SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_REVOKED, started_at=None), 0),
+        (SimpleNamespace(attempt_number=1, retry_decision=None, started_at=datetime.now(UTC)), 1),
+    ],
+    ids=["cancel_finalized_the_attempt", "activity_re_entered_a_started_attempt"],
+)
+async def test_execute_workflow_stops_when_the_attempt_was_finalized_before_it_started(
+    monkeypatch: pytest.MonkeyPatch,
+    attempt: SimpleNamespace,
+    expected_block_runs: int,
+) -> None:
+    """The attempt-start CAS loses to a cancel that lands after the running write; the run must not
+    resolve secrets or run blocks after its final webhook. A re-entered activity still continues."""
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    final_status = WorkflowRunStatus.canceled if expected_block_runs == 0 else WorkflowRunStatus.completed
+    final_run = _execute_workflow_run(final_status)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, final_run)
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", AsyncMock())
+    _patch_finalize(monkeypatch, svc, order, final_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock())
+    monkeypatch.setattr(service_module, "mark_attempt_started", AsyncMock(return_value=False))
+    service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "claim_attempt_side_effects",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "get_recorded_decision",
+        AsyncMock(return_value=RetryDecision(False, 1, 0, True, RETRY_DECISION_FINAL)),
+    )
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is final_run
+    assert svc._execute_workflow_blocks.await_count == expected_block_runs
+    assert svc.get_workflow_run_parameter_tuples.await_count == expected_block_runs
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_abandons_retry_for_non_retry_aware_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    completed_run.finished_at = datetime.now(UTC)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(
+        svc,
+        "_persist_workflow_browser_session_if_needed",
+        AsyncMock(side_effect=lambda **_kwargs: order.append("store")),
+    )
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
+    webhook = AsyncMock(side_effect=lambda *a, **k: order.append("webhook"))
+    monkeypatch.setattr(svc, "execute_workflow_webhook", webhook)
+
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_RETRY)
+    service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "claim_attempt_side_effects",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "get_recorded_decision",
+        AsyncMock(return_value=RetryDecision(True, 1, 5, False, None)),
+    )
+    finalize_abandoned = AsyncMock(return_value=RetryDecision(False, 1, 0, True, "caller_not_retry_aware"))
+    monkeypatch.setattr(service_module, "finalize_abandoned_attempt", finalize_abandoned)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is completed_run
+    assert order == ["teardown", "store", "finalize", "video", "webhook"]
+    finalize_abandoned.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        reason="caller_not_retry_aware",
+        status=WorkflowRunStatus.completed,
+        failure_reason=None,
+        finished_at=completed_run.finished_at,
+        attempt_number=1,
+    )
+    webhook.assert_awaited_once_with(
+        completed_run,
+        None,
+        claim_kind="final",
+        skip_side_effects_lease_check=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_with_retries_retries_escaped_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    organization = SimpleNamespace(organization_id="o_test")
+    running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    attempt_rows = [
+        SimpleNamespace(
+            attempt_number=1,
+            retry_decision=None,
+            finished_at=None,
+            decision_reason=None,
+            next_attempt_at=None,
+        )
+    ]
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(
+                get_attempts=AsyncMock(return_value=attempt_rows),
+                claim_prepared_attempt_execution=AsyncMock(return_value=True),
+            ),
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(side_effect=[running_run, completed_run]),
+            ),
+        ),
+    )
+    execute = AsyncMock(side_effect=[RuntimeError("escaped"), completed_run])
+    monkeypatch.setattr(svc, "execute_workflow", execute)
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    side_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", side_effects)
+    decisions = [
+        RetryDecision(True, 1, 0, False, "matched"),
+        RetryDecision(True, 1, 0, False, "matched"),
+        RetryDecision(False, 2, 0, True, "no_match"),
+    ]
+    monkeypatch.setattr(service_module, "get_recorded_decision", AsyncMock(side_effect=decisions))
+    prepare = AsyncMock(
+        return_value=PrepareNextAttemptResult(
+            status="inserted",
+            pinned_browser_session_id="browser-2",
+        )
+    )
+    monkeypatch.setattr(service_module, "prepare_next_attempt_result", prepare)
+
+    result = await svc.execute_workflow_with_retries(
+        workflow_run_id="wr_test",
+        api_key=None,
+        organization=organization,
+    )
+
+    assert result is completed_run
+    assert [call.kwargs["attempt_number"] for call in execute.await_args_list] == [1, 2]
+    mark_failed.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        failure_reason="escaped",
+        cascade_children=True,
+    )
+    prepare.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        from_attempt=1,
+        clear_browser_address=False,
+    )
+    assert [call.args[1] for call in side_effects.await_args_list] == [decisions[0], decisions[2]]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_with_retries_leaves_pending_retry_for_recovery_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    organization = SimpleNamespace(organization_id="o_test")
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    completed_run.finished_at = datetime.now(UTC)
+    attempt_rows = [
+        SimpleNamespace(
+            attempt_number=1,
+            retry_decision=None,
+            finished_at=None,
+            decision_reason=None,
+            next_attempt_at=None,
+        )
+    ]
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=attempt_rows)),
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(return_value=completed_run),
+            ),
+        ),
+    )
+    monkeypatch.setattr(svc, "execute_workflow", AsyncMock(return_value=completed_run))
+    retry_decision = RetryDecision(True, 1, 30, False, "matched")
+    monkeypatch.setattr(service_module, "get_recorded_decision", AsyncMock(return_value=retry_decision))
+
+    side_effects_started = asyncio.Event()
+
+    async def record_side_effects(*_args: Any, **_kwargs: Any) -> None:
+        side_effects_started.set()
+
+    side_effects = AsyncMock(side_effect=record_side_effects)
+    monkeypatch.setattr(svc, "run_terminal_side_effects", side_effects)
+    prepare = AsyncMock()
+    monkeypatch.setattr(service_module, "prepare_next_attempt_result", prepare)
+    finalize_abandoned = AsyncMock()
+    monkeypatch.setattr(service_module, "finalize_abandoned_attempt", finalize_abandoned)
+
+    task = asyncio.create_task(
+        svc.execute_workflow_with_retries(
+            workflow_run_id="wr_test",
+            api_key=None,
+            organization=organization,
+        )
+    )
+    await asyncio.wait_for(side_effects_started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Shutdown must not convert the durable retry; recovery resumes it on the next start.
+    finalize_abandoned.assert_not_awaited()
+    assert [call.args[1] for call in side_effects.await_args_list] == [retry_decision]
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_with_retries_sleeps_until_the_recorded_next_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The decision stamps next_attempt_at before cleanup and interim webhooks run; the owner must not
+    # add the full policy delay on top of that work.
+    svc = WorkflowService()
+    organization = SimpleNamespace(organization_id="o_test")
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    completed_run.finished_at = datetime.now(UTC)
+    attempt_rows = [
+        SimpleNamespace(
+            attempt_number=1, retry_decision=None, finished_at=None, decision_reason=None, next_attempt_at=None
+        )
+    ]
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=attempt_rows)),
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=completed_run)),
+        ),
+    )
+    monkeypatch.setattr(svc, "execute_workflow", AsyncMock(return_value=completed_run))
+    retry_decision = RetryDecision(
+        True, 1, 30, False, "matched", next_attempt_at=datetime.now(UTC) + timedelta(seconds=2)
+    )
+    monkeypatch.setattr(service_module, "get_recorded_decision", AsyncMock(return_value=retry_decision))
+    monkeypatch.setattr(svc, "run_terminal_side_effects", AsyncMock())
+    monkeypatch.setattr(svc, "_prepare_recorded_retry", AsyncMock(return_value=None))
+    sleep = AsyncMock()
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep))
+
+    result = await svc.execute_workflow_with_retries(workflow_run_id="wr_test", api_key=None, organization=organization)
+
+    assert result is completed_run
+    (slept,) = (call.args[0] for call in sleep.await_args_list)
+    assert 0 < slept <= 2
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_with_retries_re_raises_escaped_exception_after_final_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    organization = SimpleNamespace(organization_id="o_test")
+    running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    attempt_rows = [SimpleNamespace(attempt_number=1)]
+    get_run = AsyncMock(return_value=running_run)
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=attempt_rows)),
+            workflow_runs=SimpleNamespace(get_workflow_run=get_run),
+        ),
+    )
+    monkeypatch.setattr(svc, "execute_workflow", AsyncMock(side_effect=RuntimeError("escaped")))
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    side_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", side_effects)
+    final_decision = RetryDecision(False, 1, 0, True, "no_match")
+    monkeypatch.setattr(service_module, "get_recorded_decision", AsyncMock(return_value=final_decision))
+
+    with pytest.raises(RuntimeError, match="escaped"):
+        await svc.execute_workflow_with_retries(
+            workflow_run_id="wr_test",
+            api_key=None,
+            organization=organization,
+        )
+
+    get_run.assert_awaited_once_with(workflow_run_id="wr_test", organization_id="o_test")
+    mark_failed.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        failure_reason="escaped",
+        cascade_children=True,
+    )
+    side_effects.assert_awaited_once()
+    assert side_effects.await_args.args == (failed_run, final_decision)
+    assert side_effects.await_args.kwargs["api_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_claims_session_downloads_from_retry_attempt_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    workflow_run.created_at = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+    attempt_started_at = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+    attempt = SimpleNamespace(attempt_number=2, started_at=attempt_started_at)
+    claim = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[attempt])),
+            debug=SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False)),
+            artifacts=SimpleNamespace(claim_session_download_artifacts_for_run=claim),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            on_workflow_run_terminal=AsyncMock(),
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(
+            remove_workflow_run_context=lambda _workflow_run_id: None,
+            has_workflow_run_context=lambda _workflow_run_id: False,
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.skyvern_context,
+        "current",
+        lambda: SimpleNamespace(browser_session_id="bs_retry", run_id=workflow_run.workflow_run_id),
+    )
+    monkeypatch.setattr(service_module.app.STORAGE, "save_downloaded_files", AsyncMock())
+    monkeypatch.setattr(service_module.app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
+    monkeypatch.setattr(
+        service_module, "get_recorded_decision", AsyncMock(return_value=RetryDecision(False, 2, 0, True, "final"))
+    )
+    monkeypatch.setattr(svc, "run_terminal_side_effects", AsyncMock())
+
+    await svc.clean_up_workflow(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+        attempt_number=2,
+    )
+
+    claim.assert_awaited_once_with(
+        run_id=workflow_run.workflow_run_id,
+        browser_session_id="bs_retry",
+        organization_id=workflow_run.organization_id,
+        run_started_at=attempt_started_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_uses_legacy_path_when_retry_attempt_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    workflow = _execute_workflow()
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    get_attempts = AsyncMock(side_effect=RuntimeError("attempt lookup unavailable"))
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+            debug=SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False)),
+        ),
+    )
+    terminal_hook = AsyncMock()
+    monkeypatch.setattr(
+        service_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            on_workflow_run_terminal=terminal_hook,
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(remove_workflow_run_context=Mock(), has_workflow_run_context=lambda _workflow_run_id: False),
+    )
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    save_downloads = AsyncMock()
+    monkeypatch.setattr(service_module.app.STORAGE, "save_downloaded_files", save_downloads)
+    wait_for_uploads = AsyncMock()
+    monkeypatch.setattr(service_module.app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", wait_for_uploads)
+    delete_attachments = AsyncMock()
+    monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", delete_attachments)
+    legacy_webhook = AsyncMock()
+    monkeypatch.setattr(svc, "execute_workflow_webhook", legacy_webhook)
+    policy_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", policy_effects)
+
+    await svc.clean_up_workflow(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+        schedule_credential_fallback_retry=False,
+    )
+
+    get_attempts.assert_awaited_once_with(workflow_run.workflow_run_id)
+    terminal_hook.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=workflow_run.organization_id,
+        status=workflow_run.status,
+        is_final_attempt=True,
+    )
+    wait_for_uploads.assert_awaited_once_with([])
+    save_downloads.assert_awaited_once_with(
+        organization_id=workflow_run.organization_id,
+        run_id=workflow_run.workflow_run_id,
+    )
+    delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    policy_effects.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_skips_logical_effects_when_policy_attempt_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    get_attempts = AsyncMock(side_effect=RuntimeError("attempt lookup unavailable"))
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+            debug=SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False)),
+        ),
+    )
+    terminal_hook = AsyncMock()
+    monkeypatch.setattr(
+        service_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            on_workflow_run_terminal=terminal_hook,
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(remove_workflow_run_context=Mock(), has_workflow_run_context=lambda _workflow_run_id: False),
+    )
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(service_module.app.STORAGE, "save_downloaded_files", AsyncMock())
+    monkeypatch.setattr(service_module.app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
+    delete_attachments = AsyncMock()
+    monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", delete_attachments)
+    legacy_webhook = AsyncMock()
+    monkeypatch.setattr(svc, "execute_workflow_webhook", legacy_webhook)
+    policy_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", policy_effects)
+    credential_fallback = Mock()
+    monkeypatch.setattr(svc, "_schedule_credential_fallback_retry", credential_fallback)
+
+    await svc.clean_up_workflow(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+    )
+
+    terminal_hook.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=workflow_run.organization_id,
+        status=workflow_run.status,
+        is_final_attempt=False,
+    )
+    delete_attachments.assert_not_awaited()
+    legacy_webhook.assert_not_awaited()
+    policy_effects.assert_not_awaited()
+    credential_fallback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_uses_legacy_path_when_policy_run_has_no_attempt_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Enrollment is the attempt row. A definition with a policy but no row ran the ordinary path, so
+    # cleanup owes the legacy webhook and attachment deletion; no recovery sweep can supply them later.
+    svc = WorkflowService()
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+            debug=SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False)),
+        ),
+    )
+    terminal_hook = AsyncMock()
+    monkeypatch.setattr(
+        service_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            on_workflow_run_terminal=terminal_hook,
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(remove_workflow_run_context=Mock(), has_workflow_run_context=lambda _workflow_run_id: False),
+    )
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(service_module.app.STORAGE, "save_downloaded_files", AsyncMock())
+    monkeypatch.setattr(service_module.app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
+    delete_attachments = AsyncMock()
+    monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", delete_attachments)
+    legacy_webhook = AsyncMock()
+    monkeypatch.setattr(svc, "execute_workflow_webhook", legacy_webhook)
+    policy_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", policy_effects)
+
+    await svc.clean_up_workflow(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+        schedule_credential_fallback_retry=False,
+    )
+
+    terminal_hook.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=workflow_run.organization_id,
+        status=workflow_run.status,
+        is_final_attempt=True,
+    )
+    delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    policy_effects.assert_not_awaited()
+
+
+async def _assert_policy_definition_uses_legacy_cleanup_for_ineligible_run(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_run: SimpleNamespace,
+    *,
+    block_scoped: bool,
+) -> None:
+    svc = WorkflowService()
+    workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL)
+    terminal_hook = AsyncMock()
+    delete_attachments = AsyncMock()
+    legacy_webhook = AsyncMock()
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[attempt])),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            on_workflow_run_terminal=terminal_hook,
+            is_block_scoped_workflow_run=AsyncMock(return_value=block_scoped),
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(remove_workflow_run_context=Mock(), has_workflow_run_context=lambda _workflow_run_id: False),
+    )
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(service_module.app.STORAGE, "save_downloaded_files", AsyncMock())
+    monkeypatch.setattr(service_module.app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
+    monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", delete_attachments)
+    monkeypatch.setattr(svc, "execute_workflow_webhook", legacy_webhook)
+    policy_effects = AsyncMock()
+    monkeypatch.setattr(svc, "run_terminal_side_effects", policy_effects)
+
+    await svc.clean_up_workflow(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+        schedule_credential_fallback_retry=False,
+    )
+
+    terminal_hook.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=workflow_run.organization_id,
+        status=workflow_run.status,
+        is_final_attempt=True,
+    )
+    delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    policy_effects.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_block_scoped_policy_run_uses_legacy_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    await _assert_policy_definition_uses_legacy_cleanup_for_ineligible_run(
+        monkeypatch,
+        workflow_run,
+        block_scoped=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_policy_run_uses_legacy_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    workflow_run.parent_workflow_run_id = "parent_run"
+    await _assert_policy_definition_uses_legacy_cleanup_for_ineligible_run(
+        monkeypatch,
+        workflow_run,
+        block_scoped=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_decision_rejects_non_terminal_status() -> None:
+    with pytest.raises(ValueError, match="non-terminal status: running"):
+        await service_module.on_terminal_transition(
+            SimpleNamespace(workflow_run_id="wr_test"),
+            WorkflowRunStatus.running,
+            None,
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_filter_downloaded_files_keeps_identical_redownload_touched_in_current_attempt() -> None:
+    svc = WorkflowService()
+    attempt_started_at = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    files = [
+        FileInfo(
+            url="https://example.test/old.pdf",
+            checksum="old",
+            filename="only-attempt-1.pdf",
+            modified_at=attempt_started_at.replace(hour=11, minute=59),
+            artifact_id="a_old",
+        ),
+        FileInfo(
+            url="https://example.test/report.pdf",
+            checksum="same",
+            filename="report.pdf",
+            modified_at=attempt_started_at,
+            artifact_id="a_report",
+        ),
+    ]
+
+    filtered = svc._filter_downloaded_files_to_attempt(
+        files,
+        attempt_rows=[SimpleNamespace(attempt_number=2, started_at=attempt_started_at)],
+        attempt_number=2,
+        artifact_ids={"a_report"},
+    )
+
+    assert [file_info.filename for file_info in filtered] == ["report.pdf"]
+
+
+def test_filter_downloaded_files_bounds_an_unstarted_attempt_by_its_creation() -> None:
+    svc = WorkflowService()
+    prepared_at = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    files = [
+        FileInfo(
+            url="https://example.test/old.pdf",
+            checksum="old",
+            filename="attempt-1.pdf",
+            modified_at=prepared_at.replace(hour=11),
+            artifact_id="a_old",
+        ),
+        FileInfo(
+            url="https://example.test/claimed.pdf",
+            checksum="claimed",
+            filename="claimed.pdf",
+            modified_at=prepared_at.replace(hour=11, minute=30),
+            artifact_id="a_claimed",
+        ),
+        FileInfo(url="https://example.test/unknown.pdf", checksum="unknown", filename="unknown.pdf"),
+    ]
+    attempt_rows = [
+        SimpleNamespace(
+            attempt_number=1, started_at=prepared_at.replace(hour=10), created_at=prepared_at.replace(hour=9)
+        ),
+        SimpleNamespace(attempt_number=2, started_at=None, created_at=prepared_at),
+    ]
+
+    filtered = svc._filter_downloaded_files_to_attempt(
+        files, attempt_rows=attempt_rows, attempt_number=2, artifact_ids={"a_claimed"}
+    )
+
+    assert [file_info.filename for file_info in filtered] == ["claimed.pdf"]
+    # The live attempt keeps the permissive rule for a file whose timestamp is unknown.
+    live = svc._filter_downloaded_files_to_attempt(
+        files[2:], attempt_rows=attempt_rows[:1], attempt_number=1, artifact_ids=set()
+    )
+    assert [file_info.filename for file_info in live] == ["unknown.pdf"]
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_persists_profile_when_only_finally_block_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -621,6 +1518,8 @@ async def test_execute_workflow_rechecks_terminal_winner_before_healthy_writebac
     prefinal_browser_cleanup.assert_not_awaited()
     persist_browser_session.assert_not_awaited()
     finalize.assert_awaited_once()
+    assert finalize.await_args is not None
+    assert finalize.await_args.kwargs["workflow"] is workflow
     clean_up.assert_awaited_once()
     assert clean_up.await_args is not None
     assert clean_up.await_args.kwargs["browser_persistence_status"] == WorkflowRunStatus.timed_out
@@ -841,3 +1740,664 @@ async def test_execute_workflow_does_not_close_human_interaction_session(
 
     assert result is completed_run
     close_session.assert_not_awaited()
+
+
+@pytest_asyncio.fixture
+async def forced_session_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+) -> tuple[AgentDB, WorkflowService, Workflow]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    await database.organizations.create_organization("Test", organization_id="o_test")
+    async with database.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_1",
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                title="Workflow",
+                workflow_definition={
+                    "parameters": [],
+                    "blocks": [],
+                    "retry_policy": {"retry_on": [{"status": "failed"}], "delay_seconds": 0},
+                },
+            )
+        )
+        await session.commit()
+    workflow = await database.workflows.get_workflow("wf_1", organization_id="o_test")
+    assert workflow is not None
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "remove_workflow_run_context", Mock())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        app.EXPERIMENTATION_PROVIDER,
+        "is_feature_enabled_cached",
+        AsyncMock(side_effect=lambda flag, *args, **kwargs: flag == "FORCE_BROWSER_SESSION"),
+    )
+    create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_forced"))
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
+    service = WorkflowService()
+    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
+    return database, service, workflow
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forced_session", [True, False])
+async def test_block_scoped_setup_does_not_enroll_a_retry_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    forced_session: bool,
+) -> None:
+    """A block run creates its block-run rows only after setup, so enrolment must trust the
+    caller's block-scoped intent; a policy definition alone must not enroll it."""
+    database, service, workflow = forced_session_setup
+    monkeypatch.setattr(
+        app.EXPERIMENTATION_PROVIDER,
+        "is_feature_enabled_cached",
+        AsyncMock(side_effect=lambda flag, *args, **kwargs: forced_session and flag == "FORCE_BROWSER_SESSION"),
+    )
+    block_run = await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(),
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_1",
+        organization_id="o_test",
+        workflow=workflow,
+        block_scoped=True,
+    )
+    full_run = await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(),
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_1",
+        organization_id="o_test",
+        workflow=workflow,
+    )
+    assert await database.workflow_run_attempts.get_attempts(block_run.workflow_run_id) == []
+    enrolled = await database.workflow_run_attempts.get_attempts(full_run.workflow_run_id)
+    assert [attempt.attempt_number for attempt in enrolled] == [1]
+
+
+@pytest_asyncio.fixture(params=["sequential", "browser_reuse"])
+async def retry_gate_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    request: pytest.FixtureRequest,
+) -> tuple[AgentDB, WorkflowService, WorkflowRun]:
+    database, service, _ = forced_session_setup
+    async with database.Session() as session:
+        workflow_model = await session.get(WorkflowModel, "wf_1")
+        assert workflow_model is not None
+        workflow_model.run_sequentially = request.param == "sequential"
+        workflow_model.reuse_browser_session = request.param == "browser_reuse"
+        workflow_model.workflow_definition = {
+            "parameters": [],
+            "blocks": [],
+            "retry_policy": {"retry_on": [{"status": "timed_out"}], "delay_seconds": 0, "max_retries": 1},
+        }
+        await session.commit()
+    workflow = await database.workflows.get_workflow("wf_1", organization_id="o_test")
+    assert workflow is not None
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(service, "_run_interim_side_effects_with_retries", AsyncMock(return_value="released"))
+    monkeypatch.setattr(service, "_run_terminal_side_effects_with_retries", AsyncMock(return_value="released"))
+    run = await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(start_fresh_browser=False),
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_1",
+        organization_id="o_test",
+        workflow=workflow,
+        max_elapsed_time_minutes=1,
+    )
+    expired_start = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=2)
+    run = await database.workflow_runs.update_workflow_run(
+        run.workflow_run_id, status=WorkflowRunStatus.running, started_at=expired_start
+    )
+    async with database.Session() as session:
+        attempt = await session.get(WorkflowRunAttemptModel, (run.workflow_run_id, 1))
+        assert attempt is not None
+        attempt.started_at = expired_start
+        await session.commit()
+
+    async def mark_timed_out(workflow_run_id: str, failure_reason: str) -> WorkflowRun:
+        return await database.workflow_runs.update_workflow_run(
+            workflow_run_id,
+            status=WorkflowRunStatus.timed_out,
+            failure_reason=failure_reason,
+            finished_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+
+    monkeypatch.setattr(service, "mark_workflow_run_as_timed_out", mark_timed_out)
+    return database, service, run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("escaped_exception", [False, True])
+async def test_timed_out_retry_gets_fresh_admission_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_gate_setup: tuple[AgentDB, WorkflowService, WorkflowRun],
+    blocked: bool,
+    escaped_exception: bool,
+) -> None:
+    database, service, run = retry_gate_setup
+    executed_attempts: list[int] = []
+    admission_budgets: list[float] = []
+    gate_sleeps: list[float] = []
+
+    async def execute_attempt(*, attempt_number: int, **kwargs: Any) -> WorkflowRun:
+        executed_attempts.append(attempt_number)
+        result = await database.workflow_runs.update_workflow_run(
+            run.workflow_run_id,
+            status=WorkflowRunStatus.timed_out if attempt_number == 1 else WorkflowRunStatus.completed,
+        )
+        if attempt_number == 1 and escaped_exception:
+            raise RuntimeError("attempt timed out")
+        return result
+
+    def scaled_timeout(seconds: float) -> asyncio.Timeout:
+        admission_budgets.append(seconds)
+        return asyncio.timeout(seconds / 60)
+
+    async def fast_sleep(seconds: float) -> None:
+        if seconds:
+            gate_sleeps.append(seconds)
+        await asyncio.sleep(0.01 if seconds else 0)
+
+    monkeypatch.setattr(service, "execute_workflow", execute_attempt)
+    monkeypatch.setattr(
+        database.workflow_runs, "get_blocking_sequential_workflow_run", AsyncMock(return_value=run if blocked else None)
+    )
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(timeout=scaled_timeout, sleep=fast_sleep))
+
+    result = await service.execute_workflow_with_retries(
+        run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test")
+    )
+
+    assert len(admission_budgets) == 1
+    assert 55 < admission_budgets[0] <= 60
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert attempts[0].status == "timed_out"
+    assert attempts[0].retry_decision == RETRY_DECISION_RETRY
+    if blocked:
+        assert gate_sleeps
+        assert executed_attempts == [1]
+        assert result.status == WorkflowRunStatus.timed_out
+        assert attempts[1].started_at is None
+        assert attempts[1].decision_reason == "sequential_gate_stopped"
+    else:
+        assert not gate_sleeps
+        assert executed_attempts == [1, 2]
+        assert result.status == WorkflowRunStatus.completed
+        assert attempts[1].started_at is not None
+
+
+@pytest.mark.asyncio
+async def test_prepared_retry_recovery_keeps_its_admission_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_gate_setup: tuple[AgentDB, WorkflowService, WorkflowRun],
+) -> None:
+    database, service, run = retry_gate_setup
+    admission_deadlines: list[datetime] = []
+    admission_budgets: list[float] = []
+    elapsed_timeout = service_module._get_workflow_run_max_elapsed_timeout_seconds
+
+    class WorkerLost(BaseException):
+        pass
+
+    def record_budget(gate_run: WorkflowRun) -> float:
+        assert gate_run.started_at is not None
+        admission_deadlines.append(gate_run.started_at.replace(tzinfo=UTC) + timedelta(minutes=1))
+        remaining = elapsed_timeout(gate_run)
+        admission_budgets.append(remaining)
+        return remaining
+
+    async def execute_attempt(**kwargs: Any) -> WorkflowRun:
+        return await database.workflow_runs.update_workflow_run(run.workflow_run_id, status=WorkflowRunStatus.timed_out)
+
+    execute = AsyncMock(side_effect=execute_attempt)
+    monkeypatch.setattr(service, "execute_workflow", execute)
+    monkeypatch.setattr(service_module, "_get_workflow_run_max_elapsed_timeout_seconds", record_budget)
+    monkeypatch.setattr(
+        database.workflow_runs, "get_blocking_sequential_workflow_run", AsyncMock(side_effect=WorkerLost)
+    )
+
+    with pytest.raises(WorkerLost):
+        await service.execute_workflow_with_retries(
+            run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test")
+        )
+
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    prepared_at = attempts[1].created_at.replace(tzinfo=UTC)
+    assert attempts[1].started_at is None
+    assert 55 < admission_budgets[0] <= 60
+    current_time = prepared_at + timedelta(seconds=30)
+
+    class RecoveryClock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return current_time.astimezone(tz) if tz is not None else current_time.replace(tzinfo=None)
+
+    monkeypatch.setattr(service_module, "datetime", RecoveryClock)
+    with pytest.raises(WorkerLost):
+        await service.execute_workflow_with_retries(
+            run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test"), attempt_number=2
+        )
+
+    assert admission_budgets[1] == 30
+    current_time = prepared_at + timedelta(minutes=1)
+    result = await service.execute_workflow_with_retries(
+        run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test"), attempt_number=2
+    )
+
+    assert admission_deadlines == [prepared_at + timedelta(minutes=1)] * 3
+    assert admission_budgets[2] == 0
+    assert result.status == WorkflowRunStatus.timed_out
+    assert [call.kwargs["attempt_number"] for call in execute.await_args_list] == [1]
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert attempts[1].started_at is None
+    assert attempts[1].decision_reason == "sequential_gate_stopped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escaped_exception", [False, True])
+async def test_forced_session_is_pinned_for_first_and_prepared_retry_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    escaped_exception: bool,
+) -> None:
+    database, service, workflow = forced_session_setup
+
+    run = await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(),
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_1",
+        organization_id="o_test",
+        workflow=workflow,
+    )
+
+    assert run.browser_session_id == "pbs_forced"
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert len(attempts) == 1
+    assert attempts[0].attempt_number == 1
+    assert attempts[0].pinned_browser_session_id == "pbs_forced"
+
+    context = skyvern_context.SkyvernContext(workflow_run_id=run.workflow_run_id, organization_id="o_test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(skyvern_context, "ensure_context", lambda: context)
+    monkeypatch.setattr(app, "BROWSER_MANAGER", RealBrowserManager())
+    generations: list[str] = []
+    released_generations: list[str] = []
+    browser_accesses: list[tuple[int, str | None]] = []
+    owned_generation: str | None = None
+
+    async def begin_session(**kwargs: Any) -> str:
+        nonlocal owned_generation
+        assert kwargs["browser_session_id"] == "pbs_forced"
+        assert kwargs["runnable_id"] == run.workflow_run_id
+        assert owned_generation is None
+        owned_generation = f"lease_{len(generations) + 1}"
+        generations.append(owned_generation)
+        return owned_generation
+
+    async def release_session(**kwargs: Any) -> bool:
+        nonlocal owned_generation
+        assert kwargs["expected_runnable_id"] == run.workflow_run_id
+        assert kwargs["expected_runnable_generation_id"] == owned_generation
+        assert owned_generation is not None
+        released_generations.append(owned_generation)
+        owned_generation = None
+        return True
+
+    async def execute_attempt(*, attempt_number: int, browser_session_id: str | None, **kwargs: Any) -> WorkflowRun:
+        current_run = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
+        assert current_run is not None
+        session_id = browser_session_id or current_run.browser_session_id
+        assert session_id == "pbs_forced"
+        if attempt_number > 1:
+            assert context.browser_session_id == session_id
+        await service._ensure_browser_session_lease(
+            organization_id="o_test", workflow_run_id=run.workflow_run_id, browser_session_id=session_id
+        )
+        generation = context.browser_session_runnable_generation_id
+        browser_accesses.append((attempt_number, generation))
+        owns_session = (
+            context.browser_session_runnable_id == run.workflow_run_id
+            and generation == owned_generation
+            and generation not in released_generations
+        )
+        if owns_session:
+            await service._clean_up_workflow_browser(
+                workflow_run=current_run, close_browser_on_completion=False, browser_session_id=session_id
+            )
+        status = WorkflowRunStatus.completed if attempt_number == 2 and owns_session else WorkflowRunStatus.failed
+        current_run = await database.workflow_runs.update_workflow_run(run.workflow_run_id, status=status)
+        async with database.Session() as session:
+            attempt = await session.scalar(
+                select(WorkflowRunAttemptModel).where(
+                    WorkflowRunAttemptModel.workflow_run_id == run.workflow_run_id,
+                    WorkflowRunAttemptModel.attempt_number == attempt_number,
+                )
+            )
+            assert attempt is not None
+            attempt.status = status.value
+            attempt.retry_decision = RETRY_DECISION_RETRY if attempt_number == 1 else RETRY_DECISION_FINAL
+            await session.commit()
+        if attempt_number == 1 and escaped_exception:
+            raise RuntimeError("escaped after browser cleanup")
+        return current_run
+
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "begin_session", begin_session)
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "release_browser_session", release_session)
+    monkeypatch.setattr(service, "execute_workflow", execute_attempt)
+    monkeypatch.setattr(service, "_wait_for_retry_sequential_clearance", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_run_interim_side_effects_with_retries", AsyncMock(return_value="released"))
+    monkeypatch.setattr(service, "_run_terminal_side_effects_with_retries", AsyncMock(return_value="released"))
+
+    result = await service.execute_workflow_with_retries(
+        run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test")
+    )
+
+    assert browser_accesses == [(1, "lease_1"), (2, "lease_2")]
+    assert generations == released_generations == ["lease_1", "lease_2"]
+    assert result.status == WorkflowRunStatus.completed
+    assert context.browser_session_id == "pbs_forced"
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert [(attempt.attempt_number, attempt.pinned_browser_session_id) for attempt in attempts] == [
+        (1, "pbs_forced"),
+        (2, "pbs_forced"),
+    ]
+    prepared_run = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
+    assert prepared_run is not None
+    assert prepared_run.browser_session_id == "pbs_forced"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_source", ["forced", "explicit", "unpinned"])
+async def test_retry_preparation_preserves_session_after_transient_forced_pin_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    session_source: str,
+) -> None:
+    database, service, workflow = forced_session_setup
+    pin_session = database.workflow_run_attempts.pin_first_attempt_browser_session_if_unset
+    pin_calls = 0
+
+    async def fail_first_pin(**kwargs: Any) -> None:
+        nonlocal pin_calls
+        pin_calls += 1
+        if pin_calls == 1:
+            raise RuntimeError("pin failed")
+        await pin_session(**kwargs)
+
+    monkeypatch.setattr(database.workflow_run_attempts, "pin_first_attempt_browser_session_if_unset", fail_first_pin)
+    if session_source != "forced":
+        monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    if session_source == "explicit":
+        monkeypatch.setattr(
+            database.browser_sessions,
+            "get_persistent_browser_session",
+            AsyncMock(return_value=SimpleNamespace(browser_profile_id=None, runnable_id="wr_other")),
+        )
+    run = await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(
+            browser_session_id="pbs_explicit" if session_source == "explicit" else None
+        ),
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_1",
+        organization_id="o_test",
+        workflow=workflow,
+    )
+    await database.workflow_runs.update_workflow_run(
+        run.workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        browser_session_id="pbs_leased" if session_source == "unpinned" else run.browser_session_id,
+    )
+    async with database.Session() as session:
+        attempt = await session.get(WorkflowRunAttemptModel, (run.workflow_run_id, 1))
+        assert attempt is not None
+        attempt.status = WorkflowRunStatus.failed.value
+        attempt.retry_decision = RETRY_DECISION_RETRY
+        await session.commit()
+
+    preparation = await service_module.prepare_next_attempt_result(run.workflow_run_id, "o_test", 1)
+
+    expected_session_id = {"forced": "pbs_forced", "explicit": "pbs_explicit", "unpinned": None}[session_source]
+    assert preparation.status == "inserted"
+    assert preparation.pinned_browser_session_id == expected_session_id
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert [attempt.pinned_browser_session_id for attempt in attempts] == [expected_session_id, expected_session_id]
+    reopened = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
+    assert reopened is not None
+    assert reopened.browser_session_id == expected_session_id
+    assert pin_calls == (2 if session_source == "forced" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["assignment", "pin"])
+async def test_forced_session_assignment_precedes_required_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    failure_point: str,
+) -> None:
+    database, service, workflow = forced_session_setup
+    close_session = AsyncMock()
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "close_session", close_session)
+    if failure_point == "assignment":
+        monkeypatch.setattr(
+            database.workflow_runs, "update_workflow_run", AsyncMock(side_effect=RuntimeError("assignment failed"))
+        )
+    else:
+        monkeypatch.setattr(
+            database.workflow_run_attempts,
+            "pin_first_attempt_browser_session_if_unset",
+            AsyncMock(side_effect=RuntimeError("pin failed")),
+        )
+
+    if failure_point == "pin":
+        with pytest.raises(RuntimeError, match="pin failed"):
+            await service.create_workflow_run(
+                workflow_request=WorkflowRequestBody(),
+                workflow_permanent_id="wpid_test",
+                workflow_id="wf_1",
+                workflow_run_id="wr_pin_failure",
+                organization_id="o_test",
+                workflow=workflow,
+            )
+        run = await database.workflow_runs.get_workflow_run("wr_pin_failure", "o_test")
+        assert run is not None
+        assert run.status == WorkflowRunStatus.failed
+        assert run.finished_at is not None
+        assert run.failure_reason == "Failed to pin forced browser session for workflow retry"
+        close_session.assert_awaited_once_with("o_test", "pbs_forced", reason=BrowserSessionCloseReason.aborted)
+        assert database.workflow_run_attempts.pin_first_attempt_browser_session_if_unset.await_count == 2
+    else:
+        run = await service.create_workflow_run(
+            workflow_request=WorkflowRequestBody(),
+            workflow_permanent_id="wpid_test",
+            workflow_id="wf_1",
+            organization_id="o_test",
+            workflow=workflow,
+        )
+
+    persisted_run = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
+    assert persisted_run is not None
+    expected_session_id = None if failure_point == "assignment" else "pbs_forced"
+    assert run.browser_session_id == persisted_run.browser_session_id == expected_session_id
+    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert len(attempts) == 1
+    assert attempts[0].pinned_browser_session_id is None
+    if failure_point == "pin":
+        assert attempts[0].status == WorkflowRunStatus.failed.value
+        assert attempts[0].retry_decision == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_version", [False, True])
+@pytest.mark.parametrize("seed_source", [BrowserSeedSource.credential, BrowserSeedSource.own_memory])
+async def test_retry_execution_resolves_rotated_seed_before_browser_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    deleted_version: bool,
+    seed_source: BrowserSeedSource,
+) -> None:
+    database = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    now = datetime.now(UTC)
+    credential_parameter = {
+        "parameter_type": "credential",
+        "key": "login",
+        "credential_parameter_id": "cp_login",
+        "workflow_id": "wf_1",
+        "credential_id": "cred_a",
+        "credential_ids": ["cred_a", "cred_b"],
+        "created_at": now.isoformat(),
+        "modified_at": now.isoformat(),
+    }
+    own_memory = seed_source == BrowserSeedSource.own_memory
+    async with database.Session() as session:
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id="wf_1",
+                    workflow_permanent_id="wpid_test",
+                    organization_id="o_test",
+                    title="Workflow",
+                    persist_browser_session=own_memory,
+                    browser_profile_key="{{ login }}" if own_memory else None,
+                    workflow_definition={
+                        "parameters": [credential_parameter],
+                        "blocks": [
+                            {
+                                "block_type": "login",
+                                "label": "login",
+                                "parameters": [credential_parameter],
+                                "output_parameter": {
+                                    "parameter_type": "output",
+                                    "key": "login_output",
+                                    "output_parameter_id": "op_login",
+                                    "workflow_id": "wf_1",
+                                    "created_at": now.isoformat(),
+                                    "modified_at": now.isoformat(),
+                                },
+                            }
+                        ],
+                        "retry_policy": {"max_retries": 1, "retry_on": [{"status": "failed"}]},
+                    },
+                ),
+                WorkflowRunModel(
+                    workflow_run_id="wr_test",
+                    workflow_id="wf_1",
+                    workflow_permanent_id="wpid_test",
+                    organization_id="o_test",
+                    status="failed",
+                    browser_profile_id="bp_a",
+                    browser_seed_source=seed_source,
+                    browser_sink_profile_id="bp_a" if own_memory else None,
+                    max_elapsed_time_minutes=1,
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_test",
+                    organization_id="o_test",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="retry",
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    workflow_run_id="wr_test",
+                    organization_id="o_test",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="login",
+                    credential_id="cred_a",
+                ),
+                *[
+                    CredentialModel(
+                        credential_id=f"cred_{suffix}",
+                        organization_id="o_test",
+                        name=f"Credential {suffix}",
+                        credential_type="password",
+                        item_id=f"item_{suffix}",
+                        run_sequentially=False,
+                        browser_profile_id=None if own_memory else f"bp_{suffix}",
+                    )
+                    for suffix in ("a", "b")
+                ],
+                *[
+                    BrowserProfileModel(
+                        browser_profile_id=f"bp_{suffix}",
+                        organization_id="o_test",
+                        name=f"Profile {suffix}",
+                        is_managed=own_memory,
+                        workflow_permanent_id="wpid_test" if own_memory else None,
+                        browser_profile_key_digest=(
+                            build_browser_profile_key_digest(f"cred_{suffix}") if own_memory else None
+                        ),
+                    )
+                    for suffix in ("a", "b")
+                ],
+            ]
+        )
+        await session.commit()
+    workflow = await database.workflows.get_workflow("wf_1", organization_id="o_test")
+    assert workflow is not None
+    if deleted_version:
+        async with database.Session() as session:
+            row = await session.get(WorkflowModel, "wf_1")
+            assert row is not None
+            row.deleted_at = now
+            await session.commit()
+        assert await database.workflows.get_workflow("wf_1", organization_id="o_test") is None
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.completed))
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(svc, "get_workflow_run", WorkflowService.get_workflow_run.__get__(svc))
+    monkeypatch.setattr(svc, "get_workflow", WorkflowService.get_workflow.__get__(svc))
+    monkeypatch.setattr(
+        svc, "get_workflow_by_workflow_run_id", WorkflowService.get_workflow_by_workflow_run_id.__get__(svc)
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(svc, "_managed_browser_profile_has_content", AsyncMock(return_value=True))
+    monkeypatch.setattr(svc, "_reconcile_managed_browser_profile_proxy_pin", AsyncMock())
+    monkeypatch.setattr(svc, "_maybe_pin_credential_profile_ip", AsyncMock(side_effect=lambda **kw: kw["workflow_run"]))
+    monkeypatch.setattr(svc, "clean_up_workflow", AsyncMock())
+    monkeypatch.setattr(svc, "_clean_up_workflow_browser", AsyncMock(return_value=_browser_cleanup_result()))
+    monkeypatch.setattr(svc, "_finalize_workflow_run_status", AsyncMock(side_effect=lambda **kw: kw["workflow_run"]))
+    monkeypatch.setattr(svc, "_run_terminal_side_effects_with_retries", AsyncMock())
+    monkeypatch.setattr(
+        service_module, "get_recorded_decision", AsyncMock(return_value=RetryDecision(False, 2, 0, True, "no_match"))
+    )
+
+    async def mark_running(workflow_run_id: str) -> WorkflowRun:
+        return await database.workflow_runs.update_workflow_run(
+            workflow_run_id, status=WorkflowRunStatus.running, started_at=datetime.now(UTC).replace(tzinfo=None)
+        )
+
+    monkeypatch.setattr(svc, "mark_workflow_run_as_running", mark_running)
+    browser_seeds: list[str | None] = []
+
+    async def execute_blocks(**kwargs: Any) -> tuple[WorkflowRun, set[str]]:
+        browser_seeds.append(kwargs["browser_profile_id"])
+        return await database.workflow_runs.update_workflow_run("wr_test", status=WorkflowRunStatus.completed), set()
+
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", execute_blocks)
+    preparation = await database.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+    assert preparation.status == "inserted"
+
+    result = await svc.execute_workflow_with_retries(
+        workflow_run_id="wr_test",
+        api_key=None,
+        organization=SimpleNamespace(organization_id="o_test"),
+        attempt_number=2,
+    )
+
+    assert result.status == WorkflowRunStatus.completed
+    assert browser_seeds == ["bp_b"]
+    assert result.browser_profile_id == "bp_b"
+    assert result.browser_seed_source == seed_source
+    assert result.browser_sink_profile_id == ("bp_b" if own_memory else None)
+    assert await database.workflow_run_credential_selections.get_selection("wr_test", "login") == "cred_b"

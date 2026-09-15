@@ -5328,7 +5328,7 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     assert outcome.status == "completed"
     assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
-    assert elapsed <= 0.3
+    assert elapsed < 2.0, elapsed  # loose wall-clock bound: an awaited sampler would add its full 5s sleep
 
 
 @pytest.mark.asyncio

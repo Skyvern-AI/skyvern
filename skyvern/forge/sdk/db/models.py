@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
@@ -152,6 +153,7 @@ class TaskModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
 
 
 class StepModel(Base):
@@ -850,6 +852,59 @@ class WorkflowRunModel(Base):
     )
 
 
+class WorkflowRunAttemptModel(Base):
+    __tablename__ = "workflow_run_attempts"
+    __table_args__ = (
+        Index("ix_workflow_run_attempts_organization_created_at", "organization_id", "created_at"),
+        Index(
+            "ix_workflow_run_attempts_pending_retries",
+            "next_attempt_at",
+            "workflow_run_id",
+            "attempt_number",
+            postgresql_where=text(
+                "retry_decision = 'retry' AND next_attempt_prepared_at IS NULL AND next_attempt_at IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_workflow_run_attempts_terminal_releases",
+            "side_effects_released_at",
+            postgresql_where=text("retry_decision IN ('final', 'revoked', 'abandoned') AND webhook_sent_at IS NULL"),
+        ),
+        Index(
+            "ix_workflow_run_attempts_prepared_not_started",
+            "modified_at",
+            postgresql_where=text("retry_decision IS NULL AND status = 'queued' AND started_at IS NULL"),
+        ),
+    )
+
+    workflow_run_id = Column(String, primary_key=True)
+    attempt_number = Column(Integer, primary_key=True)
+    organization_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    failure_reason = Column(Text, nullable=True)
+    failure_category = Column(JSON, nullable=True)
+    error_codes = Column(JSON, nullable=True)
+    retry_decision = Column(String, nullable=True)
+    decision_reason = Column(String, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True)
+    next_attempt_prepared_at = Column(DateTime, nullable=True)
+    webhook_sent_at = Column(DateTime, nullable=True)
+    interim_webhook_sent_at = Column(DateTime, nullable=True)
+    side_effects_released_at = Column(DateTime, nullable=True)
+    interim_side_effects_progress = Column(JSON, nullable=True)
+    final_side_effects_progress = Column(JSON, nullable=True)
+    pinned_browser_session_id = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=naive_utc_now, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=naive_utc_now,
+        onupdate=naive_utc_now,
+        nullable=False,
+    )
+
+
 class WorkflowParameterModel(Base):
     __tablename__ = "workflow_parameters"
 
@@ -1283,6 +1338,7 @@ class WorkflowRunBlockModel(Base):
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
     # not CDC-mirrored, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

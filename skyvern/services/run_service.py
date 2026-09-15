@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 
 import structlog
 from fastapi import HTTPException, status
@@ -6,8 +7,10 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
 from skyvern.forge.sdk.workflow.service import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
@@ -171,9 +174,50 @@ async def cancel_workflow_run(
         ]:
             continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if workflow_run.status.is_final() and attempt_rows:
+        latest_attempt = max(attempt_rows, key=lambda attempt: attempt.attempt_number)
+        await app.DATABASE.workflow_run_attempts.revoke_or_abandon_attempt(
+            workflow_run_id=workflow_run_id,
+            attempt_number=latest_attempt.attempt_number,
+            decision="revoked",
+            reason="cancel",
+        )
+        workflow_run = (
+            await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            or workflow_run
+        )
+
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if attempt_rows:
+        decision = await get_recorded_decision(workflow_run_id)
+        if decision is None:
+            attempt_number = max(attempt_rows, key=lambda attempt: attempt.attempt_number).attempt_number
+            decision = RetryDecision(False, attempt_number, 0, True, "cancel")
+        attempt = next((row for row in attempt_rows if row.attempt_number == decision.attempt_number), None)
+        side_effects_claim_at = getattr(attempt, "side_effects_released_at", None)
+        if isinstance(side_effects_claim_at, datetime):
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+                side_effects_claim_at=side_effects_claim_at,
+                side_effects_stale_before=naive_utc_now() - timedelta(seconds=LEASE_TAKEOVER_SECONDS),
+            )
+        else:
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+            )
+    else:
+        await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
 
 
 async def cancel_run(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:

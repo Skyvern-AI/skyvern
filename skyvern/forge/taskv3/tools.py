@@ -25,6 +25,7 @@ import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 
@@ -38,6 +39,9 @@ from skyvern.core.script_generations.fuzzy_matcher import (
     match_option_exact_or_stem_with_tier,
     normalize_option_label,
 )
+from skyvern.forge.sdk.api.files import resolve_run_download_id
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
@@ -12355,10 +12359,17 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
     seen_started: set[str] = set()
     pending: list[str] = []
     baseline = {"done": False}
+    baseline_lock = asyncio.Lock()
+    attempt_started_at: datetime | None = None
 
     def _list_split() -> tuple[list[str], list[str]]:
         try:
-            names = sorted(os.listdir(downloads_dir))
+            names = sorted(
+                name
+                for name in os.listdir(downloads_dir)
+                if attempt_started_at is None
+                or is_file_from_retry_attempt(os.path.join(downloads_dir, name), attempt_started_at)
+            )
         except OSError:
             return [], []
         completed = [n for n in names if not n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
@@ -12373,16 +12384,22 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
             _compactable: bool = tool_spec.compactable,
             _tool_name: str = tool_spec.name,
         ) -> ToolResult:
-            if not baseline["done"]:
-                baseline["done"] = True
-                try:
-                    # Snapshot BEFORE the first handler runs, so a download triggered by the very
-                    # first tool call is reported rather than absorbed into the baseline.
-                    completed0, in_progress0 = _list_split()
-                    seen_completed.update(completed0)
-                    seen_started.update(_download_signal_identity(n) for n in in_progress0)
-                except Exception:
-                    LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
+            nonlocal attempt_started_at
+            async with baseline_lock:
+                if not baseline["done"]:
+                    try:
+                        context = skyvern_context.current()
+                        attempt_started_at = await get_download_retry_started_at(
+                            context.organization_id if context else None, resolve_run_download_id(context)
+                        )
+                        # Snapshot BEFORE the first handler runs, so a download triggered by the very
+                        # first tool call is reported rather than absorbed into the baseline.
+                        completed0, in_progress0 = _list_split()
+                        seen_completed.update(completed0)
+                        seen_started.update(_download_signal_identity(n) for n in in_progress0)
+                    except Exception:
+                        LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
+                    baseline["done"] = True
             result = await _handler(args)
             try:
                 # A tool that stages its own file into downloads_dir (file_upload) names it in

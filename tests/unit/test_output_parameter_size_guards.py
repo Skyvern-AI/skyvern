@@ -42,6 +42,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.services import run_service, task_v2_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 # ---------- Layer 1: truncate_oversized_jsonb_value ----------
 
@@ -390,6 +391,7 @@ async def _build_status_response(
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
                 get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
+            workflow_run_attempts=make_workflow_run_attempts_fake(),
         ),
     )
     monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)

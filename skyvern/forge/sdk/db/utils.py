@@ -377,6 +377,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extra_http_headers=task_obj.extra_http_headers,
         cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
+        attempt_number=task_obj.attempt_number,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
         retry=task_obj.retry,
@@ -886,6 +887,7 @@ def convert_to_workflow_run_block(
     block = WorkflowRunBlock(
         workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
         workflow_run_id=workflow_run_block_model.workflow_run_id,
+        attempt_number=workflow_run_block_model.attempt_number,
         block_workflow_run_id=workflow_run_block_model.block_workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,

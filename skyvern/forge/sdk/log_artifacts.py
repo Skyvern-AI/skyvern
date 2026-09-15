@@ -5,11 +5,23 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.storage.base import resolve_current_attempt
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 LOG = structlog.get_logger()
+
+workflow_log_attempt = skyvern_context.workflow_log_attempt
+
+
+def current_workflow_log_attempt(workflow_run_id: str) -> int | None:
+    attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
+    if attempt_number is not None:
+        return attempt_number
+    workflow_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+    return workflow_context.attempt_number if workflow_context is not None else None
 
 
 def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
@@ -100,6 +112,7 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
     organization_id = context.organization_id
 
     current_workflow_run_log = [entry for entry in log if entry.get("workflow_run_id", "") == workflow_run_id]
+    attempt_number = current_workflow_log_attempt(workflow_run_id)
 
     await _save_log_artifacts(
         log=current_workflow_run_log,
@@ -107,6 +120,7 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
         log_entity_id=workflow_run_id,
         organization_id=organization_id,
         workflow_run_id=workflow_run_id,
+        attempt_number=attempt_number,
     )
 
 
@@ -147,6 +161,7 @@ async def _save_log_artifacts(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_run_block_id: str | None = None,
+    attempt_number: int | None = None,
 ) -> None:
     try:
         if not settings.ENABLE_LOG_ARTIFACTS:
@@ -158,8 +173,28 @@ async def _save_log_artifacts(
                 log_entity_id=log_entity_id,
             )
             return
-        log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
+        if workflow_run_id and log_entity_type == LogEntityType.WORKFLOW_RUN:
+            attempt_number, _ = await resolve_current_attempt(workflow_run_id, attempt_number=attempt_number)
+            log = [
+                entry
+                for entry in log
+                if entry.get("workflow_run_attempt_number") is None
+                or entry["workflow_run_attempt_number"] == attempt_number
+            ]
+            log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
+            await _save_workflow_log_artifact(
+                workflow_run_id, organization_id, attempt_number, ArtifactType.SKYVERN_LOG_RAW, log_json.encode()
+            )
+            await _save_workflow_log_artifact(
+                workflow_run_id,
+                organization_id,
+                attempt_number,
+                ArtifactType.SKYVERN_LOG,
+                SkyvernLogEncoder.encode(log).encode(),
+            )
+            return
 
+        log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
         log_artifact = await app.DATABASE.artifacts.get_artifact_by_entity_id(
             artifact_type=ArtifactType.SKYVERN_LOG_RAW,
             step_id=step_id,
@@ -231,3 +266,38 @@ async def _save_log_artifacts(
             workflow_run_block_id=workflow_run_block_id,
             exc_info=True,
         )
+
+
+async def _save_workflow_log_artifact(
+    workflow_run_id: str, organization_id: str, attempt_number: int, artifact_type: ArtifactType, data: bytes
+) -> None:
+    log_entity_id = workflow_run_id if attempt_number == 1 else f"{workflow_run_id}/attempts/{attempt_number}"
+    log_directory = f"/logs/{LogEntityType.WORKFLOW_RUN}/{log_entity_id}"
+    artifacts = await app.DATABASE.artifacts.get_artifacts_by_entity_id(
+        artifact_type=artifact_type, workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    artifact = next(
+        (artifact for artifact in artifacts if artifact.uri.rsplit("/", 1)[0].endswith(log_directory)),
+        None,
+    )
+    if artifact is not None:
+        await app.ARTIFACT_MANAGER.update_artifact_data(
+            artifact_id=artifact.artifact_id, organization_id=organization_id, data=data, primary_key="workflow_run_id"
+        )
+        return
+    uri = app.STORAGE.build_log_uri(
+        organization_id=organization_id,
+        log_entity_type=LogEntityType.WORKFLOW_RUN,
+        log_entity_id=log_entity_id,
+        artifact_type=artifact_type,
+    )
+    # Keep upload tracking keyed by the run ID so finalization still waits for these writes.
+    await app.ARTIFACT_MANAGER._create_artifact(
+        aio_task_primary_key=workflow_run_id,
+        artifact_id=generate_artifact_id(),
+        artifact_type=artifact_type,
+        uri=uri,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        data=data,
+    )

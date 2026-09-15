@@ -84,14 +84,15 @@ async def test_print_page_block_includes_downloaded_files_in_output(
     )
 
     save_mock = AsyncMock()
-    # capture_block_download_baseline calls get_downloaded_files first (empty here),
+    # capture_block_download_baseline calls get_current_attempt_downloaded_files first (empty here),
     # then the helper calls it again post-PDF.
     get_mock = AsyncMock(side_effect=[[], [file_info]])
 
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(
+            get_downloaded_file_signature_aliases=lambda _: [],
             save_downloaded_files=save_mock,
-            get_downloaded_files=get_mock,
+            get_current_attempt_downloaded_files=get_mock,
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
@@ -174,8 +175,9 @@ async def test_print_page_block_filters_downloads_to_current_loop_iteration(
     # post-PDF read sees both. The block must scope its output to just the new one.
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(
+            get_downloaded_file_signature_aliases=lambda _: [],
             save_downloaded_files=AsyncMock(),
-            get_downloaded_files=AsyncMock(side_effect=[[prev_file], [prev_file, new_file]]),
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=[[prev_file], [prev_file, new_file]]),
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
@@ -224,13 +226,14 @@ async def test_print_page_block_tolerates_save_failure(
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
 
     save_mock = AsyncMock(side_effect=RuntimeError("S3 down"))
-    # Baseline-capture awaits get_downloaded_files once before save runs.
+    # Baseline-capture awaits get_current_attempt_downloaded_files once before save runs.
     get_mock = AsyncMock(return_value=[])
 
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(
+            get_downloaded_file_signature_aliases=lambda _: [],
             save_downloaded_files=save_mock,
-            get_downloaded_files=get_mock,
+            get_current_attempt_downloaded_files=get_mock,
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
@@ -305,8 +308,9 @@ async def test_print_page_block_excludes_files_downloaded_by_prior_block(
     get_mock = AsyncMock(side_effect=[[prior_file], [prior_file, new_file]])
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(
+            get_downloaded_file_signature_aliases=lambda _: [],
             save_downloaded_files=AsyncMock(),
-            get_downloaded_files=get_mock,
+            get_current_attempt_downloaded_files=get_mock,
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)

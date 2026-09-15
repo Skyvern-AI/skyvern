@@ -246,7 +246,8 @@ def _fake_storage_app(
         ),
         STORAGE=SimpleNamespace(
             save_downloaded_files=save,
-            get_downloaded_files=get,
+            get_current_attempt_downloaded_files=get,
+            get_downloaded_file_signature_aliases=lambda _: [],
             list_downloading_files_in_browser_session=in_flight or AsyncMock(return_value=[]),
         ),
         AGENT_FUNCTION=SimpleNamespace(

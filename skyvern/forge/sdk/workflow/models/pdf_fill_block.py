@@ -1043,7 +1043,9 @@ class PdfFillBlock(Block):
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=workflow_run_id)
+                return await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=workflow_run_id
+                )
         except Exception:
             return []
 
@@ -1214,6 +1216,7 @@ class PdfFillBlock(Block):
             downloaded_files = filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 current_context.loop_internal_state if current_context else None,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
             # The run-level download list can hold other blocks' files; narrow to this block's filled PDF so a
             # downstream block consuming `{{ this_output }}` resolves to the right file (extract_file_url reads [0]).

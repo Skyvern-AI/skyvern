@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import skyvern.forge.sdk.workflow.retry_policy as retry_policy_module
 import skyvern.services.workflow_schedule_service as schedule_service
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
 def _schedule(*, modified_at: datetime | None = None) -> WorkflowSchedule:
@@ -93,10 +95,21 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         browser_session_id=None,
+        status=WorkflowRunStatus.created,
     )
     prepare_workflow = AsyncMock(return_value=fake_workflow_run)
     initialize_state = AsyncMock()
-    execute_workflow = AsyncMock()
+    prepare_llm = AsyncMock()
+    execution_started = asyncio.Event()
+    execution_release = asyncio.Event()
+    execution_completed = asyncio.Event()
+
+    async def execute_workflow_with_retries(**_kwargs: object) -> None:
+        execution_started.set()
+        await execution_release.wait()
+        execution_completed.set()
+
+    execute_workflow = AsyncMock(side_effect=execute_workflow_with_retries)
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
             schedules=SimpleNamespace(
@@ -104,16 +117,22 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
                 has_schedule_fired_since=AsyncMock(return_value=False),
             ),
             organizations=SimpleNamespace(get_organization=AsyncMock(return_value=fake_org)),
+            workflow_runs=SimpleNamespace(queue_initial_dispatch=AsyncMock(return_value=True)),
         ),
-        WORKFLOW_SERVICE=SimpleNamespace(execute_workflow=execute_workflow),
+        WORKFLOW_SERVICE=SimpleNamespace(execute_workflow_with_retries=execute_workflow),
     )
     monkeypatch.setattr(schedule_service, "app", fake_app)
+    monkeypatch.setattr(retry_policy_module, "app", fake_app)
     monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args: previous_fire_time)
     monkeypatch.setattr(schedule_service, "prepare_workflow", prepare_workflow)
     monkeypatch.setattr(schedule_service, "initialize_skyvern_state_file", initialize_state)
+    monkeypatch.setattr(schedule_service, "prepare_org_llm_runtime", prepare_llm)
 
     scheduler = schedule_service.LocalWorkflowScheduleScheduler(poll_interval_seconds=1, max_concurrent_runs=1)
     tasks = await scheduler.dispatch_due_schedules()
+    await asyncio.wait_for(execution_started.wait(), timeout=1)
+    assert tasks[0].done() is False
+    execution_release.set()
     await asyncio.gather(*tasks)
 
     assert len(tasks) == 1
@@ -127,9 +146,15 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
         workflow_run_id=expected_workflow_run_id,
         organization_id="org_test",
     )
+    prepare_llm.assert_awaited_once_with(fake_app.DATABASE, "org_test", fake_org)
+    assert execution_completed.is_set()
     execute_workflow.assert_awaited_once_with(
         workflow_run_id=expected_workflow_run_id,
         api_key=None,
         organization=fake_org,
         browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
+        need_call_webhook=True,
+        claim_initial_attempt=True,
     )

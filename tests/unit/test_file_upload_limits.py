@@ -1,3 +1,5 @@
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -37,3 +39,19 @@ def test_cloud_storage_block_rejects_more_than_300_files(tmp_path: Path, max_fil
             download_files_path=str(tmp_path),
             max_file_count=max_file_count,
         )
+
+
+def test_stale_downloads_do_not_count_toward_upload_limit(tmp_path: Path) -> None:
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    stale = tmp_path / "stale.pdf"
+    fresh = tmp_path / "fresh.pdf"
+    stale.write_bytes(b"old")
+    fresh.write_bytes(b"new")
+    os.utime(stale, (started_at.timestamp() - 1,) * 2)
+    os.utime(fresh, (started_at.timestamp(),) * 2)
+
+    files = FileUploadBlock.model_construct()._get_files_to_upload_from_download_dir(
+        download_files_path=str(tmp_path), max_file_count=1, attempt_started_at=started_at
+    )
+
+    assert files == [str(fresh)]

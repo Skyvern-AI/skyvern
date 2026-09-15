@@ -37,13 +37,14 @@ from skyvern.schemas.runs import (
     BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE,
     ProxyLocationInput,
     ScriptRunResponse,
+    WorkflowRunAttempt,
     _browser_address_is_server_assigned,
     _browser_session_is_server_assigned,
     _validate_browser_address,
     browser_type_attach_conflict,
     normalize_browser_type,
 )
-from skyvern.schemas.workflows import WorkflowStatus
+from skyvern.schemas.workflows import WorkflowRetryPolicy, WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
@@ -167,6 +168,10 @@ class WorkflowDefinition(BaseModel):
     blocks: List[BlockTypeVar]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    retry_policy: WorkflowRetryPolicy | None = Field(
+        default=None,
+        description="Optional policy for retrying eligible terminal workflow runs",
+    )
     workflow_system_prompt: str | None = None
     completion_contract: dict[str, Any] | None = Field(
         default=None,
@@ -329,6 +334,19 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
+    attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
+    retry_pending: bool = Field(
+        default=False,
+        description="Whether another attempt is scheduled for this workflow run",
+    )
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next workflow run attempt is scheduled",
+    )
+    attempts: list[WorkflowRunAttempt] = Field(
+        default_factory=list,
+        description="Attempts recorded for this workflow run",
+    )
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     proxy_location: ProxyLocationInput = None
@@ -474,6 +492,19 @@ class WorkflowRunResponseBase(BaseModel):
         return self.workflow_run_id
 
     status: WorkflowRunStatus
+    attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
+    retry_pending: bool = Field(
+        default=False,
+        description="Whether another attempt is scheduled for this workflow run",
+    )
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next workflow run attempt is scheduled",
+    )
+    attempts: list[WorkflowRunAttempt] = Field(
+        default_factory=list,
+        description="Attempts recorded for this workflow run",
+    )
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
     retried_from_workflow_run_id: str | None = None

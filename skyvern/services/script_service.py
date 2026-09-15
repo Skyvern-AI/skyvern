@@ -52,6 +52,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
@@ -654,6 +655,7 @@ async def _create_workflow_block_run_and_task(
 
     workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
         workflow_run_id=workflow_run_id,
+        attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
         parent_workflow_run_block_id=context.parent_workflow_run_block_id,
         organization_id=organization_id,
         block_type=block_type,
@@ -704,6 +706,7 @@ async def _create_workflow_block_run_and_task(
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 model=model,
                 # always use the action history for validation in caching/script run
                 include_action_history_in_verification=True,
@@ -1000,7 +1003,7 @@ async def _update_workflow_block(
             downloaded_files: list[FileInfo] = []
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                    downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                         organization_id=context.organization_id,
                         run_id=context.workflow_run_id,
                     )
@@ -1009,6 +1012,7 @@ async def _update_workflow_block(
             downloaded_files = _filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 context.loop_internal_state,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
 
             task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -2502,6 +2506,17 @@ async def download(
             context.workflow_run_id or ""
         )
 
+        attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
+
+        def current_attempt_local_files(directory: Path) -> list[str]:
+            if not directory.exists():
+                return []
+            return [
+                file_path
+                for file_path in list_files_in_directory(directory)
+                if attempt_started_at is None or is_file_from_retry_attempt(file_path, attempt_started_at)
+            ]
+
         try:
             await _prepare_cached_block_inputs(cache_key, navigation_prompt)
 
@@ -2529,7 +2544,7 @@ async def download(
 
             # Track local files before download for renaming with download_suffix
             local_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            local_files_before = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+            local_files_before = current_attempt_local_files(local_download_dir)
             local_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in local_files_before:
                 try:
@@ -2550,6 +2565,7 @@ async def download(
                 download_dir=local_download_dir,
                 organization_id=org_id,
                 browser_session_id=context.browser_session_id,
+                attempt_started_at=attempt_started_at,
             )
 
             # Poll local filesystem for newly downloaded files.
@@ -2582,7 +2598,7 @@ async def download(
             while True:
                 _now = _loop.time()
                 _elapsed = _now - _poll_start
-                _local_files_now = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+                _local_files_now = current_attempt_local_files(local_download_dir)
                 _new_files = [file_path for file_path in _local_files_now if file_path not in local_files_before]
                 _changed_files = []
                 for file_path in _local_files_now:
@@ -2659,7 +2675,7 @@ async def download(
             # correctly-named file and subsequent blocks get the right URLs.
             # This matches the agent path ordering in agent.py.
             if download_suffix and local_download_dir.exists():
-                local_files_after = list_files_in_directory(local_download_dir)
+                local_files_after = current_attempt_local_files(local_download_dir)
                 files_to_rename = [file_path for file_path in newly_downloaded_files if file_path in local_files_after]
                 newly_downloaded_files = []
                 for file_path in files_to_rename:
@@ -2809,9 +2825,7 @@ async def download(
 
             LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
             fallback_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            fallback_files_before = (
-                list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-            )
+            fallback_files_before = current_attempt_local_files(fallback_download_dir)
             fallback_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in fallback_files_before:
                 try:
@@ -2832,9 +2846,7 @@ async def download(
                 error_code_mapping=error_code_mapping,
             )
             if file_download_block is not None and storage_type is not None:
-                fallback_files_after = (
-                    list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-                )
+                fallback_files_after = current_attempt_local_files(fallback_download_dir)
                 fallback_downloaded_files = []
                 for file_path in fallback_files_after:
                     signature_before = fallback_file_signatures_before.get(file_path)
@@ -4067,7 +4079,7 @@ async def loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )
@@ -4218,7 +4230,7 @@ async def while_loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )

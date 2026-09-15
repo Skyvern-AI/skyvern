@@ -8,6 +8,7 @@ caller's organization prefix by the storage layer before the object is removed.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,8 @@ from skyvern.forge.sdk.db.id import generate_uploaded_file_id
 from skyvern.forge.sdk.schemas.files import UploadedFile
 
 LOG = structlog.get_logger()
+
+DEFAULT_TERMINAL_SIDE_EFFECT_TIMEOUT_SECONDS = 30.0
 
 
 class InvalidRetentionPeriod(ValueError):
@@ -229,7 +232,27 @@ async def attach_files_to_run(*, file_ids: list[str], organization_id: str, run_
     return attached
 
 
-async def delete_files_attached_to_run(*, run_id: str) -> int:
+async def delete_files_attached_to_run(
+    *,
+    run_id: str,
+    timeout_seconds: float | None = None,
+) -> int:
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await _delete_files_attached_to_run(run_id=run_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timed out while deleting files attached to run",
+            run_id=run_id,
+            timeout_seconds=timeout_seconds,
+        )
+        return 0
+    except Exception:
+        LOG.exception("Failed to delete files attached to run", run_id=run_id)
+        return 0
+
+
+async def _delete_files_attached_to_run(*, run_id: str) -> int:
     """Delete every file attached to a run. Safe to call for runs that have no attachments.
 
     Never raises. This runs inside run teardown, where an exception would cost the run its

@@ -793,6 +793,23 @@ _context: ContextVar[SkyvernContext | None] = ContextVar(
     default=None,
 )
 
+_WORKFLOW_LOG_ATTEMPT: ContextVar[tuple[str, int] | None] = ContextVar("workflow_log_attempt", default=None)
+
+
+@contextmanager
+def workflow_log_attempt(workflow_run_id: str, attempt_number: int) -> Iterator[None]:
+    # Child flush tasks retain this identity even after the workflow context is replaced or removed.
+    token = _WORKFLOW_LOG_ATTEMPT.set((workflow_run_id, attempt_number))
+    try:
+        yield
+    finally:
+        _WORKFLOW_LOG_ATTEMPT.reset(token)
+
+
+def current_workflow_log_attempt(workflow_run_id: str) -> int | None:
+    origin = _WORKFLOW_LOG_ATTEMPT.get()
+    return origin[1] if origin is not None and origin[0] == workflow_run_id else None
+
 
 def current() -> SkyvernContext | None:
     """

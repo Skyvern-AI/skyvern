@@ -764,6 +764,25 @@ class BaseRunResponse(BaseModel):
     )
 
 
+class WorkflowRunAttempt(BaseModel):
+    attempt_number: int = Field(description="One-based number of this workflow run attempt")
+    status: RunStatus = Field(description="Status of this workflow run attempt")
+    failure_reason: str | None = Field(default=None, description="Reason for failure, if the attempt failed")
+    error_codes: list[str] = Field(default_factory=list, description="Error codes reported by this attempt")
+    started_at: datetime | None = Field(default=None, description="Timestamp when this attempt started")
+    finished_at: datetime | None = Field(default=None, description="Timestamp when this attempt finished")
+    retry_decision: str | None = Field(default=None, description="Retry decision recorded for this attempt")
+    decision_reason: str | None = Field(default=None, description="Reason recorded for the retry decision")
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next attempt is scheduled",
+    )
+    webhook_sent_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the webhook for this attempt was sent",
+    )
+
+
 class TaskRunResponse(BaseRunResponse):
     run_type: TaskRunTypeField = Field(
         description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
@@ -775,6 +794,19 @@ class TaskRunResponse(BaseRunResponse):
 
 class WorkflowRunResponse(BaseRunResponse):
     run_type: WorkflowRunTypeField = Field(description="Type of run - always workflow_run for workflow runs")
+    attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
+    retry_pending: bool = Field(
+        default=False,
+        description="Whether another attempt is scheduled for this workflow run",
+    )
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next workflow run attempt is scheduled",
+    )
+    attempts: list[WorkflowRunAttempt] = Field(
+        default_factory=list,
+        description="Attempts recorded for this workflow run",
+    )
     run_with: str = Field(
         default="agent",
         description="Whether the workflow run was executed with agent or code",

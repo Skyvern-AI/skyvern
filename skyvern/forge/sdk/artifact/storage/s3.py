@@ -34,8 +34,10 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
+    is_file_from_retry_attempt,
     key_is_org_scoped,
     presign_with_sensitive_cap,
+    resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.bounded_file import BoundedFileReader
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
@@ -808,6 +810,8 @@ class S3Storage(BaseStorage):
         self,
         organization_id: str,
         run_id: str | None,
+        *,
+        attempt_number: int | None = None,
     ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_UPLOADS)
         base_uri = (
@@ -819,6 +823,7 @@ class S3Storage(BaseStorage):
             run_id=run_id,
             base_uri=base_uri,
             storage_class=sc,
+            attempt_number=attempt_number,
         )
 
     async def _save_downloaded_files_from_local(
@@ -827,12 +832,19 @@ class S3Storage(BaseStorage):
         run_id: str | None,
         base_uri: str,
         storage_class: S3StorageClass,
+        attempt_number: int | None = None,
     ) -> None:
         """Save files from local download directory to S3."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         if not files:
             return
+        retry_workflow_run_id, attempt_number, retry_attempt_started_at = await resolve_download_attempt_fail_open(
+            organization_id, run_id, attempt_number=attempt_number
+        )
+        retry_attempt = run_id is not None and attempt_number > 1
+        if retry_attempt:
+            base_uri = f"{base_uri}/attempts/{attempt_number}"
         already_saved = (
             download_checksums_by_uri(
                 (await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id))[0]
@@ -849,6 +861,8 @@ class S3Storage(BaseStorage):
             file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
+                continue
+            if retry_attempt and not is_file_from_retry_attempt(fpath, retry_attempt_started_at):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
@@ -898,6 +912,7 @@ class S3Storage(BaseStorage):
                         run_id=run_id,
                         uri=uri,
                         filename=file,
+                        workflow_run_id=retry_workflow_run_id if retry_attempt else None,
                         checksum=checksum,
                         file_size=file_size,
                     )
@@ -935,15 +950,16 @@ class S3Storage(BaseStorage):
         # or the lookup failed), so an unqueried read is never reported as a read that found nothing.
         download_row_count: int | None = None
         rows_lookup_failed = False
+        download_artifacts: list[Artifact] | None = None
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
-            artifacts, rows_lookup_failed = await self._list_download_artifacts_safe(
+            download_artifacts, rows_lookup_failed = await self._list_download_artifacts_safe(
                 organization_id=organization_id, run_id=run_id
             )
             if not rows_lookup_failed:
-                download_row_count = len(artifacts)
-            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
-            if artifacts:
-                file_infos = await _file_infos_from_download_artifacts(artifacts)
+                download_row_count = len(download_artifacts)
+            download_artifacts = dedupe_run_scoped_download_artifacts(download_artifacts)
+            if download_artifacts:
+                file_infos = await _file_infos_from_download_artifacts(download_artifacts)
                 if not file_infos:
                     self._log_empty_downloads_read(
                         organization_id=organization_id,
@@ -971,7 +987,11 @@ class S3Storage(BaseStorage):
 
         # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
         # OSS-default deployments without HMAC signing both arrive here.
-        file_infos = await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+        file_infos = await self._get_downloaded_files_via_s3_listing(
+            organization_id=organization_id,
+            run_id=run_id,
+            download_artifacts=download_artifacts,
+        )
         if not file_infos:
             self._log_empty_downloads_read(
                 organization_id=organization_id,
@@ -1061,7 +1081,19 @@ class S3Storage(BaseStorage):
             return [], True
         return artifacts, False
 
-    async def _get_downloaded_files_via_s3_listing(self, *, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def _get_downloaded_files_via_s3_listing(
+        self,
+        *,
+        organization_id: str,
+        run_id: str | None,
+        download_artifacts: list[Artifact] | None = None,
+    ) -> list[FileInfo]:
+        if download_artifacts is None and run_id is not None:
+            download_artifacts, _ = await self._list_download_artifacts_safe(
+                organization_id=organization_id,
+                run_id=run_id,
+            )
+        artifacts_by_uri = {artifact.uri: artifact for artifact in download_artifacts or []}
         bucket = settings.AWS_S3_BUCKET_UPLOADS
         uri = f"s3://{bucket}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
@@ -1074,15 +1106,18 @@ class S3Storage(BaseStorage):
 
             metadata = {}
             content_length: int | None = None
+            blob_modified_at = None
             try:
                 object_info = await self.async_client.get_object_info(object_uri)
                 metadata = object_info.get("Metadata", {})
                 content_length = object_info.get("ContentLength")
+                blob_modified_at = object_info.get("LastModified")
             except Exception:
                 LOG.warning("Object info retrieval failed", uri=object_uri, exc_info=True)
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
             display_name = metadata.get("original_filename", filename) if metadata else filename
+            artifact = artifacts_by_uri.get(object_uri)
 
             presigned_urls = await self.async_client.create_presigned_urls([object_uri])
             if not presigned_urls:
@@ -1094,6 +1129,8 @@ class S3Storage(BaseStorage):
                     checksum=checksum,
                     filename=display_name,
                     file_size=content_length,
+                    modified_at=artifact.modified_at if artifact is not None else blob_modified_at,
+                    artifact_id=artifact.artifact_id if artifact is not None else None,
                 )
             )
         return file_infos

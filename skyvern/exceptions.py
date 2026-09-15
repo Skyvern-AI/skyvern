@@ -640,6 +640,19 @@ class UnrecognizedWorkflowParameters(SkyvernHTTPException):
         super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
 
 
+class WorkflowRetryAttemptLookupError(Exception):
+    pass
+
+
+class WorkflowAttemptDispatchSuperseded(Exception):
+    """The dispatch sweep released this dispatch's stale claim and started the attempt elsewhere."""
+
+    def __init__(self, workflow_run_id: str, attempt_number: int) -> None:
+        super().__init__(f"Workflow run {workflow_run_id} attempt {attempt_number} is owned by a newer dispatch")
+        self.workflow_run_id = workflow_run_id
+        self.attempt_number = attempt_number
+
+
 class WorkflowRunParameterPersistenceError(SkyvernException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(

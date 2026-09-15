@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 TEMPLATE_ORG_ID = "o_template"
 CALLER_ORG_ID = "o_caller"
@@ -94,6 +95,7 @@ async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.Mon
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
                 get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
+            workflow_run_attempts=make_workflow_run_attempts_fake(),
         ),
     )
 

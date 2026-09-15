@@ -117,42 +117,60 @@ class WorkflowRunCredentialSelectionsRepository(BaseRepository):
         credential_ids: list[str],
     ) -> str:
         async with self.Session() as session:
-            lock_key = f"wrcs:{organization_id}:{workflow_permanent_id}:{parameter_key}"
-            # The lock, idempotency check, LRU read, and insert must stay in this transaction.
-            await self._take_rotation_advisory_lock(session, lock_key)
-
-            existing = await self._get_selection(
-                session,
-                workflow_run_id=workflow_run_id,
-                parameter_key=parameter_key,
-            )
-            if existing:
-                return existing
-
-            latest_selections = await self._get_latest_selections(
+            credential_id = await self._create_round_robin_selection(
                 session,
                 organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
                 parameter_key=parameter_key,
                 credential_ids=credential_ids,
             )
-            unseen = next((candidate for candidate in credential_ids if candidate not in latest_selections), None)
-            credential_id = (
-                unseen
-                if unseen is not None
-                else min(credential_ids, key=lambda candidate: latest_selections[candidate])
-            )
-
-            selection = WorkflowRunCredentialSelectionModel(
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                parameter_key=parameter_key,
-                credential_id=credential_id,
-            )
-            session.add(selection)
             await session.commit()
             return credential_id
+
+    async def _create_round_robin_selection(
+        self,
+        session: AsyncSession,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        parameter_key: str,
+        credential_ids: list[str],
+    ) -> str:
+        lock_key = f"wrcs:{organization_id}:{workflow_permanent_id}:{parameter_key}"
+        # The lock, idempotency check, LRU read, and insert must stay in this transaction.
+        await self._take_rotation_advisory_lock(session, lock_key)
+
+        existing = await self._get_selection(
+            session,
+            workflow_run_id=workflow_run_id,
+            parameter_key=parameter_key,
+        )
+        if existing:
+            return existing
+
+        latest_selections = await self._get_latest_selections(
+            session,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            parameter_key=parameter_key,
+            credential_ids=credential_ids,
+        )
+        unseen = next((candidate for candidate in credential_ids if candidate not in latest_selections), None)
+        credential_id = (
+            unseen if unseen is not None else min(credential_ids, key=lambda candidate: latest_selections[candidate])
+        )
+
+        selection = WorkflowRunCredentialSelectionModel(
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            parameter_key=parameter_key,
+            credential_id=credential_id,
+        )
+        session.add(selection)
+        return credential_id
 
     @db_operation("create_workflow_run_credential_selection", log_errors=False)
     async def create_selection(

@@ -1426,7 +1426,7 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
     xhr_capture.drain = AsyncMock(return_value=False)
     list_calls = 0
 
-    def list_files(_path: Path | str) -> list[str]:
+    def list_files(_path: Path | str, *, attempt_started_at: datetime | None = None) -> list[str]:
         nonlocal list_calls, page_closed
         list_calls += 1
         if list_calls == 2:
@@ -1570,7 +1570,9 @@ async def test_handle_action_stops_batch_after_restoring_blank_page_when_downloa
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch(
                 "skyvern.webeye.actions.handler.list_files_in_directory",
-                side_effect=lambda _path: [str(downloaded_file)] if downloaded_file.exists() else [],
+                side_effect=lambda _path, *, attempt_started_at=None: (
+                    [str(downloaded_file)] if downloaded_file.exists() else []
+                ),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -1638,7 +1640,9 @@ async def test_handle_action_does_not_close_recovered_page_when_download_finishe
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch(
                 "skyvern.webeye.actions.handler.list_files_in_directory",
-                side_effect=lambda _path: [str(downloaded_file)] if downloaded_file.exists() else [],
+                side_effect=lambda _path, *, attempt_started_at=None: (
+                    [str(downloaded_file)] if downloaded_file.exists() else []
+                ),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -3125,7 +3129,7 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
     clock = _FakeMonotonic()
     clock.advance_after_next_read(0.01)
 
-    def list_files(_download_dir: object) -> list[str]:
+    def list_files(_download_dir: object, *, attempt_started_at: datetime | None = None) -> list[str]:
         nonlocal list_calls
         list_calls += 1
         if list_calls == 2:
@@ -5136,7 +5140,7 @@ async def test_handle_action_hard_deadline_drain_uses_zero_remaining_budget_and_
         (staging_dir / "completed.pdf").write_bytes(b"%PDF-1.4 completed")
         list_calls = 0
 
-        def list_files(path: Path | str) -> list[str]:
+        def list_files(path: Path | str, *, attempt_started_at: datetime | None = None) -> list[str]:
             nonlocal list_calls
             list_calls += 1
             if list_calls == 2:
@@ -5200,7 +5204,7 @@ async def test_handle_action_xhr_body_finishing_within_remaining_deadline_is_col
         staging_dir.mkdir()
         list_calls = 0
 
-        def list_files(path: Path | str) -> list[str]:
+        def list_files(path: Path | str, *, attempt_started_at: datetime | None = None) -> list[str]:
             nonlocal list_calls
             list_calls += 1
             if list_calls == 2:

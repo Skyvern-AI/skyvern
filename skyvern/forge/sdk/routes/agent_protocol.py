@@ -4,7 +4,7 @@ import random
 import time
 import unicodedata
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -60,6 +60,7 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     verify_artifact_signature,
 )
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
@@ -150,6 +151,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunWithWorkflowResponse,
 )
+from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.service import capped_task_v1_response, capped_task_v2
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
@@ -3103,15 +3105,6 @@ def _build_attachment_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
 
 
-def _artifact_filename_from_uri(uri: str | None) -> str:
-    """Extract the basename from an ``s3://``/``azure://`` URI without using
-    ``urlparse`` — that would split on ``?``/``#`` characters, which are legal
-    in S3 keys."""
-    if not uri:
-        return ""
-    return uri.rsplit("/", 1)[-1]
-
-
 def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     """Return (media_type, Content-Disposition) for the artifact content response.
 
@@ -3119,7 +3112,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     so browsers never render user-supplied content inline (SKY-8862). All other
     types keep the historical ``inline`` behaviour.
     """
-    raw_name = _artifact_filename_from_uri(artifact.uri)
+    raw_name = artifact_filename_from_uri(artifact.uri)
     if artifact.artifact_type in {ArtifactType.RECORDING, ArtifactType.SESSION_REPLAY}:
         _, dot, extension = raw_name.lower().rpartition(".")
         media_type = _VIDEO_CONTENT_TYPES_BY_EXTENSION.get(
@@ -3825,24 +3818,11 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             expected_runnable_id=workflow_run.workflow_run_id,
         )
 
-    # get all the child workflow runs and cancel them
-    child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
-        parent_workflow_run_id=workflow_run_id,
+    await run_service.cancel_workflow_run(
+        workflow_run_id,
         organization_id=organization_id,
+        api_key=x_api_key,
     )
-
-    for child_workflow_run in child_workflow_runs:
-        if child_workflow_run.status not in [
-            WorkflowRunStatus.running,
-            WorkflowRunStatus.created,
-            WorkflowRunStatus.queued,
-            WorkflowRunStatus.paused,
-        ]:
-            continue
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
 
 
 async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
@@ -4248,6 +4228,7 @@ async def get_runs(
     runs = await app.DATABASE.workflow_runs.get_all_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
+    await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
@@ -4411,7 +4392,28 @@ async def get_runs_v2(
         failure_category=failure_category,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
-    return ORJSONResponse([item.model_dump(mode="json") for item in items])
+    workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
+    latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
+    response_items = []
+    for row, item in zip(rows, items, strict=True):
+        response_item = item.model_dump(mode="json")
+        response_item.update({"attempt": 1, "retry_pending": False, "next_attempt_at": None})
+        latest_attempt = latest_attempts.get(row["run_id"])
+        if latest_attempt is not None:
+            retry_pending = is_retry_pending(
+                RunStatus(row["status"]),
+                row["workflow_run_finished_at"],
+                latest_attempt,
+            )
+            response_item.update(
+                {
+                    "attempt": latest_attempt.attempt_number,
+                    "retry_pending": retry_pending,
+                    "next_attempt_at": latest_attempt.next_attempt_at if retry_pending else None,
+                }
+            )
+        response_items.append(response_item)
+    return ORJSONResponse(response_items)
 
 
 @legacy_base_router.get(
@@ -5930,7 +5932,7 @@ async def _flatten_workflow_run_timeline_recursive(
     TaskV2 blocks are replaced with their internal workflow run blocks.
     Other blocks (like ForLoop) are kept with their children recursively processed.
     """
-    result = []
+    result: list[WorkflowRunTimeline] = []
 
     # Check if this is a TaskV2 block that needs to be flattened
     if timeline.block and timeline.block.block_type == BlockType.TaskV2:
@@ -5941,7 +5943,16 @@ async def _flatten_workflow_run_timeline_recursive(
                 workflow_run_id=timeline.block.block_workflow_run_id,
                 cap_output_values=cap_output_values,
             )
-            result.extend(nested_timeline)
+
+            def inherit_attempt(item: WorkflowRunTimeline) -> WorkflowRunTimeline:
+                return item.model_copy(
+                    update={
+                        "attempt": timeline.attempt,
+                        "children": [inherit_attempt(child) for child in item.children],
+                    }
+                )
+
+            result.extend(inherit_attempt(item) for item in nested_timeline)
         else:
             LOG.warning(
                 "Block workflow run id is not set for task_v2 block",
@@ -5964,6 +5975,7 @@ async def _flatten_workflow_run_timeline_recursive(
         # Create a new timeline with processed children
         processed_timeline = WorkflowRunTimeline(
             type=timeline.type,
+            attempt=timeline.attempt,
             block=timeline.block,
             thought=timeline.thought,
             children=new_children,
@@ -6007,12 +6019,54 @@ async def _flatten_workflow_run_timeline(
         )
         final_workflow_run_block_timeline.extend(flattened)
 
+    def as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
     if task_v2_obj and task_v2_obj.observer_cruise_id:
         thought_timeline = await task_v2_service.get_thought_timelines(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
             cap_output_values=cap_output_values,
         )
+        attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+        block_attempts: dict[str, int] = {}
+
+        def collect_block_attempts(items: list[WorkflowRunTimeline]) -> None:
+            for item in items:
+                if item.block is not None:
+                    block_attempts[item.block.workflow_run_block_id] = item.attempt
+                collect_block_attempts(item.children)
+
+        collect_block_attempts(final_workflow_run_block_timeline)
+        started_attempts = sorted(
+            (row for row in attempt_rows if row.started_at is not None),
+            key=lambda row: as_utc(row.started_at) if row.started_at is not None else datetime.min.replace(tzinfo=UTC),
+        )
+
+        def thought_attempt(thought: Any) -> int:
+            if thought.workflow_run_block_id in block_attempts:
+                return block_attempts[thought.workflow_run_block_id]
+            thought_time = as_utc(thought.created_at)
+            for index, attempt_row in enumerate(started_attempts):
+                started_at = attempt_row.started_at
+                if started_at is None:
+                    continue
+                started_at = as_utc(started_at)
+                next_started_at = started_attempts[index + 1].started_at if index + 1 < len(started_attempts) else None
+                if next_started_at is not None:
+                    next_started_at = as_utc(next_started_at)
+                if thought_time >= started_at and (next_started_at is None or thought_time < next_started_at):
+                    return attempt_row.attempt_number
+            return 1
+
+        thought_timeline = [
+            timeline.model_copy(update={"attempt": thought_attempt(timeline.thought)})
+            if timeline.thought is not None
+            else timeline
+            for timeline in thought_timeline
+        ]
         final_workflow_run_block_timeline.extend(thought_timeline)
-    final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
+    final_workflow_run_block_timeline.sort(key=lambda x: as_utc(x.created_at), reverse=True)
     return final_workflow_run_block_timeline

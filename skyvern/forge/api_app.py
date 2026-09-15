@@ -3,6 +3,7 @@
 # The server-extra guard must run before FastAPI/Starlette imports.
 # ruff: noqa: E402
 
+import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -41,8 +42,10 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_config
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
@@ -255,16 +258,35 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
-def _upgrade_sqlite_organization_slug(connection: Connection) -> None:
-    """Add the organization slug column and index to an existing local SQLite database."""
+# Columns that migrations added to tables an older local SQLite database already has. create_all only
+# creates missing tables, so an upgraded install needs each of these added here.
+_SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("organizations", "slug", "VARCHAR"),
+    ("tasks", "attempt_number", "INTEGER"),
+    ("workflow_run_blocks", "attempt_number", "INTEGER"),
+)
+
+
+def upgrade_sqlite_schema(connection: Connection) -> None:
+    """Add the columns and indexes that create_all leaves out of an existing local SQLite database."""
     inspector = inspect(connection)
-    if "organizations" not in inspector.get_table_names():
-        return
-    if "slug" not in {column["name"] for column in inspector.get_columns("organizations")}:
-        connection.execute(text("ALTER TABLE organizations ADD COLUMN slug VARCHAR"))
-    connection.execute(
-        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL")
-    )
+    tables = set(inspector.get_table_names())
+    for table, column, column_type in _SQLITE_ADDED_COLUMNS:
+        if table in tables and column not in {existing["name"] for existing in inspector.get_columns(table)}:
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
+    if "organizations" in tables:
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL"
+            )
+        )
+
+
+async def ensure_sqlite_schema(db: AgentDB) -> None:
+    """Create missing tables and add missing columns to a local SQLite database."""
+    async with db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(upgrade_sqlite_schema)
 
 
 async def _bootstrap_sqlite() -> None:
@@ -277,9 +299,7 @@ async def _bootstrap_sqlite() -> None:
     _ensure_sqlite_dir(settings.DATABASE_STRING)
 
     db = forge_app.DATABASE
-    async with db.engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_upgrade_sqlite_organization_slug)
+    await ensure_sqlite_schema(db)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.
@@ -313,6 +333,14 @@ async def _bootstrap_sqlite() -> None:
         api_key_fingerprint=fingerprint_token(api_key),
         env_file_written=backend_env,
     )
+
+
+async def _recover_pending_retries() -> None:
+    try:
+        await AsyncExecutorFactory.get_executor().recover_pending_retries()
+        LOG.info("Pending workflow retry recovery completed")
+    except Exception:
+        LOG.exception("Failed to recover pending workflow retries")
 
 
 @asynccontextmanager
@@ -376,13 +404,20 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # lifespan here. This initializes the streamable-http session manager's
     # task group which is required for handling MCP requests.
     mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
-    if mcp_app:
-        async with mcp_app.lifespan(mcp_app):
-            LOG.info("MCP remote server lifespan started")
+    retry_recovery_task = asyncio.create_task(_recover_pending_retries(), name="workflow-retry-recovery")
+    try:
+        if mcp_app:
+            async with mcp_app.lifespan(mcp_app):
+                LOG.info("MCP remote server lifespan started")
+                yield
+            LOG.info("MCP remote server lifespan stopped")
+        else:
             yield
-        LOG.info("MCP remote server lifespan stopped")
-    else:
-        yield
+    finally:
+        retry_recovery_task.cancel()
+        await asyncio.gather(retry_recovery_task, return_exceptions=True)
+        # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
+        await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 
     # Stop cleanup scheduler
     await stop_workflow_schedule_scheduler()

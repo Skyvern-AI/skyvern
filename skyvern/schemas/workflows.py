@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
-from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_serializer, field_validator, model_validator
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
@@ -1589,12 +1589,67 @@ def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASS
     return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
 
 
+class WorkflowRetryRule(BaseModel):
+    status: Literal["completed", "failed", "terminated", "canceled", "timed_out"] = Field(
+        description=(
+            "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, "
+            "but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+        )
+    )
+    error_codes: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        default=None,
+        description="Optional error codes. The rule matches when any listed code is present.",
+    )
+
+    @field_validator("error_codes")
+    @classmethod
+    def deduplicate_error_codes(cls, error_codes: list[str] | None) -> list[str] | None:
+        if error_codes is None:
+            return None
+        return list(dict.fromkeys(error_codes))
+
+
+class WorkflowRetryPolicy(BaseModel):
+    max_retries: StrictInt = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of retries after the initial attempt",
+    )
+    delay_seconds: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        description="Fixed delay before the next attempt, in seconds",
+    )
+    webhook_on_retry: Literal["final_only", "every_attempt"] = Field(
+        default="final_only",
+        description="Whether to send a webhook for every attempt or only the final attempt",
+    )
+    retry_on: list[WorkflowRetryRule] = Field(
+        min_length=1,
+        description="Terminal status rules that enable retries",
+    )
+
+    @field_validator("retry_on")
+    @classmethod
+    def validate_unique_statuses(cls, retry_on: list[WorkflowRetryRule]) -> list[WorkflowRetryRule]:
+        statuses = [rule.status for rule in retry_on]
+        if len(statuses) != len(set(statuses)):
+            raise ValueError("retry_on must contain each status at most once")
+        return retry_on
+
+
 class WorkflowDefinitionYAML(BaseModel):
     version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    retry_policy: WorkflowRetryPolicy | None = Field(
+        default=None,
+        description="Optional policy for retrying eligible terminal workflow runs",
+    )
     workflow_system_prompt: str | None = None
     completion_contract: dict[str, Any] | None = Field(
         default=None,

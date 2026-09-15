@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,20 +15,35 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.forge import app
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.models import (
+    ArtifactModel,
     Base,
+    CredentialModel,
+    OrganizationModel,
     PersistentBrowserSessionModel,
+    TaskModel,
     TaskRunModel,
     WorkflowModel,
+    WorkflowRunAttemptModel,
+    WorkflowRunBlockModel,
+    WorkflowRunCredentialSelectionModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
+from skyvern.schemas.workflows import WorkflowRetryPolicy
 
 
 def _make_workflow_parameter(
@@ -145,6 +161,423 @@ def _credential_run(
         sequential_credential_id=credential_id,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "clear_browser_address, replacement_browser_address, expected_browser_address",
+    [
+        (False, None, "caller-cdp.example.test"),
+        (False, "healthy-cdp.example.test", "healthy-cdp.example.test"),
+        (True, None, None),
+    ],
+)
+async def test_prepare_next_attempt_clears_only_server_assigned_browser_address(
+    sqlite_db: AgentDB,
+    clear_browser_address: bool,
+    replacement_browser_address: str | None,
+    expected_browser_address: str | None,
+) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    workflow_run_id = "wr_prepare_address"
+    workflow_run = _workflow_run_model(
+        workflow_run_id=workflow_run_id,
+        queued_at=now,
+        status=WorkflowRunStatus.failed.value,
+    )
+    workflow_run.browser_address = "caller-cdp.example.test"
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id=workflow_run.workflow_run_id,
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([workflow_run, attempt])
+        await session.commit()
+
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+        clear_browser_address=clear_browser_address,
+        replacement_browser_address=replacement_browser_address,
+    )
+
+    assert preparation.status == "inserted"
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, workflow_run_id)
+        assert reopened is not None
+        assert reopened.browser_address == expected_browser_address
+        assert reopened.status == WorkflowRunStatus.queued.value
+
+
+@pytest.mark.asyncio
+async def test_prepare_next_attempt_reopens_the_task_run_mirror(sqlite_db: AgentDB) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    workflow_run_id = "wr_prepare_task_run"
+    workflow_run = _workflow_run_model(
+        workflow_run_id=workflow_run_id,
+        queued_at=now,
+        status=WorkflowRunStatus.failed.value,
+    )
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id=workflow_run_id,
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now,
+    )
+    task_run = _task_run_model(
+        run_id=workflow_run_id,
+        created_at=now,
+        workflow_permanent_id="wpid_test",
+        status=WorkflowRunStatus.failed.value,
+    )
+    task_run.started_at = now.replace(tzinfo=None)
+    task_run.finished_at = (now + timedelta(minutes=5)).replace(tzinfo=None)
+    async with sqlite_db.Session() as session:
+        session.add_all([workflow_run, attempt, task_run])
+        await session.commit()
+
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+
+    assert preparation.status == "inserted"
+    async with sqlite_db.Session() as session:
+        mirrored = await session.get(TaskRunModel, f"tr_{workflow_run_id}")
+        assert mirrored is not None
+        assert (mirrored.status, mirrored.started_at, mirrored.finished_at) == (
+            WorkflowRunStatus.queued.value,
+            None,
+            None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["round_robin", "random"])
+@pytest.mark.parametrize(
+    "seed_source, pool_size, sequential, retained_session, retained_address, replacement_address, resets_seed",
+    [
+        (BrowserSeedSource.credential, 2, False, None, None, None, True),
+        (BrowserSeedSource.own_memory, 2, False, None, None, None, True),
+        (BrowserSeedSource.credential, 1, False, None, None, None, False),
+        (BrowserSeedSource.own_memory, 1, False, None, None, None, False),
+        (BrowserSeedSource.credential, 2, True, None, None, None, False),
+        (BrowserSeedSource.override, 2, False, None, None, None, False),
+        (BrowserSeedSource.picked, 2, False, None, None, None, False),
+        (BrowserSeedSource.fresh, 2, False, None, None, None, False),
+        (BrowserSeedSource.credential, 2, False, "explicit", None, None, False),
+        (BrowserSeedSource.own_memory, 2, False, "explicit", None, None, False),
+        (BrowserSeedSource.credential, 2, False, "forced", None, None, False),
+        (BrowserSeedSource.own_memory, 2, False, "forced", None, None, False),
+        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", None, False),
+        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", None, False),
+        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
+        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
+    ],
+)
+async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
+    sqlite_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: str,
+    seed_source: BrowserSeedSource,
+    pool_size: int,
+    sequential: bool,
+    retained_session: str | None,
+    retained_address: str | None,
+    replacement_address: str | None,
+    resets_seed: bool,
+) -> None:
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    now = datetime.now(UTC)
+    retained_session_id = "pbs_retained" if retained_session else None
+    run = _workflow_run_model(
+        workflow_run_id="wr_seed",
+        queued_at=now,
+        status="failed",
+        browser_session_id=None if retained_address else retained_session_id or "pbs_unpinned",
+    )
+    run.browser_address = retained_address
+    run.browser_profile_id = "bp_a"
+    run.browser_seed_source = seed_source
+    run.browser_sink_profile_id = "bp_sink_a"
+    credential_ids = ["cred_a", "cred_b"][:pool_size]
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                run,
+                WorkflowModel(
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_test",
+                    organization_id="org_test",
+                    title="Workflow",
+                    workflow_definition={
+                        "blocks": [],
+                        "parameters": [
+                            {
+                                "parameter_type": "credential",
+                                "key": "login",
+                                "credential_parameter_id": "cp_login",
+                                "workflow_id": "wf_test",
+                                "created_at": now.isoformat(),
+                                "modified_at": now.isoformat(),
+                                "credential_id": "cred_a",
+                                "credential_ids": credential_ids,
+                                "selection_strategy": strategy,
+                            }
+                        ],
+                    },
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_seed",
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="retry",
+                    pinned_browser_session_id=retained_session_id if retained_session == "explicit" else None,
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    workflow_run_id="wr_seed",
+                    organization_id="org_test",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="login",
+                    credential_id="cred_a",
+                ),
+                *[
+                    CredentialModel(
+                        credential_id=credential_id,
+                        organization_id="org_test",
+                        name=credential_id,
+                        credential_type="password",
+                        run_sequentially=sequential,
+                    )
+                    for credential_id in credential_ids
+                ],
+            ]
+        )
+        await session.commit()
+
+    if retained_session == "forced":
+        await sqlite_db.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
+            workflow_run_id="wr_seed",
+            organization_id="org_test",
+            browser_session_id="pbs_retained",
+        )
+    attempts = await sqlite_db.workflow_run_attempts.get_attempts("wr_seed")
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id="wr_seed",
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=attempts[0].pinned_browser_session_id,
+        clear_browser_address=False,
+        replacement_browser_address=replacement_address,
+    )
+
+    assert preparation.status == "inserted"
+    assert preparation.pinned_browser_session_id == retained_session_id
+    reopened = await sqlite_db.workflow_runs.get_workflow_run("wr_seed", "org_test")
+    assert reopened is not None
+    assert reopened.browser_session_id == retained_session_id
+    assert reopened.browser_address == (replacement_address or retained_address)
+    # A retry that moved to another host has no cookies to keep paired, so it rotates like an unpinned retry.
+    rotates = (
+        pool_size == 2 and not sequential and not retained_session and (not retained_address or replacement_address)
+    )
+    selected = await sqlite_db.workflow_run_credential_selections.get_selection("wr_seed", "login")
+    assert selected == ("cred_b" if rotates else "cred_a")
+    actual_seed = (reopened.browser_profile_id, reopened.browser_seed_source, reopened.browser_sink_profile_id)
+    assert actual_seed == ((None, None, None) if resets_seed else ("bp_a", seed_source, "bp_sink_a"))
+
+
+@pytest.mark.asyncio
+async def test_list_stale_pending_retries_leaves_fresh_and_prepared_attempts_untouched(
+    sqlite_db: AgentDB,
+) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    stale = WorkflowRunAttemptModel(
+        workflow_run_id="wr_stale_retry",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now - timedelta(seconds=601),
+    )
+    fresh = WorkflowRunAttemptModel(
+        workflow_run_id="wr_fresh_retry",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now - timedelta(seconds=599),
+    )
+    prepared = WorkflowRunAttemptModel(
+        workflow_run_id="wr_prepared_retry",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now - timedelta(seconds=601),
+        next_attempt_prepared_at=now - timedelta(seconds=600),
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([stale, fresh, prepared])
+        await session.commit()
+
+    attempts = await sqlite_db.workflow_run_attempts.list_stale_pending_retries(
+        now - timedelta(seconds=600),
+    )
+
+    assert [attempt.workflow_run_id for attempt in attempts] == ["wr_stale_retry"]
+
+
+@pytest.mark.asyncio
+async def test_abandonment_skips_a_pending_retry_with_a_young_side_effects_lease(
+    sqlite_db: AgentDB,
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    young_claim = now - timedelta(seconds=LEASE_TAKEOVER_SECONDS - 1)
+    old_claim = now - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1)
+    young = WorkflowRunAttemptModel(
+        workflow_run_id="wr_young_lease",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1),
+        side_effects_released_at=young_claim,
+    )
+    old = WorkflowRunAttemptModel(
+        workflow_run_id="wr_old_lease",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1),
+        side_effects_released_at=old_claim,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([young, old])
+        await session.commit()
+
+    skipped = await sqlite_db.workflow_run_attempts.revoke_or_abandon_attempt(
+        workflow_run_id="wr_young_lease",
+        attempt_number=1,
+        decision="abandoned",
+        reason="stale_retry",
+        lease_takeover_seconds=LEASE_TAKEOVER_SECONDS,
+    )
+    abandoned = await sqlite_db.workflow_run_attempts.revoke_or_abandon_attempt(
+        workflow_run_id="wr_old_lease",
+        attempt_number=1,
+        decision="abandoned",
+        reason="stale_retry",
+        lease_takeover_seconds=LEASE_TAKEOVER_SECONDS,
+    )
+
+    assert skipped is None
+    assert abandoned is not None
+    assert abandoned.retry_decision == "abandoned"
+    assert abandoned.side_effects_released_at is None
+    async with sqlite_db.Session() as session:
+        unchanged = await session.get(WorkflowRunAttemptModel, ("wr_young_lease", 1))
+        assert unchanged is not None
+        assert unchanged.retry_decision == "retry"
+        assert unchanged.side_effects_released_at == young_claim
+
+
+@pytest.mark.asyncio
+async def test_side_effect_claim_after_abandonment_requires_the_expected_retry_decision(
+    sqlite_db: AgentDB,
+) -> None:
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id="wr_claim_after_abandonment",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+    )
+    async with sqlite_db.Session() as session:
+        session.add(attempt)
+        await session.commit()
+
+    abandoned = await sqlite_db.workflow_run_attempts.revoke_or_abandon_attempt(
+        workflow_run_id="wr_claim_after_abandonment",
+        attempt_number=1,
+        decision="abandoned",
+        reason="stale_retry",
+        lease_takeover_seconds=LEASE_TAKEOVER_SECONDS,
+    )
+    claim = await sqlite_db.workflow_run_attempts.claim_attempt_side_effects(
+        workflow_run_id="wr_claim_after_abandonment",
+        attempt_number=1,
+        kind="interim",
+        expected_retry_decision="retry",
+    )
+
+    assert abandoned is not None
+    assert claim is None
+
+
+@pytest.mark.asyncio
+async def test_reopened_retry_is_ordered_after_delay_admitted_lane_occupant(sqlite_db: AgentDB) -> None:
+    now = datetime.now(UTC)
+    occupant_queued_at = now + timedelta(hours=1)
+    retry_run = _workflow_run_model(
+        workflow_run_id="wr_retry_lane",
+        queued_at=now - timedelta(hours=2),
+        browser_session_id="pbs_shared",
+        status=WorkflowRunStatus.failed.value,
+    )
+    delay_occupant = _workflow_run_model(
+        workflow_run_id="wr_delay_occupant",
+        queued_at=occupant_queued_at,
+        browser_session_id="pbs_shared",
+    )
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id="wr_retry_lane",
+        attempt_number=1,
+        organization_id="org_test",
+        status=WorkflowRunStatus.failed.value,
+        retry_decision="retry",
+        next_attempt_at=now,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([retry_run, delay_occupant, attempt])
+        await session.commit()
+
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id="wr_retry_lane",
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id="pbs_shared",
+        clear_browser_address=False,
+    )
+
+    assert preparation.status == "inserted"
+    assert preparation.serialized_identity is True
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, "wr_retry_lane")
+        assert reopened is not None
+        assert reopened.queued_at is not None
+        assert reopened.queued_at > occupant_queued_at.replace(tzinfo=None)
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_retry_lane")
+    assert blocker is not None
+    assert blocker.workflow_run_id == "wr_delay_occupant"
 
 
 @pytest.mark.asyncio
@@ -1133,7 +1566,9 @@ async def test_get_workflow_runs_for_workflow_permanent_id_keeps_child_runs_by_d
 
 
 @pytest.mark.asyncio
-async def test_get_workflow_runs_for_browser_session_filters_and_excludes() -> None:
+async def test_get_workflow_runs_for_browser_session_filters_and_excludes(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     captured: dict[str, Any] = {}
 
     async def _execute(query):
@@ -1163,6 +1598,56 @@ async def test_get_workflow_runs_for_browser_session_filters_and_excludes() -> N
     assert "ORDER BY workflow_runs.created_at DESC" in rendered
     assert "LIMIT 5" in rendered
     assert "OFFSET 5" in rendered
+
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC).replace(tzinfo=None)
+    runs = [
+        _workflow_run_model(
+            workflow_run_id=f"wr_session_{i}", queued_at=now + timedelta(seconds=i), browser_session_id="pbs_test"
+        )
+        for i in range(4)
+    ]
+    foreign = _workflow_run_model(
+        workflow_run_id="wr_foreign", queued_at=now, browser_session_id="pbs_test", organization_id="org_other"
+    )
+    child = _workflow_run_model(workflow_run_id="wr_child", queued_at=now, browser_session_id="pbs_test")
+    child.parent_workflow_run_id = runs[0].workflow_run_id
+    copilot = _workflow_run_model(workflow_run_id="wr_copilot", queued_at=now, browser_session_id="pbs_test")
+    copilot.copilot_session_id = "cps_test"
+    other_session = _workflow_run_model(
+        workflow_run_id="wr_other_session", queued_at=now, browser_session_id="pbs_other"
+    )
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test", workflow_permanent_id="wpid_test", title="test", workflow_definition={}
+            )
+        )
+        session.add_all([*runs, foreign, child, copilot, other_session])
+        session.add_all(
+            [
+                WorkflowRunAttemptModel(
+                    workflow_run_id=run.workflow_run_id,
+                    organization_id="org_test",
+                    attempt_number=number,
+                    status="queued" if number == 2 else "failed",
+                )
+                for run in runs
+                for number in (1, 2)
+            ]
+        )
+        await session.commit()
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    statements, listener = _capture_sql(sqlite_engine)
+    try:
+        page = await workflow_service_module.WorkflowService().get_workflow_runs_for_browser_session(
+            browser_session_id="pbs_test", organization_id="org_test", page=2, page_size=2
+        )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", listener)
+
+    assert [run.workflow_run_id for run in page] == ["wr_session_1", "wr_session_0"]
+    assert [run.attempt for run in page] == [2, 2]
+    assert len([statement for statement in statements if "FROM workflow_run_attempts" in statement]) == 1
 
 
 @pytest.mark.asyncio
@@ -1885,3 +2370,512 @@ async def test_wake_candidates_signal_every_lane_head(sqlite_db: AgentDB) -> Non
     waiters = await sqlite_db.workflow_runs.get_queued_runs_sharing_sequential_lanes("wr_tri_done")
 
     assert [w.workflow_run_id for w in waiters] == ["wr_tri_key", "wr_tri_cred", "wr_tri_sess"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "stale",
+        "young",
+        "boundary",
+        "running_run",
+        "terminal_run",
+        "unstarted_run",
+        "queued_attempt",
+        "unstarted_attempt",
+        "decided_attempt",
+        "wrong_organization",
+        "wrong_attempt",
+        "mismatched_organization",
+        "missing_run",
+    ],
+)
+async def test_stale_dispatch_claim_release_is_conditional_and_reclaimable(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    monkeypatch.setattr(attempts_repository_module, "naive_utc_now", lambda: now)
+    cutoff = now - timedelta(seconds=max(600, LEASE_TAKEOVER_SECONDS))
+    old = cutoff - timedelta(seconds=1)
+    run = _workflow_run_model(workflow_run_id="wr_dispatch", queued_at=old)
+    run.started_at = old
+    run.modified_at = old
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id=run.workflow_run_id,
+        organization_id=run.organization_id,
+        attempt_number=2,
+        status="running",
+        started_at=old,
+        modified_at=old,
+    )
+    if scenario in {"young", "boundary"}:
+        attempt.modified_at = cutoff + timedelta(seconds=1 if scenario == "young" else 0)
+    elif scenario == "running_run":
+        run.status = "running"
+    elif scenario == "terminal_run":
+        run.status = "failed"
+    elif scenario == "unstarted_run":
+        run.started_at = None
+    elif scenario == "queued_attempt":
+        attempt.status = "queued"
+    elif scenario == "unstarted_attempt":
+        attempt.started_at = None
+    elif scenario == "decided_attempt":
+        attempt.retry_decision = "final"
+    elif scenario == "mismatched_organization":
+        attempt.organization_id = "org_other"
+    async with sqlite_db.Session() as session:
+        if scenario != "missing_run":
+            session.add(run)
+        session.add(attempt)
+        await session.commit()
+
+    async def snapshot() -> tuple[object, ...]:
+        async with sqlite_db.Session() as session:
+            current_run = await session.get(WorkflowRunModel, "wr_dispatch")
+            current_attempt = await session.get(WorkflowRunAttemptModel, ("wr_dispatch", 2))
+            assert current_attempt is not None
+            return (
+                (current_run.status, current_run.started_at, current_run.modified_at) if current_run else None,
+                current_attempt.status,
+                current_attempt.started_at,
+                current_attempt.modified_at,
+                current_attempt.retry_decision,
+            )
+
+    before = await snapshot()
+    candidates = await sqlite_db.workflow_run_attempts.list_stale_dispatch_claims(cutoff.replace(tzinfo=UTC))
+    assert bool(candidates) == (scenario in {"stale", "wrong_organization", "wrong_attempt"})
+    released = await sqlite_db.workflow_run_attempts.release_stale_dispatch_claim(
+        "wr_dispatch",
+        "org_other" if scenario == "wrong_organization" else "org_test",
+        3 if scenario == "wrong_attempt" else 2,
+        stale_before=cutoff.replace(tzinfo=UTC),
+    )
+    assert released is (scenario == "stale")
+    if not released:
+        assert await snapshot() == before
+        return
+    assert await snapshot() == (("queued", None, now), "queued", None, now, None)
+    assert not await sqlite_db.workflow_run_attempts.release_stale_dispatch_claim(
+        "wr_dispatch", "org_test", 2, stale_before=cutoff
+    )
+    stamp = await sqlite_db.workflow_run_attempts.claim_prepared_attempt_execution("wr_dispatch", "org_test", 2)
+    assert stamp == now
+    assert await snapshot() == (("queued", now, now), "running", now, now, None)
+    assert await sqlite_db.workflow_run_attempts.claim_prepared_attempt_execution("wr_dispatch", "org_test", 2) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_status", [WorkflowRunStatus.canceled.value, WorkflowRunStatus.queued.value])
+async def test_recovery_selects_never_started_attempts_of_terminal_runs(sqlite_db: AgentDB, run_status: str) -> None:
+    # A cancel that lands before mark_attempt_started leaves a created row with no started_at; the
+    # terminal run still owes its cleanup and webhook, so recovery must see the row.
+    old = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1)
+    run = _workflow_run_model(workflow_run_id="wr_never_started", queued_at=old, status=run_status)
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id=run.workflow_run_id,
+        organization_id=run.organization_id,
+        attempt_number=1,
+        status="created",
+        modified_at=old,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([run, attempt])
+        await session.commit()
+
+    candidates = await sqlite_db.workflow_run_attempts.list_attempts_needing_recovery(
+        datetime.now(UTC) - timedelta(seconds=LEASE_TAKEOVER_SECONDS)
+    )
+
+    expected = ["wr_never_started"] if run_status == WorkflowRunStatus.canceled.value else []
+    assert [candidate.workflow_run_id for candidate in candidates] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started_after_selection", [False, True])
+async def test_prepared_recovery_failure_is_conditional_on_unstarted_queued_run(
+    sqlite_db: AgentDB, started_after_selection: bool
+) -> None:
+    old = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1)
+    run = _workflow_run_model(workflow_run_id="wr_prepared_recovery", queued_at=old)
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id=run.workflow_run_id,
+        organization_id=run.organization_id,
+        attempt_number=2,
+        status="queued",
+        modified_at=old,
+    )
+    task_run = _task_run_model(
+        run_id=run.workflow_run_id,
+        created_at=old.replace(tzinfo=UTC),
+        workflow_permanent_id="wpid_test",
+        status=WorkflowRunStatus.queued.value,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([run, attempt, task_run])
+        await session.commit()
+    candidates = await sqlite_db.workflow_run_attempts.list_attempts_needing_recovery(
+        datetime.now(UTC) - timedelta(seconds=LEASE_TAKEOVER_SECONDS)
+    )
+    assert [candidate.workflow_run_id for candidate in candidates] == ["wr_prepared_recovery"]
+    if started_after_selection:
+        async with sqlite_db.Session() as session:
+            current = await session.get(WorkflowRunModel, "wr_prepared_recovery")
+            assert current is not None
+            # Keep queued to prove started_at independently fences the failure UPDATE.
+            current.started_at = datetime.now(UTC).replace(tzinfo=None)
+            await session.commit()
+    claimed = await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        "wr_prepared_recovery", "org_test", 2, "execution absent"
+    )
+    assert claimed is not started_after_selection
+    assert not await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        "wr_prepared_recovery", "org_test", 2, "execution absent"
+    )
+    async with sqlite_db.Session() as session:
+        current = await session.get(WorkflowRunModel, "wr_prepared_recovery")
+        assert current is not None
+        assert current.status == ("queued" if started_after_selection else "failed")
+        mirrored = await session.get(TaskRunModel, "tr_wr_prepared_recovery")
+        assert mirrored is not None
+        # The runs list reads finished_at from this mirror; the abandon must write it in the same transaction.
+        assert (mirrored.status, mirrored.finished_at is not None) == (
+            ("queued", False) if started_after_selection else ("failed", True)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("labels_only", [False, True])
+async def test_oss_run_with_unpersisted_block_outputs_abandons_retry(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, labels_only: bool
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    run_model = _workflow_run_model(workflow_run_id="wr_scoped_inputs", queued_at=now, status="failed")
+    async with sqlite_db.Session() as session:
+        session.add(run_model)
+        await session.commit()
+    await sqlite_db.workflow_run_attempts.create_attempt("wr_scoped_inputs", "org_test", 1, "queued")
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_scoped_inputs", organization_id="org_test")
+    assert run is not None
+    workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            retry_policy=WorkflowRetryPolicy.model_validate({"retry_on": [{"status": "failed"}]})
+        )
+    )
+    svc = workflow_service_module.WorkflowService()
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", svc)
+    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    assert await is_retry_eligible_run(run, "org_test")
+    execute = AsyncMock(return_value=run)
+    monkeypatch.setattr(svc, "execute_workflow", execute)
+    release = AsyncMock(return_value="released")
+    monkeypatch.setattr(svc, "_run_terminal_side_effects_with_retries", release)
+    prepare = AsyncMock()
+    monkeypatch.setattr(workflow_service_module, "prepare_next_attempt_result", prepare)
+
+    await svc.execute_workflow_with_retries(
+        workflow_run_id=run.workflow_run_id,
+        api_key=None,
+        organization=SimpleNamespace(organization_id="org_test"),
+        block_labels=["selected"] if labels_only else None,
+        block_outputs=None if labels_only else {"caller_output": {"value": "original"}},
+    )
+
+    execute.assert_awaited_once()
+    assert execute.await_args.kwargs["block_labels"] == (["selected"] if labels_only else None)
+    assert execute.await_args.kwargs["block_outputs"] == (
+        None if labels_only else {"caller_output": {"value": "original"}}
+    )
+    prepare.assert_not_awaited()
+    attempts = await sqlite_db.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    assert len(attempts) == 1
+    assert attempts[0].retry_decision == "abandoned"
+    assert attempts[0].decision_reason == "unrecoverable_block_outputs"
+    assert attempts[0].finished_at is not None
+    release.assert_awaited_once()
+    assert release.await_args.args[1].retry is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ownership", ["running", "unknown", "absent", "terminal", "error"])
+@pytest.mark.parametrize("prepared_during_check", [False, True])
+async def test_stale_retry_recovery_checks_ownership_and_decision_cas(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, ownership: str, prepared_during_check: bool
+) -> None:
+    old = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=LEASE_TAKEOVER_SECONDS + 1)
+    run = _workflow_run_model(workflow_run_id="wr_stale_owned", queued_at=old, status="failed")
+    attempt = WorkflowRunAttemptModel(
+        workflow_run_id="wr_stale_owned",
+        organization_id=run.organization_id,
+        attempt_number=1,
+        status="failed",
+        retry_decision="retry",
+        next_attempt_at=old,
+        finished_at=old,
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all([run, attempt])
+        await session.commit()
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    svc = workflow_service_module.WorkflowService()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", svc)
+    release = AsyncMock()
+    monkeypatch.setattr(svc, "_run_terminal_side_effects_with_retries", release)
+    monkeypatch.setattr(workflow_service_module, "_get_recovery_api_key", AsyncMock(return_value=None))
+
+    async def execution_status(_run: Any) -> str:
+        if prepared_during_check:
+            async with sqlite_db.Session() as session:
+                current = await session.get(WorkflowRunAttemptModel, ("wr_stale_owned", 1))
+                current.next_attempt_prepared_at = datetime.now(UTC).replace(tzinfo=None)
+                await session.commit()
+        if ownership == "error":
+            raise RuntimeError("description unavailable")
+        return ownership
+
+    describe = AsyncMock(side_effect=execution_status)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_workflow_run_execution_status", describe)
+    await workflow_service_module.recover_pending_workflow_attempts(release_only=True)
+    current = (await sqlite_db.workflow_run_attempts.get_attempts("wr_stale_owned"))[0]
+    won = ownership in {"absent", "terminal"} and not prepared_during_check
+    assert current.retry_decision == ("abandoned" if won else "retry")
+    assert release.await_count == int(won)
+    describe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_progress_fences_stale_writers_and_separates_release_kinds(sqlite_db: AgentDB) -> None:
+    repo = sqlite_db.workflow_run_attempts
+    await repo.create_attempt("wr_progress", "org_test", 1, "failed")
+    async with sqlite_db.Session() as session:
+        row = await session.get(WorkflowRunAttemptModel, ("wr_progress", 1))
+        row.retry_decision = "retry"
+        await session.commit()
+    first_token = await repo.claim_attempt_side_effects("wr_progress", 1, kind="interim")
+    assert first_token is not None
+    interim: TerminalSideEffectCheckpoint = {
+        "completed_effects": ["interim workflow webhook"],
+        "final_hook_invoked": False,
+    }
+    assert await repo.save_side_effect_progress(
+        "wr_progress", 1, kind="interim", expected_claim_at=first_token, progress=interim
+    )
+    second_token = await repo.claim_attempt_side_effects(
+        "wr_progress",
+        1,
+        kind="interim",
+        expected_claim_at=first_token,
+        stale_before=first_token + timedelta(seconds=1),
+    )
+    assert second_token is not None and second_token != first_token
+    assert not await repo.save_side_effect_progress(
+        "wr_progress",
+        1,
+        kind="interim",
+        expected_claim_at=first_token,
+        progress={"completed_effects": [], "final_hook_invoked": False},
+    )
+    assert await repo.revoke_or_abandon_attempt("wr_progress", 1, "revoked", "cancel") is not None
+    final_token = await repo.claim_attempt_side_effects("wr_progress", 1, kind="final")
+    assert final_token is not None
+    final: TerminalSideEffectCheckpoint = {"completed_effects": ["workflow final hook"], "final_hook_invoked": True}
+    assert await repo.save_side_effect_progress(
+        "wr_progress", 1, kind="final", expected_claim_at=final_token, progress=final
+    )
+    assert not await repo.save_side_effect_progress(
+        "wr_progress", 1, kind="interim", expected_claim_at=second_token, progress=interim
+    )
+    row = (await repo.get_attempts("wr_progress"))[0]
+    assert row.interim_side_effects_progress == interim
+    assert row.final_side_effects_progress == final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unrelated_count, unrelated_parent_links", [(0, False), (1000, False), (1000, True)])
+async def test_attempt_artifact_ancestry_ignores_unrelated_history(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine, unrelated_count: int, unrelated_parent_links: bool
+) -> None:
+    start = datetime(2026, 7, 22, 12, tzinfo=UTC)
+    successor = start + timedelta(minutes=10)
+    root = "wr_ancestry"
+    runs = {
+        name: _workflow_run_model(workflow_run_id=name, queued_at=start)
+        for name in (root, "wr_block_child", "wr_parent_child", "wr_grandchild", "wr_next_child")
+    }
+    runs["wr_parent_child"].parent_workflow_run_id = root
+    runs["wr_grandchild"].parent_workflow_run_id = "wr_block_child"
+    runs["wr_next_child"].parent_workflow_run_id = root
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(list(runs.values()))
+        for name, number in [("wr_block_child", 1), ("wr_next_child", 2)]:
+            session.add(
+                WorkflowRunBlockModel(
+                    workflow_run_block_id=f"spawn_{name}",
+                    workflow_run_id=root,
+                    block_workflow_run_id=name,
+                    organization_id="org_test",
+                    block_type="task_v2",
+                    status="completed",
+                    attempt_number=number,
+                )
+            )
+        await session.flush()
+        for name in runs:
+            session.add(
+                TaskModel(
+                    task_id=f"task_{name}",
+                    workflow_run_id=name,
+                    organization_id="org_test",
+                    status="completed",
+                    url="https://example.com",
+                    attempt_number=7,
+                )
+            )
+        await session.flush()
+        for name in list(runs)[1:]:
+            session.add(
+                ArtifactModel(
+                    artifact_id=f"artifact_{name}",
+                    organization_id="org_test",
+                    run_id=root,
+                    workflow_run_id=name,
+                    task_id=f"task_{name}",
+                    artifact_type=ArtifactType.DOWNLOAD,
+                    uri=f"https://example.com/{name}",
+                    created_at=start if name == "wr_parent_child" else successor + timedelta(minutes=1),
+                )
+            )
+        for name, when in [("in_window", start), ("outside_window", successor)]:
+            session.add(
+                ArtifactModel(
+                    artifact_id=name,
+                    organization_id="org_test",
+                    run_id=root,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                    uri=f"https://example.com/{name}",
+                    created_at=when,
+                )
+            )
+        for i in range(unrelated_count):
+            unrelated_id = f"wr_unrelated_{i}"
+            unrelated_run = _workflow_run_model(workflow_run_id=unrelated_id, queued_at=start)
+            unrelated_run.parent_workflow_run_id = f"wr_unrelated_{i - 1}" if i and unrelated_parent_links else None
+            session.add(unrelated_run)
+            session.add(
+                WorkflowRunBlockModel(
+                    workflow_run_block_id=f"unrelated_block_{i}",
+                    workflow_run_id=f"wr_unrelated_{i - 1}" if i else unrelated_id,
+                    block_workflow_run_id=unrelated_id if i else None,
+                    organization_id="org_test",
+                    block_type="task_v2",
+                    status="completed",
+                    attempt_number=2,
+                )
+            )
+        await session.commit()
+
+    async with sqlite_engine.begin() as connection:
+        await connection.exec_driver_sql("ANALYZE")
+    statements, listener = _capture_sql(sqlite_engine)
+    plans: list[str] = []
+
+    def explain(conn: Any, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
+        if statement.startswith("WITH RECURSIVE"):
+            plan_cursor = conn.connection.cursor()
+            try:
+                plan_cursor.execute("EXPLAIN QUERY PLAN " + statement, parameters)
+                plans.extend(row[3] for row in plan_cursor.fetchall())
+            finally:
+                plan_cursor.close()
+
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", explain)
+    try:
+        first = await sqlite_db.workflow_runs.get_artifacts_for_attempt(root, "org_test", 1, start, successor)
+        second = await sqlite_db.workflow_runs.get_artifacts_for_attempt(root, "org_test", 2, successor, None)
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", listener)
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", explain)
+
+    assert {artifact.artifact_id for artifact in first} == {
+        "artifact_wr_block_child",
+        "artifact_wr_parent_child",
+        "artifact_wr_grandchild",
+        "in_window",
+    }
+    assert {artifact.artifact_id for artifact in second} == {"artifact_wr_next_child", "outside_window"}
+    assert len(statements) == 2
+    if unrelated_count:
+        assert any("parent_workflow_run_id=?" in plan for plan in plans), plans
+        block_plans = [plan for plan in plans if "attempt_spawning_block" in plan]
+        assert block_plans and all("organization_id=? AND workflow_run_id=?" in plan for plan in block_plans), plans
+        assert not any(plan.startswith("SCAN attempt_child") for plan in plans), plans
+
+
+@pytest.mark.asyncio
+async def test_recovery_paginates_stale_undecided_terminal_runs(sqlite_db: AgentDB) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cutoff = now - timedelta(seconds=LEASE_TAKEOVER_SECONDS)
+    old = cutoff - timedelta(seconds=1)
+    terminal_statuses = ["completed", "failed", "terminated", "canceled", "timed_out"]
+    async with sqlite_db.Session() as session:
+        for index, status in enumerate(terminal_statuses + ["running", "failed", "failed"]):
+            run_id = f"wr_undecided_{index}"
+            session.add(_workflow_run_model(workflow_run_id=run_id, queued_at=old, status=status))
+            session.add(
+                WorkflowRunAttemptModel(
+                    workflow_run_id=run_id,
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="running",
+                    started_at=None if index == 7 else old,
+                    modified_at=now if index == 6 else old,
+                )
+            )
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_undecided_0",
+                organization_id="org_test",
+                attempt_number=2,
+                status="running",
+                started_at=old,
+                modified_at=old,
+            )
+        )
+        session.add(_workflow_run_model(workflow_run_id="wr_retry_decided", queued_at=old, status="failed"))
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_retry_decided",
+                organization_id="org_test",
+                attempt_number=1,
+                status="failed",
+                retry_decision="retry",
+                next_attempt_at=old - timedelta(seconds=1),
+                modified_at=now,
+            )
+        )
+        await session.commit()
+
+    recovered: list[tuple[str, int]] = []
+    cursor = None
+    for _ in range(5):
+        page = await sqlite_db.workflow_run_attempts.list_attempts_needing_recovery(cutoff, cursor=cursor, limit=2)
+        if not page:
+            break
+        recovered.extend((attempt.workflow_run_id, attempt.attempt_number) for attempt in page)
+        last = page[-1]
+        cursor = (last.next_attempt_at or last.modified_at, last.workflow_run_id, last.attempt_number)
+    # Index 7 never started but its run is terminal, so recovery still owes it the terminal effects.
+    assert recovered == [
+        ("wr_retry_decided", 1),
+        ("wr_undecided_0", 1),
+        ("wr_undecided_0", 2),
+        *((f"wr_undecided_{index}", 1) for index in range(1, 5)),
+        ("wr_undecided_7", 1),
+    ]

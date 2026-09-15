@@ -90,7 +90,7 @@ async def test_export_block_writes_and_registers_one_parquet_file_per_loop_itera
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
     monkeypatch.setattr(
         app.STORAGE,
-        "get_downloaded_files",
+        "get_current_attempt_downloaded_files",
         AsyncMock(
             return_value=[FileInfo(url="https://example.test/items-0003.parquet", filename="items-0003.parquet")]
         ),

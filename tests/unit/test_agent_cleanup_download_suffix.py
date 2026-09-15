@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,8 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import DownloadFileMaxWaitingTime, TaskNotFound
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_download_to_complete
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -1836,3 +1839,73 @@ async def test_late_cleanup_skips_popup_already_closed_by_in_seam_cleanup() -> N
 
     popup.close.assert_awaited_once()  # only the in-seam close; late cleanup did not re-close
     assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_ignore_retained_partial_files(tmp_path) -> None:
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    (tmp_path / "current.pdf").write_bytes(b"complete")
+    task = _make_task(workflow_run_id="wr_retry")
+    exhausted: set[str] = set()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=tmp_path),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        capture_logs() as logs,
+    ):
+        async with asyncio.timeout(0.5):
+            await check_downloading_files_and_wait_for_download_to_complete(
+                tmp_path, task.organization_id, timeout=5, attempt_started_at=cutoff
+            )
+            await ForgeAgent()._wait_for_in_flight_downloads(
+                task,
+                SimpleNamespace(download_timeout=5),
+                task.organization_id,
+                attempt_started_at=cutoff,
+                exhausted=exhausted,
+            )
+    assert exhausted == set()
+    assert not any("long-time downloading" in row["event"] for row in logs)
+    assert stale.read_bytes() == b"old partial"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [1, None, "lookup_error"])
+async def test_retry_waits_keep_unfiltered_fallback(tmp_path, attempt) -> None:
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    result = ("wr_retry", 1, datetime.fromtimestamp(200, tz=UTC)) if attempt == 1 else ("wr_retry", 1, None)
+    task = _make_task(workflow_run_id="wr_retry")
+    exhausted: set[str] = set()
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+            new=AsyncMock(
+                return_value=result,
+                side_effect=RuntimeError("lookup unavailable") if attempt == "lookup_error" else None,
+            ),
+        ),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=tmp_path),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        capture_logs() as logs,
+    ):
+        cutoff = await get_download_retry_started_at(task.organization_id, task.workflow_run_id)
+        await check_downloading_files_and_wait_for_download_to_complete(
+            tmp_path, task.organization_id, timeout=0.01, attempt_started_at=cutoff
+        )
+        await ForgeAgent()._wait_for_in_flight_downloads(
+            task,
+            SimpleNamespace(download_timeout=0.01),
+            task.organization_id,
+            attempt_started_at=cutoff,
+            exhausted=exhausted,
+        )
+    assert cutoff is None
+    assert exhausted == {str(stale)}
+    assert any("long-time downloading" in row["event"] for row in logs)
+    if attempt == "lookup_error":
+        assert any("Failed to resolve download attempt" in row["event"] for row in logs)
+    assert stale.exists()

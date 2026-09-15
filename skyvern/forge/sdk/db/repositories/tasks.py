@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskModel,
     TaskRunModel,
+    WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
@@ -73,6 +75,7 @@ class TasksRepository(BaseRepository):
         browser_address: str | None = None,
         download_timeout: float | None = None,
         include_extracted_text: bool = True,
+        attempt_number: int | None = None,
     ) -> Task:
         # Sanitize text fields to remove NUL bytes and control characters
         # that PostgreSQL cannot store in text columns
@@ -126,6 +129,7 @@ class TasksRepository(BaseRepository):
                 browser_address=browser_address,
                 download_timeout=download_timeout,
                 include_extracted_text=include_extracted_text,
+                attempt_number=attempt_number,
             )
             session.add(new_task)
             await session.commit()
@@ -1045,24 +1049,30 @@ class TasksRepository(BaseRepository):
             return None
 
     @db_operation("get_last_task_for_workflow_run")
-    async def get_last_task_for_workflow_run(self, workflow_run_id: str) -> Task | None:
+    async def get_last_task_for_workflow_run(
+        self, workflow_run_id: str, attempt_number: int | None = None
+    ) -> Task | None:
         async with self.Session() as session:
-            if task := (
-                await session.scalars(
-                    select(TaskModel).filter_by(workflow_run_id=workflow_run_id).order_by(TaskModel.created_at.desc())
-                )
-            ).first():
+            query = select(TaskModel).filter_by(workflow_run_id=workflow_run_id)
+            if attempt_number is not None:
+                attempt_filter = TaskModel.attempt_number == attempt_number
+                if attempt_number == 1:
+                    attempt_filter = or_(attempt_filter, TaskModel.attempt_number.is_(None))
+                query = query.where(attempt_filter)
+            if task := (await session.scalars(query.order_by(TaskModel.created_at.desc()))).first():
                 return convert_to_task(task, debug_enabled=self.debug_enabled)
             return None
 
     @db_operation("get_tasks_by_workflow_run_id")
-    async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
+    async def get_tasks_by_workflow_run_id(self, workflow_run_id: str, attempt_number: int | None = None) -> list[Task]:
         async with self.Session() as session:
-            tasks = (
-                await session.scalars(
-                    select(TaskModel).filter_by(workflow_run_id=workflow_run_id).order_by(TaskModel.created_at)
-                )
-            ).all()
+            query = select(TaskModel).filter_by(workflow_run_id=workflow_run_id)
+            if attempt_number is not None:
+                attempt_filter = TaskModel.attempt_number == attempt_number
+                if attempt_number == 1:
+                    attempt_filter = or_(attempt_filter, TaskModel.attempt_number.is_(None))
+                query = query.where(attempt_filter)
+            tasks = (await session.scalars(query.order_by(TaskModel.created_at))).all()
             return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
 
     @db_operation("delete_task_steps")
@@ -1109,9 +1119,11 @@ class TasksRepository(BaseRepository):
         status: str,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
+        source_workflow_run_id: str | None = None,
     ) -> None:
         """Best-effort write-through: propagate status from source table to task_runs.
 
+        Workflow syncs copy the current source row, since retries can outlive a queued sync.
         Does NOT raise if the task_runs row is missing (race at creation time).
         """
         try:
@@ -1125,8 +1137,20 @@ class TasksRepository(BaseRepository):
                     update(TaskRunModel)
                     .where(TaskRunModel.run_id == run_id)
                     .where(TaskRunModel.organization_id == organization_id)
-                    .values(**vals)
                 )
+                if source_workflow_run_id is not None:
+                    stmt = stmt.where(
+                        WorkflowRunModel.workflow_run_id == source_workflow_run_id,
+                        WorkflowRunModel.organization_id == TaskRunModel.organization_id,
+                    )
+                    # Copy all three fields in the same statement, including cleared timestamps.
+                    # Matching status alone cannot distinguish two attempts that both failed.
+                    vals = {
+                        "status": WorkflowRunModel.status,
+                        "started_at": WorkflowRunModel.started_at,
+                        "finished_at": WorkflowRunModel.finished_at,
+                    }
+                stmt = stmt.values(**vals)
                 await session.execute(stmt)
                 await session.commit()
         except Exception:
@@ -1231,7 +1255,7 @@ class TasksRepository(BaseRepository):
         async with self.Session() as session:
             task_run = (
                 await session.scalars(
-                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
+                    select(TaskRunModel).filter_by(run_id=run_id, organization_id=organization_id).with_for_update()
                 )
             ).first()
             if not task_run:
@@ -1242,12 +1266,27 @@ class TasksRepository(BaseRepository):
                 )
                 return
 
+            attempt_number = 1
+            if task_run.task_run_type == "workflow_run":
+                attempt_number = (
+                    await session.scalar(
+                        select(func.max(WorkflowRunAttemptModel.attempt_number)).where(
+                            WorkflowRunAttemptModel.workflow_run_id == run_id,
+                            WorkflowRunAttemptModel.organization_id == organization_id,
+                        )
+                    )
+                    or 1
+                )
+
+            # The workflow activity disables Temporal retries, so its interceptor records cost once per attempt.
             if instance_type is not None:
                 task_run.instance_type = instance_type
             if duration_ms is not None:
-                task_run.duration_ms = duration_ms
+                task_run.duration_ms = (task_run.duration_ms or 0) + duration_ms if attempt_number >= 2 else duration_ms
             if compute_cost is not None:
-                task_run.compute_cost = compute_cost
+                task_run.compute_cost = (
+                    (task_run.compute_cost or Decimal(0)) + compute_cost if attempt_number >= 2 else compute_cost
+                )
             if compute_hourly_rate_id is not None:
                 task_run.compute_hourly_rate_id = compute_hourly_rate_id
             if llm_cost is not None:
