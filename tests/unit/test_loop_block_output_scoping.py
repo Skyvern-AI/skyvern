@@ -14,7 +14,9 @@ from skyvern.exceptions import BrowserStateDiagnostic, MissingBrowserStatePage
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock, TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import ContextParameter, OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockStatus
+from tests.unit.force_stub_app import admit_block_dispatch
 
 
 def _make_output_parameter(key: str) -> OutputParameter:
@@ -145,6 +147,7 @@ def _wire_app(mock_app: MagicMock, ctx: WorkflowRunContext) -> None:
     mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(return_value=wrb)
     mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
     mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+    mock_app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch()
     mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
     mock_app.AGENT_FUNCTION.validate_block_execution = AsyncMock()
 
@@ -462,6 +465,35 @@ class TestFailedBlockDoesNotLeakPriorIterationValue:
         assert ctx.values["extract_details_output"] is None
         assert ctx.parameters["contact_from_extract"].value is None
         assert ctx.values["contact_from_extract"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "run_status", [WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out, WorkflowRunStatus.completed]
+    )
+    async def test_admission_denied_loop_block_invalidates_stale_prior_iteration_value(
+        self, run_status: WorkflowRunStatus
+    ) -> None:
+        ctx = _make_ctx()
+        param = _make_output_parameter("extract_details_output")
+        await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-1 data"})
+
+        block = _make_task_block("extract_details")
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock) as execute,
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            _wire_app(mock_app, ctx)
+            mock_app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch(run_status)
+            result = await block.execute_safe(workflow_run_id="wr_test", current_index=1)
+
+        execute.assert_not_awaited()
+        expected = BlockStatus.skipped if run_status == WorkflowRunStatus.completed else BlockStatus(run_status.value)
+        assert result.status == expected
+        # The loop's early-stop reads this flag, so a continue-on-failure loop cannot run its remaining items.
+        assert result.can_continue_after_failure is False
+        assert ctx.values["extract_details_output"] is None
+        assert ctx.get_value("extract_details") is None
 
 
 def test_traced_decorator_owns_execute_safe_not_the_invalidation_helper() -> None:

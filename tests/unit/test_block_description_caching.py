@@ -19,6 +19,7 @@ from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBl
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from tests.unit.conftest import settle_or_fail, stalled_scrolling_capture
+from tests.unit.force_stub_app import admit_block_dispatch
 
 
 def _make_block() -> TaskBlock:
@@ -60,6 +61,7 @@ def _setup_mocks(mock_app: MagicMock) -> None:
     """Set up the common mocks needed by execute_safe."""
     mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(return_value=_mock_workflow_run_block())
     mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+    mock_app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch()
     mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
     workflow_run_context = MagicMock()
     workflow_run_context.cancel_failure_evidence_capture = AsyncMock()

@@ -2232,6 +2232,41 @@ async def mark_task_v2_as_failed(
     summary: str | None = None,
     output: dict[str, Any] | None = None,
 ) -> TaskV2:
+    # This is the generic exception handler's writer, so a task already in another terminal state got there
+    # through a writer whose run write or webhook may have raised mid-way: re-drive that writer instead.
+    current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if current is not None and current.status.is_final() and current.status != TaskV2Status.failed:
+        LOG.info(
+            "Rejecting failure: task v2 already in a different terminal state, re-driving that status",
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            task_v2_status=current.status,
+        )
+        if current.status == TaskV2Status.completed:
+            return await mark_task_v2_as_completed(
+                task_v2_id, workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
+        if current.status == TaskV2Status.canceled:
+            return await mark_task_v2_as_canceled(
+                task_v2_id, workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
+        if current.status == TaskV2Status.terminated:
+            return await mark_task_v2_as_terminated(
+                task_v2_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                failure_reason=failure_reason,
+                failure_category=failure_category or current.failure_category,
+            )
+        if current.status == TaskV2Status.timed_out:
+            return await mark_task_v2_as_timed_out(
+                task_v2_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                failure_reason=failure_reason,
+            )
+        return current
+
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
@@ -2283,6 +2318,18 @@ async def mark_task_v2_as_canceled(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
 ) -> TaskV2:
+    current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if current is not None and current.status.is_final() and current.status != TaskV2Status.canceled:
+        LOG.info(
+            "Rejecting cancel: task v2 already in a different terminal state",
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            task_v2_status=current.status,
+        )
+        if workflow_run_id:
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+        return current
+
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,

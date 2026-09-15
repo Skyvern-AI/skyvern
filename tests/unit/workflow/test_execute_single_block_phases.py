@@ -21,6 +21,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.models.block import (
+    Block,
     BranchCondition,
     CodeBlock,
     ConditionalBlock,
@@ -352,6 +353,130 @@ async def test_dispatch_denial_returns_typed_stop(monkeypatch: pytest.MonkeyPatc
 
     assert result == WorkflowRunDispatchStopped(workflow_run=canceled_run)
     execute.assert_not_awaited()
+
+
+class _PausableAwait:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> bytes:
+        self.entered.set()
+        await self.release.wait()
+        return b"png"
+
+
+def _wire_real_execute_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    status_holder: list[WorkflowRunStatus],
+    *,
+    execute: AsyncMock,
+    pause_point: str | None = None,
+) -> _PausableAwait:
+    pause = _PausableAwait()
+
+    @asynccontextmanager
+    async def admit_from_holder(_: str) -> AsyncIterator[MagicMock]:
+        admitted = _workflow_run()
+        admitted.status = status_holder[0]
+        yield admitted
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_from_holder)
+    workflow_run_block = MagicMock()
+    workflow_run_block.workflow_run_block_id = "wrb_nav"
+    monkeypatch.setattr(app.DATABASE.observer, "create_workflow_run_block", AsyncMock(return_value=workflow_run_block))
+    context = MagicMock()
+    context.cancel_failure_evidence_capture = pause if pause_point == "capture" else AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=context))
+    browser_state = MagicMock()
+    browser_state.take_fullpage_screenshot = pause if pause_point == "screenshot" else AsyncMock(return_value=b"png")
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=browser_state))
+    monkeypatch.setattr(
+        app.ARTIFACT_MANAGER,
+        "create_workflow_run_block_artifact",
+        pause if pause_point == "artifact" else AsyncMock(),
+    )
+    monkeypatch.setattr(Block, "_generate_workflow_run_block_description", AsyncMock())
+    monkeypatch.setattr(NavigationBlock, "execute", execute)
+    return pause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pause_point", "terminal_status"),
+    [
+        ("capture", WorkflowRunStatus.canceled),
+        ("screenshot", WorkflowRunStatus.canceled),
+        ("artifact", WorkflowRunStatus.canceled),
+        ("capture", WorkflowRunStatus.failed),
+        ("capture", WorkflowRunStatus.timed_out),
+    ],
+)
+async def test_terminal_status_during_pre_effect_setup_skips_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    pause_point: str,
+    terminal_status: WorkflowRunStatus,
+) -> None:
+    status_holder = [WorkflowRunStatus.running]
+    execute = AsyncMock()
+    pause = _wire_real_execute_safe(monkeypatch, status_holder, execute=execute, pause_point=pause_point)
+    terminal_run = _workflow_run()
+    terminal_run.status = terminal_status
+    conditional_cancel = AsyncMock(return_value=terminal_run if terminal_status == WorkflowRunStatus.canceled else None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", conditional_cancel)
+
+    async def get_run_from_holder(*args: Any, **kwargs: Any) -> MagicMock | None:
+        return None if status_holder[0] == WorkflowRunStatus.running else terminal_run
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_run_from_holder)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "record_run_duration", AsyncMock())
+
+    run_task = asyncio.create_task(_run_single_block(WorkflowService(), _navigation_block("nav")))
+    await pause.entered.wait()
+    status_holder[0] = terminal_status
+    pause.release.set()
+    workflow_run, _, block_result, should_stop, _ = await run_task
+
+    assert execute.await_count == 0
+    assert block_result is not None
+    assert block_result.status == BlockStatus(terminal_status.value)
+    assert should_stop is True
+    assert workflow_run.status == terminal_status
+    conditional_cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_running_run_executes_block_once_after_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _navigation_block("nav")
+    completed = _completed_result(block)
+    execute = AsyncMock(return_value=completed)
+    _wire_real_execute_safe(monkeypatch, [WorkflowRunStatus.running], execute=execute)
+
+    _, _, block_result, should_stop, _ = await _run_single_block(WorkflowService(), block)
+
+    assert execute.await_count == 1
+    assert block_result is completed
+    assert should_stop is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_after_execute_entered_keeps_in_flight_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    status_holder = [WorkflowRunStatus.running]
+    block = _navigation_block("nav")
+    completed = _completed_result(block)
+
+    async def execute_then_cancel(*args: Any, **kwargs: Any) -> BlockResult:
+        status_holder[0] = WorkflowRunStatus.canceled
+        return completed
+
+    execute = AsyncMock(side_effect=execute_then_cancel)
+    _wire_real_execute_safe(monkeypatch, status_holder, execute=execute)
+
+    _, _, block_result, should_stop, _ = await _run_single_block(WorkflowService(), block)
+
+    assert execute.await_count == 1
+    assert block_result is completed
+    assert should_stop is False
 
 
 @pytest.mark.asyncio
