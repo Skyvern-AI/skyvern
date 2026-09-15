@@ -27,6 +27,7 @@ from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
+    SYSTEM_PROMPT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
@@ -1691,3 +1692,46 @@ async def test_a_run_with_no_identity_is_not_given_a_code_tool(monkeypatch: pyte
 
     assert not asked
     assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+# The combobox bullet, pinned verbatim. This bullet produced FIVE defects in one PR, every one of them
+# a claim that some `select_combobox` error class falsifies -- only 4 of its 18 classes are row-related,
+# so guidance quantifying over them is wrong for most. A phrase blacklist cannot fire on wording nobody
+# anticipated ("every refusal provides a recovery action" would pass and is false), so the enforcing
+# mechanism is a snapshot: it fires on ALL change, which is the point for this text and not a cost.
+_COMBOBOX_BULLET = (
+    "- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only "
+    "AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the "
+    "`select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects "
+    "the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own "
+    "initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. "
+    "Act on what that error tells you rather than substituting a value of your own: this field commits only the "
+    "suggestions the page itself offers, and those are often coarser than the value you hold."
+)
+
+
+def test_combobox_bullet_is_pinned_so_every_edit_is_re_derived_against_the_error_taxonomy() -> None:
+    """The property, which the snapshot enforces rather than expresses: the bullet may claim what the
+    MODEL should do, never what an ERROR CONTAINS, and any prohibition is scoped by PROVENANCE (a value
+    or keystroke the model originates) rather than by shape. Four wordings broke the first rule -- "try
+    a fuller value", "pass a listed row's text back" (identical_rows wants a click), "the error states a
+    step" (row-less commit failures state none), "do not retype a longer value" (ambiguous_rows' own
+    next_step IS longer) -- and the unconditional typing ban broke the second, contradicting
+    identical_rows' "type the value to reopen the list" (tools.py:666).
+
+    WHAT THIS IS: a change-detector, not a correctness test. It cannot tell a semantic defect from a
+    rewording -- editing this constant alongside a broken prompt restores green. All it does is force a
+    human to look, which is the most any test here can do.
+
+    WHY EXACT PROSE, given CLAUDE.md:129 ("do not assert exact prompt prose ... WHEN A BEHAVIOR/CONTRACT
+    ASSERTION EXISTS"): that precondition is not met, and the claim is checkable. Every browser e2e
+    substitutes `ScriptedLLMCaller` for the model -- test_taskv3_fixture_parity.py says so in its own
+    docstring -- so no test in this repo can assert prompt-driven behaviour. The structural fix (a
+    mechanical guidance-vs-next_step consistency check) is tracked as SKY-16299, not built here.
+
+    Updating this snapshot is not a formality: re-derive the new text against every error class in
+    tools.py first, and against the WHOLE bullet -- a new clause can falsify an older one, which is how
+    the pre-existing unconditional typing ban became a live contradiction."""
+    bullet = next(line for line in SYSTEM_PROMPT.splitlines() if "select_combobox` tool" in line)
+
+    assert bullet == _COMBOBOX_BULLET
