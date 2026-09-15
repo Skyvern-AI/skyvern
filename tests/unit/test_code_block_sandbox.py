@@ -7,15 +7,17 @@ Verifies that the CodeBlock safety layer:
 """
 
 import asyncio
+import inspect
 import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -53,6 +55,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye import dialog_handler
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.skycdp.errors import CdpError
 from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
@@ -3024,6 +3027,14 @@ class TestClearBrowserDataHelperBinding:
     def test_clear_browser_data_is_reserved_in_safe_vars(self) -> None:
         assert "clear_browser_data" in CodeBlock.build_safe_vars()
 
+    def test_the_helper_authored_code_gets_takes_only_the_page(self) -> None:
+        # The secure runner's wrapper accepts the page and nothing else, so a block that named
+        # origins here would run in one executor and be rejected by the other. Worker-side callers
+        # that do have origins to name use the private function instead.
+        bound = CodeBlock.build_safe_vars()["clear_browser_data"]
+
+        assert list(inspect.signature(bound).parameters) == ["page"]
+
     @pytest.mark.asyncio
     async def test_a_persisted_parameter_named_clear_browser_data_keeps_its_value(self) -> None:
         # The name was a valid parameter name before it became a helper; a block that declared it
@@ -3038,19 +3049,273 @@ class TestClearBrowserDataHelperBinding:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("opener_is_open", "inherits", "expected_session_clears"),
+        [
+            (
+                True,
+                True,
+                [
+                    {"securityOrigin": "https://portal.example", "isLocalStorage": False},
+                    {"storageKey": "https://portal.example/", "isLocalStorage": False},
+                ],
+            ),
+            (True, False, [{"securityOrigin": "https://portal.example", "isLocalStorage": False}]),
+            (False, True, [{"storageKey": "https://portal.example/", "isLocalStorage": False}]),
+        ],
+        ids=["window_opened_on_about_blank", "tab_on_an_opaque_origin", "only_the_opened_window_is_left"],
+    )
+    async def test_a_tab_whose_url_names_no_origin_is_cleared_by_the_origin_it_inherited(
+        self, opener_is_open: bool, inherits: bool, expected_session_clears: list[dict]
+    ) -> None:
+        # A window opened on about:blank keeps a copy of its opener's sessionStorage in a tab area of
+        # its own, which clearing by origin does not reach and the opener's own clear does not
+        # address. A tab that inherited nothing has no storage area at all and must not fail the run,
+        # and one left without its opener is the only document still naming that origin.
+        context = FakeClearingBrowserContext()
+        popup = SimpleNamespace(url="about:blank", context=context, frames=[SimpleNamespace(url="about:blank")])
+        opener = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login")],
+        )
+        page = opener if opener_is_open else SimpleNamespace(url="about:blank", context=context, frames=[])
+        context.pages = [page, popup]
+        # A tab that inherited nothing is on an opaque origin, which reaches no storage either.
+        context.frames_without_storage = [] if opener_is_open else [page]
+        if inherits:
+            context.inherited_storage_keys = [(popup, "https://portal.example/")]
+        else:
+            context.frames_without_storage.append(popup)
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        sent = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert [params["storageId"] for method, params in sent if method == "DOMStorage.clear"] == (
+            expected_session_clears
+        )
+        # The origin an inherited-origin tab names still has to reach the origin-keyed pass, which is
+        # all that clears its persistent storage once no other document spells it.
+        assert [params["origin"] for method, params in sent if method == "Storage.clearDataForOrigin"] == [
+            "https://portal.example"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_tab_that_reaches_storage_but_cannot_be_keyed_fails_the_clear(self) -> None:
+        # Only a tab with no storage area at all has nothing to clear. A lookup that fails on a tab
+        # which CAN reach storage -- a timeout, say -- must not pass for one, or the helper reports a
+        # clear while that tab keeps its session.
+        context = FakeClearingBrowserContext()
+        popup = SimpleNamespace(url="about:blank", context=context, frames=[SimpleNamespace(url="about:blank")])
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login")],
+        )
+        context.pages = [page, popup]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(PlaywrightError):
+            await user_function()
+        assert context.clear_cookies_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_an_origin_that_closes_during_the_clear_still_has_its_stored_data_cleared(self) -> None:
+        # The session-storage pass awaits, and a page can drop a frame while it does. The origin was
+        # open when the clear began, so its stored data is still the run's to clear.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        original_new_cdp_session = context.new_cdp_session
+
+        async def dropping_frame_session(target: object) -> object:
+            session = await original_new_cdp_session(target)
+            page.frames = [page.frames[0]]
+            return session
+
+        context.new_cdp_session = dropping_frame_session  # type: ignore[assignment]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        sent = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert [params["origin"] for method, params in sent if method == "Storage.clearDataForOrigin"] == [
+            "https://portal.example",
+            "https://embedded.example",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_frame_without_a_session_of_its_own_is_cleared_through_the_page(self) -> None:
+        # A frame sharing its parent's renderer is refused a session of its own, and is the ordinary
+        # case: same-site iframes, and any cross-origin one when site isolation is off. Its clear has
+        # to fall back to the page's session, which can reach it, or nothing clears it at all.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.frames_without_own_session = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        cleared = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert (
+            "DOMStorage.clear",
+            {"storageId": {"securityOrigin": "https://embedded.example", "isLocalStorage": False}},
+        ) in cleared
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("has_own_session", "reaches_storage", "skipped"),
+        [
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
+        ids=["sandboxed_frame", "real_defect", "same_process_frame_cannot_be_classified"],
+    )
+    @pytest.mark.parametrize("refusal_error", [PlaywrightError, CdpError], ids=["playwright", "raw_cdp"])
+    async def test_a_frame_whose_clear_fails_is_skipped_only_when_it_reports_no_storage_of_its_own(
+        self, has_own_session: bool, reaches_storage: bool, skipped: bool, refusal_error: type[BaseException]
+    ) -> None:
+        # A sandboxed iframe has no storage area to address, so a clear that cannot find one found
+        # nothing to clear and the block carries on. A frame that CAN reach storage is an addressing
+        # defect. And a frame sharing its parent's renderer cannot be asked at all -- the probe would
+        # answer for the page -- so its failure surfaces rather than being explained away.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.origins_refusing_clear = ["https://embedded.example"]
+        # Both engines a run can select refuse the same way; only the error family differs.
+        context.refusal_error = refusal_error
+        if not has_own_session:
+            context.frames_without_own_session = [embedded]
+            # Even with the page itself reporting no storage, the frame's failure still surfaces.
+            context.frames_without_storage = [page]
+        elif not reaches_storage:
+            context.frames_without_storage = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        if not skipped:
+            with pytest.raises(refusal_error):
+                await user_function()
+            # The cookie drop comes after this pass, so the run is still recoverable.
+            assert context.clear_cookies_calls == 0
+            return
+        assert await user_function() == {"cleared": True}
+        assert context.clear_cookies_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_an_origin_is_cleared_through_a_frame_that_can_reach_its_storage(self) -> None:
+        # A sandboxed frame spells its origin exactly as an ordinary frame does, so an origin can be
+        # represented by one frame that reaches no storage and another that holds it. Passing over the
+        # first has to leave the second its turn, or that storage survives a clear reporting success.
+        context = FakeClearingBrowserContext()
+        sandboxed = SimpleNamespace(url="https://shared.example/ad")
+        ordinary = SimpleNamespace(url="https://shared.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), sandboxed, ordinary],
+        )
+        context.pages = [page]
+        context.frames_refusing_clear = [sandboxed]
+        context.frames_without_storage = [sandboxed]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        cleared_through = [
+            attached_to
+            for attached_to, session in context.cdp_sessions
+            for method, _ in session.sent
+            if method == "DOMStorage.clear"
+        ]
+        assert ordinary in cleared_through
+
+    @pytest.mark.asyncio
+    async def test_a_clear_failing_with_something_other_than_a_driver_error_is_not_excused(self) -> None:
+        # Only a browser driver's own refusal is a candidate for "there was nothing to clear"; anything
+        # else is a fault, and excusing it would report a clear that never happened.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.origins_failing_unexpectedly = ["https://embedded.example"]
+        context.frames_without_storage = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError):
+            await user_function()
+        assert context.clear_cookies_calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("page_url", "expected_origin"),
         [
             ("https://portal.example/login?next=%2Fhome", "https://portal.example"),
             ("https://svc:s3cret@portal.example:8443/login", "https://portal.example:8443"),
-            ("about:blank", None),
+            # A blob document reaches the storage of the origin that minted it, and carries that
+            # origin inside its own URL rather than as a host of its own.
+            ("blob:https://portal.example/9f1c2f5e-7a44-4d3e", "https://portal.example"),
+            ("about:blank", ""),
+            # An opaque blob has no origin to reach, so there is nothing of its own to clear.
+            ("blob:null/9f1c2f5e-7a44-4d3e", ""),
         ],
-        ids=["web_origin", "userinfo_stripped", "no_origin"],
+        ids=["web_origin", "userinfo_in_url", "blob_of_a_web_origin", "no_origin", "opaque_blob"],
     )
-    async def test_authored_code_clears_cookies_and_the_current_origin_storage(
-        self, page_url: str, expected_origin: str | None
+    async def test_authored_code_clears_cookies_and_every_origin_in_the_context(
+        self, page_url: str, expected_origin: str
     ) -> None:
+        # Cookies always go; stored data goes for the origins the context holds a document for, and a
+        # page whose URL names none is asked which origin it inherited instead.
         context = FakeClearingBrowserContext()
-        page = SimpleNamespace(url=page_url, context=context)
+        page = SimpleNamespace(url=page_url, context=context, frames=[SimpleNamespace(url=page_url)])
+        context.pages = [page]
+        if not expected_origin:
+            context.frames_without_storage = [page]
 
         user_function = self._block().generate_async_user_function(
             'await clear_browser_data(page)\nreturn {"cleared": True}\n',
@@ -3060,16 +3325,29 @@ class TestClearBrowserDataHelperBinding:
 
         assert result == {"cleared": True}
         assert context.clear_cookies_calls == 1
-        if expected_origin is None:
-            assert context.cdp_sessions == []
+        if not expected_origin:
+            # This tab inherited no origin either, so the lookup is all that happens and nothing is
+            # cleared for it.
+            assert [(attached_to, session.sent) for attached_to, session in context.cdp_sessions] == [
+                (
+                    page,
+                    [
+                        ("Page.getFrameTree", None),
+                        ("Storage.getStorageKeyForFrame", {"frameId": "frame-of-this-session"}),
+                        ("Runtime.evaluate", ANY),
+                    ],
+                ),
+            ]
+            assert all(session.detached for _, session in context.cdp_sessions)
             return
-        [(session_page, session)] = context.cdp_sessions
-        assert session_page is page
-        assert session.sent == [
-            ("Storage.clearDataForOrigin", {"origin": expected_origin, "storageTypes": "all"}),
-            ("DOMStorage.clear", {"storageId": {"securityOrigin": expected_origin, "isLocalStorage": False}}),
+        assert [(attached_to, session.sent) for attached_to, session in context.cdp_sessions] == [
+            (
+                page.frames[0],
+                [("DOMStorage.clear", {"storageId": {"securityOrigin": expected_origin, "isLocalStorage": False}})],
+            ),
+            (page, [("Storage.clearDataForOrigin", {"origin": expected_origin, "storageTypes": "all"})]),
         ]
-        assert session.detached
+        assert all(session.detached for _, session in context.cdp_sessions)
 
 
 class TestInertSlotRenderIsTheSpliceReference:

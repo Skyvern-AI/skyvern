@@ -23,6 +23,7 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -559,12 +560,43 @@ class FakeSearchBrowserContext:
 
 
 class FakeCdpSession:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        storage_reachable: bool = True,
+        origins_refusing_clear: tuple[str, ...] = (),
+        origins_failing_unexpectedly: tuple[str, ...] = (),
+        refuses_clear: bool = False,
+        refusal_error: type[BaseException] = PlaywrightError,
+        storage_key: str | None = None,
+    ) -> None:
         self.sent: list[tuple[str, dict | None]] = []
         self.detached = False
+        self.storage_key = storage_key
+        self.storage_reachable = storage_reachable
+        self.origins_refusing_clear = origins_refusing_clear
+        self.origins_failing_unexpectedly = origins_failing_unexpectedly
+        self.refuses_clear = refuses_clear
+        self.refusal_error = refusal_error
 
     async def send(self, method: str, params: dict | None = None) -> dict:
         self.sent.append((method, params))
+        if method == "Runtime.evaluate":
+            # Answers for whatever document this session is attached to, as the real one does.
+            return {"result": {"value": "reachable" if self.storage_reachable else "unreachable"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-of-this-session"}}}
+        if method == "Storage.getStorageKeyForFrame":
+            if self.storage_key is None:
+                raise self.refusal_error(
+                    "Protocol error (Storage.getStorageKeyForFrame): Frame corresponds to an opaque origin"
+                )
+            return {"storageKey": self.storage_key}
+        if method == "DOMStorage.clear":
+            origin = (params or {}).get("storageId", {}).get("securityOrigin")
+            if origin in self.origins_failing_unexpectedly:
+                raise ValueError("not a browser-driver error")
+            if self.refuses_clear or origin in self.origins_refusing_clear:
+                raise self.refusal_error("Protocol error (DOMStorage.clear): Frame not found for the given storage id")
         return {}
 
     async def detach(self) -> None:
@@ -572,17 +604,50 @@ class FakeCdpSession:
 
 
 class FakeClearingBrowserContext:
-    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out."""
+    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out.
 
-    def __init__(self) -> None:
+    `pages` is what the clear enumerates origins from, so a test that expects storage to be cleared has
+    to put its page in it, the way a live context holds its open tabs.
+    """
+
+    def __init__(self, clear_cookies_error: Exception | None = None) -> None:
         self.clear_cookies_calls = 0
+        self.clear_cookies_error = clear_cookies_error
         self.cdp_sessions: list[tuple[object, FakeCdpSession]] = []
+        self.pages: list[object] = []
+        # Documents whose session reports no reachable storage, the way a sandboxed frame's does.
+        self.frames_without_storage: list[object] = []
+        # Origins whose DOMStorage.clear fails, whichever session carries it.
+        self.origins_refusing_clear: list[str] = []
+        # Frames sharing their parent's renderer: Playwright refuses them a session of their own.
+        self.frames_without_own_session: list[object] = []
+        # Origins whose clear fails with something that is not a browser-driver error at all.
+        self.origins_failing_unexpectedly: list[str] = []
+        # Frames whose own clear fails, however the origin is spelled -- a sandboxed frame does this
+        # while an ordinary frame at the same origin clears fine.
+        self.frames_refusing_clear: list[object] = []
+        # Raise this engine's refusal instead of the Playwright family's, as a raw-CDP run would.
+        self.refusal_error: type[BaseException] = PlaywrightError
+        # Storage key the browser reports for a tab whose URL names no origin, as it does for a
+        # window opened on about:blank. A tab absent from this list has an opaque origin and none.
+        self.inherited_storage_keys: list[tuple[object, str]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
+        if self.clear_cookies_error is not None:
+            raise self.clear_cookies_error
 
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
-        session = FakeCdpSession()
+        if page in self.frames_without_own_session:
+            raise PlaywrightError("This frame does not have a separate CDP session")
+        session = FakeCdpSession(
+            storage_reachable=page not in self.frames_without_storage,
+            origins_refusing_clear=tuple(self.origins_refusing_clear),
+            origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
+            refuses_clear=page in self.frames_refusing_clear,
+            refusal_error=self.refusal_error,
+            storage_key=next((key for held, key in self.inherited_storage_keys if held is page), None),
+        )
         self.cdp_sessions.append((page, session))
         return session
 
