@@ -5,22 +5,29 @@ workflow_run_blocks and the dispatched engine come from the same resolution.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     DISABLE_TASK_V3_FLAG,
+    TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
     WORKFLOW_TASK_V3_AB_FLAG,
+    NewWorkflowDefaultRollout,
+    WorkflowBlockEngineRouteReason,
+    _as_utc,
     resolve_workflow_block_engine_arm,
     workflow_block_engine_override,
 )
@@ -51,7 +58,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockType
+from skyvern.schemas.workflows import BlockResult, BlockType, WorkflowStatus
 from skyvern.services import script_service
 from tests.unit.helpers import make_organization
 from tests.unit.test_agent_task_v3 import (
@@ -67,17 +74,70 @@ WORKFLOW_BLOCK_ENGINE_APP_TARGET = "skyvern.forge.sdk.experimentation.workflow_b
 
 
 class _FakeExperimentationProvider(BaseExperimentationProvider):
-    def __init__(self, flags: dict[str, bool] | None = None, raise_error: bool = False) -> None:
+    """Shaped like the two cloud providers, which is what makes a direction-sensitive flag testable.
+
+    In production an evaluation error never escapes ``_is_feature_enabled``: both PostHog providers
+    swallow it into ``None`` and ``bool()`` it to ``False``, so only ``_resolve_feature_flag_strict``
+    can tell a failure from a real ``False``. A fake that raised from ``_is_feature_enabled`` would
+    verify a shape no provider has, and would let a fail-safe that is inverted in production pass.
+
+    ``False`` here is the answer an INACTIVE flag gives: posthog's local evaluator returns a
+    conclusive ``False`` for one before it reads any filter, so "disable the flag" and "roll it to 0%"
+    arrive as the same value, and a rule that fired on ``False`` would enrol everybody the moment an
+    operator switched the flag off.
+    """
+
+    def __init__(
+        self,
+        flags: dict[str, bool] | None = None,
+        raise_error: bool = False,
+        strict_error_flags: set[str] | None = None,
+        unresolvable_flags: set[str] | None = None,
+    ) -> None:
         super().__init__()
         self.flags = dict(flags or {})
+        # The rule fires only on a conclusive True, so a fake that did not mention this flag would
+        # answer "undefined" and quietly take every enrolment test in this file off the rule and onto
+        # the A/B path, where control and an unenrolled run look identical. Tests that want the other
+        # resolutions say so, with a False here or with strict_error_flags/unresolvable_flags.
+        self.flags.setdefault(TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG, True)
         self.calls: list[tuple[str, str, dict | None]] = []
         self.raise_error = raise_error
+        self.strict_error_flags = set(strict_error_flags or ())
+        # A flag key local evaluation cannot answer: absent from the snapshot the poller wrote, or
+        # carrying a condition only the PostHog API can resolve. Neither resolver raises; both
+        # return None.
+        self.unresolvable_flags = set(unresolvable_flags or ())
 
-    async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
-        self.calls.append((feature_name, distinct_id, properties))
+    async def _prepare_feature_flag_resolution(self, feature_name: str, *, cached: bool) -> None:
+        # Where a provider does raise in production: the local provider reloads its flag snapshot
+        # from the database here, and a database failure escapes instead of resolving to a value.
         if self.raise_error:
             raise RuntimeError("provider unavailable")
-        return self.flags.get(feature_name, False)
+
+    async def _evaluate(self, feature_name: str, distinct_id: str, properties: dict | None) -> bool | None:
+        self.calls.append((feature_name, distinct_id, properties))
+        if feature_name in self.strict_error_flags:
+            raise RuntimeError("provider unavailable")
+        if feature_name in self.unresolvable_flags:
+            return None
+        return self.flags.get(feature_name)
+
+    async def _resolve_feature_flag_strict(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        return await self._evaluate(feature_name, distinct_id, properties)
+
+    async def _resolve_feature_flag(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        try:
+            return await self._evaluate(feature_name, distinct_id, properties)
+        except Exception:
+            return None
+
+    async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return bool(await self._resolve_feature_flag(feature_name, distinct_id, properties))
 
     async def _get_value(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> str | None:
         return None
@@ -96,6 +156,23 @@ def scoped_context() -> Iterator[SkyvernContext]:
         skyvern_context.reset()
 
 
+class _Resolution(NamedTuple):
+    log: dict[str, Any]
+    birth_reads: AsyncMock
+    warnings: list[Any]
+
+
+def _consulted_flags(provider: _FakeExperimentationProvider) -> list[str]:
+    return [flag for flag, _distinct_id, _properties in provider.calls]
+
+
+# When the LATEST version of every workflow in this file was saved, deliberately after the
+# v3_default_cutoff fixture below: that models an old workflow edited after the cutoff, so a resolver
+# reading the version this run executes instead of the permanent id's birth flips the arm and is
+# caught behaviorally rather than by an assertion about a mock's call kwargs.
+_LATEST_VERSION_CREATED_AT = datetime(2026, 9, 20)
+
+
 async def _resolve(
     context: SkyvernContext,
     provider: BaseExperimentationProvider,
@@ -104,17 +181,75 @@ async def _resolve(
     ineligibility_reason: V3AbIneligibleReason | None,
     organization_id: str | None = "org_1",
     workflow_permanent_id: str | None = "wpid_1",
-) -> None:
-    with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+    billing_tier: BillingTier = BillingTier.UNKNOWN,
+    first_version_created_at: datetime | None = None,
+    first_version_status: WorkflowStatus = WorkflowStatus.published,
+    first_version_error: Exception | None = None,
+    workflow_status: WorkflowStatus = WorkflowStatus.published,
+    trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
+) -> _Resolution:
+    async def read_birth_timestamp(workflow_permanent_id: str, organization_id: str) -> datetime | None:
+        if first_version_error is not None:
+            raise first_version_error
+        return first_version_created_at
+
+    async def read_workflow_version(
+        workflow_permanent_id: str, *, version: int | None = None, **_: Any
+    ) -> SimpleNamespace | None:
+        if version != 1:
+            return SimpleNamespace(created_at=_LATEST_VERSION_CREATED_AT, status=WorkflowStatus.published)
+        if first_version_created_at is None:
+            return None
+        return SimpleNamespace(created_at=first_version_created_at, status=first_version_status)
+
+    birth_reads = AsyncMock(side_effect=read_birth_timestamp)
+    with (
+        patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app,
+        patch("skyvern.forge.sdk.experimentation.workflow_block_engine.LOG") as mock_log,
+    ):
         mock_app.EXPERIMENTATION_PROVIDER = provider
-        stub_workflow_block_engine_app(mock_app)
+        stub_workflow_block_engine_app(mock_app, billing_tier=billing_tier)
+        # spec'd to the one repository the rule may reach, and to the two reads it could plausibly
+        # use: on a bare MagicMock any attribute path answers, so a resolver reading a method the
+        # real AgentDB does not have would pass here and raise in production, where the helper's
+        # catch-all would bury it as "not a new workflow".
+        database = MagicMock(spec=["workflows"])
+        database.workflows = MagicMock(spec=["get_workflow_permanent_id_created_at", "get_workflow_by_permanent_id"])
+        database.workflows.get_workflow_permanent_id_created_at = birth_reads
+        # Answers whatever version is asked for, carrying the birth version's own status at version 1:
+        # a resolver that regressed to deciding the per-call exclusion on the BIRTH version's status
+        # reds the prompt-created case, and one that read the executing version's timestamp reds the
+        # long-lived-workflow case, both behaviorally.
+        database.workflows.get_workflow_by_permanent_id = AsyncMock(side_effect=read_workflow_version)
+        mock_app.DATABASE = database
         await resolve_workflow_block_engine_arm(
             context,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
+            workflow_status=workflow_status,
+            trigger_type=trigger_type,
             ineligibility_reason=ineligibility_reason,
         )
+    logged = dict(mock_log.info.call_args.kwargs) if mock_log.info.call_args else {}
+    return _Resolution(log=logged, birth_reads=birth_reads, warnings=list(mock_log.warning.call_args_list))
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_v3_default_cutoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rollout this file covers sets TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF in the environment, and
+    # Settings reads .env at import: without pinning it, every test here answers to whatever the
+    # machine happens to export.
+    monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", None)
+
+
+@pytest.fixture
+def v3_default_cutoff(monkeypatch: pytest.MonkeyPatch, _no_ambient_v3_default_cutoff: None) -> datetime:
+    # Ordered after the autouse pin above by requesting it, so the off-by-default pin cannot clobber
+    # the cutoff a test asked for.
+    cutoff = datetime(2026, 9, 15, tzinfo=UTC)
+    monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", cutoff)
+    return cutoff
 
 
 def test_mixed_eligibility_run_download_block_is_eligible(scoped_context: SkyvernContext) -> None:
@@ -309,11 +444,48 @@ async def test_disable_flag_wins_over_ab_flag(scoped_context: SkyvernContext) ->
 @pytest.mark.asyncio
 async def test_provider_exception_fails_closed_to_control(scoped_context: SkyvernContext) -> None:
     provider = _FakeExperimentationProvider(raise_error=True)
-    await _resolve(scoped_context, provider, workflow_run_id="wr_err", ineligibility_reason=None)
+    resolution = await _resolve(scoped_context, provider, workflow_run_id="wr_err", ineligibility_reason=None)
 
     assert scoped_context.workflow_block_engine_override is None
     block = _make_block(TaskBlock, label="err_block")
     assert block.resolve_engine("wr_err") == RunEngine.skyvern_v1
+    # An unrandomized control run has to be separable from a bucketed one in the same read.
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_error
+
+
+@pytest.mark.asyncio
+async def test_a_failing_ab_evaluation_is_labelled_flag_error_not_bucketed_control(
+    scoped_context: SkyvernContext,
+) -> None:
+    # A failed A/B evaluation and a real control bucket produce the same arm, so only route_reason
+    # separates them. Reading a provider outage as flag_bucket_control mixes runs that were never
+    # randomized into the control cell of every per-arm comparison, which is the one thing this field
+    # exists to prevent. Only reachable through the strict resolver: the boolean one swallows the
+    # error into None and bool()s it to a plain False.
+    provider = _FakeExperimentationProvider(strict_error_flags={WORKFLOW_TASK_V3_AB_FLAG})
+    resolution = await _resolve(scoped_context, provider, workflow_run_id="wr_ab_down", ineligibility_reason=None)
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert _make_block(TaskBlock, label="ab_down").resolve_engine("wr_ab_down") == RunEngine.skyvern_v1
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_error
+
+
+@pytest.mark.asyncio
+async def test_an_ab_flag_local_evaluation_cannot_answer_is_control_but_not_a_bucket(
+    scoped_context: SkyvernContext,
+) -> None:
+    # The third A/B answer: None from local evaluation is neither a failure nor a bucket. A key the
+    # snapshot has no row for, or a condition local evaluation cannot answer, leaves the run on
+    # control without it ever having been randomized -- and the runbook builds this rule's control
+    # cell out of flag_bucket_control, so labelling it that way pours never-randomized runs into
+    # every per-arm comparison, the same defect flag_error exists to prevent. The arm is unchanged.
+    provider = _FakeExperimentationProvider(
+        {WORKFLOW_TASK_V3_AB_FLAG: True}, unresolvable_flags={WORKFLOW_TASK_V3_AB_FLAG}
+    )
+    resolution = await _resolve(scoped_context, provider, workflow_run_id="wr_ab_undefined", ineligibility_reason=None)
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_undefined
 
 
 def test_script_run_is_never_eligible() -> None:
@@ -336,6 +508,8 @@ async def test_noop_provider_never_queried_and_leaves_engine_unchanged(scoped_co
             workflow_run_id="wr_noop",
             organization_id="org_1",
             workflow_permanent_id="wpid_1",
+            workflow_status=WorkflowStatus.published,
+            trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
         )
 
@@ -465,25 +639,35 @@ async def test_base_task_block_execute_dispatches_with_the_resolved_engine(scope
     assert captured["engine"] == RunEngine.skyvern_v3
 
 
-@pytest.mark.asyncio
-async def test_execute_workflow_blocks_pins_the_context_execute_safe_reads_from(
-    scoped_context: SkyvernContext,
+async def _persisted_engine_from_execute_workflow_blocks(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    provider: BaseExperimentationProvider,
+    *,
+    workflow_status: WorkflowStatus = WorkflowStatus.published,
+    billing_tier: BillingTier = BillingTier.UNKNOWN,
+    first_version_created_at: datetime | None = None,
+    trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
+) -> RunEngine:
     """Drives the real WorkflowService._execute_workflow_blocks -> _execute_single_block ->
-    Block.execute_safe chain for a single eligible TaskBlock, forcing only the experimentation
-    provider. If resolve_workflow_block_engine_arm pinned the arm on a different SkyvernContext
-    object than the one execute_safe's resolve_engine() reads back from, this fails: the
-    persisted engine would be skyvern_v1 instead of skyvern_v3.
+    Block.execute_safe chain for a single eligible TaskBlock and returns the engine it persisted,
+    forcing only the experimentation provider, the billing tier and the workflow's birth timestamp.
+    Everything the arm decision depends on is therefore supplied by the real caller, not by the
+    resolver's own test seam.
     """
-    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
     monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", provider)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_billing_tier", AsyncMock(return_value=billing_tier))
+    monkeypatch.setattr(
+        app.DATABASE.workflows,
+        "get_workflow_permanent_id_created_at",
+        AsyncMock(return_value=first_version_created_at),
+    )
 
     block = _make_block(TaskBlock, label="e2e_block")
     workflow = MagicMock()
     workflow.workflow_definition.blocks = [block]
     workflow.workflow_definition.version = 1
     workflow.workflow_definition.finally_block_label = None
+    workflow.status = workflow_status
 
     workflow_run = MagicMock()
     workflow_run.workflow_run_id = "wr_e2e"
@@ -491,6 +675,7 @@ async def test_execute_workflow_blocks_pins_the_context_execute_safe_reads_from(
     workflow_run.organization_id = "org_e2e"
     workflow_run.run_with = None
     workflow_run.retried_from_workflow_run_id = None
+    workflow_run.trigger_type = trigger_type
 
     organization = MagicMock()
     organization.organization_id = "org_e2e"
@@ -527,7 +712,91 @@ async def test_execute_workflow_blocks_pins_the_context_execute_safe_reads_from(
             organization=organization,
         )
 
-    assert captured["engine"] == RunEngine.skyvern_v3
+    return captured["engine"]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_blocks_pins_the_context_execute_safe_reads_from(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If resolve_workflow_block_engine_arm pinned the arm on a different SkyvernContext object
+    than the one execute_safe's resolve_engine() reads back from, this fails: the persisted engine
+    would be skyvern_v1 instead of skyvern_v3.
+    """
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+
+    engine = await _persisted_engine_from_execute_workflow_blocks(monkeypatch, provider)
+
+    assert engine == RunEngine.skyvern_v3
+
+
+@pytest.mark.parametrize(
+    ("workflow_status", "expected_engine"),
+    [
+        (WorkflowStatus.auto_generated, RunEngine.skyvern_v1),
+        (WorkflowStatus.published, RunEngine.skyvern_v3),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_workflow_blocks_hands_the_resolver_the_running_versions_status(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    v3_default_cutoff: datetime,
+    workflow_status: WorkflowStatus,
+    expected_engine: RunEngine,
+) -> None:
+    # The per-call exclusion is only as real as the status the caller passes. Both cases are the same
+    # new self-serve workflow with the percentage knob off, so the only thing deciding the engine is
+    # workflow.status reaching the resolver: a caller that stopped passing it, or passed the
+    # workflow_run instead, would take the login/download/credential-test/SDK endpoints' per-call
+    # workflows onto v3 with it.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+
+    engine = await _persisted_engine_from_execute_workflow_blocks(
+        monkeypatch,
+        provider,
+        workflow_status=workflow_status,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert engine == expected_engine
+
+
+@pytest.mark.parametrize(
+    ("trigger_type", "expected_engine"),
+    [
+        (WorkflowRunTriggerType.job_recipe_apply, RunEngine.skyvern_v1),
+        (WorkflowRunTriggerType.job_recipe_extract, RunEngine.skyvern_v1),
+        (WorkflowRunTriggerType.api, RunEngine.skyvern_v3),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_workflow_blocks_hands_the_resolver_the_runs_trigger_type(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    v3_default_cutoff: datetime,
+    trigger_type: WorkflowRunTriggerType,
+    expected_engine: RunEngine,
+) -> None:
+    # The job-recipe endpoints run a brand-new published workflow_permanent_id per request, so the
+    # status the caller passes cannot exclude them and only the run's trigger kind can. All three
+    # cases are the same new self-serve published workflow with the percentage knob off, so the only
+    # thing deciding the engine is workflow_run.trigger_type reaching the resolver: a caller that
+    # stopped passing it would force-route every recipe call to v3, unrandomized.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+
+    engine = await _persisted_engine_from_execute_workflow_blocks(
+        monkeypatch,
+        provider,
+        workflow_status=WorkflowStatus.published,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+        trigger_type=trigger_type,
+    )
+
+    assert engine == expected_engine
 
 
 def _eligible_mix_blocks() -> list[BaseTaskBlock]:
@@ -668,6 +937,8 @@ async def test_resolver_logs_the_ineligibility_reason(scoped_context: SkyvernCon
             workflow_run_id="wr_logged",
             organization_id="org_1",
             workflow_permanent_id="wpid_1",
+            workflow_status=WorkflowStatus.published,
+            trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=V3AbIneligibleReason.pinned_engine,
         )
 
@@ -834,6 +1105,8 @@ async def test_arm_offers_the_billing_tier_to_the_ab_flag_but_not_the_kill_switc
             workflow_run_id="wr_tier",
             organization_id="org_1",
             workflow_permanent_id="wpid_1",
+            workflow_status=WorkflowStatus.published,
+            trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
         )
 
@@ -864,6 +1137,8 @@ async def test_a_run_that_never_reaches_the_ab_pays_for_no_tier_lookup(scoped_co
                 workflow_run_id=run_id,
                 organization_id="org_1",
                 workflow_permanent_id="wpid_1",
+                workflow_status=WorkflowStatus.published,
+                trigger_type=WorkflowRunTriggerType.api,
                 ineligibility_reason=reason,
             )
         tier.assert_not_awaited()
@@ -885,9 +1160,474 @@ async def test_a_failing_billing_tier_lookup_cannot_decide_the_arm(scoped_contex
             workflow_run_id="wr_tier_down",
             organization_id="org_1",
             workflow_permanent_id="wpid_1",
+            workflow_status=WorkflowStatus.published,
+            trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
         )
 
     assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
     by_flag = {flag: properties or {} for flag, _distinct_id, properties in provider.calls}
     assert by_flag[WORKFLOW_TASK_V3_AB_FLAG][BILLING_TIER_PROPERTY] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_new_self_serve_workflow_defaults_to_v3_without_consulting_the_ab_flag(
+    scoped_context: SkyvernContext,
+    v3_default_cutoff: datetime,
+) -> None:
+    # The whole point of the rule: the percentage knob is bypassed, so a flag sitting at 0% (or a
+    # bucket that landed on control) cannot take a new self-serve workflow back to v1.
+    provider = _FakeExperimentationProvider(
+        {WORKFLOW_TASK_V3_AB_FLAG: False, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: True}
+    )
+    run_id = "wr_new_self_serve_enrolled"
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=run_id,
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(seconds=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
+    assert _make_block(TaskBlock, label="new_wf").resolve_engine(run_id) == RunEngine.skyvern_v3
+    # The percentage knob is still never consulted for an enrolled run.
+    assert _consulted_flags(provider) == [DISABLE_TASK_V3_FLAG, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG]
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
+    assert resolution.log["new_workflow_default_rollout"] is True
+    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.enrolled
+    assert resolution.log["billing_tier"] == BillingTier.SELF_SERVE.value
+
+
+@pytest.mark.parametrize(
+    ("ab_flag", "expected_override", "expected_reason"),
+    [
+        (True, RunEngine.skyvern_v3, WorkflowBlockEngineRouteReason.flag_bucket_treatment),
+        (False, None, WorkflowBlockEngineRouteReason.flag_bucket_control),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unenrolled_new_workflow_is_bucketed_by_the_ab_as_if_the_rule_did_not_exist(
+    scoped_context: SkyvernContext,
+    v3_default_cutoff: datetime,
+    ab_flag: bool,
+    expected_override: RunEngine | None,
+    expected_reason: WorkflowBlockEngineRouteReason,
+) -> None:
+    # A conclusive False is what an operator's fastest off-gesture produces: posthog's local evaluator
+    # answers False for an INACTIVE flag before it reads any filter, and the same value comes back for
+    # a run outside the percentage or excluded by a condition. Enrolling on it would put 100% of this
+    # population on v3 with the control cell zeroed at the exact moment someone switched the rollout
+    # off, and the log would read like a rule that was not firing. So False leaves the run in the
+    # ordinary bucketing, both ways -- which is also where this population's concurrent control and
+    # its scoped kill come from, the cutoff being a setting that needs a restart and a condition on
+    # WORKFLOW_TASK_V3_AB being unable to reach a run that never evaluates it.
+    provider = _FakeExperimentationProvider(
+        {WORKFLOW_TASK_V3_AB_FLAG: ab_flag, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: False}
+    )
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=f"wr_not_enrolled_{ab_flag}",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override == expected_override
+    assert resolution.log["route_reason"] == expected_reason
+    assert resolution.log["new_workflow_default_rollout"] is False
+    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.not_enrolled
+    rollout_call = next(call for call in provider.calls if call[0] == TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG)
+    # Bucketed per run, and carrying the two properties a scoped condition is written against: holding
+    # one organization or one workflow out of the rollout is what the runbook promises as the fast
+    # lever.
+    assert rollout_call[1] == f"wr_not_enrolled_{ab_flag}"
+    assert rollout_call[2] == {
+        "organization_id": "org_1",
+        "workflow_permanent_id": "wpid_1",
+        BILLING_TIER_PROPERTY: BillingTier.SELF_SERVE.value,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_failing_rollout_evaluation_leaves_the_run_on_the_ab_path(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # An evaluation that raised is not an answer, and treating it as one would enrol a population
+    # whose fastest kill is the flag that just failed. It also must not be reported as a real
+    # "outside the percentage": the error resolution is what separates the two on the log. Only
+    # reachable through the strict resolver -- the boolean one swallows the error into None and
+    # bool()s it to False.
+    provider = _FakeExperimentationProvider(
+        {WORKFLOW_TASK_V3_AB_FLAG: False}, strict_error_flags={TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG}
+    )
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_rollout_down",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+    assert resolution.log["new_workflow_default_rollout"] is False
+    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.error
+    assert WORKFLOW_TASK_V3_AB_FLAG in _consulted_flags(provider)
+    # A rollout that stopped answering must not be silent: an operator reading a quiet
+    # new_self_serve_workflow_default needs this warning and the resolution field above to tell a
+    # broken evaluation from a rollout nobody enabled.
+    assert [call.kwargs.get("workflow_run_id") for call in resolution.warnings] == ["wr_rollout_down"]
+
+
+@pytest.mark.parametrize(
+    ("ab_flag", "expected_override", "expected_reason"),
+    [
+        (True, RunEngine.skyvern_v3, WorkflowBlockEngineRouteReason.flag_bucket_treatment),
+        (False, None, WorkflowBlockEngineRouteReason.flag_bucket_control),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unresolvable_rollout_flag_leaves_the_run_on_the_ab_path(
+    scoped_context: SkyvernContext,
+    v3_default_cutoff: datetime,
+    ab_flag: bool,
+    expected_override: RunEngine | None,
+    expected_reason: WorkflowBlockEngineRouteReason,
+) -> None:
+    # The arm-resolving processes evaluate PostHog locally against a snapshot, which answers None --
+    # not False, not an error -- for a flag key it has no row for; so does a cutoff set before anyone
+    # created the flag, and so does a condition local evaluation cannot answer. Enrolling on that
+    # would make the cutoff alone a 100%-v3 cohort with no concurrent control, and would bypass the
+    # organization exclusions this rollout's own conditions carry. So an unresolved flag leaves the
+    # run in the ordinary bucketing, both ways -- and the resolution field still separates "no flag"
+    # from a rollout that answered, which is what an operator reads after an enable.
+    provider = _FakeExperimentationProvider(
+        {WORKFLOW_TASK_V3_AB_FLAG: ab_flag},
+        unresolvable_flags={TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG},
+    )
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=f"wr_rollout_undefined_{ab_flag}",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override == expected_override
+    assert resolution.log["route_reason"] == expected_reason
+    assert resolution.log["new_workflow_default_rollout"] is False
+    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.undefined
+    assert WORKFLOW_TASK_V3_AB_FLAG in _consulted_flags(provider)
+
+
+@pytest.mark.asyncio
+async def test_a_new_version_of_an_older_workflow_is_not_a_new_workflow(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # A workflow saved again after the cutoff keeps an old birthday. _resolve wires the latest
+    # version at _LATEST_VERSION_CREATED_AT, on the far side of the cutoff, so a resolver that read
+    # the version this run executes would enrol this workflow and flip the arm below to treatment --
+    # which is the regression that would otherwise take every long-lived workflow onto v3 at once.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_old_wf",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) - timedelta(days=30),
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert DISABLE_TASK_V3_FLAG in [flag for flag, _distinct_id, _properties in provider.calls]
+    assert WORKFLOW_TASK_V3_AB_FLAG in [flag for flag, _distinct_id, _properties in provider.calls]
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+    # Asserted here rather than inside the fake, whose AssertionError the rule's catch-all would
+    # swallow into "not a new workflow": the birth timestamp is read once, scoped to this run's own
+    # organization. The read itself is the min over every version of the id including deleted ones,
+    # so a deleted or copilot-test first version cannot make a long-lived workflow look unborn.
+    resolution.birth_reads.assert_awaited_once_with("wpid_1", "org_1")
+
+
+@pytest.mark.asyncio
+async def test_a_per_call_auto_generated_workflow_is_never_a_new_workflow(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # /v1/run/tasks/login, /v1/run/tasks/download_files, the two credential test-login endpoints and
+    # the SDK run endpoint each mint a fresh workflow_permanent_id per call and run it while it is
+    # still auto_generated, holding a v3-eligible block. Every one of those is born after any cutoff,
+    # so without this exclusion setting the cutoff moves all of that standing API traffic onto v3 at
+    # once instead of only the workflows customers keep.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_auto_generated",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+        workflow_status=WorkflowStatus.auto_generated,
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert WORKFLOW_TASK_V3_AB_FLAG in _consulted_flags(provider)
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+    assert resolution.log["new_workflow_default_rollout_resolution"] is None
+    # A status the rule cannot use must not pay for the workflow read either.
+    resolution.birth_reads.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "trigger_type",
+    [WorkflowRunTriggerType.job_recipe_apply, WorkflowRunTriggerType.job_recipe_extract],
+)
+@pytest.mark.asyncio
+async def test_a_per_call_recipe_run_is_never_a_new_workflow(
+    scoped_context: SkyvernContext,
+    v3_default_cutoff: datetime,
+    trigger_type: WorkflowRunTriggerType,
+) -> None:
+    # The job-recipe endpoints also mint a fresh workflow_permanent_id per request and run it in that
+    # same request, but the definition they build carries no status and so is born published: the
+    # auto_generated exclusion cannot see it, and every one of those ids is born after any cutoff.
+    # One run per permanent id also means an enrolled recipe call has no control run of the same
+    # workflow to be matched against, so the trigger kind is what keeps this standing API traffic
+    # randomized by the A/B instead of force-routed.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=f"wr_{trigger_type.value}",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+        workflow_status=WorkflowStatus.published,
+        trigger_type=trigger_type,
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert WORKFLOW_TASK_V3_AB_FLAG in _consulted_flags(provider)
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+    assert resolution.log["new_workflow_default_rollout_resolution"] is None
+    # A trigger the rule cannot use must not pay for the workflow read either.
+    resolution.birth_reads.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_born_auto_generated_and_kept_by_the_customer_is_a_new_workflow(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # POST /workflows/create-from-prompt -- the prompt box, the product's main new-workflow path --
+    # writes version 1 as auto_generated whenever publish_workflow is false, which is its default, and
+    # then drops the customer into the editor on that same workflow_permanent_id; an editor save
+    # writes the next version as published. Excluding on the BIRTH version's status would therefore
+    # exclude every prompt-created workflow forever, including the ones a customer edits and re-runs
+    # for months, and the rule's whole stated purpose would be defeated for the path that creates most
+    # of its population. The exclusion is about the version this run executes, not about how the id
+    # was born.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_prompt_created_kept",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+        first_version_status=WorkflowStatus.auto_generated,
+        workflow_status=WorkflowStatus.published,
+    )
+
+    assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
+    assert WORKFLOW_TASK_V3_AB_FLAG not in _consulted_flags(provider)
+
+
+@pytest.mark.parametrize(
+    ("first_version_created_at", "expect_v3_default"),
+    [
+        (datetime(2026, 9, 14, 23, 59, 59), False),
+        # Naive rows come from datetime.utcnow(): the cutoff is aware, so a resolver that compared
+        # them directly would raise and lose every enrolment. At-or-after includes the instant itself.
+        (datetime(2026, 9, 15, 0, 0, 0), True),
+        (datetime(2026, 9, 15, 0, 0, 1), True),
+        (datetime(2026, 9, 15, 0, 0, 1, tzinfo=UTC), True),
+        # 2026-09-14 21:00 at UTC-4 is 2026-09-15 01:00 UTC, i.e. after the cutoff despite the date.
+        (datetime(2026, 9, 14, 21, 0, 0, tzinfo=timezone(timedelta(hours=-4))), True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cutoff_compares_aware_and_naive_first_version_timestamps_in_utc(
+    scoped_context: SkyvernContext,
+    v3_default_cutoff: datetime,
+    first_version_created_at: datetime,
+    expect_v3_default: bool,
+) -> None:
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=f"wr_cutoff_{first_version_created_at.isoformat()}",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=first_version_created_at,
+    )
+
+    expected_override = RunEngine.skyvern_v3 if expect_v3_default else None
+    assert scoped_context.workflow_block_engine_override == expected_override
+    expected_reason = (
+        WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
+        if expect_v3_default
+        else WorkflowBlockEngineRouteReason.flag_bucket_control
+    )
+    assert resolution.log["route_reason"] == expected_reason
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="TZ cannot be changed in-process on this platform")
+def test_a_naive_created_at_is_read_as_utc_not_as_local_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "Naive means UTC" and the classic astimezone() spelling that means "naive means local" are the
+    # same function on a UTC machine, which CI and every container is -- so neither the cases above
+    # nor any assertion made under the ambient zone can tell them apart. workflows.created_at is
+    # datetime.utcnow(), so reading it as local time misclassifies every workflow born within the
+    # process's TZ offset of the cutoff, silently enrolling or excluding runs that have no control arm.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        assert _as_utc(datetime(2026, 9, 15, 12)) == datetime(2026, 9, 15, 12, tzinfo=UTC)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+@pytest.mark.parametrize("billing_tier", [BillingTier.ENTERPRISE, BillingTier.UNKNOWN])
+@pytest.mark.asyncio
+async def test_only_the_self_serve_tier_gets_the_new_workflow_default(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime, billing_tier: BillingTier
+) -> None:
+    # UNKNOWN is a failed lookup, so it must fall through with enterprise rather than be force-routed.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id=f"wr_tier_{billing_tier.value}",
+        ineligibility_reason=None,
+        billing_tier=billing_tier,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert WORKFLOW_TASK_V3_AB_FLAG in [flag for flag, _distinct_id, _properties in provider.calls]
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_treatment
+    # A tier the rule cannot use must not pay for the workflow read either.
+    resolution.birth_reads.assert_not_awaited()
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_wins_over_the_new_workflow_default(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True, DISABLE_TASK_V3_FLAG: True})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_new_but_killed",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.disabled
+    resolution.birth_reads.assert_not_awaited()
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+
+
+@pytest.mark.asyncio
+async def test_no_cutoff_leaves_every_workflow_on_the_flag_path(scoped_context: SkyvernContext) -> None:
+    # Deliberately does not request v3_default_cutoff: the autouse pin holds the setting at None.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_no_cutoff",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=datetime(2030, 1, 1),
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+    resolution.birth_reads.assert_not_awaited()
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+
+
+@pytest.mark.asyncio
+async def test_ineligible_run_is_never_defaulted_to_v3(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # Run-level eligibility is about whether the run can be rerouted at all, so the rule changes the
+    # arm decision only: a script run or a pinned block still executes as authored.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_new_but_ineligible",
+        ineligibility_reason=V3AbIneligibleReason.script_run,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert provider.calls == []
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.ineligible
+    resolution.birth_reads.assert_not_awaited()
+    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in _consulted_flags(provider)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_first_version_read_falls_back_to_the_flag_path(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    # The new rule must not be able to take the run off the arm it would have had: a database blip
+    # falls back to the A/B, not to control, and never forces v3.
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_first_version_down",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_error=RuntimeError("workflows read failed"),
+    )
+
+    assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_treatment
+    # The fallback is silent in the arm it produces, so the swallowed read has to be visible
+    # somewhere: a rule that stops enrolling because a query broke must not look like a rule nobody
+    # set the cutoff for.
+    assert [call.kwargs.get("workflow_permanent_id") for call in resolution.warnings] == ["wpid_1"]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_first_version_falls_back_to_the_flag_path(
+    scoped_context: SkyvernContext, v3_default_cutoff: datetime
+) -> None:
+    provider = _FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+    resolution = await _resolve(
+        scoped_context,
+        provider,
+        workflow_run_id="wr_first_version_missing",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=None,
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
