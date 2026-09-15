@@ -1,6 +1,7 @@
 import logging
 import os
 import platform
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -557,6 +558,20 @@ class Settings(BaseSettings):
     # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
     # there is no in-process execution path to fall back to.
     TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
+    # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
+    # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
+    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default). Setting it is not
+    # enough on its own: the rule fires only for runs whose TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT
+    # evaluation returns a conclusive true, so the cutoff stays inert until that flag enrols someone.
+    # Every off-state of that flag -- disabled, deleted, 0%, an excluding condition, an evaluation
+    # that raised, no flag provider at all -- leaves the run on the A/B, so there is no off-state that
+    # enrols. A naive value is read as UTC. Per-call platform workflows are excluded twice over -- by
+    # an auto_generated executing version, which covers the login, download_files, credential
+    # test-login and SDK endpoints, and by a per-call trigger kind, which covers the job recipe
+    # endpoints because those build a published definition. Enrolled runs are not randomized, so every
+    # per-arm read must exclude them by route_reason and read them against the unenrolled control cell
+    # instead.
+    TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -1009,6 +1024,16 @@ class Settings(BaseSettings):
     def _api_limit_concurrency_unlimited_sentinels(cls, value: Any) -> Any:
         # gt=0 otherwise leaves the unlimited setting unreachable from the environment.
         if value is None or str(value).strip().lower() in ("", "0", "none", "null"):
+            return None
+        return value
+
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", mode="before")
+    @classmethod
+    def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
+        # This setting is the rule's settings-side kill path, and blanking an already-set env var is
+        # how it gets turned off mid-incident. Without this, every off-spelling fails datetime
+        # validation and crashes the process at import instead of disabling the rule.
+        if value is None or str(value).strip().lower() in ("", "0", "none", "null", "off", "disabled"):
             return None
         return value
 

@@ -5827,6 +5827,8 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
+                workflow_status=workflow.status,
+                trigger_type=workflow_run.trigger_type,
                 ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
             )
         else:
