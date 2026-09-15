@@ -231,7 +231,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
 
     svc = WorkflowService()
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=workflow_run))
-    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
     mark_workflow_run_as_failed = AsyncMock(return_value=failed_workflow_run)
     clean_up_workflow = AsyncMock()
     monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_workflow_run_as_failed)
@@ -256,4 +256,5 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         browser_session_id=None,
         close_browser_on_completion=True,
         need_call_webhook=True,
+        attempt_number=1,
     )

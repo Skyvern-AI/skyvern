@@ -1253,6 +1253,7 @@ class FakeWorkflowRunContext:
     values: dict = {}
     workflow_run_outputs: list = []
     include_secrets_in_templates = False
+    organization_id: str | None = None
     workflow_title = "Test Workflow"
     workflow_id = "w_test"
     workflow_permanent_id = "wpid_test"

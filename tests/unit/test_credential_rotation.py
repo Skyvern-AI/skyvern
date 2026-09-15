@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import asyncio
+import random
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -19,13 +23,27 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, evaluate_output_policy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import Base, WorkflowRunCredentialSelectionModel
+from skyvern.forge.sdk.db.models import (
+    Base,
+    CredentialModel,
+    CredentialParameterModel,
+    WorkflowModel,
+    WorkflowRunAttemptModel,
+    WorkflowRunCredentialSelectionModel,
+    WorkflowRunModel,
+)
+from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository_module
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
+from skyvern.forge.sdk.workflow import credential_selection as credential_selection_module
+from skyvern.forge.sdk.workflow import retry_policy as retry_policy_module
 from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
+from skyvern.forge.sdk.workflow.credential_selection import (
+    clear_credential_selections_for_retry,
+    select_credential_for_run,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     ContextParameter,
     CredentialParameter,
@@ -34,7 +52,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
@@ -47,7 +65,7 @@ def _credential_parameter(
     credential_ids: list[str] | None = None,
     selection_strategy: str | None = None,
 ) -> CredentialParameter:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return CredentialParameter(
         key=key,
         credential_parameter_id=f"cp_{key}",
@@ -64,7 +82,7 @@ def _workflow_parameter(
     key: str,
     workflow_parameter_type: WorkflowParameterType = WorkflowParameterType.STRING,
 ) -> WorkflowParameter:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return WorkflowParameter(
         key=key,
         workflow_parameter_id=f"wp_{key}",
@@ -192,7 +210,7 @@ async def _select(repo: _SelectionRepo, credential_ids: list[str], strategy: str
 
 @pytest.mark.asyncio
 async def test_round_robin_picks_unseen_first() -> None:
-    repo = _SelectionRepo(latest={"cred_a": datetime.now(timezone.utc)})
+    repo = _SelectionRepo(latest={"cred_a": datetime.now(UTC)})
 
     selected = await _select(repo, ["cred_a", "cred_b", "cred_c"])
 
@@ -202,7 +220,7 @@ async def test_round_robin_picks_unseen_first() -> None:
 
 @pytest.mark.asyncio
 async def test_round_robin_picks_oldest_last_used_and_ties_by_list_order() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     repo = _SelectionRepo(latest={"cred_a": now, "cred_b": now - timedelta(minutes=5), "cred_c": now})
 
     selected = await _select(repo, ["cred_a", "cred_b", "cred_c"])
@@ -322,7 +340,7 @@ async def test_select_rotating_credentials_keeps_override_and_selects_remaining(
 
 
 def _fallback_only_credential_parameter() -> CredentialParameter:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return CredentialParameter(
         key="login_cred",
         credential_parameter_id="cp_login",
@@ -361,7 +379,7 @@ async def test_select_render_resolves_indirect_fallback_primary_from_parameter_v
     # A fallback-only credential_id can indirectly reference another workflow parameter carrying the
     # real credential value (mirrors WorkflowRunContext.resolve_credential_parameter_id). The render
     # must resolve it, or a browser_profile_key would collapse distinct accounts onto one profile.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     service = WorkflowService()
     workflow = _setup_workflow_with_rotating_credential(browser_profile_key="{{ login_cred }}")
     workflow.workflow_definition.parameters = [
@@ -795,7 +813,7 @@ async def _attempt_setup_rotation_profile_run(
                 workflow_permanent_id="wpid_test",
                 organization=organization,
             )
-        except Exception as exc:
+        except RuntimeError as exc:
             caught = exc
 
     return result, mock_app, service, caught
@@ -890,8 +908,10 @@ async def test_direct_bindings_snapshot_only_opted_in_credentials_and_runtime_re
     parallel_context = _runtime_context()
 
     assert workflow_run.sequential_credential_id == "cred_serial"
-    assert await sequential_context.resolve_credential_parameter_id(sequential, "org_test") == "cred_serial"
-    assert await parallel_context.resolve_credential_parameter_id(parallel, "org_test") == "cred_parallel"
+    with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
+        context_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
+        assert await sequential_context.resolve_credential_parameter_id(sequential, "org_test") == "cred_serial"
+        assert await parallel_context.resolve_credential_parameter_id(parallel, "org_test") == "cred_parallel"
 
 
 @pytest.mark.asyncio
@@ -920,7 +940,9 @@ async def test_plain_indirect_binding_snapshots_and_runtime_resolves_bound_param
         context.values[account_parameter.key] = "cred_runtime"
 
     assert workflow_run.sequential_credential_id == "cred_runtime"
-    assert await context.resolve_credential_parameter_id(login, "org_test") == "cred_runtime"
+    with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
+        context_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
+        assert await context.resolve_credential_parameter_id(login, "org_test") == "cred_runtime"
     assert context.get_resolved_credential_parameter_id(login.key) == "cred_runtime"
 
 
@@ -944,7 +966,7 @@ async def test_runtime_only_indirect_binding_defers_credential_validation_until_
     runtime_parameter_type: str,
 ) -> None:
     source = _workflow_parameter("source")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     runtime_parameter = (
         ContextParameter(key="runtime_credential", source=source)
         if runtime_parameter_type == "context"
@@ -977,6 +999,7 @@ async def test_runtime_only_indirect_binding_fails_closed_if_resolved_credential
     organization = SimpleNamespace(organization_id="org_test")
 
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as mock_app:
+        mock_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         mock_app.DATABASE.credentials.get_credential = AsyncMock(
             return_value=SimpleNamespace(credential_id="cred_runtime", run_sequentially=True)
         )
@@ -1022,6 +1045,7 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
     credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
 
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as mock_app:
+        mock_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         mock_app.DATABASE.credentials.get_credential = AsyncMock(return_value=db_credential)
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
             return_value=SimpleNamespace(sequential_credential_id=stamped_credential_id)
@@ -1053,8 +1077,12 @@ async def test_keyed_rotation_snapshot_and_runtime_reuse_one_persisted_selection
         selection_repo=repo,
     )
     context = _runtime_context()
-    with patch("skyvern.forge.sdk.workflow.credential_selection.app") as selection_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.credential_selection.app") as selection_app,
+        patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app,
+    ):
         selection_app.DATABASE.workflow_run_credential_selections = repo
+        context_app.DATABASE.workflow_run_credential_selections = repo
         runtime_credential_id = await context.resolve_credential_parameter_id(login, "org_test")
 
     assert workflow_run.sequential_credential_id == "cred_a"
@@ -1242,3 +1270,798 @@ async def test_keyed_rotation_selection_failure_fails_closed_even_with_non_seque
                 SimpleNamespace(credential_id="cred_b", run_sequentially=False),
             ],
         )
+
+
+def _retry_workflow(parameter: CredentialParameter) -> WorkflowModel:
+    return WorkflowModel(
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        title="Credential rotation",
+        workflow_definition=WorkflowDefinition(parameters=[parameter], blocks=[]).model_dump(mode="json"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_rebinds_only_its_run_and_organization_selections(sqlite_db) -> None:
+    repo = sqlite_db.workflow_run_credential_selections
+    await sqlite_db.organizations.create_organization("Test", organization_id="org_test")
+    async with sqlite_db.Session() as session:
+        session.add(_retry_workflow(_credential_parameter(key="login", credential_ids=["cred_a", "cred_b"])))
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_retry",
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                organization_id="org_test",
+                status="failed",
+            )
+        )
+        session.add_all(
+            CredentialModel(
+                credential_id=credential_id,
+                organization_id="org_test",
+                name="Login",
+                credential_type="password",
+            )
+            for credential_id in ["cred_a", "cred_b"]
+        )
+        await session.commit()
+    for run_id, org_id, key in (
+        ("wr_retry", "org_test", "login"),
+        ("wr_other", "org_test", "other_login"),
+        ("wr_retry", "org_other", "other_login"),
+    ):
+        await repo.create_selection(
+            organization_id=org_id,
+            workflow_run_id=run_id,
+            workflow_permanent_id="wpid_test",
+            parameter_key=key,
+            credential_id="cred_a",
+        )
+    with patch("skyvern.forge.sdk.workflow.credential_selection.app") as selection_app:
+        selection_app.DATABASE = sqlite_db
+        workflow = await sqlite_db.workflows.get_workflow("wf_test", organization_id="org_test")
+        assert workflow is not None
+        previous_history = await repo.get_latest_selections(
+            organization_id="org_test",
+            workflow_permanent_id="wpid_test",
+            parameter_key="login",
+            credential_ids=["cred_a", "cred_b"],
+        )
+        await clear_credential_selections_for_retry(
+            "wr_retry", "org_test", attempt_number=1, workflow_definition=workflow.workflow_definition
+        )
+        assert await repo.get_selection("wr_retry", "login") == "cred_a"
+        await clear_credential_selections_for_retry(
+            "wr_retry", "org_test", attempt_number=2, workflow_definition=workflow.workflow_definition
+        )
+        assert await repo.get_selection("wr_retry", "login") == "cred_b"
+        selected = await select_credential_for_run(
+            workflow_run_id="wr_retry",
+            organization_id="org_test",
+            workflow_permanent_id="wpid_test",
+            parameter_key="login",
+            credential_ids=["cred_a", "cred_b"],
+            selection_strategy=None,
+        )
+    assert selected == "cred_b"
+    history = await repo.get_latest_selections(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        parameter_key="login",
+        credential_ids=["cred_a", "cred_b"],
+    )
+    assert history.keys() == {"cred_a", "cred_b"}
+    assert history["cred_a"] == previous_history["cred_a"]
+    assert await repo.get_selections_for_run("wr_retry") == {"login": "cred_b", "other_login": "cred_a"}
+    assert await repo.get_selection("wr_other", "other_login") == "cred_a"
+    assert await repo.get_selection("wr_retry", "other_login") == "cred_a"
+    with patch("skyvern.forge.sdk.workflow.credential_selection.app") as selection_app:
+        selection_app.DATABASE = sqlite_db
+        await clear_credential_selections_for_retry(
+            "wr_retry", "org_test", attempt_number=3, workflow_definition=workflow.workflow_definition
+        )
+        assert await repo.get_selection("wr_retry", "login") == "cred_a"
+        assert (
+            await select_credential_for_run(
+                workflow_run_id="wr_retry",
+                organization_id="org_test",
+                workflow_permanent_id="wpid_test",
+                parameter_key="login",
+                credential_ids=["cred_a", "cred_b"],
+                selection_strategy=None,
+            )
+            == "cred_a"
+        )
+    async with sqlite_db.Session() as session:
+        rows = (
+            await session.execute(
+                select(
+                    WorkflowRunCredentialSelectionModel.workflow_run_id,
+                    WorkflowRunCredentialSelectionModel.credential_id,
+                ).where(
+                    WorkflowRunCredentialSelectionModel.organization_id == "org_test",
+                    WorkflowRunCredentialSelectionModel.parameter_key == "login",
+                )
+            )
+        ).all()
+    assert set(rows) == {("wr_retry:attempt:1", "cred_a"), ("wr_retry:attempt:2", "cred_b"), ("wr_retry", "cred_a")}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_statement", ["UPDATE", "INSERT INTO"])
+async def test_next_attempt_preparation_atomically_clears_and_reselects_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_statement: str,
+) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'credentials.db'}"
+    engine = _build_engine(url)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    database = AgentDB(url, db_engine=engine)
+    stub = SimpleNamespace(
+        DATABASE=database, WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(remove_workflow_run_context=lambda _run: None)
+    )
+    monkeypatch.setattr(retry_policy_module, "app", stub)
+    monkeypatch.setattr(credential_selection_module, "app", stub)
+    repo = database.workflow_run_credential_selections
+    try:
+        await database.organizations.create_organization("Test", organization_id="org_test")
+        async with database.Session() as session:
+            session.add(_retry_workflow(_credential_parameter(key="login", credential_ids=["cred_a", "cred_b"])))
+            session.add_all(
+                CredentialModel(
+                    credential_id=credential_id,
+                    organization_id="org_test",
+                    name="Login",
+                    credential_type="password",
+                )
+                for credential_id in ["cred_a", "cred_b"]
+            )
+            session.add_all(
+                [
+                    WorkflowRunModel(
+                        workflow_run_id="wr_retry",
+                        workflow_id="wf_test",
+                        workflow_permanent_id="wpid_test",
+                        organization_id="org_test",
+                        status="failed",
+                    ),
+                    WorkflowRunModel(
+                        workflow_run_id="wr_legacy",
+                        workflow_id="wf_test",
+                        workflow_permanent_id="wpid_test",
+                        organization_id="org_test",
+                        status="failed",
+                    ),
+                    WorkflowRunAttemptModel(
+                        workflow_run_id="wr_retry",
+                        organization_id="org_test",
+                        attempt_number=1,
+                        status="failed",
+                        retry_decision="retry",
+                    ),
+                ]
+            )
+            await session.commit()
+        for run_id, org_id, key in (
+            ("wr_retry", "org_test", "login"),
+            ("wr_other", "org_test", "login"),
+            ("wr_retry", "org_other", "other_login"),
+            ("wr_legacy", "org_test", "login"),
+        ):
+            await repo.create_selection(
+                organization_id=org_id,
+                workflow_run_id=run_id,
+                workflow_permanent_id="wpid_test",
+                parameter_key=key,
+                credential_id="cred_a",
+            )
+        legacy = await retry_policy_module.prepare_next_attempt_result("wr_legacy", "org_test", 1)
+        assert legacy.status == "failed"
+        assert await repo.get_selection("wr_legacy", "login") == "cred_a"
+
+        def fail_after_clear(
+            _connection: Any,
+            _cursor: Any,
+            statement: str,
+            _parameters: Any,
+            _context: Any,
+            _many: bool,
+        ) -> None:
+            if statement.startswith(f"{failure_statement} workflow_run_credential_selections"):
+                raise RuntimeError("crash after credential archive before preparation commit")
+
+        event.listen(engine.sync_engine, "after_cursor_execute", fail_after_clear)
+        try:
+            with pytest.raises(RuntimeError, match="crash after credential archive"):
+                await retry_policy_module.prepare_next_attempt_result("wr_retry", "org_test", 1)
+        finally:
+            event.remove(engine.sync_engine, "after_cursor_execute", fail_after_clear)
+        assert await repo.get_selection("wr_retry", "login") == "cred_a"
+        attempts = await database.workflow_run_attempts.get_attempts("wr_retry")
+        assert len(attempts) == 1 and attempts[0].next_attempt_prepared_at is None
+        run = await database.workflow_runs.get_workflow_run("wr_retry")
+        assert run is not None and run.status.value == "failed"
+
+        # Both real preparation callers observe attempt 1. Only the winning transaction may clear.
+        cleared = asyncio.Event()
+        release_commit = asyncio.Event()
+        clear_calls = 0
+        clear = workflow_runs_repository_module.clear_credential_selections_for_retry
+
+        async def pause_before_commit(*args: Any, **kwargs: Any) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            await clear(*args, **kwargs)
+            cleared.set()
+            await release_commit.wait()
+
+        monkeypatch.setattr(
+            workflow_runs_repository_module, "clear_credential_selections_for_retry", pause_before_commit
+        )
+        winner = asyncio.create_task(retry_policy_module.prepare_next_attempt_result("wr_retry", "org_test", 1))
+        loser = None
+        try:
+            await asyncio.wait_for(cleared.wait(), timeout=5)
+            assert await repo.get_selection("wr_retry", "login") == "cred_a"
+            loser = asyncio.create_task(retry_policy_module.prepare_next_attempt_result("wr_retry", "org_test", 1))
+            release_commit.set()
+            result = await winner
+            assert result.status == "inserted"
+            assert await repo.get_selection("wr_retry", "login") == "cred_b"
+            selected = await select_credential_for_run(
+                workflow_run_id="wr_retry",
+                organization_id="org_test",
+                workflow_permanent_id="wpid_test",
+                parameter_key="login",
+                credential_ids=["cred_a", "cred_b"],
+                selection_strategy=None,
+            )
+            assert selected == "cred_b"
+            assert (await loser).status in {"already_prepared", "failed"}
+        finally:
+            release_commit.set()
+            await asyncio.gather(winner, *([loser] if loser is not None else []), return_exceptions=True)
+        assert clear_calls == 1
+        repeat = await retry_policy_module.prepare_next_attempt_result("wr_retry", "org_test", 1)
+        assert repeat.status == "already_prepared"
+        assert await repo.get_selection("wr_retry", "login") == "cred_b"
+        assert await repo.get_selection("wr_other", "login") == "cred_a"
+        assert await repo.get_selection("wr_retry", "other_login") == "cred_a"
+        assert await repo.get_selection("wr_legacy", "login") == "cred_a"
+        assert [row.attempt_number for row in await database.workflow_run_attempts.get_attempts("wr_retry")] == [1, 2]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pool_kind",
+    [
+        "sequential",
+        "mixed",
+        "unverified",
+        "fallback",
+        "stale_metadata",
+        "missing_metadata",
+        "fallback_only_empty",
+        "fallback_only_absent",
+    ],
+)
+async def test_retry_retains_credential_pool_binding_when_new_lane_cannot_be_admitted(
+    sqlite_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    pool_kind: str,
+) -> None:
+    sequential_credential_id = "cred_a" if pool_kind == "sequential" else None
+    await sqlite_db.organizations.create_organization("Test", organization_id="org_test")
+    fallback_only = pool_kind in {"fallback", "fallback_only_empty", "fallback_only_absent"}
+    parameter = _credential_parameter(
+        credential_ids=["cred_a"] if pool_kind == "stale_metadata" else ["cred_a", "cred_b"]
+    )
+    if fallback_only:
+        parameter = parameter.model_copy(
+            update={
+                "credential_id": "cred_b",
+                "credential_ids": [] if pool_kind == "fallback_only_empty" else None,
+                "fallback_credential_ids": ["cred_a"],
+            }
+        )
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _retry_workflow(parameter),
+                WorkflowRunModel(
+                    workflow_run_id="wr_test",
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_test",
+                    organization_id="org_test",
+                    status="failed",
+                    sequential_credential_id=sequential_credential_id,
+                    fallback_attempt=1 if fallback_only else 0,
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_test",
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="retry",
+                ),
+                CredentialModel(
+                    credential_id="cred_a",
+                    organization_id="org_test",
+                    name="Login",
+                    credential_type="password",
+                    item_id="item_a",
+                    run_sequentially=pool_kind == "sequential",
+                ),
+            ]
+        )
+        if pool_kind != "missing_metadata":
+            session.add(
+                CredentialParameterModel(
+                    workflow_id="wf_test",
+                    key="login_cred",
+                    credential_id=parameter.credential_id,
+                    credential_ids=parameter.credential_ids,
+                    fallback_credential_ids=parameter.fallback_credential_ids,
+                )
+            )
+        if pool_kind != "unverified":
+            session.add(
+                CredentialModel(
+                    credential_id="cred_b",
+                    organization_id="org_test",
+                    name="Alternate login",
+                    credential_type="password",
+                    item_id="item_b",
+                    run_sequentially=pool_kind not in {"fallback_only_empty", "fallback_only_absent"},
+                )
+            )
+        await session.commit()
+    repo = sqlite_db.workflow_run_credential_selections
+    if fallback_only:
+        await repo.create_selection(
+            organization_id="org_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            parameter_key="login_cred",
+            credential_id="cred_a",
+        )
+    stub = SimpleNamespace(
+        DATABASE=sqlite_db, WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(remove_workflow_run_context=lambda _run: None)
+    )
+    monkeypatch.setattr(retry_policy_module, "app", stub)
+    monkeypatch.setattr(credential_selection_module, "app", stub)
+
+    credential = MagicMock()
+    credential.model_dump.return_value = {}
+    credential_service = MagicMock()
+    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
+        context_app.DATABASE = sqlite_db
+        context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
+        context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
+            side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
+        )
+        first_context = _runtime_context()
+        workflow = await sqlite_db.workflows.get_workflow("wf_test", organization_id="org_test")
+        assert workflow is not None
+        await first_context.register_credential_parameter_value(
+            workflow.workflow_definition.parameters[0],
+            SimpleNamespace(organization_id="org_test"),
+        )
+        assert first_context.get_resolved_credential_parameter_id("login_cred") == "cred_a"
+
+        if pool_kind == "stale_metadata":
+            parameter = parameter.model_copy(update={"credential_ids": ["cred_a", "cred_b"]})
+            await sqlite_db.workflows.update_workflow_and_reconcile_definition_params(
+                "wf_test",
+                organization_id="org_test",
+                workflow_definition=WorkflowDefinition(parameters=[parameter], blocks=[]),
+            )
+        if pool_kind in {"stale_metadata", "missing_metadata"}:
+            async with sqlite_db.Session() as session:
+                metadata = await session.scalar(
+                    select(CredentialParameterModel).where(CredentialParameterModel.workflow_id == "wf_test")
+                )
+                if pool_kind == "stale_metadata":
+                    assert metadata is not None and metadata.credential_ids == ["cred_a"]
+                else:
+                    assert metadata is None
+
+        preparation = await retry_policy_module.prepare_next_attempt_result("wr_test", "org_test", 1)
+        assert preparation.status == "inserted"
+        assert preparation.serialized_identity is (pool_kind == "sequential")
+        workflow = await sqlite_db.workflows.get_workflow("wf_test", organization_id="org_test")
+        assert workflow is not None
+        context = _runtime_context()
+        await context.register_credential_parameter_value(
+            workflow.workflow_definition.parameters[0],
+            SimpleNamespace(organization_id="org_test"),
+        )
+    assert context.get_resolved_credential_parameter_id("login_cred") == "cred_a"
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_test", "org_test")
+    assert run is not None and run.sequential_credential_id == sequential_credential_id
+    assert run.fallback_attempt == (1 if fallback_only else 0)
+    assert await repo.get_selections_for_run("wr_test") == {"login_cred": "cred_a"}
+
+
+@pytest_asyncio.fixture
+async def retry_rotation_db(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -> AgentDB:
+    await sqlite_db.organizations.create_organization("Test", organization_id="org_test")
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _retry_workflow(_credential_parameter(credential_ids=["cred_a", "cred_b"])),
+                WorkflowRunModel(
+                    workflow_run_id="wr_test",
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_test",
+                    organization_id="org_test",
+                    status="failed",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_test",
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="retry",
+                ),
+                *[
+                    CredentialModel(
+                        credential_id=credential_id,
+                        organization_id="org_test",
+                        name="Login",
+                        credential_type="password",
+                        item_id=f"item_{credential_id}",
+                        run_sequentially=False,
+                    )
+                    for credential_id in ["cred_a", "cred_b"]
+                ],
+            ]
+        )
+        await session.commit()
+    monkeypatch.setattr(credential_selection_module, "app", SimpleNamespace(DATABASE=sqlite_db))
+    return sqlite_db
+
+
+@pytest.mark.asyncio
+async def test_retry_registers_prepared_binding_after_definition_edit(retry_rotation_db: AgentDB) -> None:
+    database = retry_rotation_db
+    repo = database.workflow_run_credential_selections
+    parameter = _credential_parameter(credential_ids=["cred_a"])
+    async with database.Session() as session:
+        workflow = await session.get(WorkflowModel, "wf_test")
+        workflow.workflow_definition = WorkflowDefinition(parameters=[parameter], blocks=[]).model_dump(mode="json")
+        credential_b = await session.get(CredentialModel, "cred_b")
+        credential_b.run_sequentially = True
+        await session.commit()
+    await repo.create_selection(
+        organization_id="org_test",
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        parameter_key="login_cred",
+        credential_id="cred_a",
+    )
+    preparation = await database.workflow_runs.prepare_next_attempt_atomic("wr_test", "org_test", 1, "failed", None)
+    assert preparation.status == "inserted"
+    prepared_credential = await repo.get_selection("wr_test", "login_cred")
+    parameter = parameter.model_copy(update={"credential_ids": ["cred_a", "cred_b"]})
+    await database.workflows.update_workflow_and_reconcile_definition_params(
+        "wf_test",
+        organization_id="org_test",
+        workflow_definition=WorkflowDefinition(parameters=[parameter], blocks=[]),
+    )
+    workflow = await database.workflows.get_workflow("wf_test", organization_id="org_test")
+    assert workflow is not None
+    credential = MagicMock()
+    credential.model_dump.return_value = {}
+    credential_service = MagicMock()
+    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
+        context_app.DATABASE = database
+        context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
+        context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
+            side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
+        )
+        context = _runtime_context()
+        await context.register_credential_parameter_value(
+            workflow.workflow_definition.parameters[0], SimpleNamespace(organization_id="org_test")
+        )
+    assert context.get_resolved_credential_parameter_id("login_cred") == prepared_credential == "cred_a"
+    assert context.has_value("login_cred")
+    run = await database.workflow_runs.get_workflow_run("wr_test", "org_test")
+    assert run is not None and run.sequential_credential_id is None
+    assert await repo.get_selections_for_run("wr_test") == {"login_cred": "cred_a"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_kind", ["unseen", "oldest", "tie"])
+async def test_retry_preparation_binds_lru_and_alternates(retry_rotation_db: AgentDB, history_kind: str) -> None:
+    database = retry_rotation_db
+    repo = database.workflow_run_credential_selections
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with database.Session() as session:
+        session.add(
+            WorkflowRunCredentialSelectionModel(
+                organization_id="org_test",
+                workflow_run_id="wr_test",
+                workflow_permanent_id="wpid_test",
+                parameter_key="login_cred",
+                credential_id="cred_a",
+                created_at=now - timedelta(minutes=1),
+            )
+        )
+        if history_kind != "unseen":
+            session.add(
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="wr_history",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="login_cred",
+                    credential_id="cred_b",
+                    created_at=now - timedelta(minutes=1 if history_kind == "tie" else 2),
+                )
+            )
+        if history_kind == "tie":
+            workflow = await session.get(WorkflowModel, "wf_test")
+            workflow.workflow_definition = WorkflowDefinition(
+                parameters=[_credential_parameter(credential_ids=["cred_b", "cred_a"])], blocks=[]
+            ).model_dump(mode="json")
+        await session.commit()
+    for from_attempt, expected_credential in [(1, "cred_b"), (2, "cred_a"), (3, "cred_b")]:
+        preparation = await database.workflow_runs.prepare_next_attempt_atomic(
+            "wr_test", "org_test", from_attempt, "failed", None
+        )
+        assert preparation.status == "inserted"
+        assert await repo.get_selection("wr_test", "login_cred") == expected_credential
+        async with database.Session() as session:
+            run = await session.get(WorkflowRunModel, "wr_test")
+            run.status = "failed"
+            attempt = await session.scalar(
+                select(WorkflowRunAttemptModel).where(
+                    WorkflowRunAttemptModel.workflow_run_id == "wr_test",
+                    WorkflowRunAttemptModel.attempt_number == from_attempt + 1,
+                )
+            )
+            attempt.status = "failed"
+            attempt.retry_decision = "retry"
+            await session.commit()
+    async with database.Session() as session:
+        bindings = (
+            await session.execute(
+                select(
+                    WorkflowRunCredentialSelectionModel.workflow_run_id,
+                    WorkflowRunCredentialSelectionModel.credential_id,
+                ).where(WorkflowRunCredentialSelectionModel.workflow_run_id != "wr_history")
+            )
+        ).all()
+    assert set(bindings) == {
+        ("wr_test:attempt:1", "cred_a"),
+        ("wr_test:attempt:2", "cred_b"),
+        ("wr_test:attempt:3", "cred_a"),
+        ("wr_test", "cred_b"),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool", [["cred_a", "cred_b", "cred_c"], ["cred_a"]])
+async def test_retry_preparation_uses_random_strategy(
+    retry_rotation_db: AgentDB, monkeypatch: pytest.MonkeyPatch, pool: list[str]
+) -> None:
+    database = retry_rotation_db
+    async with database.Session() as session:
+        workflow = await session.get(WorkflowModel, "wf_test")
+        workflow.workflow_definition = WorkflowDefinition(
+            parameters=[_credential_parameter(credential_ids=pool, selection_strategy="random")], blocks=[]
+        ).model_dump(mode="json")
+        session.add(
+            CredentialModel(
+                credential_id="cred_c",
+                organization_id="org_test",
+                name="Login",
+                credential_type="password",
+                item_id="item_c",
+                run_sequentially=False,
+            )
+        )
+        await session.commit()
+    repo = database.workflow_run_credential_selections
+    await repo.create_selection(
+        organization_id="org_test",
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        parameter_key="login_cred",
+        credential_id="cred_a",
+    )
+    monkeypatch.setattr(credential_selection_module, "random", random.Random(0))
+    preparation = await database.workflow_runs.prepare_next_attempt_atomic("wr_test", "org_test", 1, "failed", None)
+
+    assert preparation.status == "inserted"
+    selected = await repo.get_selection("wr_test", "login_cred")
+    assert selected == ("cred_c" if len(pool) > 1 else "cred_a")
+    assert selected in pool
+    if len(pool) > 1:
+        assert selected != "cred_a"
+    assert await repo.get_selection("wr_test:attempt:1", "login_cred") == "cred_a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate_kind", ["credential", "workflow", "output", "context"])
+async def test_retry_preparation_retains_duplicate_parameter_keys(
+    retry_rotation_db: AgentDB, duplicate_kind: str
+) -> None:
+    database = retry_rotation_db
+    parameter = _credential_parameter(credential_ids=["cred_a", "cred_b"])
+    duplicates = {
+        "credential": parameter.model_copy(update={"credential_ids": ["cred_a"]}),
+        "workflow": _workflow_parameter(parameter.key),
+        "output": OutputParameter(
+            key=parameter.key,
+            output_parameter_id="op_test",
+            workflow_id="wf_test",
+            created_at=parameter.created_at,
+            modified_at=parameter.modified_at,
+        ),
+        "context": ContextParameter(key=parameter.key, source=_workflow_parameter("source")),
+    }
+    async with database.Session() as session:
+        workflow = await session.get(WorkflowModel, "wf_test")
+        workflow.workflow_definition = WorkflowDefinition(
+            parameters=[parameter, duplicates[duplicate_kind]], blocks=[]
+        ).model_dump(mode="json")
+        await session.commit()
+    repo = database.workflow_run_credential_selections
+    await repo.create_selection(
+        organization_id="org_test",
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        parameter_key=parameter.key,
+        credential_id="cred_a",
+    )
+    preparation = await database.workflow_runs.prepare_next_attempt_atomic("wr_test", "org_test", 1, "failed", None)
+    assert preparation.status == "inserted"
+    assert await repo.get_selection("wr_test", parameter.key) == "cred_a"
+    async with database.Session() as session:
+        bindings = (await session.scalars(select(WorkflowRunCredentialSelectionModel))).all()
+    assert len(bindings) == 1 and bindings[0].workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_retry_without_selections_never_loads_definition(
+    retry_rotation_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    database = retry_rotation_db
+    repo = database.workflow_run_credential_selections
+    for run_id, org_id in [("wr_other", "org_test"), ("wr_test", "org_other")]:
+        await repo.create_selection(
+            organization_id=org_id,
+            workflow_run_id=run_id,
+            workflow_permanent_id="wpid_test",
+            parameter_key="login_cred",
+            credential_id="cred_a",
+        )
+
+    def reject_definition_read(
+        _connection: Any, _cursor: Any, statement: str, _parameters: Any, _context: Any, _many: bool
+    ) -> None:
+        if " from workflows " in " ".join(statement.lower().split()) and "workflows.workflow_definition" in statement:
+            raise AssertionError("Preparation loaded a definition without credential selections")
+
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", reject_definition_read)
+    try:
+        with patch.object(
+            workflow_runs_repository_module.WorkflowDefinition,
+            "model_validate",
+            side_effect=AssertionError("Preparation parsed a definition without credential selections"),
+        ):
+            preparation = await database.workflow_runs.prepare_next_attempt_atomic(
+                "wr_test", "org_test", 1, "failed", None
+            )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", reject_definition_read)
+    assert preparation.status == "inserted"
+    attempts = await database.workflow_run_attempts.get_attempts("wr_test")
+    assert [(attempt.attempt_number, attempt.status) for attempt in attempts] == [(1, "failed"), (2, "queued")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolver", ["context", "service"])
+@pytest.mark.parametrize("single_credential_id", ["cred_b", "cred_c"])
+@pytest.mark.parametrize("credential_ids", [None, []], ids=["none", "empty"])
+@pytest.mark.parametrize("prepared_binding", [True, False], ids=["prepared", "unbound"])
+async def test_retry_runtime_registration_with_single_credential_definition(
+    retry_rotation_db: AgentDB,
+    resolver: str,
+    single_credential_id: str,
+    credential_ids: list[str] | None,
+    prepared_binding: bool,
+) -> None:
+    database = retry_rotation_db
+    repo = database.workflow_run_credential_selections
+    single_parameter = _credential_parameter(credential_id=single_credential_id, credential_ids=credential_ids)
+    initial_parameter = _credential_parameter(credential_ids=["cred_a"]) if prepared_binding else single_parameter
+    sequential_credential_id = "cred_b" if not prepared_binding and single_credential_id == "cred_b" else None
+    async with database.Session() as session:
+        workflow = await session.get(WorkflowModel, "wf_test")
+        workflow.workflow_definition = WorkflowDefinition(parameters=[initial_parameter], blocks=[]).model_dump(
+            mode="json"
+        )
+        credential_b = await session.get(CredentialModel, "cred_b")
+        credential_b.run_sequentially = True
+        session.add(
+            CredentialModel(
+                credential_id="cred_c",
+                organization_id="org_test",
+                name="Login",
+                credential_type="password",
+                item_id="item_cred_c",
+                run_sequentially=False,
+            )
+        )
+        run = await session.get(WorkflowRunModel, "wr_test")
+        run.sequential_credential_id = sequential_credential_id
+        await session.commit()
+    if prepared_binding:
+        await repo.create_selection(
+            organization_id="org_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            parameter_key="login_cred",
+            credential_id="cred_a",
+        )
+    preparation = await database.workflow_runs.prepare_next_attempt_atomic("wr_test", "org_test", 1, "failed", None)
+    assert preparation.status == "inserted"
+    expected_binding = "cred_a" if prepared_binding else None
+    assert await repo.get_selection("wr_test", "login_cred") == expected_binding
+    attempts = await database.workflow_run_attempts.get_attempts("wr_test")
+    assert [(attempt.attempt_number, attempt.status) for attempt in attempts] == [(1, "failed"), (2, "queued")]
+    await database.workflows.update_workflow_and_reconcile_definition_params(
+        "wf_test",
+        organization_id="org_test",
+        workflow_definition=WorkflowDefinition(parameters=[single_parameter], blocks=[]),
+    )
+    workflow = await database.workflows.get_workflow("wf_test", organization_id="org_test")
+    assert workflow is not None
+    parameter = workflow.workflow_definition.parameters[0]
+    assert isinstance(parameter, CredentialParameter)
+    assert parameter.credential_id == single_credential_id
+    assert parameter.credential_ids == credential_ids
+    assert parameter.fallback_credential_ids is None
+    credential = MagicMock()
+    credential.model_dump.return_value = {}
+    credential_service = MagicMock()
+    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    with (
+        patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app,
+        patch("skyvern.forge.sdk.workflow.service.app") as service_app,
+    ):
+        context_app.DATABASE = database
+        context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
+        context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
+            side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
+        )
+        service_app.DATABASE = database
+        service_app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts = {}
+        context = _runtime_context()
+        context.attempt_number = 2
+        organization = SimpleNamespace(organization_id="org_test")
+        if resolver == "context":
+            await context.register_credential_parameter_value(parameter, organization)
+        else:
+            resolved = await WorkflowService()._resolve_credential_parameter_id(
+                parameter=parameter,
+                workflow_run_id="wr_test",
+                organization_id="org_test",
+                workflow_permanent_id="wpid_test",
+            )
+            await context._register_credential_parameter_value(resolved, parameter, organization)
+    assert context.get_resolved_credential_parameter_id("login_cred") == (expected_binding or single_credential_id)
+    assert context.has_value("login_cred")
+    run = await database.workflow_runs.get_workflow_run("wr_test", "org_test")
+    assert run is not None and run.sequential_credential_id == sequential_credential_id
+    assert await repo.get_selections_for_run("wr_test") == ({"login_cred": "cred_a"} if prepared_binding else {})

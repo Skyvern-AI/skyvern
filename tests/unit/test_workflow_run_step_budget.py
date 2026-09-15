@@ -20,6 +20,7 @@ def _make_task(
     task = MagicMock()
     task.task_id = task_id
     task.organization_id = organization_id
+    task.attempt_number = None
     task.workflow_run_id = workflow_run_id
     return task
 

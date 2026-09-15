@@ -13,7 +13,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypeVar
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,6 +40,26 @@ from tests.unit.force_stub_app import start_forge_stub_app
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+
+class FakeWorkflowRunAttemptsRepository:
+    """Small in-memory repository for tests that need durable attempt resolution."""
+
+    def __init__(self, attempts: list[Any] | None = None) -> None:
+        self.attempts = list(attempts or [])
+        self.requested_workflow_run_ids: list[str] = []
+
+    async def get_attempts(self, workflow_run_id: str) -> list[Any]:
+        self.requested_workflow_run_ids.append(workflow_run_id)
+        return list(self.attempts)
+
+    async def refresh_attempt_finished_at(self, workflow_run_id: str, attempt_number: int, *, finished_at: Any) -> Any:
+        for attempt in self.attempts:
+            if attempt.workflow_run_id == workflow_run_id and attempt.attempt_number == attempt_number:
+                if getattr(attempt, "retry_decision", None) is not None:
+                    attempt.finished_at = finished_at
+                return attempt
+        return None
 
 
 @pytest.fixture
@@ -90,12 +110,14 @@ def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
         mask_secrets: bool = True,
         secrets: dict[str, str] | None = None,
         runtime_otp_values: set[str] | None = None,
+        attempt_number: int = 1,
     ) -> WorkflowContextManager:
         manager = WorkflowContextManager()
         manager.workflow_run_contexts[workflow_run_id] = SimpleNamespace(
             mask_secrets=mask_secrets,
             secrets=dict(secrets or {}),
             runtime_otp_values=set(runtime_otp_values or set()),
+            attempt_number=attempt_number,
         )
         return manager
 

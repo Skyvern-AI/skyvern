@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 import pickle
 import re
 import smtplib
@@ -1138,3 +1139,30 @@ async def test_a_substituted_newline_is_flattened_rather_than_failing_the_send(
 
     assert message["Subject"] == "Report okBcc: attacker@example.com"
     assert message["BCC"] == "sender@example.com"
+
+
+@pytest.mark.asyncio
+async def test_email_download_directory_ignores_previous_attempt_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    download_dir = tmp_path / "wr_email"
+    download_dir.mkdir()
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    for name, offset in (("old.txt", -1), ("fresh.txt", 0)):
+        path = download_dir / name
+        path.write_text(name)
+        os.utime(path, (started_at.timestamp() + offset,) * 2)
+    block = _send_email_block(file_attachments=[settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY])
+    context = _run_context()
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+            AsyncMock(return_value=("wr_email", 2, started_at)),
+        ),
+    ):
+        message = await block._build_email_message(context, "wr_email", "o_1")
+
+    assert [part.get_filename() for part in message.iter_attachments()] == ["fresh.txt"]
+    assert (download_dir / "old.txt").read_text() == "old.txt"

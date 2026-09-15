@@ -675,7 +675,7 @@ def _install_db_fakes(
         state["execute_step_kwargs"] = kwargs
         return None, None, None
 
-    async def _get_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
+    async def _get_current_attempt_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
         return list(downloaded_files or [])
 
     async def _create_action(action: Action) -> Action:
@@ -711,7 +711,11 @@ def _install_db_fakes(
     monkeypatch.setattr(
         app.DATABASE.observer, "update_workflow_run_block", AsyncMock(side_effect=_update_workflow_run_block)
     )
-    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(side_effect=_get_downloaded_files))
+    monkeypatch.setattr(
+        app.STORAGE,
+        "get_current_attempt_downloaded_files",
+        AsyncMock(side_effect=_get_current_attempt_downloaded_files),
+    )
     monkeypatch.setattr(
         app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock(return_value=None)
     )

@@ -159,6 +159,7 @@ async def test_failure_is_committed_before_exact_page_capture_finishes(
             engine="secure_runner",
             resolved_download_id=None,
             download_dir_before=None,
+            attempt_started_at=None,
         )
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
@@ -233,6 +234,7 @@ async def test_continuation_cancels_pending_capture_without_attaching(
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
     await context.cancel_failure_evidence_capture()
@@ -736,6 +738,7 @@ async def test_end_url_is_persisted_while_the_frame_is_still_stalled(
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
 
@@ -831,6 +834,7 @@ async def test_capture_failure_leaves_committed_failure_intact(monkeypatch: pyte
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_attempted.wait(), timeout=1)
     await context.drain_failure_evidence_capture()
@@ -870,6 +874,7 @@ async def test_missing_page_publishes_failure_without_starting_capture(monkeypat
         engine="inline",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
 
     assert result.failure_reason == failure_reason

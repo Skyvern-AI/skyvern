@@ -7,10 +7,16 @@ previous blocks.
 """
 
 import asyncio
+import os
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.artifact.storage import base as base_module
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.loop_download_filter import (
@@ -19,7 +25,15 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
     to_downloaded_file_signature,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    DOWNLOAD_BINDING_FAILURE_REASON,
+    CodeBlock,
     capture_block_download_baseline,
+)
+from tests.unit.test_code_block_downloads import (
+    _fake_storage_app,
+    _output_parameter,
+    _wire_block_runtime,
+    _wire_secure_runner,
 )
 
 
@@ -48,7 +62,7 @@ def test_second_block_excludes_first_blocks_files():
         DOWNLOADED_FILE_SIGS_KEY: baseline_sigs,
     }
 
-    # After block 2 runs, get_downloaded_files returns both files
+    # After block 2 runs, get_current_attempt_downloaded_files returns both files
     all_files = [file1, file2]
 
     # Filter should return only file2 (new since baseline)
@@ -121,7 +135,7 @@ async def test_baseline_captured_when_loop_internal_state_is_none():
     context = SkyvernContext(run_id="wr_test", loop_internal_state=None)
 
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(return_value=[file1])
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(return_value=[file1])
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
@@ -147,7 +161,7 @@ async def test_baseline_recaptured_when_set_by_previous_block():
     )
 
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(return_value=[file1, file2])
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(return_value=[file1, file2])
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
@@ -172,7 +186,7 @@ async def test_baseline_recaptured_even_when_loop_set_it():
     # exists alongside the loop's pre-iteration a.pdf.
     sibling_file = _make_file_info("s3://bucket/b.pdf", "b.pdf", "checksum_b")
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(
         return_value=[_make_file_info("s3://a.pdf", "a.pdf", "abc"), sibling_file]
     )
 
@@ -182,7 +196,7 @@ async def test_baseline_recaptured_even_when_loop_set_it():
 
     # Re-captured: the sibling's file is now part of this block's baseline, so it
     # will be filtered out of this block's own output.
-    mock_storage.get_downloaded_files.assert_called_once()
+    mock_storage.get_current_attempt_downloaded_files.assert_called_once()
     assert len(context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY]) == 2
 
 
@@ -191,7 +205,7 @@ async def test_baseline_capture_degrades_on_timeout():
     """TimeoutError clears loop_internal_state and lets the block proceed."""
     context = SkyvernContext(run_id="wr_test", loop_internal_state=None)
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
@@ -210,13 +224,13 @@ async def test_stale_loop_baseline_overwritten_by_fresh_capture():
     }
     context = SkyvernContext(run_id="wr_test", loop_internal_state=stale_loop_state)
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(return_value=[])
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(return_value=[])
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
 
-    mock_storage.get_downloaded_files.assert_called_once()
+    mock_storage.get_current_attempt_downloaded_files.assert_called_once()
     assert context.loop_internal_state is not stale_loop_state
     assert context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY] == []
 
@@ -226,7 +240,7 @@ async def test_baseline_capture_degrades_on_generic_exception():
     """Non-timeout exceptions (e.g. S3 errors) clear state and let the block proceed."""
     context = SkyvernContext(run_id="wr_test", loop_internal_state=None)
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(side_effect=RuntimeError("S3 blip"))
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(side_effect=RuntimeError("S3 blip"))
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
@@ -295,7 +309,7 @@ async def test_sibling_download_blocks_in_loop_iteration_scope_to_own_files():
 
     mock_storage = AsyncMock()
     # Each baseline capture reads a snapshot of the files that exist at that moment.
-    mock_storage.get_downloaded_files = AsyncMock(side_effect=lambda **_: list(run_files))
+    mock_storage.get_current_attempt_downloaded_files = AsyncMock(side_effect=lambda **_: list(run_files))
 
     async def run_download_block(produced: FileInfo) -> list[FileInfo]:
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
@@ -317,3 +331,134 @@ async def test_sibling_download_blocks_in_loop_iteration_scope_to_own_files():
     context.loop_internal_state = {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(f) for f in run_files]}
     out4 = await run_download_block(pp4)
     assert [f.filename for f in out4] == ["page_4.pdf"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt_number", [1, 2])
+@pytest.mark.parametrize("start_kind", ["aware", "naive", "missing"])
+async def test_current_attempt_downloads_preserve_unknown_dates_and_include_start_boundary(
+    tmp_path, monkeypatch, attempt_number, start_kind
+):
+    boundary = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    started_at = {"aware": boundary, "naive": boundary.replace(tzinfo=None), "missing": None}[start_kind]
+    files = [
+        FileInfo(url="file:///old.pdf", modified_at=boundary - timedelta(microseconds=1)),
+        FileInfo(url="file:///old-naive.pdf", modified_at=(boundary - timedelta(seconds=1)).replace(tzinfo=None)),
+        FileInfo(url="file:///boundary.pdf", modified_at=boundary.replace(tzinfo=None)),
+        FileInfo(url="file:///offset.pdf", modified_at=boundary.astimezone(timezone(timedelta(hours=-4)))),
+        FileInfo(url="file:///new.pdf", modified_at=boundary + timedelta(seconds=1)),
+        FileInfo(url="file:///unknown.pdf", modified_at=None),
+    ]
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    monkeypatch.setattr(storage, "get_downloaded_files", AsyncMock(return_value=files))
+    resolve_attempt = AsyncMock(return_value=("wr_owner", attempt_number, started_at))
+    monkeypatch.setattr(base_module, "resolve_download_attempt", resolve_attempt)
+
+    result = await storage.get_current_attempt_downloaded_files("o_1", "wr_child")
+
+    assert result == (files[2:] if attempt_number > 1 and started_at is not None else files)
+    resolve_attempt.assert_awaited_once_with("o_1", "wr_child", attempt_number=None)
+    storage.get_downloaded_files.assert_awaited_once_with(organization_id="o_1", run_id="wr_child")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt_number", [1, 2])
+@pytest.mark.parametrize("change", ["rewrite", "late_stale", "unchanged"])
+@pytest.mark.parametrize("engine", ["inline", "secure"])
+async def test_code_block_binding_verdict_recognizes_proven_retry_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt_number: int, change: str, engine: str
+) -> None:
+    download_dir = tmp_path / "wr_1"
+    download_dir.mkdir()
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path))
+    old_file = download_dir / "report.pdf"
+    old_file.write_bytes(b"before")
+    old_time = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(old_file, (old_time, old_time))
+    cutoff = datetime(2026, 1, 2, tzinfo=UTC)
+    monkeypatch.setattr(
+        base_module, "resolve_download_attempt", AsyncMock(return_value=("wr_1", attempt_number, cutoff))
+    )
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+
+    def produce_download() -> None:
+        if change == "unchanged":
+            return
+        target = old_file if change == "rewrite" else download_dir / "late.pdf"
+        target.write_bytes(b"newly generated bytes")
+        os.utime(target, (old_time, old_time))
+
+    async def execute_code(*args: object, **kwargs: object) -> dict[str, bool]:
+        produce_download()
+        return {"ok": True}
+
+    if engine == "secure":
+        _wire_secure_runner(monkeypatch, output={"ok": True}, on_execute=produce_download)
+    else:
+        monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(side_effect=execute_code))
+    block = CodeBlock(label="download", code="value = 'unused'", output_parameter=_output_parameter("code_out"))
+    previous_context = skyvern_context.current()
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    try:
+        result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+    finally:
+        if previous_context is None:
+            skyvern_context.reset()
+        else:
+            skyvern_context.set(previous_context)
+
+    has_new_download = change == "rewrite" or (change == "late_stale" and attempt_number == 1)
+    assert (result.failure_reason == DOWNLOAD_BINDING_FAILURE_REASON) == has_new_download
+    assert result.success is not has_new_download
+    assert old_file.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_lookup_fails", [False, True])
+async def test_secure_code_block_reuses_retry_cutoff_when_lookup_is_transient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_lookup_fails: bool
+) -> None:
+    download_dir = tmp_path / "wr_1"
+    download_dir.mkdir()
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path))
+    cutoff = datetime(2026, 1, 2, tzinfo=UTC)
+    resolved_attempt = ("wr_1", 2, cutoff)
+    lookup_error = RuntimeError("download attempt lookup unavailable")
+    resolve_attempt = AsyncMock(
+        side_effect=[lookup_error, resolved_attempt] if first_lookup_fails else [resolved_attempt, lookup_error]
+    )
+    monkeypatch.setattr(base_module, "resolve_download_attempt", resolve_attempt)
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+    register_downloads = AsyncMock(return_value=([], set()))
+    monkeypatch.setattr(CodeBlock, "_register_downloaded_files", register_downloads)
+
+    def materialize_stale_download() -> None:
+        late_file = download_dir / "late.pdf"
+        late_file.write_bytes(b"retained download")
+        old_time = (cutoff - timedelta(days=1)).timestamp()
+        os.utime(late_file, (old_time, old_time))
+
+    _wire_secure_runner(monkeypatch, output={"ok": True}, on_execute=materialize_stale_download)
+    block = CodeBlock(label="download", code="value = 'unused'", output_parameter=_output_parameter("code_out"))
+    previous_context = skyvern_context.current()
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    try:
+        result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+    finally:
+        if previous_context is None:
+            skyvern_context.reset()
+        else:
+            skyvern_context.set(previous_context)
+
+    if first_lookup_fails:
+        register_downloads.assert_awaited_once()
+        assert result.failure_reason == DOWNLOAD_BINDING_FAILURE_REASON
+        assert result.output_parameter_value["download_registration_failed"] is True
+    else:
+        register_downloads.assert_not_awaited()
+        assert result.success
+        assert result.failure_reason is None
+        assert result.output_parameter_value == {"ok": True}
+    resolve_attempt.assert_awaited_once_with("o_1", "wr_1", attempt_number=None)

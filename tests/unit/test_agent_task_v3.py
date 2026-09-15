@@ -4127,6 +4127,49 @@ async def test_execute_task_v3_handoff_flag_on_renders_predecessor_into_goal(mon
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_handoff_ignores_blocks_from_prior_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.settings.TASK_V3_BLOCK_HANDOFF", True)
+    monkeypatch.setattr("skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number", lambda _run_id: 2)
+    previous_attempt_row = _make_predecessor_run_block(
+        workflow_run_block_id="wrb_attempt_1",
+        attempt_number=1,
+        created_at=datetime.now(UTC) - timedelta(minutes=5),
+        label="old_shipping",
+        status=BlockStatus.failed,
+        finish_reason="prior attempt failure",
+    )
+    current_attempt_row = _make_predecessor_run_block(
+        workflow_run_block_id="wrb_attempt_2",
+        attempt_number=2,
+        task_id="task-123",
+        created_at=datetime.now(UTC),
+        label="shipping",
+        status=BlockStatus.running,
+        finish_reason=None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks",
+        AsyncMock(return_value=[previous_attempt_row, current_attempt_row]),
+    )
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "Workflow context" not in goal
+    assert "prior attempt failure" not in goal
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_handoff_flag_off_skips_lookup_and_goal_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

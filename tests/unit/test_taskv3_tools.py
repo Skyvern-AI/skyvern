@@ -11,13 +11,16 @@ import contextlib
 import html
 import itertools
 import json
+import os
 import re
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from html import escape as html_escape
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -29,6 +32,8 @@ from structlog.testing import capture_logs
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -22137,6 +22142,101 @@ async def test_a_selector_rewrite_does_not_outlive_the_call_that_made_it() -> No
     # "not rendered", which would have sent the model away from the layer it has to dismiss.
     assert "Call log" in str(raised.value), str(raised.value)[:400]
     assert "not rendered" not in str(raised.value), str(raised.value)[:400]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [2, 1, None, "lookup_error"])
+async def test_download_signal_ignores_retained_partial_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt
+) -> None:
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    result = ("wr_retry", attempt or 1, cutoff if attempt else None)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+        AsyncMock(
+            return_value=result,
+            side_effect=RuntimeError("lookup unavailable") if attempt == "lookup_error" else None,
+        ),
+    )
+    monkeypatch.setattr(
+        skyvern_context, "current", lambda: SkyvernContext(organization_id="o_test", workflow_run_id="wr_retry")
+    )
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old bytes")
+    os.utime(stale, (100, 100))
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()), downloads_dir=str(tmp_path))
+    await _prime(tools)
+    stale.rename(tmp_path / "previous.pdf")
+    result = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert bool((result.data or {}).get("download_new")) is (attempt != 2)
+    assert ("Downloaded: previous.pdf" in result.content) is (attempt != 2)
+    assert (tmp_path / "previous.pdf").stat().st_mtime == 100
+    (tmp_path / "current.pdf").write_bytes(b"current bytes")
+    current = await _tool(tools, "wait").handler({"time_ms": 1})
+    assert (current.data or {}).get("download_new") is True
+    assert "Downloaded: current.pdf" in current.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_download_signal_waits_for_cutoff_before_concurrent_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_first: bool
+) -> None:
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+    second_entered = asyncio.Event()
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old bytes")
+    os.utime(stale, (100, 100))
+
+    async def resolve_attempt(*_args, **_kwargs):
+        lookup_started.set()
+        await release_lookup.wait()
+        return "wr_retry", 2, cutoff
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt", resolve_attempt)
+    monkeypatch.setattr(
+        skyvern_context, "current", lambda: SkyvernContext(organization_id="o_test", workflow_run_id="wr_retry")
+    )
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()), downloads_dir=str(tmp_path))
+    wait = _tool(tools, "wait").handler
+
+    async def second_call():
+        second_entered.set()
+        return await wait({"time_ms": 1})
+
+    async with asyncio.timeout(2):
+        first = asyncio.create_task(wait({"time_ms": 1}))
+        try:
+            await lookup_started.wait()
+            if cancel_first:
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+            second = asyncio.create_task(second_call())
+            try:
+                await second_entered.wait()
+                stale.rename(tmp_path / "previous.pdf")
+                await asyncio.sleep(0.01)
+                assert not second.done()
+                release_lookup.set()
+                result = await second
+                if not cancel_first:
+                    await first
+            finally:
+                second.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await second
+        finally:
+            first.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first
+    assert not (result.data or {}).get("download_new")
+    assert "Downloaded: previous.pdf" not in result.content
+    (tmp_path / "current.pdf").write_bytes(b"new bytes")
+    current = await wait({"time_ms": 1})
+    assert (current.data or {}).get("download_new") is True
 
 
 # A form that repeats a section renders the same caption many times over: eight `Year` inputs, five

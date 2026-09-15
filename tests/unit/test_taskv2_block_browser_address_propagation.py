@@ -76,7 +76,10 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
             get_recent_task_screenshot_artifacts=AsyncMock(return_value=[]),
             get_recent_workflow_screenshot_artifacts=AsyncMock(return_value=[]),
         ),
-        STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[], []])),
+        STORAGE=SimpleNamespace(
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=[[], []]),
+            get_downloaded_file_signature_aliases=lambda _: [],
+        ),
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(has_workflow_run_context=lambda _run_id: False),
     )
     monkeypatch.setattr(block_module, "app", fake_app)

@@ -189,6 +189,30 @@ async def test_sqlite_bootstrap_upgrades_legacy_organization_table(
 
 
 @pytest.mark.asyncio
+async def test_sqlite_bootstrap_adds_attempt_columns_to_existing_tables(
+    sqlite_bootstrap_db,
+    patched_env_writes,
+) -> None:
+    """Bootstrap adds the retry attempt columns to a database created before them, so ORM reads work again."""
+    from sqlalchemy import select
+
+    from skyvern.forge.api_app import _bootstrap_sqlite
+    from skyvern.forge.sdk.db.models import Base, TaskModel, WorkflowRunBlockModel
+
+    async with sqlite_bootstrap_db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
+        await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
+
+    await _bootstrap_sqlite()
+    await _bootstrap_sqlite()
+
+    async with sqlite_bootstrap_db.Session() as session:
+        assert (await session.execute(select(TaskModel))).scalars().all() == []
+        assert (await session.execute(select(WorkflowRunBlockModel))).scalars().all() == []
+
+
+@pytest.mark.asyncio
 async def test_sqlite_bootstrap_syncs_existing_env_api_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -350,6 +374,43 @@ async def test_local_persistent_mode_accepts_settings_without_dotenv(
         assert skyvern._embedded_client is embedded_client
     finally:
         await skyvern.aclose()
+
+
+@pytest.mark.asyncio
+async def test_persistent_embedded_mode_upgrades_an_existing_sqlite_schema(tmp_path: Path) -> None:
+    """Persistent embedded mode never runs the server lifespan, so it must bootstrap the SQLite schema itself."""
+    from sqlalchemy import select
+
+    from skyvern.forge import app as forge_app
+    from skyvern.forge.sdk.db.agent_db import AgentDB
+    from skyvern.forge.sdk.db.models import Base, TaskModel, WorkflowRunBlockModel
+    from skyvern.library.embedded_server_factory import create_embedded_server
+
+    db = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'existing.db'}")
+    async with db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
+        await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
+
+    async def fake_app(scope, receive, send):  # type: ignore[no-untyped-def]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"[]"})
+
+    original_db = forge_app.DATABASE
+    forge_app.DATABASE = db  # type: ignore[assignment]
+    client = create_embedded_server(settings_overrides={"SKYVERN_API_KEY": "dummy-key"}, use_in_memory_db=False)
+    try:
+        with patch("skyvern.library.embedded_server_factory.create_api_app", return_value=fake_app):
+            response = await client.get("/")
+        assert response.status_code == 200
+        # The mapped models select every column; a missing one fails here with "no such column".
+        async with db.Session() as session:
+            assert (await session.execute(select(TaskModel))).scalars().all() == []
+            assert (await session.execute(select(WorkflowRunBlockModel))).scalars().all() == []
+    finally:
+        await client.aclose()
+        forge_app.DATABASE = original_db  # type: ignore[assignment]
+        await db.engine.dispose()
 
 
 @pytest.mark.asyncio
