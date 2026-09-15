@@ -8,8 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import structlog.testing
 
-from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, UnresolvableHost
+from skyvern.exceptions import (
+    BlockedHost,
+    BlockedNavigationDestination,
+    FailedToNavigateToUrl,
+    UnresolvableHost,
+    UnresolvableNavigationHost,
+)
 from skyvern.webeye.navigation import (
+    is_egress_attributable_navigation_failure,
     navigate_with_retry,
     redact_url_secrets,
     revalidate_redirect_chain,
@@ -226,6 +233,102 @@ async def test_get_or_create_page_retries_retriable_failed_navigation() -> None:
     assert browser_state.check_and_fix_state.await_count == 2
     browser_state.close_current_open_page.assert_awaited_once()
     browser_state.validate_browser_context.assert_awaited_once_with(page)
+
+
+_DEAD_URL = "https://gone.example.com/search"
+
+
+def _no_such_host(*args: object, **kwargs: object) -> list[object]:
+    raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+
+def _resolver_cannot_answer(*args: object, **kwargs: object) -> list[object]:
+    raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+
+async def _navigate_failing_with(error_message: str) -> FailedToNavigateToUrl:
+    page = AsyncMock()
+    page.goto = AsyncMock(side_effect=Exception(error_message))
+
+    with pytest.raises(FailedToNavigateToUrl) as raised:
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(_DEAD_URL, timeout=30000, wait_until=strategy),
+            url=_DEAD_URL,
+            retry_times=5,
+            settle=AsyncMock(),
+            sleep=AsyncMock(),
+        )
+
+    assert page.goto.call_count == 1
+    return raised.value
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", id="tunnel"),
+        pytest.param("net::ERR_SOCKS_CONNECTION_FAILED", id="socks"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_proxy_error_for_a_host_with_no_address_record_is_not_blamed_on_our_egress(
+    monkeypatch: pytest.MonkeyPatch, error_message: str
+) -> None:
+    # A proxied browser hands the hostname to the proxy, so a domain whose record is gone comes
+    # back as the proxy failing to open a tunnel rather than as ERR_NAME_NOT_RESOLVED.
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _no_such_host)
+
+    error = await _navigate_failing_with(error_message)
+
+    assert isinstance(error, UnresolvableNavigationHost)
+    assert error.host == "gone.example.com"
+    assert is_egress_attributable_navigation_failure(error) is False
+    # The browser's code is retained so downstream consumers still read the failure as terminal.
+    assert error_message in error.error_message
+
+
+@pytest.mark.asyncio
+async def test_a_proxy_error_for_a_resolvable_host_stays_attributed_to_our_egress() -> None:
+    # The autouse fixture resolves every host, so this is a genuine proxy fault and must keep the
+    # recovery path that retries it on a different proxy node.
+    error = await _navigate_failing_with("net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    assert not isinstance(error, UnresolvableNavigationHost)
+    assert is_egress_attributable_navigation_failure(error) is True
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_that_cannot_answer_does_not_reattribute_a_proxy_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # EAI_AGAIN means the resolver never answered. Reading it as a dead host would reclassify every
+    # egress failure fleet-wide the moment worker DNS degrades.
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_cannot_answer)
+
+    error = await _navigate_failing_with("net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    assert not isinstance(error, UnresolvableNavigationHost)
+    assert is_egress_attributable_navigation_failure(error) is True
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_does_not_redraw_a_proxy_node_for_an_unresolvable_host() -> None:
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.check_and_fix_state = AsyncMock(
+        side_effect=UnresolvableNavigationHost(
+            url=_DEAD_URL,
+            host="gone.example.com",
+            error_message="net::ERR_TUNNEL_CONNECTION_FAILED",
+        )
+    )
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+
+    with pytest.raises(UnresolvableNavigationHost):
+        await browser_state.get_or_create_page(url=_DEAD_URL)
+
+    assert browser_state.check_and_fix_state.await_count == 1
+    browser_state.close_current_open_page.assert_not_awaited()
 
 
 @pytest.mark.parametrize("url", BLOCKED_DESTINATIONS)
