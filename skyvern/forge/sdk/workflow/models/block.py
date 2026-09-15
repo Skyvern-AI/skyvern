@@ -62,7 +62,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import BrowserContext, CDPSession, Frame, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
@@ -302,6 +302,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
+from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
@@ -5233,24 +5234,214 @@ def _bind_code_block_download_claim(
     return click_and_claim_download
 
 
+def _page_origin(url: str) -> str:
+    """The page's origin as CDP's ``securityOrigin`` spells it: never the userinfo a URL can carry."""
+    parsed = urlsplit(url)
+    if parsed.scheme == "blob":
+        # A blob: document reaches the storage of the origin that minted it, and carries that origin
+        # inside its own URL rather than as a host of its own; an opaque one spells `null` and falls
+        # through to the empty answer below.
+        return _page_origin(parsed.path)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
+
+
+def _frames_by_origin(open_page: Page) -> dict[str, list[Frame]]:
+    """Every frame this tab holds, grouped by origin, its own document and each nested one.
+
+    Keyed by origin because sessionStorage is per tab and origin, and carrying the frames because
+    `DOMStorage` is answered by the renderer: a cross-site frame runs out-of-process under the site
+    isolation production has on, and is reachable only from a session attached to that frame. All of
+    them are kept rather than the first, because a sandboxed frame spells the same origin as an
+    ordinary one while reaching no storage at all, and clearing has to find the one that does.
+    """
+    frames: dict[str, list[Frame]] = {}
+    for frame in open_page.frames:
+        origin = _page_origin(frame.url)
+        if origin:
+            frames.setdefault(origin, []).append(frame)
+    return frames
+
+
+def _context_origins(context: BrowserContext) -> list[str]:
+    """Every origin the run's context currently holds a document for, across all its tabs.
+
+    `Storage.clearDataForOrigin` takes one serialized origin and has no wildcard: an origin it cannot
+    parse clears the whole partition only because the filter fails open, which is not something to
+    aim a destructive call at. An origin whose document has already been closed is not reachable this
+    way and keeps its stored data.
+    """
+    origins: dict[str, None] = {}
+    for open_page in context.pages:
+        for origin in _frames_by_origin(open_page):
+            origins[origin] = None
+    return list(origins)
+
+
+def _is_browser_refusal(exc: BaseException) -> bool:
+    """Whether the browser refused this command, on any engine a run can select.
+
+    The clear is handed a page rather than the run's `BrowserEngineSelection`, so it cannot ask the
+    pinned engine the way `skyvern/webeye/utils/page.py` does; the registry answers for every engine
+    instead. `is_driver_error` covers the two Playwright-family packages a single image can install,
+    which the registry's stock spec names as one.
+    """
+    return is_any_engine_error(exc) or is_driver_error(exc)
+
+
+async def _dom_storage_session(context: BrowserContext, open_page: Page, frame: Frame) -> tuple[CDPSession, bool]:
+    """A CDP session that can answer `DOMStorage` for this frame, and whether it is the frame's own.
+
+    `DOMStorage` is served by the renderer holding the document, so a cross-site frame — out-of-process
+    under the site isolation a headful browser has on — answers only on a session of its own, and a
+    frame sharing its parent's renderer has no such session and answers on the page's. The flag
+    matters because anything else asked of the page's session answers for the page, not the frame.
+    """
+    try:
+        return await context.new_cdp_session(frame), True
+    except Exception as exc:
+        # Both driver packages are live in the production image and a persistent session's pages raise
+        # the one the source rewrite did not repoint, so the refusal is recognised by driver family.
+        if not _is_browser_refusal(exc):
+            raise
+        return await context.new_cdp_session(open_page), False
+
+
+_FRAME_STORAGE_REACHABLE_PROBE = (
+    "(() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } })()"
+)
+
+
+async def _frame_storage_is_unreachable(session: CDPSession) -> bool:
+    """Whether the frame behind this session can reach web storage at all.
+
+    A sandboxed or otherwise opaque frame has no storage area to address and nothing that outlives its
+    document, so a clear that cannot find one has found nothing to clear. Asked only after the clear
+    has already failed: a page can make this probe throw, but it cannot make the browser lose a frame
+    it can address, so a real addressing failure still surfaces.
+    """
+    try:
+        answer = await session.send(
+            "Runtime.evaluate", {"expression": _FRAME_STORAGE_REACHABLE_PROBE, "returnByValue": True}
+        )
+    except Exception as exc:
+        if not _is_browser_refusal(exc):
+            raise
+        return False
+    return answer.get("result", {}).get("value") == "unreachable"
+
+
+async def _cleared_session_storage(context: BrowserContext, open_page: Page, frame: Frame, origin: str) -> bool:
+    """Clear one frame's sessionStorage, reporting whether this frame turned out to hold any.
+
+    A frame that cannot reach storage has none to clear and is passed over, so another frame at the
+    same origin still gets its turn: a sandboxed frame spells the origin the same way an ordinary one
+    does, and going only by the first would leave the ordinary frame's storage behind.
+    """
+    frame_session, is_own_session = await _dom_storage_session(context, open_page, frame)
+    try:
+        await frame_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
+        return True
+    except Exception as exc:
+        # Only a frame holding a session of its own can be asked about its own storage, and a frame
+        # with nothing to clear is exactly that kind: it is opaque, so it has a target.
+        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame_session)):
+            raise
+        return False
+    finally:
+        await frame_session.detach()
+
+
+async def _cleared_inherited_session_storage(context: BrowserContext, open_page: Page) -> str:
+    """Clear the sessionStorage of a tab whose URL names no origin, returning the origin it inherited.
+
+    A window opened on `about:blank` inherits its opener's origin and takes a copy of its sessionStorage
+    into a tab area of its own, which `Storage.clearDataForOrigin` does not reach and the opener's own
+    `DOMStorage.clear` does not address. The browser is asked which storage key the frame uses rather
+    than the document, which can redefine `window.origin`; the frame tree cannot answer, reporting an
+    inherited origin as `://` exactly as it does for a tab that has none.
+    """
+    session = await context.new_cdp_session(open_page)
+    try:
+        frame_tree = await session.send("Page.getFrameTree")
+        try:
+            frame_id = frame_tree["frameTree"]["frame"]["id"]
+            answer = await session.send("Storage.getStorageKeyForFrame", {"frameId": frame_id})
+        except Exception as exc:
+            # A frame with no storage key is one on an opaque origin, which has no storage area to
+            # clear -- and which answers the probe as such. Any other refusal, a timeout among them,
+            # would otherwise pass for a tab with nothing to clear and leave its session behind.
+            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(session):
+                raise
+            return ""
+        storage_key = answer.get("storageKey")
+        if not storage_key:
+            return ""
+        await session.send("DOMStorage.clear", {"storageId": {"storageKey": storage_key, "isLocalStorage": False}})
+        return _page_origin(storage_key)
+    finally:
+        await session.detach()
+
+
 async def _code_block_clear_browser_data_builtin(page: Page | RecordingPage) -> None:
-    """Drop every cookie in the run's browser context and all stored data for the current page's
-    origin, the way a block navigating to the browser's clear-browsing-data page meant to; the author
-    is choosing to lose the session, so nothing is restored afterwards."""
+    """Drop every cookie in the run's browser context and all stored data for the origins it holds, the
+    way a block navigating to the browser's clear-browsing-data page meant to; the author is choosing
+    to lose the session, so nothing is restored afterwards.
+
+    This is the signature authored code is given, in both executors: a block names the page it is
+    clearing and nothing else. Naming origins is a worker-side concern, below.
+    """
+    await _clear_browser_data_in_context(page)
+
+
+async def _clear_browser_data_in_context(page: Page | RecordingPage, replaced_origins: Sequence[str] = ()) -> None:
+    """``replaced_origins`` are origins a worker destroyed on the way here, whose stored data is still
+    clearable by origin even though no frame is left to name it. Their sessionStorage is not: that
+    needs a live frame, and it went with the document.
+    """
     real_page = page._underlying_page if isinstance(page, RecordingPage) else page
     context = real_page.context
-    origin = _page_origin(real_page.url)
-    LOG.info("Code block clearing browser data", origin=origin)
+    # Taken before the pass below awaits anything: a frame the page navigates or removes while that
+    # runs is gone by the time it could be enumerated, and its stored data outlives it.
+    opened_origins = _context_origins(context)
+    # sessionStorage first: it is the only part addressed per frame, so it is the part that can fail,
+    # and failing here leaves the session intact for a retry rather than half-cleared.
+    # `Storage.clearDataForOrigin` has no sessionStorage storage type, so this pass is what covers it.
+    inherited_origins: list[str] = []
+    session_storage_cleared: set[str] = set()
+    for open_page in context.pages:
+        if not _page_origin(open_page.url):
+            inherited = await _cleared_inherited_session_storage(context, open_page)
+            inherited_origins.append(inherited)
+            session_storage_cleared.add(inherited)
+        for origin, frames in _frames_by_origin(open_page).items():
+            for frame in frames:
+                if await _cleared_session_storage(context, open_page, frame, origin):
+                    session_storage_cleared.add(origin)
+                    break
+    origins = list(
+        dict.fromkeys(
+            [*opened_origins, *_context_origins(context), *filter(None, inherited_origins), *replaced_origins]
+        )
+    )
+    # sessionStorage is reachable only through a live frame at that origin, so an origin no frame
+    # answered for keeps it. Named here because the caller is told the clear succeeded, which it did:
+    # everything addressable went. Nothing outside this list is a claim about what survived.
+    LOG.info(
+        "Code block clearing browser data",
+        origins=len(origins),
+        session_storage_unreached=[origin for origin in origins if origin not in session_storage_cleared],
+    )
     await context.clear_cookies()
-    if not origin:
-        return
-    cdp_session = await context.new_cdp_session(real_page)
-    try:
-        await cdp_session.send("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"})
-        # Storage.clearDataForOrigin leaves the open tab's sessionStorage in place.
-        await cdp_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
-    finally:
-        await cdp_session.detach()
+    if origins:
+        cdp_session = await context.new_cdp_session(real_page)
+        try:
+            for origin in origins:
+                await cdp_session.send("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"})
+        finally:
+            await cdp_session.detach()
 
 
 CLEAR_BROWSER_DATA_HELPER_CONTRACT: dict[str, Any] = {
@@ -5265,22 +5456,14 @@ CLEAR_BROWSER_DATA_HELPER_CONTRACT: dict[str, Any] = {
     "returns": {"type": "null"},
     "effect": (
         "Every cookie in the run's browser context is dropped, and all stored data (local and session "
-        "storage, IndexedDB, caches) for the page's current origin. Nothing is restored afterwards."
+        "storage, IndexedDB, caches) for every origin the context has a page or frame open on. Nothing is "
+        "restored afterwards."
     ),
     "usage": (
         "For a site that requires a clean session before sign-in: read page.url, await the helper, then "
         "await page.goto(url). Browser settings pages such as chrome://settings cannot be navigated to."
     ),
 }
-
-
-def _page_origin(url: str) -> str:
-    """The page's origin as CDP's ``securityOrigin`` spells it: never the userinfo a URL can carry."""
-    parsed = urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return ""
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
 
 
 def _bind_code_block_search_web(

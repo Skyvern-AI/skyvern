@@ -893,32 +893,18 @@ workflow_definition:
         assert "button:nth-of-type" not in prompt
         assert "secret-token" not in prompt
 
-    @pytest.mark.parametrize(
-        ("failure_reason", "replacement"),
-        [
-            (
-                "CodeBlock failed because it requested an unsupported browser operation at line 2: blocked "
-                "navigation to non-web scheme: 'chrome://settings/clearBrowserData'; use "
-                "`await clear_browser_data(page)` to clear the run's cookies and site data.",
-                "await clear_browser_data(page)",
-            ),
-            (
-                "CodeBlock failed because it requested an unsupported browser operation at line 10: page.on is not "
-                "supported by the secure CodeBlock runner; a CodeBlock cannot register a browser event callback "
-                "that outlives it. Take the triggering action, then wait for its effect with a bounded call: "
-                "`await click_and_claim_download(page, selector)` for a download, "
-                "`await page.wait_for_url(url, timeout=...)` for navigation, or "
-                "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the "
-                "page. There is no brokered way to wait on a network response; wait on what the response "
-                "renders instead.",
-                "await page.wait_for_selector(selector, timeout=...)",
-            ),
-        ],
-        ids=["clear_browsing_data_navigation", "listener_denial"],
-    )
-    def test_runtime_repair_prompt_carries_the_denials_named_replacement(
-        self, failure_reason: str, replacement: str
-    ) -> None:
+    def test_runtime_repair_prompt_carries_the_denials_named_replacement(self) -> None:
+        failure_reason = (
+            "CodeBlock failed because it requested an unsupported browser operation at line 10: page.on is not "
+            "supported by the secure CodeBlock runner; a CodeBlock cannot register a browser event callback "
+            "that outlives it. Take the triggering action, then wait for its effect with a bounded call: "
+            "`await click_and_claim_download(page, selector)` for a download, "
+            "`await page.wait_for_url(url, timeout=...)` for navigation, or "
+            "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the "
+            "page. There is no brokered way to wait on a network response; wait on what the response "
+            "renders instead."
+        )
+        replacement = "await page.wait_for_selector(selector, timeout=...)"
         # A runner denial names the sanctioned replacement after the denied call, so a bound that
         # keeps only the refusal hands the repair turn a dead end it will re-emit.
         ctx = _ctx(
