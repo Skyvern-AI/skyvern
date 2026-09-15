@@ -155,10 +155,12 @@ from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY,
     CUA_ENGINES,
     MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
     BlockRunResponse,
+    BrowserTypeOption,
     BulkCancelRunsRequest,
     BulkCancelRunsResponse,
     RunEngine,
@@ -171,6 +173,8 @@ from skyvern.schemas.runs import (
     UploadFileResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    read_browser_type,
+    supported_browser_type_options,
 )
 from skyvern.schemas.tags import (
     RunTagHistoryResponse,
@@ -219,6 +223,7 @@ from skyvern.utils.organization_slug import is_org_slug_unique_violation
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.real_browser_manager import runtime_supports_browser_type_selection
 
 LOG = structlog.get_logger()
 
@@ -600,6 +605,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         cdp_connect_headers=workflow_run_request.cdp_connect_headers,
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
+        browser_type=read_browser_type(workflow_run_request),
         ai_fallback=workflow_run_request.ai_fallback,
         run_metadata=workflow_run_request.run_metadata,
     )
@@ -611,6 +617,21 @@ def _tag_write_context_from_caller(caller: org_auth_service.CallerContext) -> Ta
         source=TagSource.MANUAL,
         caller_type=caller.caller_type,
     )
+
+
+def _hydrate_run_request_for_response(
+    run_request: WorkflowRunRequest, workflow_run: WorkflowRun, workflow: Workflow | None
+) -> WorkflowRunRequest:
+    """Echo the effective persisted values on the create response without mutating the caller's request.
+
+    A run that omits browser_type inherits the workflow's engine (resolved onto workflow_run at
+    persistence), so the returned request must report that engine rather than the request's omitted
+    null; the title is hydrated from the workflow when one exists.
+    """
+    updates: dict[str, str | None] = {"browser_type": read_browser_type(workflow_run)}
+    if workflow is not None:
+        updates["title"] = workflow.title
+    return run_request.model_copy(update=updates)
 
 
 @base_router.post(
@@ -702,14 +723,14 @@ async def run_workflow(
             if workflow_run.workflow_id:
                 span.set_attribute("workflow_id", workflow_run.workflow_id)
 
-    # Hydrate workflow title from workflow_run.workflow_id
+    # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
+    # the effective browser_type, so a run that omitted browser_type reports the inherited engine
+    # instead of the request's null.
     workflow = await app.WORKFLOW_SERVICE.get_workflow(
         workflow_id=workflow_run.workflow_id,
         organization_id=current_org.organization_id,
     )
-    workflow_run_request_hydrated = workflow_run_request
-    if workflow:
-        workflow_run_request_hydrated = workflow_run_request.model_copy(update={"title": workflow.title})
+    workflow_run_request_hydrated = _hydrate_run_request_for_response(workflow_run_request, workflow_run, workflow)
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -1628,6 +1649,39 @@ async def get_folders(
         )
 
     return result
+
+
+@base_router.get(
+    "/browser_types",
+    tags=["Server"],
+    response_model=list[BrowserTypeOption],
+    description=(
+        "List the selectable browser engines for the workflow/run browser_type setting. The list is "
+        "runtime-capability aware: a runtime that can honor an explicit engine (the cloud "
+        "dynamic-browser capability) returns all supported engines, while a runtime without it "
+        "(OSS/self-host) returns an empty list rather than advertising selections the server would "
+        "reject."
+    ),
+    summary="List selectable browser types",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_browser_types",
+    },
+    responses={200: {"description": "Successfully listed selectable browser types"}},
+)
+# Backwards-compatible aliases (legacy prefix + trailing slash); hidden from schema in favor of the
+# canonical /browser_types above.
+@legacy_base_router.get("/browser_types", response_model=list[BrowserTypeOption], include_in_schema=False)
+@legacy_base_router.get("/browser_types/", response_model=list[BrowserTypeOption], include_in_schema=False)
+@base_router.get("/browser_types/", response_model=list[BrowserTypeOption], include_in_schema=False)
+async def get_browser_types(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[BrowserTypeOption]:
+    """Selectable browser engines for the workflow/run browser_type setting, generated from the
+    BrowserType domain enum. Capability-gated: only advertised where the runtime can actually honor an
+    explicit selection (the cloud dynamic-browser creator is registered); OSS/self-host returns []."""
+    if not runtime_supports_browser_type_selection():
+        return []
+    return supported_browser_type_options()
 
 
 @legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
@@ -3538,7 +3592,10 @@ async def run_block(
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
-        run_request=block_run_request,
+        # Echo the effective persisted engine (an omitted browser_type inherits the workflow default at
+        # setup) without mutating the caller's input model, so the response matches the launched engine
+        # instead of reporting the request's null.
+        run_request=block_run_request.model_copy(update={"browser_type": read_browser_type(workflow_run)}),
         downloaded_files=None,
         recording_url=None,
         browser_session_id=workflow_run.browser_session_id,
@@ -3829,9 +3886,13 @@ def _workflow_run_request_from_workflow_request(
             "browser_address": workflow_request.browser_address,
             "run_with": workflow_request.run_with,
             "ai_fallback": workflow_request.ai_fallback,
+            "browser_type": read_browser_type(workflow_request),
             "run_metadata": workflow_request.run_metadata,
         },
-        context={BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True},
+        context={
+            BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True,
+            BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY: True,
+        },
     )
 
 

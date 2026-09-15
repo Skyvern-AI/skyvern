@@ -1,9 +1,10 @@
 import typing as t
+from http import HTTPStatus
 
 import structlog
 from fastapi import BackgroundTasks, Request
 
-from skyvern.exceptions import OutputParameterNotFound, WorkflowNotFound
+from skyvern.exceptions import OutputParameterNotFound, SkyvernHTTPException, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -11,8 +12,12 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
-from skyvern.schemas.runs import BlockRunRequest
+from skyvern.schemas.runs import BlockRunRequest, read_browser_type
 from skyvern.services import workflow_service
+from skyvern.webeye.real_browser_manager import (
+    SelectedBrowserTypeUnsupportedError,
+    ensure_runtime_supports_browser_type,
+)
 
 LOG = structlog.get_logger()
 
@@ -49,6 +54,14 @@ async def ensure_workflow_run(
 ) -> WorkflowRun:
     context = skyvern_context.ensure_context()
 
+    # Fail fast before the block run is prepared/persisted: reject an explicit browser_type this runtime
+    # cannot honor with a 4xx (the same predicate and contract as the run_workflow ingress), rather than
+    # persisting the debugger run and only rejecting at launch. No-op when unset or on a supporting runtime.
+    try:
+        ensure_runtime_supports_browser_type(read_browser_type(block_run_request))
+    except SelectedBrowserTypeUnsupportedError as e:
+        raise SkyvernHTTPException(str(e), HTTPStatus.BAD_REQUEST) from e
+
     legacy_workflow_request = WorkflowRequestBody(
         data=block_run_request.parameters,
         proxy_location=block_run_request.proxy_location,
@@ -57,6 +70,11 @@ async def ensure_workflow_run(
         totp_verification_url=block_run_request.totp_url,
         browser_session_id=block_run_request.browser_session_id,
         browser_profile_id=block_run_request.browser_profile_id,
+        # Forward the explicit engine so the block run executes in the selected browser_type instead of
+        # dropping it and inheriting the workflow default (which mismatched BlockRunResponse's echo).
+        # BlockRunRequest already rejects browser_type + an attached session/address at ingress, so this
+        # never reaches the WorkflowRequestBody attach-conflict validator with both set.
+        browser_type=block_run_request.browser_type,
         start_fresh_browser=block_run_request.start_fresh_browser,
         reuse_browser_session=block_run_request.reuse_browser_session,
         max_screenshot_scrolls=block_run_request.max_screenshot_scrolls,

@@ -617,6 +617,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -803,6 +804,7 @@ class WorkflowRunModel(Base):
     sequential_key = Column(String, nullable=True)
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)

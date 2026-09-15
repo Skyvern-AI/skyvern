@@ -28,12 +28,20 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
-from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
+from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_run_metadata,
+    normalize_run_with,
+)
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE,
     ProxyLocationInput,
     ScriptRunResponse,
+    _browser_address_is_server_assigned,
+    _browser_session_is_server_assigned,
     _validate_browser_address,
+    browser_type_attach_conflict,
+    normalize_browser_type,
 )
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
@@ -57,6 +65,7 @@ class WorkflowRequestBody(BaseModel):
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
+    browser_type: str | None = None
     ai_fallback: bool | None = None
     run_metadata: dict[str, str] | None = None
 
@@ -77,12 +86,34 @@ class WorkflowRequestBody(BaseModel):
     def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
 
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
+
     @field_validator("browser_address")
     @classmethod
     def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
         if info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY):
             return browser_address
         return _validate_browser_address(browser_address)
+
+    @model_validator(mode="after")
+    def _reject_browser_type_with_attached_browser(self, info: ValidationInfo) -> Self:
+        if not browser_type_attach_conflict(
+            browser_type=self.browser_type,
+            browser_session_id=self.browser_session_id,
+            browser_address=self.browser_address,
+        ):
+            return self
+        # A raw browser_type+attachment conflict exists. Reconstruction re-materializes the server's own
+        # persisted state (a typed run can legitimately gain a server-generated session), so a
+        # SERVER-ASSIGNED session/address is excused; a caller-supplied one (no context) still 422s.
+        session_ok = self.browser_session_id is None or _browser_session_is_server_assigned(info)
+        address_ok = self.browser_address is None or _browser_address_is_server_assigned(info)
+        if session_ok and address_ok:
+            return self
+        raise ValueError(BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE)
 
     @model_validator(mode="after")
     def _reject_start_fresh_with_session(self) -> Self:
@@ -208,6 +239,7 @@ class Workflow(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     run_with: str = "agent"
+    browser_type: str | None = None
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
@@ -314,6 +346,7 @@ class WorkflowRun(BaseModel):
     max_elapsed_time_minutes: int | None = None
     browser_address: str | None = None
     run_with: str | None = None
+    browser_type: str | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
     depends_on_workflow_run_id: str | None = None
@@ -485,6 +518,7 @@ class WorkflowRunResponseBase(BaseModel):
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     run_with: str = "agent"
+    browser_type: str | None = None
     script_run: ScriptRunResponse | None = None
     script_id: str | None = None
     errors: list[dict[str, Any]] | None = None
