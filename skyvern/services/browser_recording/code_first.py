@@ -55,11 +55,11 @@ DRAFT_TIMESTAMP_TOLERANCE_MS = 1.0
 ActionDraftPair = tuple[Action, RecordingDraftStep | None]
 
 # Interactions that silently vanish from a workflow if the synthesizer cannot
-# locate them; any unlocatable one forces the legacy (LLM agent block) fallback.
+# locate them; any unlocatable one rejects the recording result.
 # Dropped hovers are tolerated: they are usually incidental to a located click.
-_REQUIRED_LOCATOR_TOOLS = frozenset({"click", "type_text", "select_option", CREDENTIAL_FILL_TOOL_NAME})
+_REQUIRED_LOCATOR_TOOLS = frozenset({"click", "type_text", "select_option", "upload_file", CREDENTIAL_FILL_TOOL_NAME})
 
-# The credential field each recorded kind fills. `secret` mirrors the legacy path's single
+# The credential field each recorded kind fills. A secret credential exposes one
 # `secret_value`; `magic_link` resolves at runtime rather than as a field, and `credit_card`
 # spreads over six fields the recorder cannot tell apart, so both stay plain parameters.
 CREDENTIAL_FILL_FIELD_BY_KIND: dict[CredentialKind, str] = {
@@ -137,8 +137,8 @@ def transfer_focus_click_credentials(pairs: list[ActionDraftPair]) -> list[Actio
 
     The recording panel offers the credential prompt on every step it classifies, and the
     mouse-driven login clicks the password box before typing into it, so the user can bind on
-    the click card - after which the panel dismisses the prompt on the fill. The legacy path
-    reads the credential off whichever step carries it; a code block has to fill it.
+    the click card - after which the panel dismisses the prompt on the fill. Move that binding
+    to the fill that the code block executes.
     """
     transferred = list(pairs)
     for index, (action, draft) in enumerate(pairs):
@@ -243,12 +243,16 @@ def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = N
         base["role"] = target.role
     if target.accessible_name:
         base["accessible_name"] = target.accessible_name
+    if target.selector or (target.role and target.accessible_name):
+        base["observed_hidden"] = True
 
     if isinstance(action, ActionClick):
         return {"tool_name": "click", **base}
     if isinstance(action, ActionHover):
         return {"tool_name": "hover", **base}
     if isinstance(action, ActionInputText):
+        if (target.input_type or "").lower() == "file":
+            return {"tool_name": "upload_file", "parameter_name": "upload_file", **base}
         credential_fill = _credential_fill(draft)
         if credential_fill is not None:
             return {**credential_fill, **base}
@@ -410,11 +414,22 @@ def _segment_summary(segment: RecordingSegment, emitted_indices: set[int] | None
         if emitted_indices is None or trajectory_index in emitted_indices:
             actions.append(action)
         trajectory_index += 1
-    typed = [action for action in actions if isinstance(action, ActionInputText)]
+    uploads = [
+        action
+        for action in actions
+        if isinstance(action, ActionInputText) and (action.target.input_type or "").lower() == "file"
+    ]
+    typed = [
+        action
+        for action in actions
+        if isinstance(action, ActionInputText) and (action.target.input_type or "").lower() != "file"
+    ]
     clicks = [action for action in actions if isinstance(action, ActionClick)]
 
     if any((action.target.input_type or "").lower() == "password" for action in typed):
         return f"log_in_to_{site}" if site else "log_in"
+    if uploads:
+        return "upload_a_file"
     if any(not _SEARCH_FIELD_HINTS.isdisjoint(_target_name(action.target).split("_")) for action in typed):
         return f"search_{site}" if site else "search"
     if typed and all((action.target.tag_name or "").upper() == "SELECT" for action in typed):
@@ -459,7 +474,7 @@ def actions_to_code_first_blocks(
     *,
     bind_credentials: bool = True,
 ) -> CodeFirstResult | None:
-    """Convert recorded actions into code blocks and parameters; None means fall back to legacy blocks."""
+    """Convert recorded actions into code blocks and parameters; None means synthesis was rejected."""
     if draft_steps is not None and not draft_steps:
         # The user deleted every interpreted step; commit an empty workflow rather
         # than falling back to blocks derived from the raw actions.
@@ -472,6 +487,7 @@ def actions_to_code_first_blocks(
     # (selector, role, accessible name). The same field re-filled in a later
     # segment reuses its key; a different same-labeled field gets a fresh key.
     parameter_identities: dict[str, tuple[str, str, str] | None] = {}
+    parameter_types: dict[str, str] = {}
     # Credential parameter key (the credential id, a token the editor re-keys) -> credential id.
     credential_ids_by_key: dict[str, str] = {}
     used_labels: set[str] = set()
@@ -540,19 +556,20 @@ def actions_to_code_first_blocks(
                         break
                 renames[key] = resolved_key
             parameter_identities.setdefault(resolved_key, identity)
+            parameter_types.setdefault(resolved_key, str(parameter.get("workflow_parameter_type") or "string"))
             block_parameter_keys.append(resolved_key)
 
         for original_key, resolved_key in renames.items():
-            # A typed-text fill is the only emission that reads a string parameter,
-            # always as `str(<key>)`, so this rename cannot touch selectors. Rename
-            # targets never collide with this block's own keys, so one rename cannot
-            # cascade onto the fill of another parameter.
             code = code.replace(f"str({original_key})", f"str({resolved_key})")
+            code = code.replace(
+                f"attach_authorized_file(page, {original_key}, ",
+                f"attach_authorized_file(page, {resolved_key}, ",
+            )
 
         try:
             CodeBlock.is_safe_code(code)
         # ast.parse raises ValueError on e.g. null bytes; any failure inside the
-        # safety gate must fall back to legacy blocks, never surface as a 500.
+        # safety gate rejects the recording result rather than surfacing as a 500.
         except (SyntaxError, ValueError, InsecureCodeDetected):
             LOG.warning(
                 "record_browser.code_first_safety_rejected",
@@ -587,9 +604,9 @@ def actions_to_code_first_blocks(
     parameters: list[WorkflowDefinitionYamlParametersItem] = [
         WorkflowDefinitionYamlParametersItem_Workflow(
             key=key,
-            workflow_parameter_type="string",
-            # Like the legacy path, recorded values never persist as defaults: a
-            # secret typed into any field (not just type=password) must not land
+            workflow_parameter_type=parameter_types.get(key, "string"),
+            # Recorded values never persist as defaults: a secret typed into any
+            # field (not just type=password) must not land
             # in a DB-stored, API-exposed default_value. The user binds values.
             default_value="",
             description="",

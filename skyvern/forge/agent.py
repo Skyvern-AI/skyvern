@@ -2298,6 +2298,20 @@ class ForgeAgent:
             )
             await browser_state.reload_page(page=pinned)
 
+        async def _restore_page_url(page: Any, url: str) -> None:
+            # Not `reload_page`: the tab is blanked in place, so reloading it reloads `about:blank`.
+            await browser_state.navigate_to_url(page=page, url=url)
+
+        def _download_attempts() -> int | None:
+            # The interceptor counts an attempt before it checks for a byte-identical file already on
+            # disk, so this still moves for a deduplicated download -- which leaves no filesystem
+            # trace at all. Attached dynamically to the Playwright context, hence the getattr chain
+            # (the same access `real_browser_state` uses); absent interceptor simply yields None.
+            context = browser_state.browser_context
+            interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None) if context else None
+            attempts = getattr(interceptor, "_download_index", None)
+            return attempts if isinstance(attempts, int) else None
+
         # Whether the control the run CLICKED is still in flight. Scoped to that one control on
         # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
         # widget or a stale modal the app left in the DOM. Narrow for the same reason -- every
@@ -2363,6 +2377,8 @@ class ForgeAgent:
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
                 reload_page=_reload_page,
+                restore_page_url=_restore_page_url,
+                download_attempts=_download_attempts,
                 block_type=str(task_block.block_type) if task_block is not None else None,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The

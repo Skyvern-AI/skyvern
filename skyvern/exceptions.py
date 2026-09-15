@@ -780,6 +780,29 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
         super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
 
 
+# Leads the error_message below, and so the run's failure_reason. A consumer that only ever sees
+# that string matches on this instead of restating the prose, since the egress-attributable browser
+# error code stays in the message and would otherwise classify the failure as ours.
+NO_ADDRESS_RECORD_NAV_ERROR_MARKER = "has no DNS address record"
+
+
+class UnresolvableNavigationHost(FailedToNavigateToUrl):
+    """The navigation target's host has no DNS address record, so no egress of ours can reach it.
+
+    A browser behind a proxy hands the hostname to the proxy (HTTP CONNECT, SOCKS remote DNS), so a
+    target whose record is gone surfaces as the proxy failing to open a tunnel rather than as
+    ERR_NAME_NOT_RESOLVED. The distinct type is what keeps that borrowed error code from being read
+    as our own egress failing; it subclasses FailedToNavigateToUrl so the failure stays terminal.
+    """
+
+    def __init__(self, url: str, host: str, error_message: str) -> None:
+        self.host = host
+        super().__init__(
+            url=url,
+            error_message=f"{host} {NO_ADDRESS_RECORD_NAV_ERROR_MARKER}: {error_message}",
+        )
+
+
 class FailedToReloadPage(SkyvernException):
     def __init__(self, url: str, error_message: str) -> None:
         self.url = url

@@ -147,6 +147,9 @@ class MessageInBeginExfiltration(Message):
 @dataclasses.dataclass
 class MessageInEndExfiltration(Message):
     kind: t.Literal[MessageKind.END_EXFILTRATION] = MessageKind.END_EXFILTRATION
+    discard: bool = False
+    interpretation_session_id: str | None = None
+    workflow_permanent_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -352,7 +355,15 @@ def reify_channel_message(data: dict) -> MessageIn:
             text = data.get("text") or ""
             return MessageInClipboardPaste(text=text)
         case MessageKind.END_EXFILTRATION:
-            return MessageInEndExfiltration()
+            interpretation_session_id = data.get("interpretation_session_id")
+            workflow_permanent_id = data.get("workflow_permanent_id")
+            return MessageInEndExfiltration(
+                discard=data.get("discard") is True,
+                interpretation_session_id=(
+                    interpretation_session_id if isinstance(interpretation_session_id, str) else None
+                ),
+                workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
+            )
         case MessageKind.RECORDING_CAPTURE_PAUSE:
             return MessageInRecordingCapturePause()
         case MessageKind.RECORDING_CAPTURE_RESUME:
@@ -844,8 +855,26 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                 exfiltration_channel = None
                 if live_interpretation_browser_session_id:
-                    await interpretation_registry.stop_session(live_interpretation_browser_session_id)
+                    if message.discard:
+                        await interpretation_registry.stop_session(
+                            live_interpretation_browser_session_id,
+                            retain_finalized_actions=False,
+                        )
+                    else:
+                        await interpretation_registry.stop_session(live_interpretation_browser_session_id)
                     live_interpretation_browser_session_id = None
+                elif (
+                    message.discard
+                    and message.interpretation_session_id
+                    and message.workflow_permanent_id
+                    and message_channel.browser_session
+                ):
+                    interpretation_registry.discard_finalized_actions_if_owned(
+                        interpretation_session_id=message.interpretation_session_id,
+                        browser_session_id=message_channel.browser_session.persistent_browser_session_id,
+                        organization_id=message_channel.organization_id,
+                        workflow_permanent_id=message.workflow_permanent_id,
+                    )
 
             case MessageKind.RECORDING_CAPTURE_PAUSE:
                 if exfiltration_channel is not None:

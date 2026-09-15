@@ -295,16 +295,10 @@ class RecordingInterpretationSession:
             # followed by the keypress, not replace it.
             sm.PressKey(),
             sm.UrlChange(),
-            sm.Wait(),
         ]
         self._all_actions: list[Action] = []
         self._processed_event_count = 0
         self._capture_paused = False
-
-    def reset_wait_capture(self) -> None:
-        for machine in self._action_machines:
-            if isinstance(machine, sm.Wait):
-                machine.reset()
 
     def set_deltas_enabled(self, enabled: bool) -> None:
         # Deltas require both the client capability and the server kill switch.
@@ -312,11 +306,9 @@ class RecordingInterpretationSession:
 
     def pause_capture(self) -> None:
         self._capture_paused = True
-        self.reset_wait_capture()
 
     def resume_capture(self) -> None:
         self._capture_paused = False
-        self.reset_wait_capture()
         # Enrichment deltas that landed while paused were dropped client-side, so
         # send an authoritative snapshot to resync on resume.
         if self.session_revision > 0:
@@ -361,6 +353,9 @@ class RecordingInterpretationSession:
         self._cancel_debounce()
         await self._interpret(finalized=True)
         return self.steps
+
+    def recorded_actions(self) -> list[Action]:
+        return list(self._all_actions)
 
     def _cancel_debounce(self) -> None:
         if self._debounce_task and not self._debounce_task.done():

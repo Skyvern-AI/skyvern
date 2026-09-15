@@ -284,8 +284,12 @@ def credential_scout_gap(
     return ScoutGap(missing_fields=missing_fields, missing_submit=missing_submit)
 
 
-_ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
-_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
+_ENTRY_TARGET_TOOLS = frozenset(
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key"}
+)
+_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
+    {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}
+)
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
     r"\b(?:accept|agree|allow|consent|cookies?|decline|reject|refuse|dismiss|got it|no thanks)\b|^(?:ok|okay)$",
     re.I,
@@ -2664,6 +2668,26 @@ def synthesize_code_block(
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
+        elif tool_name == "upload_file":
+            selector = str(interaction.get("selector") or "").strip()
+            if not selector:
+                notes.append("dropped a file upload with no durable selector")
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_selector"}
+                )
+                continue
+            parameter_name = str(interaction.get("parameter_name") or "upload_file")
+            param_key = _unique_key(_safe_param_base(parameter_name), used_param_keys)
+            parameters.append({"key": param_key, "workflow_parameter_type": "file_url"})
+            lines.append(f"{action_indent}await attach_authorized_file(page, {param_key}, {_py_str(selector)})")
+            record_emission(
+                trajectory_index,
+                tool_name,
+                "attach_authorized_file",
+                locator,
+                line_start=line_start,
+            )
+            append_step(f"Upload a file to {_step_target(interaction)}", "upload_file", line_start)
         elif tool_name == "hover" and not strict_selectors:
             # Non-strict only: recording trajectories carry deliberate hovers; the
             # strict-imposition envelope keeps treating hover as unsupported.

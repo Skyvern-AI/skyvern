@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import cast, func, select
+from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1487,15 +1487,35 @@ class WorkflowParametersRepository(BaseRepository):
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        request_cancel_token: str | None = None,
     ) -> WorkflowCopilotChat | None:
         async with self.Session() as session:
             query = (
                 select(WorkflowCopilotChatModel)
                 .filter(WorkflowCopilotChatModel.organization_id == organization_id)
                 .filter(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
-                .order_by(WorkflowCopilotChatModel.created_at.desc())
-                .limit(1)
             )
+            if request_cancel_token is not None:
+                completed_turn = (
+                    select(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id)
+                    .where(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id
+                        == WorkflowCopilotChatModel.workflow_copilot_chat_id
+                    )
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotChatMessageModel.turn_outcome["request_cancel_token"].as_string()
+                        == request_cancel_token
+                    )
+                    .exists()
+                )
+                pending_turn = func.jsonb_path_exists(
+                    cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                    cast("$.* ? (@.cancel_token == $token)", JSONPATH),
+                    func.jsonb_build_object("token", request_cancel_token),
+                )
+                query = query.filter(or_(pending_turn, completed_turn))
+            query = query.order_by(WorkflowCopilotChatModel.created_at.desc()).limit(1)
             chat = (await session.scalars(query)).first()
             if not chat:
                 return None

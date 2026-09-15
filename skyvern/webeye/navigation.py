@@ -14,8 +14,14 @@ from skyvern.constants import (
     PERMANENT_NAV_ERRORS,
     SKIP_INNER_NAV_RETRY_ERRORS,
 )
-from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
-from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
+from skyvern.exceptions import (
+    BlockedHost,
+    BlockedNavigationDestination,
+    FailedToNavigateToUrl,
+    InvalidUrl,
+    UnresolvableNavigationHost,
+)
+from skyvern.utils.url_validators import canonical_navigation_host, host_has_no_address_record, is_blocked_host
 
 LOG = structlog.get_logger()
 
@@ -126,6 +132,38 @@ def is_egress_attributable_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in EGRESS_ATTRIBUTABLE_NAV_ERRORS)
 
 
+def is_egress_attributable_navigation_failure(error: BaseException) -> bool:
+    """Whether a navigation failure is attributable to our own egress rather than the target.
+
+    The error code alone does not settle it: a target with no DNS address record makes the run
+    proxy report a tunnel failure, and ``UnresolvableNavigationHost`` is that case already
+    distinguished. Prefer this over the message-only form wherever the exception is in hand.
+    """
+    if isinstance(error, UnresolvableNavigationHost):
+        return False
+    message = error.error_message if isinstance(error, FailedToNavigateToUrl) else str(error)
+    return is_egress_attributable_navigation_error(message)
+
+
+async def _unresolvable_navigation_host(url: str, error_message: str) -> str | None:
+    """The host of ``url`` when an egress-attributable failure was really a dead target.
+
+    A proxied browser delegates hostname resolution to the proxy, so a target whose address record
+    is gone comes back as the proxy failing to open a tunnel. Corroborating with our own resolver is
+    what separates "the pool cannot reach this host" from "this host no longer exists" -- the latter
+    must not redraw a proxy node, page our egress, or tell the customer our network is at fault.
+    """
+    if not is_egress_attributable_navigation_error(error_message):
+        return None
+    try:
+        host = canonical_navigation_host(url)
+    except InvalidUrl:
+        return None
+    if not host:
+        return None
+    return host if await asyncio.to_thread(host_has_no_address_record, host) else None
+
+
 def redact_url_secrets(url: str) -> str:
     """Reduce a URL to scheme and host for display.
 
@@ -210,6 +248,20 @@ async def navigate_with_retry(
             safe_error_str = error_str.replace(url, display_url) if log_url is not None else error_str
 
             if is_skip_inner_retry_error(error_str):
+                # The host is the one part of a secret URL that redaction keeps, so naming it is
+                # safe for a redacting caller too.
+                dead_host = await _unresolvable_navigation_host(url, error_str)
+                if dead_host is not None:
+                    LOG.warning(
+                        "Navigation target has no DNS address record, failing without a proxy retry",
+                        url=display_url,
+                        host=dead_host,
+                        error=safe_error_str,
+                    )
+                    raise UnresolvableNavigationHost(
+                        url=display_url, host=dead_host, error_message=safe_error_str
+                    ) from (None if redacting else error)
+
                 LOG.warning(
                     "Non-retriable navigation error, failing immediately",
                     url=display_url,

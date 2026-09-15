@@ -192,18 +192,20 @@ DIAGNOSE_RUN_TURN_MESSAGE = "Diagnose run {run_id} and repair the workflow."
 # WorkflowCopilotChat.tsx echoes it so a history reload does not reword the turn.
 REFINE_RECORDING_RECEIPT = "Refine the recording ({action_count} actions) into a reusable workflow."
 REFINE_RECORDING_INSTRUCTION = (
-    "From the recorded browser evidence (provided separately as untrusted observations), infer the user's objective "
-    "and refine the current literal replay draft into the simplest reusable workflow that reliably achieves it.\n\n"
-    "Treat recorded actions as evidence, not a mandatory checklist. Remove an action only if it is clearly "
-    "exploratory, corrective, duplicated, or incidental and no later interaction plausibly depends on the state it "
-    "creates. Otherwise preserve its position in the sequence, especially when it navigates, reveals controls, opens "
-    "menus or dialogs, switches context, submits forms, or advances a multi-step flow. You may replace it with a "
-    "simpler equivalent that produces the same required state. If the dependency is uncertain and the workflow cannot "
-    "be tested in this turn, retain the action.\n\n"
-    "Generalize concrete user-entered values into workflow parameters. Prefer selectors supported by the recorded "
-    "evidence and add appropriate validation and extraction logic.\n\n"
-    "The program must fail closed: raise when the objective is not verifiably achieved and return output only "
-    "on success. Write the workflow with the workflow tool in this turn; never answer in prose."
+    "From recorded browser evidence, infer the user's objective and refine the literal replay into the simplest "
+    "reusable workflow that achieves it.\n\n"
+    "Treat recorded actions as evidence, not a checklist. Remove exploratory, corrective, duplicated, or incidental "
+    "actions only when neither the objective nor any retained interaction depends on the state they create. You may "
+    "collapse a multi-action path into a direct action only when the replacement reaches the same required browser "
+    "state and does not depend on state created by removed actions.\n\n"
+    "For every required interaction, preserve its recorded semantics and actionable target by default. Do not "
+    "change the interaction primitive or retarget to an associated, nested, or semantically similar element unless "
+    "the replacement is successfully tested and produces the same observable state. If a dependency or equivalence "
+    "is uncertain and cannot be tested in this turn, retain the recorded interaction.\n\n"
+    "Generalize user-entered values into workflow parameters. Improve selectors only while targeting the same "
+    "actionable surface. Add validation and any extraction required by the objective.\n\n"
+    "Fail closed: raise unless the objective is verifiably achieved, and return output only on success. Write the "
+    "workflow with the workflow tool before replying; do not substitute a prose-only answer."
 )
 
 
@@ -1002,6 +1004,7 @@ async def _persist_turn_messages(
     narrative_payload: TurnNarrativePayload | None,
     sender: WorkflowCopilotChatSender,
     attached_files: list[CopilotAttachedFile] | None = None,
+    request_cancel_token: str | None = None,
 ) -> WorkflowCopilotChatMessage | None:
     """The only writer of a copilot turn's chat rows; idempotent per ``turn_id``.
 
@@ -1011,21 +1014,33 @@ async def _persist_turn_messages(
     if turn_id is not None and turn_outcome is not None and not turn_outcome.copilot_turn_id:
         turn_outcome = turn_outcome.model_copy(update={"copilot_turn_id": turn_id})
 
+    pending_user_message_id: str | None = None
     if turn_id is not None:
         stored_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
             chat.organization_id, chat.workflow_copilot_chat_id
         )
         if isinstance(stored_chat, WorkflowCopilotChat):
             pending = stored_chat.pending_turns.get(turn_id)
-            if pending is not None and pending.question_interactions:
-                if narrative_payload is None:
-                    narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
-                narrative_payload["questionInteractions"] = [
-                    item.model_dump(mode="json") for item in pending.question_interactions
-                ]
+            if pending is not None:
+                pending_user_message_id = pending.user_message_id
+                request_cancel_token = pending.cancel_token or request_cancel_token
+                if pending.question_interactions:
+                    if narrative_payload is None:
+                        narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
+                    narrative_payload["questionInteractions"] = [
+                        item.model_dump(mode="json") for item in pending.question_interactions
+                    ]
+
+    if turn_outcome is not None:
+        turn_outcome = turn_outcome.model_copy(
+            update={
+                **({"user_message_id": pending_user_message_id} if pending_user_message_id is not None else {}),
+                **({"request_cancel_token": request_cancel_token} if request_cancel_token is not None else {}),
+            }
+        )
 
     if not user_row_already_persisted:
-        await asyncio.shield(
+        user_row = await asyncio.shield(
             app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -1035,6 +1050,9 @@ async def _persist_turn_messages(
                 attached_files=attached_files,
             )
         )
+        user_message_id = getattr(user_row, "workflow_copilot_chat_message_id", None)
+        if turn_outcome is not None and turn_outcome.user_message_id is None and user_message_id is not None:
+            turn_outcome = turn_outcome.model_copy(update={"user_message_id": user_message_id})
 
     assistant_message: WorkflowCopilotChatMessage | None = None
     existing = await _assistant_row_for_turn(chat, turn_id) if turn_id is not None else None
@@ -1044,7 +1062,22 @@ async def _persist_turn_messages(
         and turn_outcome is not None
         and turn_outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
     )
-    if existing is not None and superseding_recovery:
+    if existing is not None and superseding_recovery and turn_outcome is not None:
+        replacement_updates: dict[str, str] = {}
+        if (
+            turn_outcome.user_message_id is None
+            and existing.turn_outcome is not None
+            and existing.turn_outcome.user_message_id is not None
+        ):
+            replacement_updates["user_message_id"] = existing.turn_outcome.user_message_id
+        if (
+            turn_outcome.request_cancel_token is None
+            and existing.turn_outcome is not None
+            and existing.turn_outcome.request_cancel_token is not None
+        ):
+            replacement_updates["request_cancel_token"] = existing.turn_outcome.request_cancel_token
+        if replacement_updates:
+            turn_outcome = turn_outcome.model_copy(update=replacement_updates)
         # Recovery reached this turn first and wrote an interrupted row. The turn then finished,
         # so its real reply is the truth and replaces that row rather than being dropped.
         LOG.info(
@@ -1163,6 +1196,7 @@ async def _persist_interrupted_turn(
     sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
     effective_mode: PersistedCopilotComposerMode | None = None,
     code_available: bool | None = None,
+    request_cancel_token: str | None = None,
 ) -> None:
     """Write the assistant row for a turn that stopped before it finished.
 
@@ -1200,6 +1234,7 @@ async def _persist_interrupted_turn(
             code_available=code_available,
         ),
         narrative_payload=narrative_payload,
+        request_cancel_token=request_cancel_token,
     )
 
 
@@ -1220,6 +1255,7 @@ async def _persist_cancel_turn(
     sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
     effective_mode: PersistedCopilotComposerMode | None = None,
     code_available: bool | None = None,
+    request_cancel_token: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -1381,6 +1417,7 @@ async def _persist_cancel_turn(
         global_llm_context=updated_global_llm_context,
         turn_outcome=turn_outcome,
         narrative_payload=narrative_payload,
+        request_cancel_token=request_cancel_token,
     )
     response_time = assistant_message.created_at if assistant_message else datetime.now(UTC)
     try:
@@ -1520,6 +1557,7 @@ async def _finalise_normal_turn(
         turn_outcome=agent_result.turn_outcome,
         narrative_payload=narrative_payload,
         attached_files=attached_files,
+        request_cancel_token=chat_request.cancel_token,
     )
 
     response_data = {
@@ -2000,6 +2038,11 @@ async def _new_copilot_chat_post(
                     code_available=current_code_available,
                     turn_id=turn_id,
                 )
+                if agent_result is not None:
+                    # Without this turn's candidate token the recovered result reads as owning whatever
+                    # the row holds now, so its clear would take a candidate another turn published.
+                    recovered_result.proposal_owner_turn_id = agent_result.proposal_owner_turn_id
+                    recovered_result.proposal_revision = agent_result.proposal_revision
                 LOG.error(
                     translated_log_message,
                     organization_id=organization.organization_id,
@@ -2374,6 +2417,7 @@ async def _new_copilot_chat_post(
                     cancel_source=user_cancel_source[0],
                     effective_mode=effective_mode,
                     code_available=current_code_available,
+                    request_cancel_token=chat_request.cancel_token,
                 )
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
@@ -2470,6 +2514,7 @@ async def _new_copilot_chat_post(
                             sender=_turn_opener_sender(chat_request),
                             effective_mode=effective_mode,
                             code_available=current_code_available,
+                            request_cancel_token=chat_request.cancel_token,
                         )
                     )
                 except Exception as writer_exc:
@@ -2525,6 +2570,7 @@ async def _new_copilot_chat_post(
                                 sender=_turn_opener_sender(chat_request),
                                 effective_mode=effective_mode,
                                 code_available=current_code_available,
+                                request_cancel_token=chat_request.cancel_token,
                             )
                         )
                 raise
@@ -2931,6 +2977,7 @@ async def _recover_interrupted_copilot_turn(
         idempotency_digest=entry.idempotency_digest,
         effective_mode=entry.copilot_effective_mode,
         code_available=entry.copilot_code_available,
+        request_cancel_token=entry.cancel_token,
     )
     LOG.info(
         "Recovered an interrupted copilot turn on read",
@@ -3069,6 +3116,7 @@ async def workflow_copilot_chat_history(
     credential_recovery_token: str | None = Header(None, alias="X-Copilot-Credential-Recovery-Token"),
     workflow_permanent_id: str | None = None,
     workflow_copilot_chat_id: str | None = None,
+    request_cancel_token: str | None = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotChatHistoryResponse:
     if workflow_copilot_chat_id:
@@ -3080,6 +3128,7 @@ async def workflow_copilot_chat_history(
         chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
             organization_id=organization.organization_id,
             workflow_permanent_id=workflow_permanent_id,
+            request_cancel_token=request_cancel_token,
         )
     else:
         raise HTTPException(
@@ -3102,6 +3151,22 @@ async def workflow_copilot_chat_history(
     proposed_workflow, proposed_workflow_metadata, proposed_workflow_run = await _history_proposal_state(
         chat, organization.organization_id
     )
+    request_turn_id = None
+    if chat is not None and request_cancel_token is not None:
+        request_turn_id = next(
+            (turn_id for turn_id, entry in chat.pending_turns.items() if entry.cancel_token == request_cancel_token),
+            None,
+        )
+        if request_turn_id is None:
+            request_turn_id = next(
+                (
+                    message.turn_outcome.copilot_turn_id
+                    for message in reversed(chat_messages)
+                    if message.turn_outcome is not None
+                    and message.turn_outcome.request_cancel_token == request_cancel_token
+                ),
+                None,
+            )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=await pending_credential_requests(
             organization.organization_id,
@@ -3112,6 +3177,7 @@ async def workflow_copilot_chat_history(
         if chat
         else [],
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
+        request_turn_id=request_turn_id,
         question_interactions=list(
             {
                 item.interaction_id: item
@@ -3138,7 +3204,11 @@ async def workflow_copilot_chat_history(
             ),
             None,
         ),
-        chat_history=await _history_with_resolved_attachments(chat_messages, organization.organization_id),
+        chat_history=await _history_with_resolved_attachments(
+            chat_messages,
+            organization.organization_id,
+            chat.pending_turns if chat else None,
+        ),
         proposed_workflow=proposed_workflow,
         proposed_workflow_metadata=proposed_workflow_metadata,
         proposed_workflow_run=proposed_workflow_run,
@@ -3513,14 +3583,16 @@ async def workflow_copilot_apply_proposed_workflow(
 
 
 async def _history_with_resolved_attachments(
-    messages: list[WorkflowCopilotChatMessage], organization_id: str
+    messages: list[WorkflowCopilotChatMessage],
+    organization_id: str,
+    pending_turns: dict[str, CopilotPendingTurn] | None = None,
 ) -> list[WorkflowCopilotChatHistoryMessage]:
     """Re-resolve every attachment this chat carries before serving it.
 
     The row records identity, never availability: a file that expired since it was attached must
     render as missing on reload rather than as a reference the user can still act on.
     """
-    history = convert_to_history_messages(messages)
+    history = convert_to_history_messages(messages, pending_turns)
     resolved = {
         attached.file_id: attached
         for attached in await _resolve_copilot_attached_files(
@@ -3543,15 +3615,39 @@ async def _history_with_resolved_attachments(
 
 def convert_to_history_messages(
     messages: list[WorkflowCopilotChatMessage],
+    pending_turns: dict[str, CopilotPendingTurn] | None = None,
 ) -> list[WorkflowCopilotChatHistoryMessage]:
+    opener_turn_ids = {
+        outcome.user_message_id: outcome.copilot_turn_id
+        for message in messages
+        if (outcome := message.turn_outcome) is not None
+        and outcome.user_message_id is not None
+        and outcome.copilot_turn_id is not None
+    }
+    opener_turn_ids.update(
+        {
+            pending.user_message_id: turn_id
+            for turn_id, pending in (pending_turns or {}).items()
+            if pending.user_message_id is not None
+        }
+    )
+
+    def resolve_turn_id(message: WorkflowCopilotChatMessage) -> str | None:
+        if message.turn_outcome is not None:
+            return message.turn_outcome.copilot_turn_id
+        message_id = getattr(message, "workflow_copilot_chat_message_id", None)
+        return opener_turn_ids.get(message_id) if isinstance(message_id, str) else None
+
     return [
         WorkflowCopilotChatHistoryMessage(
             sender=message.sender,
             content=message.content,
+            turn_id=resolve_turn_id(message),
             audio_artifact_id=message.audio_artifact_id,
             attached_files=message.attached_files,
             turn_outcome=message.turn_outcome,
             created_at=message.created_at,
+            modified_at=getattr(message, "modified_at", message.created_at),
             narrative_payload=message.narrative_payload,
         )
         for message in messages
