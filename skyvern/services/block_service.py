@@ -92,6 +92,7 @@ async def ensure_workflow_run(
         debug_session_id=block_run_request.debug_session_id,
         code_gen=block_run_request.code_gen,
         trigger_type=trigger_type,
+        block_scoped=True,
     )
 
     return workflow_run

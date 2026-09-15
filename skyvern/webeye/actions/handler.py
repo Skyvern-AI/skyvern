@@ -115,6 +115,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
@@ -1645,13 +1646,16 @@ def _normalize_download_identity(file: str) -> str:
     return _INTERCEPTOR_TEMP_IDENTITY_RE.sub("", file.removesuffix(BROWSER_DOWNLOADING_SUFFIX))
 
 
-def _local_download_signal_identities(download_dir: Path) -> set[str]:
+def _local_download_signal_identities(download_dir: Path, *, attempt_started_at: datetime | None = None) -> set[str]:
     """Task-local download-signal identities from the local run directory only (no remote-storage
     enumeration). Each name is normalized so both in-flight temp shapes -- Chrome-native ``<final>.crdownload``
     and the interceptor's ``<final>.<32-lowercase-hex>.crdownload`` -- collapse to the same ``<final>`` identity
     as the settled file, so a download counted mid-flight and again once settled is never seen as new against
     its own baseline. Incomplete temp files are included so a pre-existing partial is part of the baseline."""
-    return {_normalize_download_identity(file) for file in list_files_in_directory(download_dir)}
+    return {
+        _normalize_download_identity(file)
+        for file in list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+    }
 
 
 async def _settle_and_close_false_click_download(
@@ -1665,6 +1669,7 @@ async def _settle_and_close_false_click_download(
     baseline: _PageDeltaBaseline | None,
     download_dir: Path,
     signal_before: set[str],
+    attempt_started_at: datetime | None = None,
 ) -> None:
     """Synchronous FileDownloadBlock lifecycle for a non-download click/select, entered only when the action
     left an immediate same-context Page delta (the caller gates on it). With a Page present but no file signal
@@ -1681,7 +1686,11 @@ async def _settle_and_close_false_click_download(
         return
 
     def _list_local_final_files() -> list[str]:
-        return [file for file in list_files_in_directory(download_dir) if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        return [
+            file
+            for file in list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+            if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+        ]
 
     async def _list_final() -> list[str]:
         return _list_local_final_files()
@@ -1724,7 +1733,7 @@ async def _settle_and_close_false_click_download(
             observed_delta_pages.append(candidate)
             if owning_context is not None:
                 owning_context.record_download_popup_claim(task.task_id, candidate)
-        if _local_download_signal_identities(download_dir) - signal_before:
+        if _local_download_signal_identities(download_dir, attempt_started_at=attempt_started_at) - signal_before:
             file_signal_observed = True
         if observed_delta_pages and file_signal_observed:
             break
@@ -1742,10 +1751,12 @@ async def _settle_and_close_false_click_download(
     # whose normalized identity appeared since the pre-action baseline. Unrelated pre-existing partials in
     # the shared download dir are excluded, so a stalled older download cannot extend this action for
     # minutes. An already-settled new file leaves this set empty, so finalization returns without waiting.
-    new_identities = _local_download_signal_identities(download_dir) - signal_before
+    new_identities = (
+        _local_download_signal_identities(download_dir, attempt_started_at=attempt_started_at) - signal_before
+    )
     attributable_downloading = [
         path
-        for path in list_downloading_files_in_directory(download_dir)
+        for path in list_downloading_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
         if _normalize_download_identity(path) in new_identities
     ]
     downloaded_file_names, _ = await _finalize_download_artifacts(
@@ -1755,6 +1766,7 @@ async def _settle_and_close_false_click_download(
         list_observed_download_files=_list_final,
         timeout_seconds=max(0.0, overall_deadline_seconds - (time.monotonic() - started_at)),
         downloading_files=attributable_downloading,
+        attempt_started_at=attempt_started_at,
     )
     # Durable completion is what authorizes the close: an observed signal that never finalizes (e.g. a
     # stalled ``.crdownload``) leaves the page open and the claim intact for the late-credit backstop
@@ -1856,6 +1868,7 @@ async def _finalize_download_artifacts(
     task: Task,
     list_files_before: list[str],
     list_observed_download_files: Callable[[], Awaitable[list[str]]],
+    attempt_started_at: datetime | None = None,
     timeout_seconds: float | None = None,
     downloading_files: list[str] | None = None,
 ) -> tuple[list[str], set[str]]:
@@ -1872,6 +1885,7 @@ async def _finalize_download_artifacts(
             organization_id=task.organization_id,
             browser_session_id=task.browser_session_id,
             timeout=settle_timeout,
+            attempt_started_at=attempt_started_at,
         )
     elif downloading_files:
         try:
@@ -4643,6 +4657,12 @@ class ActionHandler:
                 # Capture the owning context in the action coroutine so the popup callback never reads a
                 # possibly empty/stale skyvern_context.current() at dispatch.
                 false_click_owning_context = skyvern_context.current()
+                false_click_run_id = resolve_run_download_id(
+                    false_click_owning_context, task.workflow_run_id or task.task_id
+                )
+                false_click_attempt_started_at = await get_download_retry_started_at(
+                    task.organization_id, false_click_run_id
+                )
                 # Retain the initiating BrowserContext, run the bounded pre-action quiescence gate, THEN
                 # snapshot the delta baseline: a Page/file a previous action's in-flight browser/CDP handler
                 # produced during the admission window is pre-existing, not this click's. Prove quiescence
@@ -4665,11 +4685,10 @@ class ActionHandler:
                     false_click_quiescent = False
                 # Task/run download baseline captured BEFORE the inner action (contract requirement) so a file
                 # landing during it counts as new. Local run dir only, including in-flight ``.crdownload``.
-                false_click_run_id = resolve_run_download_id(
-                    false_click_owning_context, task.workflow_run_id or task.task_id
-                )
                 false_click_download_dir = Path(get_download_dir(run_id=false_click_run_id))
-                false_click_signal_before = _local_download_signal_identities(false_click_download_dir)
+                false_click_signal_before = _local_download_signal_identities(
+                    false_click_download_dir, attempt_started_at=false_click_attempt_started_at
+                )
                 false_click_popup_event_count = 0
                 with traced_span(_tracer, "skyvern.agent.action.false_click_download"):
                     false_click_download_event: asyncio.Future[tuple[Download, Page]] = (
@@ -4723,15 +4742,23 @@ class ActionHandler:
                             context = skyvern_context.current()
                             run_id = resolve_run_download_id(context, task.workflow_run_id or task.task_id)
                             download_dir = Path(get_download_dir(run_id=run_id))
+                            attempt_started_at = await get_download_retry_started_at(task.organization_id, run_id)
 
                             async def list_false_click_files(extra: Path | None = None) -> list[str]:
-                                files = list_files_in_directory(download_dir)
+                                files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                                 if task.browser_session_id:
                                     files += await app.STORAGE.list_downloaded_files_in_browser_session(
                                         organization_id=task.organization_id,
                                         browser_session_id=task.browser_session_id,
                                     )
-                                if extra and extra.is_file():
+                                if (
+                                    extra
+                                    and extra.is_file()
+                                    and (
+                                        attempt_started_at is None
+                                        or is_file_from_retry_attempt(str(extra), attempt_started_at)
+                                    )
+                                ):
                                     files.append(str(extra))
                                 return files
 
@@ -4761,6 +4788,7 @@ class ActionHandler:
                                     task=task,
                                     list_files_before=baseline,
                                     list_observed_download_files=lambda: list_false_click_files(persisted.path),
+                                    attempt_started_at=attempt_started_at,
                                 )
                                 try:
                                     persisted_artifact_qualified = (
@@ -4871,6 +4899,7 @@ class ActionHandler:
                         baseline=false_click_baseline,
                         download_dir=false_click_download_dir,
                         signal_before=false_click_signal_before,
+                        attempt_started_at=false_click_attempt_started_at,
                     )
             action.finished_at = naive_utc_now()
             persisted_action = await app.DATABASE.workflow_params.create_action(
@@ -4882,6 +4911,7 @@ class ActionHandler:
         context = skyvern_context.current()
         run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id or task.task_id)
         download_dir = Path(get_download_dir(run_id=run_id))
+        attempt_started_at = await get_download_retry_started_at(task.organization_id, run_id)
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
         eager_blob_capture = _EagerAdoptedBlobCapture(
             enabled=bool(task.browser_session_id),
@@ -4915,7 +4945,7 @@ class ActionHandler:
             return _normalize_download_identity(file)
 
         async def _list_download_signal_files() -> list[str]:
-            files = list_files_in_directory(download_dir)
+            files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
             if task.browser_session_id:
                 downloading_files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
                     organization_id=task.organization_id, browser_session_id=task.browser_session_id
@@ -4928,7 +4958,9 @@ class ActionHandler:
 
         async def _list_final_download_files() -> list[str]:
             files = [
-                file for file in list_files_in_directory(download_dir) if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+                file
+                for file in list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+                if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
             ]
             if task.browser_session_id:
                 files += await app.STORAGE.list_downloaded_files_in_browser_session(
@@ -5473,6 +5505,7 @@ class ActionHandler:
                         task=task,
                         list_files_before=list_files_before,
                         list_observed_download_files=_list_final_download_files,
+                        attempt_started_at=attempt_started_at,
                     )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names

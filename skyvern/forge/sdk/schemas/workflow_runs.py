@@ -16,6 +16,7 @@ class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     block_workflow_run_id: str | None = None
     workflow_run_id: str
+    attempt_number: int | None = None
     organization_id: str
     description: str | None = None
     parent_workflow_run_block_id: str | None = None
@@ -87,6 +88,7 @@ class WorkflowRunTimelineType(StrEnum):
 
 class WorkflowRunTimeline(BaseModel):
     type: WorkflowRunTimelineType
+    attempt: int = 1
     block: WorkflowRunBlock | None = None
     thought: Thought | None = None
     children: list[WorkflowRunTimeline] = []

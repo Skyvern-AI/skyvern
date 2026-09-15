@@ -43,6 +43,7 @@ from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.uploaded_files import UploadedFilesRepository
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
@@ -403,6 +404,7 @@ class AgentDB(BaseAlchemyDB):
             sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
         )
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflow_run_attempts = WorkflowRunAttemptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error
         )

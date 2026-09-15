@@ -417,7 +417,7 @@ class Skyvern(AsyncSkyvern):
             async with asyncio.timeout(timeout):
                 while True:
                     workflow_run = await super().get_run(workflow_run.run_id)
-                    if RunStatus(workflow_run.status).is_final():
+                    if RunStatus(workflow_run.status).is_final() and not getattr(workflow_run, "retry_pending", False):
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
@@ -476,7 +476,7 @@ class Skyvern(AsyncSkyvern):
             async with asyncio.timeout(timeout):
                 while True:
                     workflow_run = await super().get_run(workflow_run.run_id)
-                    if RunStatus(workflow_run.status).is_final():
+                    if RunStatus(workflow_run.status).is_final() and not getattr(workflow_run, "retry_pending", False):
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())

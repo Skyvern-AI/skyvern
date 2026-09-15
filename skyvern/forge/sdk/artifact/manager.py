@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.signing import (
     sign_artifact_url,
     verify_artifact_signature,
 )
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
@@ -461,22 +462,14 @@ class ArtifactManager:
         row so the file can be served through the signed ``/v1/artifacts/{id}/content``
         endpoint.
         """
-        # Idempotent on (run_id, uri): if a DOWNLOAD artifact already exists for the
-        # same physical file (e.g. a loop iteration re-uploads the same download dir),
-        # return the existing artifact_id so signed URLs stay stable across calls —
-        # otherwise ``loop_download_filter.to_downloaded_file_signature`` would treat
-        # every iteration's URL as new.
+        context = skyvern_context.current()
+        # Retry uploads use attempt-specific URIs; reuse within one attempt keeps loop URLs stable.
         existing = await app.DATABASE.artifacts.find_download_artifact(
             organization_id=organization_id,
             run_id=run_id,
             uri=uri,
         )
         if existing is not None:
-            # Changed bytes under the same uri refresh the row's checksum so the loop filter's
-            # (filename, checksum, url) signature moves with the content instead of hiding a
-            # genuine re-download behind the stale row. A failed refresh propagates: the stale
-            # row must not vouch for bytes it does not describe, so the save loop records the
-            # file as skipped and workflow finalization's re-save retries the refresh.
             if checksum is not None and existing.checksum != checksum:
                 await app.DATABASE.artifacts.refresh_download_artifact_content(
                     artifact_id=existing.artifact_id,
@@ -487,7 +480,6 @@ class ArtifactManager:
             return existing.artifact_id
 
         artifact_id = generate_artifact_id()
-        context = skyvern_context.current()
         if workflow_run_id is None and context is not None:
             workflow_run_id = context.workflow_run_id
         await app.DATABASE.artifacts.create_artifact(
@@ -1482,9 +1474,7 @@ class ArtifactManager:
             # in ``bundle_key``; non-bundled artifacts have it as the URI
             # basename. Without this fallback the path basename is just
             # "content" and the UI falls back to a literal "download" label.
-            artifact_name = artifact.bundle_key
-            if artifact_name is None and artifact.uri:
-                artifact_name = artifact.uri.rsplit("/", 1)[-1] or None
+            artifact_name = artifact.bundle_key or artifact_filename_from_uri(artifact.uri) or None
             return self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact_name,

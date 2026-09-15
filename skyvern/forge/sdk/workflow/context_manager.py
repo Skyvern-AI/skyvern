@@ -128,6 +128,8 @@ def resolve_credential_parameter_binding(
 
 
 class WorkflowRunContext:
+    attempt_number: int = 1
+
     @classmethod
     async def init(
         cls,
@@ -153,6 +155,7 @@ class WorkflowRunContext:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -164,6 +167,7 @@ class WorkflowRunContext:
             workflow=workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
+            attempt_number=attempt_number,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -259,11 +263,13 @@ class WorkflowRunContext:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
+        self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
         # Joined raw workflow_system_prompt(s) from ancestor workflows (outermost
@@ -1031,8 +1037,11 @@ class WorkflowRunContext:
         cached = self.resolved_credential_parameter_ids.get(parameter.key)
         if cached:
             return cached
-        selected_credential_id = None
-        if parameter.credential_ids:
+        selected_credential_id = await app.DATABASE.workflow_run_credential_selections.get_selection(
+            workflow_run_id=self.workflow_run_id,
+            parameter_key=parameter.key,
+        )
+        if selected_credential_id is None and parameter.credential_ids:
             selected_credential_id = await select_credential_for_run(
                 workflow_run_id=self.workflow_run_id,
                 organization_id=organization_id,
@@ -1040,11 +1049,6 @@ class WorkflowRunContext:
                 parameter_key=parameter.key,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
-            )
-        elif parameter.fallback_credential_ids:
-            selected_credential_id = await app.DATABASE.workflow_run_credential_selections.get_selection(
-                workflow_run_id=self.workflow_run_id,
-                parameter_key=parameter.key,
             )
         registered_parameter_values = {
             key: self.resolved_credential_parameter_ids.get(key, self.values[key])
@@ -2024,6 +2028,7 @@ class WorkflowContextManager:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -2040,6 +2045,7 @@ class WorkflowContextManager:
             workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
+            attempt_number=attempt_number,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
@@ -2047,6 +2053,10 @@ class WorkflowContextManager:
     def get_workflow_run_context(self, workflow_run_id: str) -> WorkflowRunContext:
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
+
+    def get_attempt_number(self, workflow_run_id: str) -> int:
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        return context.attempt_number if context is not None else 1
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)

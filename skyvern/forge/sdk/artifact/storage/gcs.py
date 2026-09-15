@@ -30,8 +30,10 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
+    is_file_from_retry_attempt,
     key_is_org_scoped,
     presign_with_sensitive_cap,
+    resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
@@ -550,6 +552,8 @@ class GcsStorage(BaseStorage):
         self,
         organization_id: str,
         run_id: str | None,
+        *,
+        attempt_number: int | None = None,
     ) -> None:
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -563,6 +567,7 @@ class GcsStorage(BaseStorage):
             run_id=run_id,
             storage_class=storage_class,
             tags=tags,
+            attempt_number=attempt_number,
         )
 
     async def _save_downloaded_files_from_local(
@@ -572,12 +577,19 @@ class GcsStorage(BaseStorage):
         run_id: str | None,
         storage_class: str,
         tags: dict[str, str] | None,
+        attempt_number: int | None = None,
     ) -> None:
         """Save files from local download directory to GCS."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         if not files:
             return
+        retry_workflow_run_id, attempt_number, retry_attempt_started_at = await resolve_download_attempt_fail_open(
+            organization_id, run_id, attempt_number=attempt_number
+        )
+        retry_attempt = run_id is not None and attempt_number > 1
+        if retry_attempt:
+            base_uri = f"{base_uri}/attempts/{attempt_number}"
         already_saved = (
             download_checksums_by_uri(
                 await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
@@ -594,6 +606,8 @@ class GcsStorage(BaseStorage):
             file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
+                continue
+            if retry_attempt and not is_file_from_retry_attempt(fpath, retry_attempt_started_at):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
@@ -639,6 +653,7 @@ class GcsStorage(BaseStorage):
                         run_id=run_id,
                         uri=uri,
                         filename=file,
+                        workflow_run_id=retry_workflow_run_id if retry_attempt else None,
                         checksum=checksum,
                         file_size=file_size,
                     )
@@ -667,13 +682,20 @@ class GcsStorage(BaseStorage):
         # the keyring isn't configured (OSS default) or no artifact rows exist
         # (legacy run) we fall back to the legacy listing path so
         # downloaded files remain reachable.
+        download_artifacts: list[Artifact] | None = None
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
-            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
-            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
-            if artifacts:
-                return await _file_infos_from_download_artifacts(artifacts)
+            download_artifacts = await self._list_download_artifacts_safe(
+                organization_id=organization_id, run_id=run_id
+            )
+            download_artifacts = dedupe_run_scoped_download_artifacts(download_artifacts)
+            if download_artifacts:
+                return await _file_infos_from_download_artifacts(download_artifacts)
 
-        return await self._get_downloaded_files_via_blob_listing(organization_id=organization_id, run_id=run_id)
+        return await self._get_downloaded_files_via_blob_listing(
+            organization_id=organization_id,
+            run_id=run_id,
+            download_artifacts=download_artifacts,
+        )
 
     async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
         try:
@@ -692,8 +714,18 @@ class GcsStorage(BaseStorage):
             return []
 
     async def _get_downloaded_files_via_blob_listing(
-        self, *, organization_id: str, run_id: str | None
+        self,
+        *,
+        organization_id: str,
+        run_id: str | None,
+        download_artifacts: list[Artifact] | None = None,
     ) -> list[FileInfo]:
+        if download_artifacts is None and run_id is not None:
+            download_artifacts = await self._list_download_artifacts_safe(
+                organization_id=organization_id,
+                run_id=run_id,
+            )
+        artifacts_by_uri = {artifact.uri: artifact for artifact in download_artifacts or []}
         uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
@@ -705,13 +737,16 @@ class GcsStorage(BaseStorage):
 
             metadata = {}
             content_length: int | None = None
+            blob_modified_at = None
             object_info = await _get_object_info_safe(self, object_uri)
             if object_info:
                 metadata = object_info.get("Metadata", {})
                 content_length = object_info.get("ContentLength")
+                blob_modified_at = object_info.get("LastModified")
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
             display_name = metadata.get("original_filename", filename) if metadata else filename
+            artifact = artifacts_by_uri.get(object_uri)
 
             signed_urls = await self.async_client.create_signed_urls([object_uri])
             if not signed_urls:
@@ -723,6 +758,8 @@ class GcsStorage(BaseStorage):
                     checksum=checksum,
                     filename=display_name,
                     file_size=content_length,
+                    modified_at=artifact.modified_at if artifact is not None else blob_modified_at,
+                    artifact_id=artifact.artifact_id if artifact is not None else None,
                 )
             )
 

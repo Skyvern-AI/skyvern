@@ -123,6 +123,7 @@ from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_
 from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.browser_action_preflight import (
     observed_page,
     preflight_action,
@@ -1182,6 +1183,7 @@ class ForgeAgent:
         download_suffix: str | None,
         list_files_before: list[str],
         randomize_if_missing: bool,
+        attempt_started_at: datetime | None = None,
     ) -> list[str]:
         """Rename newly downloaded files for a task before persistence.
 
@@ -1196,7 +1198,7 @@ class ForgeAgent:
         workflow_download_directory = get_path_for_workflow_download_directory(
             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
         )
-        list_files_after = list_files_in_directory(workflow_download_directory)
+        list_files_after = list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at)
         if task.browser_session_id:
             browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
                 organization_id=organization_id,
@@ -1420,6 +1422,7 @@ class ForgeAgent:
         organization_id: str,
         *,
         timeout_cap: float | None = None,
+        attempt_started_at: datetime | None = None,
         exhausted: set[str] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
@@ -1443,7 +1446,9 @@ class ForgeAgent:
             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
         )
 
-        downloading_files = list_downloading_files_in_directory(workflow_download_directory)
+        downloading_files = list_downloading_files_in_directory(
+            workflow_download_directory, attempt_started_at=attempt_started_at
+        )
         if task.browser_session_id:
             browser_session_downloading_files = await app.STORAGE.list_downloading_files_in_browser_session(
                 organization_id=organization_id,
@@ -1559,6 +1564,7 @@ class ForgeAgent:
             proxy_location=workflow_run.proxy_location,
             extracted_information_schema=task_block.data_schema,
             workflow_run_id=workflow_run.workflow_run_id,
+            attempt_number=workflow_run_context.attempt_number,
             order=task_order,
             retry=task_retry,
             max_steps_per_run=task_block.max_steps_per_run,
@@ -1628,6 +1634,7 @@ class ForgeAgent:
                 navigation_payload=None,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 order=task_order,
                 retry=task_retry,
             )
@@ -1847,6 +1854,12 @@ class ForgeAgent:
                 run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
                     workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
                 )
+                current_attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(task.workflow_run_id)
+                run_blocks = [
+                    block
+                    for block in run_blocks
+                    if (block.attempt_number if block.attempt_number is not None else 1) == current_attempt_number
+                ]
                 previous_block = select_previous_block(run_blocks, task.task_id)
             except Exception:
                 LOG.warning("task_v3 previous-block handoff lookup failed", task_id=task.task_id, exc_info=True)
@@ -1902,6 +1915,9 @@ class ForgeAgent:
             return False
 
         download_id = resolve_run_download_id(context, fallback_run_id=task.task_id)
+        attempt_started_at = await get_download_retry_started_at(
+            organization.organization_id, resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+        )
 
         # Same baseline v1 takes before its per-step download check, so a file that was already
         # sitting in the run's download directory before this block started is never mistaken for
@@ -1917,7 +1933,9 @@ class ForgeAgent:
             workflow_download_directory = get_path_for_workflow_download_directory(
                 resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
             )
-            download_baseline_files = list_files_in_directory(workflow_download_directory)
+            download_baseline_files = list_files_in_directory(
+                workflow_download_directory, attempt_started_at=attempt_started_at
+            )
             if task.browser_session_id:
                 browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
                     organization_id=organization.organization_id,
@@ -1965,6 +1983,7 @@ class ForgeAgent:
                     timeout_cap=loop_deadline_at - time.monotonic(),
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
+                    attempt_started_at=attempt_started_at,
                 )
                 if cancelled:
                     # The run is being canceled; even if a file landed while we waited, don't
@@ -1977,6 +1996,7 @@ class ForgeAgent:
                     download_suffix=complete_on_download_block.download_suffix,
                     list_files_before=[*(download_baseline_files or []), *staged_paths],
                     randomize_if_missing=True,
+                    attempt_started_at=attempt_started_at,
                 )
                 if not new_files:
                     return None
@@ -2024,6 +2044,7 @@ class ForgeAgent:
                     timeout_cap=loop_deadline_at - time.monotonic(),
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
+                    attempt_started_at=attempt_started_at,
                 )
                 return None
 
@@ -2902,6 +2923,9 @@ class ForgeAgent:
             )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
+        attempt_started_at = await get_download_retry_started_at(
+            organization.organization_id, resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+        )
         list_files_before: list[str] = download_baseline_files.copy() if download_baseline_files is not None else []
         browser_state: BrowserState | None = None
         # Set by a handler that ended the task but could not fail the row, so it skipped cleanup;
@@ -2914,7 +2938,8 @@ class ForgeAgent:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
                         resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
-                    )
+                    ),
+                    attempt_started_at=attempt_started_at,
                 )
             if task.browser_session_id and download_baseline_files is None:
                 browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
@@ -3056,7 +3081,9 @@ class ForgeAgent:
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
-                await self._wait_for_in_flight_downloads(task, task_block, organization.organization_id)
+                await self._wait_for_in_flight_downloads(
+                    task, task_block, organization.organization_id, attempt_started_at=attempt_started_at
+                )
 
                 files_to_rename = await self._finalize_downloaded_files_for_task(
                     task,
@@ -3064,6 +3091,7 @@ class ForgeAgent:
                     download_suffix=task_block.download_suffix,
                     list_files_before=list_files_before,
                     randomize_if_missing=True,
+                    attempt_started_at=attempt_started_at,
                 )
                 if files_to_rename:
                     LOG.info(
@@ -7352,12 +7380,16 @@ class ForgeAgent:
                         async with settle_browser_downloads_for_context(browser_context):
                             pass
                         if download_suffix and list_files_before is not None:
+                            attempt_started_at = await get_download_retry_started_at(
+                                task.organization_id, finalization_run_id
+                            )
                             cleanup_finalized_files = await self._finalize_downloaded_files_for_task(
                                 task,
                                 organization_id=task.organization_id,
                                 download_suffix=download_suffix,
                                 list_files_before=list_files_before,
                                 randomize_if_missing=False,
+                                attempt_started_at=attempt_started_at,
                             )
                             # Cleanup finalization is the second durable-credit seam: only when it
                             # proves a new file did the download land, so only then close the popups the
@@ -8836,13 +8868,16 @@ class ForgeAgent:
         """Returns (total_steps_so_far, max_steps_per_workflow_run) when the org has a
         run-level cap and this task belongs to a workflow run; otherwise None.
 
-        ``max_steps_per_workflow_run`` is a per-org cap on total step count summed across
-        all task blocks within a single workflow run. Distinct from the per-block
+        ``max_steps_per_workflow_run`` is a per-org cap on the step count summed across all
+        task blocks of one attempt of a workflow run, so a retried run may spend up to
+        cap x (max_retries + 1) steps under one run id. Distinct from the per-block
         ``max_steps_per_run`` ceiling.
         """
         if not task.workflow_run_id or not organization.max_steps_per_workflow_run:
             return None
-        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(task.workflow_run_id)
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(
+            task.workflow_run_id, attempt_number=task.attempt_number or 1
+        )
         task_ids = [t.task_id for t in workflow_run_tasks]
         if not task_ids:
             return 0, organization.max_steps_per_workflow_run

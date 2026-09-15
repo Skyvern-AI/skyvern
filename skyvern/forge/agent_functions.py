@@ -71,6 +71,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
@@ -1364,6 +1365,11 @@ class AgentFunction:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
 
+    async def get_workflow_run_execution_status(
+        self, workflow_run: WorkflowRun
+    ) -> Literal["running", "terminal", "absent", "unknown"]:
+        return "unknown" if workflow_run.job_id else "absent"
+
     async def is_block_scoped_workflow_run(self, workflow_run: WorkflowRun) -> bool:
         """Return whether this workflow run was created for scoped block execution."""
         return workflow_run.debug_session_id is not None
@@ -2415,7 +2421,7 @@ class AgentFunction:
         url: str,
         payload: str,
         headers: dict[str, str],
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS,
         organization_id: str | None = None,
         run_id: str | None = None,
         resolved_ips: tuple[str, ...] | None = None,
@@ -2884,6 +2890,26 @@ class AgentFunction:
         workflow_run_id: str,
         organization_id: str,
         status: WorkflowRunStatus,
+        is_final_attempt: bool = True,
     ) -> None:
-        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        """Fired after a workflow attempt reaches a final status.
+
+        ``is_final_attempt`` is false for an attempt that will be retried. Overrides must be
+        best-effort and never raise.
+        """
+        return
+
+    async def on_workflow_run_final(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        """Fired once per logical run after its final retry decision.
+
+        A process paused across a side-effect lease takeover may observe a second call only if it
+        resumes between the fresh ownership check and this call. Overrides must be best-effort and
+        never raise.
+        """
         return

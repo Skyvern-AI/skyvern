@@ -143,6 +143,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -374,7 +375,7 @@ async def capture_block_download_baseline(
     """
     try:
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-            baseline_files = await app.STORAGE.get_downloaded_files(
+            baseline_files = await app.STORAGE.get_current_attempt_downloaded_files(
                 organization_id=organization_id,
                 run_id=resolve_run_download_id(context, fallback_run_id=workflow_run_id),
             )
@@ -470,6 +471,27 @@ def local_download_dir_file_identities(download_run_id: str | None) -> set[tuple
         return identities
     except Exception:
         return None
+
+
+def current_attempt_local_download_dir_file_identities(
+    download_run_id: str | None,
+    attempt_started_at: datetime | None,
+    *,
+    baseline: set[tuple[str, int, int]] | None = None,
+) -> set[tuple[str, int, int]] | None:
+    identities = local_download_dir_file_identities(download_run_id)
+    if identities is None:
+        return None
+    if attempt_started_at is None:
+        return identities
+    baseline_names = {identity[0] for identity in baseline or set()}
+    # An old mtime requires a changed entry in the raw baseline, not merely a newly appearing name.
+    return {
+        identity
+        for identity in identities
+        if identity[2] / 1_000_000_000 >= attempt_started_at.timestamp()
+        or (baseline is not None and identity[0] in baseline_names and identity not in baseline)
+    }
 
 
 def download_binding_of(browser_state: BrowserState | None) -> DownloadBinding:
@@ -615,7 +637,9 @@ class ParquetExportMixin:
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+                return await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=run_download_id
+                )
         except Exception:
             LOG.warning(
                 "Failed to read registered Parquet exports",
@@ -1581,6 +1605,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 parent_workflow_run_block_id=parent_workflow_run_block_id,
                 label=self.label,
                 block_type=self.block_type,
@@ -1916,12 +1941,19 @@ class BaseTaskBlock(Block):
         self._apply_workflow_system_prompt(workflow_run_context)
 
     @staticmethod
-    async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
+    async def get_task_order(
+        workflow_run_id: str,
+        current_retry: int,
+        attempt_number: int | None = None,
+    ) -> tuple[int, int]:
         """
         Returns the order and retry for the next task in the workflow run as a tuple.
         """
+        if attempt_number is None:
+            attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
         last_task_for_workflow_run = await app.DATABASE.tasks.get_last_task_for_workflow_run(
-            workflow_run_id=workflow_run_id
+            workflow_run_id=workflow_run_id,
+            attempt_number=attempt_number,
         )
         # If there is no previous task, the order will be 0 and the retry will be 0.
         if last_task_for_workflow_run is None:
@@ -2390,7 +2422,7 @@ class BaseTaskBlock(Block):
                 downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             run_id=current_context.run_id
                             if current_context and current_context.run_id
@@ -2403,6 +2435,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state if current_context else None,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -2491,7 +2524,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             run_id=current_context.run_id
                             if current_context and current_context.run_id
@@ -2505,6 +2538,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state if current_context else None,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -3405,7 +3439,7 @@ class ForLoopBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_file_sigs_before = [
                             to_downloaded_file_signature(fi)
-                            for fi in await app.STORAGE.get_downloaded_files(
+                            for fi in await app.STORAGE.get_current_attempt_downloaded_files(
                                 organization_id=organization_id or "",
                                 run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
@@ -4140,7 +4174,7 @@ class WhileLoopBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_file_sigs_before = [
                             to_downloaded_file_signature(fi)
-                            for fi in await app.STORAGE.get_downloaded_files(
+                            for fi in await app.STORAGE.get_current_attempt_downloaded_files(
                                 organization_id=organization_id or "",
                                 run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
@@ -6215,7 +6249,7 @@ async def wrapper({default_args}):
             return None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                files = await app.STORAGE.get_downloaded_files(
+                files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=download_run_id or workflow_run_id,
                 )
@@ -6248,6 +6282,7 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         skipped_file_names: set[str],
+        attempt_started_at: datetime | None = None,
         authored_registration: bool = False,
     ) -> tuple[Any, str | None]:
         """Bind registration evidence into the block output, returning a failure reason if it cannot.
@@ -6286,6 +6321,7 @@ async def wrapper({default_args}):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
         output = bind_downloaded_files_to_output(result, downloaded_files)
         await self._record_unregistered_download_intent(
@@ -6315,7 +6351,11 @@ async def wrapper({default_args}):
         if downloaded_files:
             _log_verdict_skipped_for_partial_save()
             return output, None
-        download_dir_after = local_download_dir_file_identities(resolved_download_id)
+        download_dir_after = current_attempt_local_download_dir_file_identities(
+            resolved_download_id,
+            attempt_started_at,
+            baseline=download_dir_before,
+        )
         if download_dir_after is None or download_dir_before is None:
             LOG.warning(
                 "codeblock.download_binding_verdict_skipped",
@@ -6808,6 +6848,7 @@ async def wrapper({default_args}):
                 navigation_payload=None,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=workflow_run_context.attempt_number,
                 order=task_order,
                 retry=task_retry,
                 max_steps_per_run=heal_max_steps,
@@ -6836,6 +6877,7 @@ async def wrapper({default_args}):
                 parent_workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 task_id=escalation_task.task_id,
+                attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
             )
@@ -6881,7 +6923,7 @@ async def wrapper({default_args}):
                 downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id,
                             run_id=current_context.run_id if current_context.run_id else workflow_run_id,
                         )
@@ -6890,6 +6932,7 @@ async def wrapper({default_args}):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
                 task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
@@ -7274,6 +7317,7 @@ async def wrapper({default_args}):
         resolved_download_id: str | None,
         download_dir_before: set[tuple[str, int, int]] | None,
         session_bound: bool,
+        attempt_started_at: datetime | None,
         download_binding_kind: str | None = None,
         result: dict[str, Any] | list | str | None = None,
     ) -> dict[str, Any] | None:
@@ -7289,7 +7333,11 @@ async def wrapper({default_args}):
         skipped_file_names: set[str] = set()
         needs_registration = session_bound
         if not session_bound:
-            download_dir_after = local_download_dir_file_identities(resolved_download_id)
+            download_dir_after = current_attempt_local_download_dir_file_identities(
+                resolved_download_id,
+                attempt_started_at,
+                baseline=download_dir_before,
+            )
             if download_dir_after is None or download_dir_before is None:
                 return None
             new_files = download_dir_after - download_dir_before
@@ -7325,6 +7373,7 @@ async def wrapper({default_args}):
             downloaded_files=downloaded_files,
             skipped_file_names=skipped_file_names,
             download_dir_before=download_dir_before,
+            attempt_started_at=attempt_started_at,
             resolved_download_id=resolved_download_id,
             workflow_run_context=workflow_run_context,
             workflow_run_id=workflow_run_id,
@@ -7427,6 +7476,7 @@ async def wrapper({default_args}):
         engine: str,
         resolved_download_id: str | None,
         download_dir_before: set[tuple[str, int, int]] | None,
+        attempt_started_at: datetime | None,
         output_parameter_value: dict[str, Any] | list | str | None = None,
         error_codes: list[str] | None = None,
     ) -> BlockResult:
@@ -7442,6 +7492,7 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     session_bound=session_download_lane_active(browser_state),
                     download_binding_kind=download_binding_of(browser_state).value,
                     result=output_parameter_value,
@@ -7485,6 +7536,7 @@ async def wrapper({default_args}):
         page: Page | None = None,
         resolved_download_id: str | None = None,
         download_dir_before: set[tuple[str, int, int]] | None = None,
+        attempt_started_at: datetime | None = None,
         redaction_parameters: dict[str, Any] | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
@@ -7545,6 +7597,7 @@ async def wrapper({default_args}):
                             downloaded_files=downloaded_files,
                             skipped_file_names=skipped_file_names,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -7591,6 +7644,7 @@ async def wrapper({default_args}):
                         organization_id=organization_id,
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
+                        attempt_started_at=attempt_started_at,
                         session_bound=session_download_lane_active(browser_state),
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=result.output_parameter_value,
@@ -8035,6 +8089,9 @@ async def wrapper({default_args}):
             )
 
         resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
+        attempt_started_at = await get_download_retry_started_at(
+            organization_id or workflow_run_context.organization_id, resolved_download_id
+        )
         download_dir_before = local_download_dir_file_identities(resolved_download_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -8402,6 +8459,7 @@ async def wrapper({default_args}):
                             page=page,
                             resolved_download_id=resolved_download_id,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             redaction_parameters=serialized_parameter_values,
                         )
                     if secure_code_block_result.block_result is None:
@@ -8424,6 +8482,7 @@ async def wrapper({default_args}):
                             engine="secure_runner",
                             resolved_download_id=resolved_download_id,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                         )
                     # failure=None does not imply success: infra arms (no browser/page, runner raise,
                     # invalid output) return a failed block_result with no healable failure metadata.
@@ -8458,7 +8517,11 @@ async def wrapper({default_args}):
                             download_run_id=resolved_download_id,
                         )
                         secure_skipped_file_names: set[str] = set()
-                        secure_dir_after = local_download_dir_file_identities(resolved_download_id)
+                        secure_dir_after = current_attempt_local_download_dir_file_identities(
+                            resolved_download_id,
+                            attempt_started_at,
+                            baseline=download_dir_before,
+                        )
                         secure_registered_names = {file_info.filename for file_info in host_files or []}
                         # An unreadable snapshot is unknown, never empty: coverage cannot be proven,
                         # so the save runs rather than being skipped on a coerced empty diff. A
@@ -8497,6 +8560,7 @@ async def wrapper({default_args}):
                             downloaded_files=host_files,
                             skipped_file_names=secure_skipped_file_names,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -8628,6 +8692,7 @@ async def wrapper({default_args}):
                 engine="inline",
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
             )
         except asyncio.TimeoutError:
             await recorder.persist(recorder.recorded_actions())
@@ -8648,6 +8713,7 @@ async def wrapper({default_args}):
                 engine="inline",
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
             )
         except Exception as e:
             # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
@@ -8667,6 +8733,7 @@ async def wrapper({default_args}):
                     engine="inline",
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                 )
             failing_line = user_code_line_from_exception(e)
             declared_error = self._extract_declared_error(e, workflow_run_context)
@@ -8689,6 +8756,7 @@ async def wrapper({default_args}):
                         organization_id=organization_id,
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
+                        attempt_started_at=attempt_started_at,
                         session_bound=session_download_lane_active(browser_state),
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=failure_output,
@@ -8720,6 +8788,7 @@ async def wrapper({default_args}):
                     page=page,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     redaction_parameters=serialized_parameter_values,
                 )
             if (
@@ -8819,6 +8888,7 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     session_bound=session_download_lane_active(browser_state),
                     download_binding_kind=download_binding_of(browser_state).value,
                     result=failure_output,
@@ -8856,6 +8926,7 @@ async def wrapper({default_args}):
                 page=page,
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
                 redaction_parameters=serialized_parameter_values,
             )
 
@@ -8889,6 +8960,7 @@ async def wrapper({default_args}):
                     downloaded_files=downloaded_files,
                     skipped_file_names=skipped_file_names,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     resolved_download_id=resolved_download_id,
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
@@ -9847,7 +9919,16 @@ class UploadToS3Block(Block):
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(resolved_path):
-                files = os.listdir(resolved_path)
+                attempt_started_at = await get_download_retry_started_at(
+                    organization_id or workflow_run_context.organization_id,
+                    resolve_run_download_id(context, fallback_run_id=workflow_run_id),
+                )
+                files = [
+                    name
+                    for name in os.listdir(resolved_path)
+                    if attempt_started_at is None
+                    or is_file_from_retry_attempt(os.path.join(resolved_path, name), attempt_started_at)
+                ]
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
@@ -10508,10 +10589,16 @@ class FileDestinationBlock(Block):
         *,
         download_files_path: str,
         max_file_count: int,
+        attempt_started_at: datetime | None = None,
     ) -> list[str]:
         files_to_upload = []
         if os.path.isdir(download_files_path):
-            files = os.listdir(download_files_path)
+            files = [
+                name
+                for name in os.listdir(download_files_path)
+                if attempt_started_at is None
+                or is_file_from_retry_attempt(os.path.join(download_files_path, name), attempt_started_at)
+            ]
             if len(files) > max_file_count:
                 raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
             for file in files:
@@ -10648,6 +10735,7 @@ class FileDestinationBlock(Block):
         run_download_id: str | None,
         download_files_path: str,
         max_file_count: int,
+        attempt_started_at: datetime | None = None,
     ) -> tuple[list[str] | None, str]:
         """Return alternate local files plus a failure-reason count label.
 
@@ -10665,6 +10753,7 @@ class FileDestinationBlock(Block):
                 alternate_files = self._get_files_to_upload_from_download_dir(
                     download_files_path=candidate_download_files_path,
                     max_file_count=max_file_count,
+                    attempt_started_at=attempt_started_at,
                 )
             except ValueError:
                 LOG.warning(
@@ -10741,7 +10830,7 @@ class FileDestinationBlock(Block):
         run_download_id: str | None,
         context: SkyvernContext | None,
     ) -> list[FileInfo] | None:
-        """Return registered downloads, or None when the signal is unknown.
+        """Return registered downloads from the current attempt, or None when the signal is unknown.
 
         A timeout on any candidate stays unknown even if later candidates might be empty; an empty later lookup cannot
         prove that the timed-out candidate had no downloads, so the caller fails closed.
@@ -10763,7 +10852,7 @@ class FileDestinationBlock(Block):
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     registered_downloaded_files.extend(
-                        await app.STORAGE.get_downloaded_files(
+                        await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id,
                             run_id=candidate_run_id,
                         )
@@ -10867,9 +10956,13 @@ class FileUploadBlock(FileDestinationBlock):
                 if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
+            attempt_started_at = await get_download_retry_started_at(
+                organization_id or workflow_run_context.organization_id, run_download_id
+            )
             files_to_upload = self._get_files_to_upload_from_download_dir(
                 download_files_path=download_files_path,
                 max_file_count=max_file_count,
+                attempt_started_at=attempt_started_at,
             )
 
             if not files_to_upload and not self.continue_on_empty:
@@ -10885,6 +10978,7 @@ class FileUploadBlock(FileDestinationBlock):
                         run_download_id=run_download_id,
                         download_files_path=download_files_path,
                         max_file_count=max_file_count,
+                        attempt_started_at=attempt_started_at,
                     ),
                     self._get_browser_session_downloaded_files_for_empty_scan(
                         organization_id=organization_id or workflow_run_context.organization_id,
@@ -11316,7 +11410,12 @@ class SendEmailBlock(Block):
                 reason="the hostname resolves to a private or internal address, which is not allowed",
             ) from None
 
-    def _get_file_paths(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str) -> list[str]:
+    def _get_file_paths(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        attempt_started_at: datetime | None = None,
+    ) -> list[str]:
         file_paths = []
         context = skyvern_context.current()
         run_id = context.run_id if context and context.run_id else workflow_run_id
@@ -11349,6 +11448,10 @@ class SendEmailBlock(Block):
             if os.path.exists(path):
                 if os.path.isdir(path):
                     for file in os.listdir(path):
+                        if attempt_started_at is not None and not is_file_from_retry_attempt(
+                            os.path.join(path, file), attempt_started_at
+                        ):
+                            continue
                         if os.path.isdir(os.path.join(path, file)):
                             LOG.warning("SendEmailBlock Skipping directory", file=file)
                             continue
@@ -11402,7 +11505,11 @@ class SendEmailBlock(Block):
 
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
-        for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
+        attempt_started_at = await get_download_retry_started_at(
+            organization_id or workflow_run_context.organization_id,
+            resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id),
+        )
+        for filename in self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at):
             if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
@@ -13824,7 +13931,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
 
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_files = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=run_download_id,
                 )
@@ -13983,6 +14090,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             context = skyvern_context.current()
             run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id) or workflow_run_id
             download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            attempt_started_at = await get_download_retry_started_at(
+                organization_id or early_context.organization_id, run_download_id
+            )
             try:
                 pre_download_filenames = os.listdir(download_files_path)
             except FileNotFoundError:
@@ -14101,6 +14211,12 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             files_to_upload: list[str] = []
             for filename in post_download_filenames:
                 local_file = os.path.join(download_files_path, filename)
+                if (
+                    attempt_started_at is not None
+                    and filename not in pre_mtimes
+                    and not is_file_from_retry_attempt(local_file, attempt_started_at)
+                ):
+                    continue
                 try:
                     if not os.path.isfile(local_file):
                         if os.path.isdir(local_file):
@@ -14139,7 +14255,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                     current_mtime_ns = os.stat(local_file).st_mtime_ns
                 except OSError:
                     continue
-                if current_mtime_ns > baseline_mtime_ns:
+                if current_mtime_ns > baseline_mtime_ns or (
+                    attempt_started_at is not None and current_mtime_ns != baseline_mtime_ns
+                ):
                     files_to_upload.append(local_file)
 
             if not files_to_upload:
@@ -14450,7 +14568,7 @@ class TaskV2Block(Block):
         downloaded_files: list[FileInfo] = []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_files = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id or "",
                     run_id=download_lookup_run_id,
                 )
@@ -14459,6 +14577,7 @@ class TaskV2Block(Block):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             loop_internal_state,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
 
         task_v2_output = {
@@ -15207,7 +15326,7 @@ class PrintPageBlock(Block):
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(
+                return await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=storage_run_id,
                 )
@@ -15313,6 +15432,7 @@ class PrintPageBlock(Block):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
         output = {
             "filename": filename,

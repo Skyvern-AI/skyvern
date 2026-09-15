@@ -7,6 +7,14 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 
 
 class AsyncExecutor(abc.ABC):
+    async def recover_pending_retries(self) -> None:
+        """Recover retry decisions left pending by an executor process restart."""
+        return
+
+    async def stop_retry_recovery(self) -> None:
+        """Stop any periodic retry recovery started by recover_pending_retries."""
+        return
+
     @abc.abstractmethod
     async def execute_task(
         self,
