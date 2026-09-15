@@ -5796,9 +5796,14 @@ class ForgeAgent:
             except Exception:
                 LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
-            screenshot = await browser_state.take_post_action_screenshot(
-                scrolling_number=scrolling_number,
-            )
+            try:
+                screenshot = await browser_state.take_post_action_screenshot(
+                    scrolling_number=scrolling_number,
+                )
+            except TimeoutError as e:
+                # take_scrolling_screenshot raises the builtin TimeoutError when its capture deadline expires.
+                # Converted here so a TimeoutError from the artifact write below still logs at error.
+                raise SkyvernPageAnalysisTimeout("Timed out taking the post-action screenshot") from e
             # scroll back to the original x, y position of the page
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
@@ -7306,7 +7311,11 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot()
+                    try:
+                        screenshot = await browser_state.take_fullpage_screenshot()
+                    except TimeoutError as e:
+                        # Same capture-deadline conversion as record_artifacts_after_action; the write stays at error.
+                        raise SkyvernPageAnalysisTimeout("Timed out taking the final screenshot") from e
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -7316,6 +7325,8 @@ class ForgeAgent:
                     LOG.warning(
                         "Failed to take screenshot before sending task response, page is closed",
                     )
+                except SkyvernPageAnalysisTimeout:
+                    LOG.warning("Timed out taking the final screenshot before sending task response, skipping it")
                 except Exception:
                     LOG.exception("Failed to take screenshot before sending task response")
 
