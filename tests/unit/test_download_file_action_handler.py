@@ -15,6 +15,7 @@ import pytest
 import structlog
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel, ValidationError
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
@@ -40,6 +41,8 @@ from skyvern.webeye.actions.handler import (
     _EagerAdoptedBlobCapture,
     _looks_like_pdf,
     _persist_captured_download,
+    _provider_poll_and_measure,
+    _ProviderPollPhase,
     _recover_adopted_session_blob_pdf_iframe,
     _recover_blocked_inline_pdf_download,
     _remove_download_listener,
@@ -6785,12 +6788,15 @@ class _FakeActionDownloadObservation:
     honoring the ``deadline`` (monotonic) contract strictly (a handler passing per-call ``timeout_seconds``
     materializes nothing -- the anti-terminal-cleanup RED)."""
 
-    def __init__(self, files: list[tuple[str, bytes]]) -> None:
+    def __init__(self, files: list[tuple[str, bytes]], *, empty_polls: int = 0) -> None:
         self._pending = list(files)
+        self._empty_polls = empty_polls
         self.poll_deadlines: list[float] = []
 
     async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
         self.poll_deadlines.append(deadline)
+        if len(self.poll_deadlines) <= self._empty_polls:
+            return
         destination_dir.mkdir(parents=True, exist_ok=True)
         for name, data in self._pending:
             (destination_dir / name).write_bytes(data)
@@ -6802,7 +6808,7 @@ class _RaisingActionDownloadObservation:
     the real leak surface (the vendor list body is parsed into typed rows). When ``materialize_first`` is
     set, the first poll drops a completed file (so the handler reaches its final poll) and a later poll raises."""
 
-    def __init__(self, error: Exception, *, materialize_first: tuple[str, bytes] | None = None) -> None:
+    def __init__(self, error: BaseException, *, materialize_first: tuple[str, bytes] | None = None) -> None:
         self._error = error
         self._materialize_first = materialize_first
         self.calls = 0
@@ -6884,7 +6890,11 @@ def _capture_handler_logs() -> Iterator[io.StringIO]:
 
 
 async def _run_download_action_with_provider_source(
-    source: _ActionDownloadSource, *, inner: Callable[[Path], None] | None = None
+    source: _ActionDownloadSource,
+    *,
+    inner: Callable[[Path], None] | None = None,
+    emit_download_event: bool = False,
+    settle: AsyncMock | None = None,
 ) -> tuple[list[object], object]:
     """Drive ``handle_action`` with ``source`` wired as the vendor download seam.
 
@@ -6898,7 +6908,7 @@ async def _run_download_action_with_provider_source(
         organization=organization,
         page_url="https://example.com/download",
     )
-    task.download_timeout = 0.2
+    task.download_timeout = 3600.0 if emit_download_event else 0.2
 
     page.expose_binding = AsyncMock()
     page.evaluate = AsyncMock(return_value=[])
@@ -6909,9 +6919,13 @@ async def _run_download_action_with_provider_source(
         async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
             if inner is not None:
                 inner(Path(temp_dir))
+            if emit_download_event:
+                for registered in page.on.call_args_list:
+                    if registered.args[0] == "download":
+                        registered.args[1](_download())
+                        break
             return [ActionSuccess()]
 
-        settle = AsyncMock()
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
         mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
@@ -6923,7 +6937,7 @@ async def _run_download_action_with_provider_source(
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
-                new=settle,
+                new=settle if settle is not None else AsyncMock(),
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
@@ -7405,3 +7419,158 @@ async def test_stale_action_abort_never_stamps_observed_failure_status(tmp_path:
     assert xhr_capture.disable.called
     assert isinstance(results[-1], StaleActionAbort)
     assert results[-1].download_failure_status is None
+
+
+class TestProviderPollPhaseLifecycle:
+    """Action-scoped provider download polling emits exactly one entry marker on the first poll and
+    exactly one exit marker when the phase ends, never one per poll iteration, and never before a
+    poll is actually reached."""
+
+    @staticmethod
+    def _events(logs: list[dict], event: str) -> list[dict]:
+        return [entry for entry in logs if entry.get("event") == event]
+
+    def test_repeated_polls_emit_one_entry_and_one_exit(self) -> None:
+        phase = _ProviderPollPhase(workflow_run_id="wr_test")
+        with capture_logs() as logs:
+            for _ in range(4):
+                phase.mark_poll_starting()
+                phase.record_poll_result(materialized_delta=False)
+            phase.finish()
+
+        started = self._events(logs, "Provider download polling started")
+        finished = self._events(logs, "Provider download polling finished")
+        assert len(started) == 1
+        assert len(finished) == 1
+        assert finished[0]["provider_poll_calls"] == 4
+
+    def test_no_poll_emits_neither_marker(self) -> None:
+        phase = _ProviderPollPhase(workflow_run_id="wr_test")
+        with capture_logs() as logs:
+            # Phase created because a provider source/baseline exists, but polling is never reached.
+            phase.finish()
+
+        assert self._events(logs, "Provider download polling started") == []
+        assert self._events(logs, "Provider download polling finished") == []
+
+    def test_normal_no_file_exit_fields_are_truthful(self) -> None:
+        phase = _ProviderPollPhase(workflow_run_id="wr_test")
+        with capture_logs() as logs:
+            phase.mark_poll_starting()
+            phase.record_poll_result(materialized_delta=False)
+            phase.finish()
+
+        finished = self._events(logs, "Provider download polling finished")
+        assert len(finished) == 1
+        exit_event = finished[0]
+        assert exit_event["provider_poll_calls"] == 1
+        assert exit_event["provider_poll_error"] is False
+        assert exit_event["materialized_file_delta"] is False
+        assert isinstance(exit_event["elapsed_seconds"], float)
+        assert exit_event["elapsed_seconds"] >= 0.0
+
+    def test_materialized_delta_is_reported(self) -> None:
+        phase = _ProviderPollPhase(workflow_run_id="wr_test")
+        with capture_logs() as logs:
+            phase.mark_poll_starting()
+            phase.record_poll_result(materialized_delta=True)
+            phase.finish()
+
+        finished = self._events(logs, "Provider download polling finished")
+        assert len(finished) == 1
+        assert finished[0]["materialized_file_delta"] is True
+
+    def test_error_flag_and_finish_is_idempotent(self) -> None:
+        # Exceptional/cancellation exits call finish() through a finally; a started phase must be
+        # matched by exactly one exit even if finish() runs more than once.
+        phase = _ProviderPollPhase(workflow_run_id="wr_test")
+        with capture_logs() as logs:
+            phase.mark_poll_starting()
+            phase.mark_poll_error()
+            phase.finish()
+            phase.finish()
+
+        started = self._events(logs, "Provider download polling started")
+        finished = self._events(logs, "Provider download polling finished")
+        assert len(started) == 1
+        assert len(finished) == 1
+        assert finished[0]["provider_poll_error"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("materialization_site", ["mid_poll", "final_poll", "finalization"])
+async def test_provider_poll_materialization_is_measured_before_finalization(materialization_site: str) -> None:
+    observation = _FakeActionDownloadObservation(
+        [] if materialization_site == "finalization" else [("synthetic-download.txt", b"synthetic")],
+        empty_polls=0 if materialization_site == "mid_poll" else 1,
+    )
+
+    async def settle_files(*, download_dir: Path, **kwargs: object) -> None:
+        if materialization_site == "finalization":
+            (download_dir / "synthetic-download.txt").write_bytes(b"synthetic")
+
+    # An empty browser event credits the action without a local artifact, reaching the final poll.
+    with (
+        patch("skyvern.webeye.actions.handler.time", _RampingMonotonic(step=100.0)),
+        patch(
+            "skyvern.webeye.actions.handler._persist_captured_download",
+            new=AsyncMock(return_value=SimpleNamespace(path=None, outcome="empty")),
+        ),
+        capture_logs() as logs,
+    ):
+        results, action = await _run_download_action_with_provider_source(
+            _ActionDownloadSource(observation),
+            emit_download_event=True,
+            settle=AsyncMock(side_effect=settle_files),
+        )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["synthetic-download.txt"]
+    lifecycle = [entry for entry in logs if entry["event"].startswith("Provider download polling")]
+    assert [entry["event"] for entry in lifecycle] == [
+        "Provider download polling started",
+        "Provider download polling finished",
+    ]
+    assert all(entry["log_level"] == "info" for entry in lifecycle)
+    # The mid-wait poll measures the delta that detects the download; the final poll issues NO telemetry-only
+    # listing, so it contributes no measurement and sticks to the mid-wait observation. Here the mid-wait poll
+    # ran and saw nothing (False); the final poll materializing the file is captured by finalization, not this
+    # aggregate -- proof the final path never adds an extra signal read ahead of the authoritative finalization.
+    expected_materialized_delta = {"mid_poll": True, "final_poll": False, "finalization": False}[materialization_site]
+    assert lifecycle[-1]["materialized_file_delta"] is expected_materialized_delta
+    assert lifecycle[-1]["provider_poll_calls"] == (1 if materialization_site == "mid_poll" else 2)
+    assert lifecycle[-1]["provider_poll_error"] is False
+    assert len(set(observation.poll_deadlines)) == 1
+    assert "synthetic-download.txt" not in repr(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_provider_poll_cancellation_propagates_without_recording_error() -> None:
+    observation = _RaisingActionDownloadObservation(asyncio.CancelledError())
+    phase = _ProviderPollPhase(workflow_run_id="synthetic-run")
+    list_signal_files = AsyncMock(return_value=[])
+    with capture_logs() as logs:
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _provider_poll_and_measure(
+                    observation,
+                    phase,
+                    destination_dir=Path("."),
+                    deadline=0.0,
+                    list_signal_files=list_signal_files,
+                    signal_identity=lambda file: file,
+                    identities_before=set(),
+                    poll_failure_log="Synthetic provider poll failed",
+                )
+        finally:
+            phase.finish()
+
+    assert [entry["event"] for entry in logs] == [
+        "Provider download polling started",
+        "Provider download polling finished",
+    ]
+    assert logs[-1]["provider_poll_error"] is False
+    # Cancellation re-raised before any measurement was taken: the delta is unknown, so the exit log must
+    # not report a measured negative it never actually observed.
+    assert logs[-1]["materialized_file_delta"] is None
+    list_signal_files.assert_not_awaited()
