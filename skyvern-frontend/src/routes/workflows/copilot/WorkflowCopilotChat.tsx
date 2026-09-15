@@ -149,6 +149,7 @@ import {
 } from "@/routes/workflows/studio/liveSearch";
 import { resolveOpenPanes } from "@/routes/workflows/studio/panes";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -183,10 +184,19 @@ const RECOVERY_IN_PROGRESS_MESSAGE =
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 const diagnoseRunReceipt = (runId: string) =>
   `Diagnose run ${runId} and repair the workflow.`;
+// Must stay equal to REFINE_RECORDING_RECEIPT in routes/workflow_copilot.py: the server
+// rewrites the message, so a different wording here would change the row on history reload.
+const refineRecordingReceipt = (actionCount: number) =>
+  `Refine the recording (${actionCount} actions) into a reusable workflow.`;
+
+// diagnose_run and refine_recording both open the turn with a server-authored receipt.
+const isProductAuthoredAction = (action: ArmedProductAction | null): boolean =>
+  action?.action === "diagnose_run" || action?.action === "refine_recording";
 
 type ArmedProductAction =
-  | { action: "test_end_to_end"; workflowRunId?: undefined }
-  | { action: "diagnose_run"; workflowRunId: string };
+  | { action: "test_end_to_end"; workflowRunId?: undefined; nonce?: undefined }
+  | { action: "diagnose_run"; workflowRunId: string; nonce?: undefined }
+  | { action: "refine_recording"; workflowRunId?: undefined; nonce: string };
 
 // Cadence for re-fetching a live test run's recorded actions. Mirrors the
 // backend block-status poll (5s) closely enough to surface rows soon after
@@ -1700,6 +1710,11 @@ export function WorkflowCopilotChat({
     requiresLiveBrowser,
     isLiveBrowserReady,
   });
+  // Read, not taken: the receipt names the action count, and the packet itself is
+  // taken (and cleared) only when the turn is actually posted.
+  const armedRecordingEvidence = useRecordingRefinementEvidenceStore(
+    (state) => state.armed,
+  );
   // Reset on initialMessage/action change so a re-arrival of the prop (without a
   // remount) can fire auto-send again.
   useEffect(() => {
@@ -1707,9 +1722,13 @@ export function WorkflowCopilotChat({
   }, [initialMessage, initialAction?.nonce]);
   // The server rewrites a typed action's message to its own receipt; echoing that same
   // text keeps the row from changing wording when the persisted history reloads.
-  const autoSendMessage = initialAction
-    ? diagnoseRunReceipt(initialAction.workflowRunId)
-    : initialMessage;
+  const autoSendMessage = !initialAction
+    ? initialMessage
+    : initialAction.kind === "diagnose_run"
+      ? diagnoseRunReceipt(initialAction.workflowRunId)
+      : refineRecordingReceipt(
+          armedRecordingEvidence?.evidence.actions.length ?? 0,
+        );
   const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
   useEffect(() => {
     onInitialMessageConsumedRef.current = onInitialMessageConsumed;
@@ -2928,6 +2947,7 @@ export function WorkflowCopilotChat({
     };
   }, [
     credentialGetter,
+    initialAction?.nonce,
     adoptRecoveredCredentialPause,
     repin,
     stopRecoveryPolls,
@@ -2942,7 +2962,7 @@ export function WorkflowCopilotChat({
   // Set by a product affordance so the next send posts that typed action instead of prose.
   const productActionRef = useRef<ArmedProductAction | null>(null);
   const echoSenderForArmedAction = (): WorkflowCopilotChatSender =>
-    productActionRef.current?.action === "diagnose_run" ? "product" : "user";
+    isProductAuthoredAction(productActionRef.current) ? "product" : "user";
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -2956,10 +2976,11 @@ export function WorkflowCopilotChat({
       return;
     }
 
-    // A diagnose action's queued text is the server's receipt, not words the user wrote, so
+    // A product action's queued text is the server's receipt, not words the user wrote, so
     // handing it back as an editable draft would repost it as a user message.
-    const wasDiagnoseAction =
-      productActionRef.current?.action === "diagnose_run";
+    const wasProductAuthoredAction = isProductAuthoredAction(
+      productActionRef.current,
+    );
 
     updateQueuedPrompt(null);
     // Drop the queued block-build target and end-to-end action so neither leaks into the next
@@ -2970,7 +2991,7 @@ export function WorkflowCopilotChat({
     setMessages((prev) => prev.filter((message) => message.id !== queued.id));
     // Text already in the composer is the newer intent — the user was part way
     // through replacing the queued message — so it wins over what comes back.
-    if (!wasDiagnoseAction) {
+    if (!wasProductAuthoredAction) {
       setInputValue((current) => (current.trim() ? current : queued.content));
     }
     // The files belong to the message being edited, so they return to the tray with its text.
@@ -4018,6 +4039,12 @@ export function WorkflowCopilotChat({
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             product_action: productAction?.action ?? null,
+            recording_evidence:
+              productAction?.action === "refine_recording"
+                ? useRecordingRefinementEvidenceStore
+                    .getState()
+                    .peek(productAction.nonce)
+                : null,
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
@@ -4114,6 +4141,12 @@ export function WorkflowCopilotChat({
                 setLivePauseFrame(payload);
                 return false;
               case "turn_start": {
+                if (productAction?.action === "refine_recording") {
+                  useRecordingRefinementEvidenceStore
+                    .getState()
+                    .take(productAction.nonce);
+                  onInitialMessageConsumedRef.current?.();
+                }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
                 // Move the pre-submit canvas snapshot into the per-turn
@@ -4560,12 +4593,17 @@ export function WorkflowCopilotChat({
     // an in-flight send. handleSend internally routes to the queue when the
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
-    onInitialMessageConsumedRef.current?.();
+    if (initialAction?.kind !== "refine_recording") {
+      onInitialMessageConsumedRef.current?.();
+    }
     if (initialAction) {
-      productActionRef.current = {
-        action: initialAction.kind,
-        workflowRunId: initialAction.workflowRunId,
-      };
+      productActionRef.current =
+        initialAction.kind === "diagnose_run"
+          ? {
+              action: "diagnose_run",
+              workflowRunId: initialAction.workflowRunId,
+            }
+          : { action: "refine_recording", nonce: initialAction.nonce };
     }
     handleSend(autoSendMessage).catch((error) => {
       console.error("Auto-send failed:", error);
@@ -4582,7 +4620,7 @@ export function WorkflowCopilotChat({
   ]);
 
   useEffect(() => {
-    if (!autoSendMessage || hasAutoSentRef.current) {
+    if (!autoSendMessage || initialAction || hasAutoSentRef.current) {
       return;
     }
     if (

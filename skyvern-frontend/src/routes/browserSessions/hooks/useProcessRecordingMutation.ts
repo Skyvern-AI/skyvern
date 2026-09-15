@@ -13,6 +13,9 @@ import {
 } from "@/store/useRecordingStore";
 import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
 import type { RecordedParameter } from "@/store/RecordedBlocksStore";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
+import type { RecordingEvidencePacket } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
   captureRecordBrowser,
@@ -33,6 +36,7 @@ const useProcessRecordingMutation = ({
   }) => void;
 }) => {
   const credentialGetter = useCredentialGetter();
+  const { openPane } = useStudioPanes();
   const recordingStore = useRecordingStore();
   const workflowPermanentId = useWorkflowPermanentId();
   const mutationStartedAtRef = useRef<number | null>(null);
@@ -122,6 +126,7 @@ const useProcessRecordingMutation = ({
               recording_id: string | null;
               blocks: Array<WorkflowBlock>;
               parameters: Array<RecordedParameter>;
+              evidence?: RecordingEvidencePacket | null;
             };
           }
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
@@ -143,9 +148,10 @@ const useProcessRecordingMutation = ({
           recordingId: response.data.recording_id ?? null,
           blocks: response.data.blocks,
           parameters: response.data.parameters,
+          evidence: response.data.evidence ?? null,
         }));
     },
-    onSuccess: ({ recordingId, blocks, parameters }) => {
+    onSuccess: ({ recordingId, blocks, parameters, evidence }) => {
       const latencyMs =
         mutationStartedAtRef.current !== null
           ? Date.now() - mutationStartedAtRef.current
@@ -191,6 +197,18 @@ const useProcessRecordingMutation = ({
         });
 
         onSuccess?.({ recordingId, blocks, parameters: parameters });
+
+        if (codeFirst && evidence) {
+          // One replace-navigation stores the packet and arms the copilot turn that
+          // reads it, the same handoff RunTab makes for diagnose_run.
+          const nonce = crypto.randomUUID();
+          useRecordingRefinementEvidenceStore
+            .getState()
+            .set({ nonce, evidence });
+          openPane("copilot", {
+            state: { copilotAction: { kind: "refine_recording", nonce } },
+          });
+        }
 
         return;
       }
