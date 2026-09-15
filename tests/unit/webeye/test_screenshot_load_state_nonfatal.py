@@ -46,6 +46,7 @@ class _SelectedTargetClosed(_SelectedError):
 def _selection(*, native_target_closed: bool = False) -> BrowserEngineSelection:
     engine_error_types = (_SelectedError, TargetClosedError) if native_target_closed else (_SelectedError,)
     selection = MagicMock(spec=BrowserEngineSelection)
+    selection.name = "selected-engine"
     selection.is_engine_error.side_effect = lambda exc: isinstance(exc, engine_error_types)
     selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedTimeout)
     selection.classify_error.side_effect = lambda exc: (
@@ -58,6 +59,7 @@ def _stock_selection() -> BrowserEngineSelection:
     """A bound selection modeling stock Playwright: the base Error family classifies to
     BrowserAutomationError, and only the native TargetClosedError maps to the rich target-closed type."""
     selection = MagicMock(spec=BrowserEngineSelection)
+    selection.name = "stock-playwright"
     selection.is_engine_error.side_effect = lambda exc: isinstance(exc, PlaywrightError)
     selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, PlaywrightTimeoutError)
     selection.classify_error.side_effect = lambda exc: (
