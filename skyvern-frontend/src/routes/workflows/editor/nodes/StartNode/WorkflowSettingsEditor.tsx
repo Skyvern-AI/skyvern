@@ -1,3 +1,6 @@
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
+import { RetryPolicyEditor } from "./RetryPolicyEditor";
+import { collectKnownErrorCodes } from "./retryPolicyUtils";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -97,6 +100,8 @@ function WorkflowSettingsEditorBody({
 }) {
   const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
+  const readOnly = useWorkflowScopeReadOnly();
+  const knownErrorCodes = useMemo(() => collectKnownErrorCodes(nodes), [nodes]);
   const edges = useEdges();
   const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });
   const studioEnabled = useWorkflowStudioEnabled();
@@ -150,6 +155,12 @@ function WorkflowSettingsEditorBody({
 
   return (
     <div data-testid="workflow-settings-block-form" className="space-y-4">
+      <RetryPolicyEditor
+        value={data.retryPolicy ?? null}
+        onChange={(retryPolicy) => update({ retryPolicy })}
+        knownErrorCodes={knownErrorCodes}
+        readOnly={readOnly || !data.editable}
+      />
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label>Model</Label>

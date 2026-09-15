@@ -1,3 +1,8 @@
+import {
+  runIsCancellable,
+  runIsExecuting,
+  runIsLogicallyActive,
+} from "../workflowRun/runRetryState";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -101,21 +106,21 @@ describe("runOutcomeFromStatus", () => {
   });
 
   test("running for in-flight statuses", () => {
-    expect(runOutcomeFromStatus(Status.Created)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Queued)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Running)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Paused)).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Created })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Queued })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Running })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Paused })).toBe("running");
   });
 
   test("success only for completed", () => {
-    expect(runOutcomeFromStatus(Status.Completed)).toBe("success");
+    expect(runOutcomeFromStatus({ status: Status.Completed })).toBe("success");
   });
 
   test("failed for failure types and canceled", () => {
-    expect(runOutcomeFromStatus(Status.Failed)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.Terminated)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.TimedOut)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.Canceled)).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Failed })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Terminated })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.TimedOut })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Canceled })).toBe("failed");
   });
 });
 
@@ -123,18 +128,26 @@ describe("finalizedRunStatus", () => {
   test("null while there is no status or the run is in-flight", () => {
     expect(finalizedRunStatus(null)).toBeNull();
     expect(finalizedRunStatus(undefined)).toBeNull();
-    expect(finalizedRunStatus(Status.Created)).toBeNull();
-    expect(finalizedRunStatus(Status.Queued)).toBeNull();
-    expect(finalizedRunStatus(Status.Running)).toBeNull();
-    expect(finalizedRunStatus(Status.Paused)).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Created })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Queued })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Running })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Paused })).toBeNull();
   });
 
   test("preserves the real terminal status instead of collapsing it", () => {
-    expect(finalizedRunStatus(Status.Completed)).toBe(Status.Completed);
-    expect(finalizedRunStatus(Status.Failed)).toBe(Status.Failed);
-    expect(finalizedRunStatus(Status.Terminated)).toBe(Status.Terminated);
-    expect(finalizedRunStatus(Status.TimedOut)).toBe(Status.TimedOut);
-    expect(finalizedRunStatus(Status.Canceled)).toBe(Status.Canceled);
+    expect(finalizedRunStatus({ status: Status.Completed })).toBe(
+      Status.Completed,
+    );
+    expect(finalizedRunStatus({ status: Status.Failed })).toBe(Status.Failed);
+    expect(finalizedRunStatus({ status: Status.Terminated })).toBe(
+      Status.Terminated,
+    );
+    expect(finalizedRunStatus({ status: Status.TimedOut })).toBe(
+      Status.TimedOut,
+    );
+    expect(finalizedRunStatus({ status: Status.Canceled })).toBe(
+      Status.Canceled,
+    );
   });
 });
 
@@ -689,6 +702,16 @@ describe("formatRunTimesTooltip", () => {
   });
 });
 
+test("created and paused runs remain active and cancellable", () => {
+  for (const status of [Status.Created, Status.Paused]) {
+    const run = { status };
+    expect(runIsLogicallyActive(run)).toBe(true);
+    expect(runIsCancellable(run)).toBe(true);
+    expect(runOutcomeFromStatus(run)).toBe("running");
+    expect(finalizedRunStatus(run)).toBeNull();
+  }
+});
+
 describe("actionLabel", () => {
   // Task V3 stamps every action's description with its tool call, so a description-first fallback
   // labelled every v3 frame with machine syntax instead of what the agent said it was doing.
@@ -723,4 +746,10 @@ describe("actionLabel", () => {
       ),
     ).toBe("Open the billing page");
   });
+});
+
+test.each(Object.values(Status))("execution semantics for %s", (status) => {
+  const executing = status === Status.Running || status === Status.Queued;
+  expect(runIsExecuting({ status })).toBe(executing);
+  expect(runIsExecuting({ status, retry_pending: true })).toBe(executing);
 });

@@ -283,3 +283,11 @@ describe("searchWithRunSwitched", () => {
     expect(params.get("panes")).toBe("browser");
   });
 });
+
+test("the attempt chip adds no tab stop inside its run row", () => {
+  mocks.runs = [makeRun({ attempt: 2 })];
+  renderList();
+  const chip = screen.getByText("Attempt 2");
+  expect(chip.hasAttribute("tabindex")).toBe(false);
+  expect(chip.closest("button")).toBeTruthy();
+});

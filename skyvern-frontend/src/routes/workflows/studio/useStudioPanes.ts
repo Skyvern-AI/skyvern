@@ -26,7 +26,10 @@ import {
 import { SELECTED_BLOCK_SEARCH_PARAM } from "../editor/hooks/useSelectedBlockUrlSync";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioRunId } from "./useStudioRunId";
-import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import {
+  useStudioShellContext,
+  useStudioWorkflowDeletedAt,
+} from "./StudioShellContext";
 
 type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   // When true the resulting pane list is stored as the learned default for this
@@ -89,6 +92,7 @@ export function useStudioPanes() {
   const { defaultPanes, clamp, notePaneWrite, learnedRunPanes } =
     useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
+  const { restoreExpandedPane } = useStudioShellContext();
 
   const present = useCallback(
     (resolved: StudioPaneId[]): StudioPaneId[] => {
@@ -159,6 +163,7 @@ export function useStudioPanes() {
       options?: ApplyPanesOptions,
       writeKind: PaneWriteKind = "normal",
     ) => {
+      restoreExpandedPane?.();
       const search = liveSearch(location.search);
       const resolvedSearch = searchWithRunReference(search, studioRunId);
       const context = copilotContextForSearch(resolvedSearch);
@@ -317,6 +322,7 @@ export function useStudioPanes() {
       navigate,
       notePaneWrite,
       present,
+      restoreExpandedPane,
       setCopilotSelection,
       setPaneLayout,
       workflowDeleted,

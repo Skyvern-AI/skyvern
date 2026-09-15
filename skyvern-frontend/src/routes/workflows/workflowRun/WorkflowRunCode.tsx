@@ -1,3 +1,4 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -11,7 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
@@ -92,7 +93,7 @@ function WorkflowRunCode(props?: Props) {
     page: 1,
     workflowPermanentId,
   });
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : null;
   const parameters = workflowRun?.parameters;
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);

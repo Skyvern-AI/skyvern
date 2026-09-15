@@ -230,6 +230,7 @@ const SETTINGS_LABELS: Array<{
   { fields: ["finallyBlockLabel"], label: "Changed finally block" },
   { fields: ["workflowSystemPrompt"], label: "Changed workflow system prompt" },
   { fields: ["errorCodeMapping"], label: "Changed error handling" },
+  { fields: ["retryPolicy"], label: "Automatic retry" },
 ];
 
 function summarizeSettingsChanges(

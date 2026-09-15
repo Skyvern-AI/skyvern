@@ -408,6 +408,26 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
+  test("mounts the completion milestone only after a pending retry is final", () => {
+    seedCompletedRun({ retry_pending: true });
+    const MilestoneCard = vi.fn(() => <div data-testid="milestone-card" />);
+    const overview = renderRunView({}, "/?panes=overview", false, undefined, {
+      workflowRunMilestoneCard: MilestoneCard,
+    });
+
+    expect(MilestoneCard).not.toHaveBeenCalled();
+    expect(overview.queryByTestId("milestone-card")).toBeNull();
+    expect(
+      overview.queryByRole("button", {
+        name: "Watch live in the Browser pane",
+      }),
+    ).toBeNull();
+
+    seedCompletedRun({ retry_pending: false });
+    overview.rerenderRunView();
+    expect(overview.queryByTestId("milestone-card")).not.toBeNull();
+  });
+
   test("mounts the milestone slot throughout Overview but not the editor", () => {
     seedCompletedRun();
     const MilestoneCard = vi.fn(() => <div data-testid="milestone-card" />);
@@ -1701,6 +1721,47 @@ describe("RunView timeline → editor jump", () => {
 
   afterEach(() => {
     useWorkflowBlockSearchStore.getState().registerHandle(null);
+  });
+
+  test("clicking a historical block keeps its ID when the canvas mirrors its label", () => {
+    const label = "jump-target-block";
+    seedRunWithBlock(label);
+    mocks.workflowRun = { ...(mocks.workflowRun as object), attempt: 2 };
+    mocks.timeline = [
+      {
+        ...buildBlockItem(
+          buildBlock({ workflow_run_block_id: "wrb_historical", label }),
+        ),
+        attempt: 1,
+      },
+      {
+        ...buildBlockItem(
+          buildBlock({ workflow_run_block_id: "wrb_current", label }),
+        ),
+        attempt: 2,
+      },
+    ];
+    registerHandle();
+    const { container, getByRole } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=editor,overview&active=wrb_current",
+      false,
+      <SelectBlockOnCanvas label={label} />,
+    );
+    fireEvent.click(getByRole("button", { name: "Search blocks" }));
+    expect(
+      screen.getAllByRole("option").map((option) => option.textContent),
+    ).toEqual(["#1jump-target-block"]);
+    fireEvent.keyDown(screen.getByPlaceholderText("Search blocks…"), {
+      key: "Escape",
+    });
+    const historicalGroup = getByRole("button", { name: /Attempt 1/ });
+    expect(historicalGroup.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(historicalGroup);
+    clickBlock(container);
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_historical");
+    fireEvent.click(getByRole("button", { name: `canvas: select ${label}` }));
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_historical");
   });
 
   test("clicking a timeline block jumps the editor when the editor pane is open", () => {

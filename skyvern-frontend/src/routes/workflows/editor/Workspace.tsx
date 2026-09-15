@@ -102,7 +102,10 @@ import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
-import { statusIsFinalized } from "@/routes/tasks/types.ts";
+import {
+  runIsLogicallyFinal,
+  runIsExecuting,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
@@ -572,7 +575,7 @@ function Workspace({
   const { getNodes, getEdges } = useReactFlow();
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -1729,6 +1732,7 @@ function Workspace({
         workflowData.workflow_definition?.workflow_system_prompt ?? null,
       errorCodeMapping:
         workflowData.workflow_definition?.error_code_mapping ?? null,
+      retryPolicy: workflowData.workflow_definition?.retry_policy ?? null,
     };
 
     const elements = getElements(
@@ -1924,6 +1928,7 @@ function Workspace({
         finally_block_label: finallyBlockLabel,
         workflow_system_prompt: saveData.settings.workflowSystemPrompt ?? null,
         error_code_mapping: saveData.settings.errorCodeMapping ?? null,
+        retry_policy: saveData.settings.retryPolicy ?? null,
       };
       const version = workflowVersionFromSaveData(saveData, definition, {
         extraHttpHeaders,
@@ -2070,6 +2075,7 @@ function Workspace({
         selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
       errorCodeMapping:
         selectedVersion.workflow_definition?.error_code_mapping ?? null,
+      retryPolicy: selectedVersion.workflow_definition?.retry_policy ?? null,
     };
 
     const elements = getElements(
@@ -2692,7 +2698,9 @@ function Workspace({
                           // debug session owns the recording reset.
                           resetRecordingOnUnmount={false}
                           resizeTrigger={windowResizeTrigger}
-                          isExecuting={!!workflowRun && !isFinalized}
+                          isExecuting={
+                            !!workflowRun && runIsExecuting(workflowRun)
+                          }
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (
@@ -2979,6 +2987,7 @@ function Workspace({
               version: saveData.workflowDefinitionVersion,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
               workflow_system_prompt:

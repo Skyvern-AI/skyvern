@@ -8,7 +8,11 @@ import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { type Status as WorkflowRunStatus } from "@/api/types";
+import {
+  type Status as WorkflowRunStatus,
+  type WorkflowRunRetryFields,
+} from "@/api/types";
+import { runIsRetryWaiting } from "./runRetryState";
 
 const deadStatuses = [
   "canceled",
@@ -25,12 +29,13 @@ type LiveStatus = (typeof liveStatuses)[number];
 type WatchableStatus = EndingStatus | LiveStatus;
 
 interface Props {
-  status: WorkflowRunStatus;
+  run: { status: WorkflowRunStatus } & WorkflowRunRetryFields;
   title?: string;
   visible: boolean;
 }
 
-function WorkflowRunStatusAlert({ status, title, visible }: Props) {
+function WorkflowRunStatusAlert({ run, title, visible }: Props) {
+  const { status, retry_pending } = run;
   const [notifyIsOpen, setNotifyIsOpen] = useState(false);
   const [statusesWatched, setStatusesWatched] = useState<Set<WatchableStatus>>(
     new Set(),
@@ -85,6 +90,7 @@ function WorkflowRunStatusAlert({ status, title, visible }: Props) {
   }, [notifyIsOpen]);
 
   useEffect(() => {
+    if (runIsRetryWaiting(run)) return;
     if (!hasRequestedNotification) {
       return;
     }
@@ -125,7 +131,7 @@ function WorkflowRunStatusAlert({ status, title, visible }: Props) {
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status]);
+  }, [status, retry_pending]);
 
   function askForPermissions() {
     if (hasRequestedNotification) {

@@ -126,6 +126,7 @@ function WorkflowEditor() {
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
     errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
+    retryPolicy: workflow.workflow_definition?.retry_policy ?? null,
   };
 
   const elements = getElements(

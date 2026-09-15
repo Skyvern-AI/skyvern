@@ -4,11 +4,18 @@ import {
   QueryClientProvider,
   QueryObserver,
 } from "@tanstack/react-query";
-import { cleanup, render, renderHook, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  renderHook,
+  waitFor,
+} from "@testing-library/react";
 import { type ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { toast } from "@/components/ui/use-toast";
 import { Status } from "@/api/types";
 import { retryTransientNetworkFailures } from "@/api/QueryClient";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -24,6 +31,8 @@ import {
   useWorkflowRunQuery,
 } from "./useWorkflowRunQuery";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
+
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 const { getClientMock } = vi.hoisted(() => ({ getClientMock: vi.fn() }));
 
@@ -361,4 +370,28 @@ describe("studio consumers of a retained run payload", () => {
 
     expect(container.textContent).toBe("");
   });
+});
+
+test("Studio completion toast waits for cancel to revoke a pending retry and fires once", async () => {
+  const client = makeClient();
+  const id = "wr_cancel_wait";
+  const run = {
+    ...buildRun(id, Status.Failed),
+    retry_pending: true,
+    next_attempt_at: "2026-09-09T12:00:00Z",
+  };
+  client.setQueryData(["workflowRun", id], run);
+  const { rerender } = renderHook(() => useStudioRunSignals(), {
+    wrapper: harness(client, `/agents/wpid_1/studio?wr=${id}`),
+  });
+  expect(toast).not.toHaveBeenCalled();
+  act(() => {
+    client.setQueryData(["workflowRun", id], { ...run, retry_pending: false });
+  });
+  await waitFor(() => expect(toast).toHaveBeenCalledTimes(1));
+  rerender();
+  expect(toast).toHaveBeenCalledWith(
+    expect.objectContaining({ title: "Run Failed" }),
+  );
+  expect(toast).toHaveBeenCalledTimes(1);
 });

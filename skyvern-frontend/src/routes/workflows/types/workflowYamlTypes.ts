@@ -6,6 +6,7 @@ import {
   EmailBodyFormat,
   WorkflowBlockType,
   WorkflowModel,
+  WorkflowRetryPolicy,
 } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
@@ -41,6 +42,7 @@ export type WorkflowCreateYAMLRequest = {
 };
 
 export type WorkflowDefinitionYAML = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;

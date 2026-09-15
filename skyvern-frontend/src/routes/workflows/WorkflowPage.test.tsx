@@ -440,3 +440,10 @@ describe("Past Runs list state in the URL", () => {
     expect(locationSearch(container)).not.toContain("status=");
   });
 });
+
+it("refetches the history on mount without adding list polling", () => {
+  renderWorkflowPage();
+  const options = mockWorkflowRunsQuery.mock.lastCall?.[0];
+  expect(options.refetchOnMount).toBe("always");
+  expect(options.refetchInterval).toBeUndefined();
+});

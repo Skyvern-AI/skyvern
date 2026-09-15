@@ -1,8 +1,9 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+
 import {
   DefaultError,
   keepPreviousData,
@@ -64,13 +65,13 @@ function useWorkflowRunWithWorkflowQuery(options?: {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data) ? "always" : false;
+      return runIsLogicallyActive(query.state.data) ? "always" : false;
     },
     refetchOnWindowFocus: (query) => {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data);
+      return runIsLogicallyActive(query.state.data);
     },
     enabled: (options?.enabled ?? true) && !!workflowRunId,
   });

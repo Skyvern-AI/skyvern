@@ -489,3 +489,9 @@ export function findRunCodeBlockFailure(
     ? null
     : { ...failure, workflowRunBlockId: culprit.workflow_run_block_id };
 }
+
+export function formatCodeBlockErrorCode(code: string): string {
+  return Object.prototype.hasOwnProperty.call(FAILURE_TEMPLATES, code)
+    ? FAILURE_TEMPLATES[code]!.title
+    : code;
+}

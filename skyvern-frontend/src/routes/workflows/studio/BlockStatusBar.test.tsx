@@ -9,6 +9,7 @@ import { BlockStatusBar } from "./BlockStatusBar";
 
 const mocks = vi.hoisted(() => ({
   timeline: undefined as unknown,
+  run: undefined as unknown,
   isPlaceholderData: false,
 }));
 
@@ -17,6 +18,10 @@ vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
     data: mocks.timeline,
     isPlaceholderData: mocks.isPlaceholderData,
   }),
+}));
+
+vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
+  useWorkflowRunWithWorkflowQuery: () => ({ data: mocks.run }),
 }));
 
 function seedRunningBlock() {
@@ -49,6 +54,7 @@ function renderBar() {
 afterEach(() => {
   cleanup();
   mocks.timeline = undefined;
+  mocks.run = undefined;
   mocks.isPlaceholderData = false;
 });
 
@@ -69,4 +75,11 @@ describe("BlockStatusBar", () => {
 
     expect(container.textContent).toContain("Running");
   });
+});
+
+it("does not show an attempt-1 block once attempt 2 starts", () => {
+  seedRunningBlock();
+  mocks.run = { workflow_run_id: "wr_2", status: Status.Running, attempt: 2 };
+  const { container } = renderBar();
+  expect(container.textContent).toBe("");
 });
