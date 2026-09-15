@@ -61,8 +61,11 @@ DIALOG_POLICY_HELPER_CONTRACT: dict[str, Any] = {
     "call": "await set_dialog_policy(page, 'accept'|'dismiss', prompt_text=None)",
     "when_to_use": (
         "The supported way for a code block to answer a native JS dialog: declare the answer as data "
-        "rather than registering a listener. On the secure CodeBlock runner page.on('dialog', ...) and "
-        "the rest of the listener family are refused outright."
+        "rather than registering a listener. On the secure CodeBlock runner a page.on('dialog', ...) "
+        "handler whose whole body is one dialog.accept('literal') or dialog.dismiss() call is read -- "
+        "never run -- and becomes this same policy; a handler that does anything else, "
+        "page.once('dialog', ...) because the answer covers the whole block, "
+        "page.remove_listener('dialog', ...), and every other event name are refused."
     ),
     "parameters": {
         "page": {"accepted_type": "the block's own page object"},
@@ -76,7 +79,9 @@ DIALOG_POLICY_HELPER_CONTRACT: dict[str, Any] = {
     "reading_the_result": (
         "The declaring call runs before any dialog fires, so records come back on the NEXT call: "
         "declare, drive the page, then call again to read what fired. An alert is recorded but "
-        "answered by its own branch rather than by the policy."
+        "answered by its own branch rather than by the policy. On the secure CodeBlock runner a "
+        "page.on('dialog', ...) registration is the same call and also consumes the pending "
+        "records when it is sent, ahead of the block's next page call."
     ),
     "lifetime": (
         "The policy covers the whole browser context for the rest of the block -- sibling and popup "
