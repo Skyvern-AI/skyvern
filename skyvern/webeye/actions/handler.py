@@ -391,6 +391,97 @@ SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
 
 
+class _ProviderPollPhase:
+    """Emit one INFO entry marker on the first provider poll and one INFO exit marker when the phase
+    ends, the exit driven from a finally so an exceptional, timeout, or cancellation exit still closes a
+    started phase. Only privacy-safe aggregates are recorded -- never provider session ids, URLs,
+    filenames, headers, response bodies, or exception strings."""
+
+    def __init__(self, *, workflow_run_id: str | None) -> None:
+        self._workflow_run_id = workflow_run_id
+        self._entered = False
+        self._exited = False
+        self._started_at: float | None = None
+        self._poll_calls = 0
+        self._poll_error = False
+        self._materialized_file_delta: bool | None = None
+
+    def mark_poll_starting(self) -> None:
+        """Call immediately before each provider poll; emits the entry marker on the first poll only."""
+        self._poll_calls += 1
+        if self._entered:
+            return
+        self._entered = True
+        self._started_at = time.monotonic()
+        LOG.info(
+            "Provider download polling started",
+            workflow_run_id=self._workflow_run_id,
+        )
+
+    def mark_poll_error(self) -> None:
+        self._poll_error = True
+
+    def record_poll_result(self, *, materialized_delta: bool | None) -> None:
+        # None is a poll that took no measurement (the telemetry-only final poll): keep any earlier real
+        # observation and otherwise leave the delta unknown. The default is unknown too, so a cancellation
+        # re-raised before any measurement never reports a measured negative it did not actually take.
+        if materialized_delta is None:
+            return
+        if materialized_delta:
+            self._materialized_file_delta = True
+        elif self._materialized_file_delta is not True:
+            self._materialized_file_delta = False
+
+    def finish(self) -> None:
+        """Emit the exit marker once, only if polling started. Idempotent so a finally that runs after
+        a normal or exceptional exit never double-logs and never logs a phase that never polled."""
+        if not self._entered or self._exited:
+            return
+        self._exited = True
+        LOG.info(
+            "Provider download polling finished",
+            workflow_run_id=self._workflow_run_id,
+            provider_poll_calls=self._poll_calls,
+            provider_poll_error=self._poll_error,
+            materialized_file_delta=self._materialized_file_delta,
+            elapsed_seconds=(time.monotonic() - self._started_at) if self._started_at is not None else 0.0,
+        )
+
+
+async def _provider_poll_and_measure(
+    observation: ActionDownloadObservation,
+    phase: _ProviderPollPhase,
+    *,
+    destination_dir: Path,
+    deadline: float,
+    list_signal_files: Callable[[], Awaitable[list[str]]],
+    signal_identity: Callable[[str], str],
+    identities_before: set[str],
+    poll_failure_log: str,
+    measure: bool = True,
+) -> tuple[list[str], set[str]]:
+    """Poll the provider and, on mid-wait polls, measure the post-poll signal-file delta that detects the
+    download. On the final poll (measure=False) that delta is telemetry-only downstream, so skip the extra
+    listing entirely, record it as unknown, and let the authoritative _finalize_download_artifacts read
+    stand -- no telemetry read can then fail or hang ahead of finalization."""
+    phase.mark_poll_starting()
+    try:
+        await observation.poll_and_materialize(destination_dir=destination_dir, deadline=deadline)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Provider list/schema errors can embed the secret-bearing presigned URL; log only its type.
+        phase.mark_poll_error()
+        LOG.debug(poll_failure_log, error_type=type(exc).__name__)
+    if not measure:
+        phase.record_poll_result(materialized_delta=None)
+        return [], set()
+    files_after = await list_signal_files()
+    delta = {signal_identity(file) for file in files_after} - identities_before
+    phase.record_poll_result(materialized_delta=bool(delta))
+    return files_after, delta
+
+
 def _select_shadow_match_enabled() -> bool:
     return settings.SKYVERN_SELECT_SHADOW_MATCH
 
@@ -4849,6 +4940,9 @@ class ActionHandler:
         # deliberately private/non-serialized on BrowserArtifacts; absent sources preserve existing
         # PBS/CDP/local behavior unchanged.
         action_download_observation: ActionDownloadObservation | None = None
+        # One entry marker on the first provider poll and one exit marker when the phase ends (closed
+        # from the finally below); per-poll iterations are intentionally not logged.
+        provider_poll_phase = _ProviderPollPhase(workflow_run_id=task.workflow_run_id)
         provider_source = browser_state.browser_artifacts.get_action_download_source() if browser_state else None
         if provider_source is not None:
             baseline_budget_seconds = min(
@@ -5163,24 +5257,16 @@ class ActionHandler:
                             # provider would be pure duplication -- it could stall to the shared deadline or
                             # materialize a collision-suffixed copy of a file already saved.
                             if not local_signal_delta and action_download_observation is not None:
-                                try:
-                                    await action_download_observation.poll_and_materialize(
-                                        destination_dir=download_dir,
-                                        deadline=download_wait_deadline,
-                                    )
-                                except asyncio.CancelledError:
-                                    raise
-                                except Exception as exc:
-                                    # Provider-list schema/validation errors can embed the secret-bearing
-                                    # presigned URL; log only its type, never the exception/traceback.
-                                    LOG.debug(
-                                        "Provider download poll failed; continuing existing paths",
-                                        error_type=type(exc).__name__,
-                                    )
-                                list_files_after = await _list_download_signal_files()
-                                local_signal_delta = {
-                                    _download_signal_identity(file) for file in list_files_after
-                                } - signal_file_identities_before
+                                list_files_after, local_signal_delta = await _provider_poll_and_measure(
+                                    action_download_observation,
+                                    provider_poll_phase,
+                                    destination_dir=download_dir,
+                                    deadline=download_wait_deadline,
+                                    list_signal_files=_list_download_signal_files,
+                                    signal_identity=_download_signal_identity,
+                                    identities_before=signal_file_identities_before,
+                                    poll_failure_log="Provider download poll failed; continuing existing paths",
+                                )
 
                             if local_signal_delta:
                                 _record_download_signal("download_file_detected")
@@ -5371,16 +5457,17 @@ class ActionHandler:
                             - signal_file_identities_before
                         )
                         if not local_signal_accounts_for_action:
-                            try:
-                                await action_download_observation.poll_and_materialize(
-                                    destination_dir=download_dir,
-                                    deadline=download_wait_deadline,
-                                )
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as exc:
-                                # Same secret-leak guard as the mid-poll catch: metadata only, no traceback.
-                                LOG.debug("Final provider download poll failed", error_type=type(exc).__name__)
+                            await _provider_poll_and_measure(
+                                action_download_observation,
+                                provider_poll_phase,
+                                destination_dir=download_dir,
+                                deadline=download_wait_deadline,
+                                list_signal_files=_list_download_signal_files,
+                                signal_identity=_download_signal_identity,
+                                identities_before=signal_file_identities_before,
+                                poll_failure_log="Final provider download poll failed",
+                                measure=False,
+                            )
                     downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
                         download_dir=download_dir,
                         task=task,
@@ -5433,6 +5520,9 @@ class ActionHandler:
             # Fallback for exceptional exits that never reached the post-action stamp.
             if action.finished_at is None:
                 action.finished_at = naive_utc_now()
+            # Close the provider polling phase exactly once if it ever started; a no-op otherwise.
+            with contained_effect("provider download polling lifecycle exit"):
+                provider_poll_phase.finish()
             await _close_eager_capture_then_teardown_retention(
                 eager_blob_capture,
                 page,
