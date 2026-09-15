@@ -4,6 +4,7 @@ import {
   cleanup,
   fireEvent,
   render,
+  renderHook,
   screen,
   waitFor,
 } from "@testing-library/react";
@@ -21,7 +22,27 @@ import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanent
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
+import { useStudioRunSignals } from "./useStudioRunSignals";
 import { StudioPaneToggles } from "./StudioPaneToggles";
+import { claimRunCompletionNotice } from "../workflowRun/runCompletionNotices";
+
+test("completion claims retain the 500 most recently used run IDs", () => {
+  const runIds = Array.from(
+    { length: 501 },
+    (_, index) => `wr_bounded_${index}`,
+  );
+  const shown: string[] = [];
+  const claim = (id: string) =>
+    claimRunCompletionNotice(id, () => {
+      shown.push(id);
+    });
+  for (const id of runIds.slice(0, 500)) claim(id);
+  expect(claim(runIds[0]!)).toBe(false);
+  expect(claim(runIds[500]!)).toBe(true);
+  expect(claim(runIds[0]!)).toBe(false);
+  expect(claim(runIds[1]!)).toBe(true);
+  expect(shown).toEqual([...runIds, runIds[1]]);
+});
 
 const { runsQueryMock, runWithWorkflowMock, infiniteRunsMock, copyTextMock } =
   vi.hoisted(() => ({
@@ -54,7 +75,8 @@ function infiniteRuns(runs: Array<Record<string, unknown>>) {
 }
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => runWithWorkflowMock(),
+  useWorkflowRunWithWorkflowQuery: (options: { workflowRunId?: string }) =>
+    runWithWorkflowMock(options),
 }));
 
 // Radix Popover positioning observes the anchor; jsdom has no ResizeObserver.
@@ -269,12 +291,15 @@ describe("StudioPaneToggles run tab label", () => {
     expect(screen.queryByRole("button", { name: "Copy run link" })).toBeNull();
   });
 
-  test("names the latest run when the URL names none", () => {
+  test("keeps Past Runs uninspected when the URL names none", () => {
     runsQueryMock.mockReturnValue({
       data: [{ workflow_run_id: "wr_late", status: Status.Completed }],
     });
     renderAt();
-    expect(tab(/^View Run: wr_late/)).toBeTruthy();
+    expect(tab(/^Past Runs/)).toBeTruthy();
+    expect(runWithWorkflowMock.mock.lastCall?.[0]).toEqual({
+      workflowRunId: undefined,
+    });
   });
 
   test("reads 'Past Runs' while no run exists to inspect", () => {
@@ -397,8 +422,8 @@ describe("StudioPaneToggles run selector", () => {
 
 describe("StudioPaneToggles run-status dot", () => {
   test("shows a status-colored dot with a status icon for a finalized run", () => {
-    runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
-    renderAt();
+    runWithWorkflowMock.mockReturnValue({ data: { status: Status.Completed } });
+    renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
     const dot = runsTab().querySelector(
       "span.absolute.-right-1",
     ) as HTMLElement | null;
@@ -408,20 +433,20 @@ describe("StudioPaneToggles run-status dot", () => {
   });
 
   test("uses a different icon per finalized status (not color-only)", () => {
-    runsQueryMock.mockReturnValue({
-      data: [{ workflow_run_id: "wr_tab", status: Status.Failed }],
+    runWithWorkflowMock.mockReturnValue({
+      data: { workflow_run_id: "wr_tab", status: Status.Failed },
     });
-    const { unmount } = renderAt();
+    const { unmount } = renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
     const failedIcon = runsTab().querySelector(
       "span.absolute.-right-1 svg",
     )?.outerHTML;
     unmount();
     cleanup();
 
-    runsQueryMock.mockReturnValue({
-      data: [{ workflow_run_id: "wr_tab", status: Status.Canceled }],
+    runWithWorkflowMock.mockReturnValue({
+      data: { workflow_run_id: "wr_tab", status: Status.Canceled },
     });
-    renderAt();
+    renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
     const canceledIcon = runsTab().querySelector(
       "span.absolute.-right-1 svg",
     )?.outerHTML;
@@ -432,27 +457,27 @@ describe("StudioPaneToggles run-status dot", () => {
   });
 
   test("includes the finalized run status in the run tab accessible name", () => {
-    runsQueryMock.mockReturnValue({
-      data: [{ workflow_run_id: "wr_tab", status: Status.TimedOut }],
+    runWithWorkflowMock.mockReturnValue({
+      data: { workflow_run_id: "wr_tab", status: Status.TimedOut },
     });
-    renderAt();
+    renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
     expect(
       screen.getByRole("button", { name: "View Run: wr_tab, timed out" }),
     ).toBeTruthy();
   });
 
   test("omits the dot while the run is still in flight", () => {
-    runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
-    renderAt();
+    runWithWorkflowMock.mockReturnValue({ data: { status: Status.Running } });
+    renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
     expect(runsTab().querySelector("span.absolute.-right-1")).toBeNull();
   });
 
   test("tooltips the run status even with labels expanded (no hidden xl:inline gate)", async () => {
-    runsQueryMock.mockReturnValue({
-      data: [{ workflow_run_id: "wr_tip", status: Status.Failed }],
+    runWithWorkflowMock.mockReturnValue({
+      data: { workflow_run_id: "wr_tip", status: Status.Failed },
     });
-    renderAt();
-    fireEvent.focus(tab(/^View Run: wr_tip/));
+    renderAt("/workflows/wpid_abc/studio?wr=wr_tab");
+    fireEvent.focus(tab(/^View Run: wr_tab/));
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip.textContent).toContain("failed");
   });
@@ -557,4 +582,36 @@ describe("StudioPaneToggles keyboard navigation", () => {
     expect(currentPanes()).toBeNull();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
   });
+});
+
+test("an uninspected latest run never consumes its completion notice", () => {
+  const runId = "wr_uninspected";
+  const run = { workflow_run_id: runId, status: Status.Running };
+  runsQueryMock.mockReturnValue({ data: [run] });
+  runWithWorkflowMock.mockReturnValue({ data: run });
+  const wrapper = ({ children }: { children: React.ReactNode }) => (
+    <MemoryRouter>
+      <WorkflowPermanentIdContext.Provider value="wpid_abc">
+        {children}
+      </WorkflowPermanentIdContext.Provider>
+    </MemoryRouter>
+  );
+  const { result, rerender } = renderHook(useStudioRunSignals, { wrapper });
+  expect(result.current.runId).toBeUndefined();
+  expect(result.current.runStatus).toBeNull();
+  runWithWorkflowMock.mockReturnValue({
+    data: { ...run, status: Status.Completed },
+  });
+  rerender();
+  expect(result.current.runStatus).toBeNull();
+  expect(runWithWorkflowMock.mock.lastCall?.[0]).toEqual({
+    workflowRunId: undefined,
+  });
+  const displayed: string[] = [];
+  expect(
+    claimRunCompletionNotice(runId, () => {
+      displayed.push("shown on the run's page");
+    }),
+  ).toBe(true);
+  expect(displayed).toEqual(["shown on the run's page"]);
 });

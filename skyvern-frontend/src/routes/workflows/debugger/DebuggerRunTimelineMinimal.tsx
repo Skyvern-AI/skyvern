@@ -1,6 +1,10 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import {
+  getRunAttempt,
+  runIsExecuting,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { filterTimelineToAttempt } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { isBlockItem, isThoughtItem } from "../types/workflowRunTypes";
@@ -26,11 +30,16 @@ function DebuggerRunTimelineMinimal() {
     return null;
   }
 
-  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
+  const attemptIsExecuting = runIsExecuting(workflowRun);
+  const currentAttemptTimeline = filterTimelineToAttempt(
+    workflowRunTimeline,
+    workflowRun.attempts ?? [],
+    getRunAttempt(workflowRun),
+  );
 
   return (
     <div className="h-full w-full">
-      {!workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
+      {attemptIsExecuting && currentAttemptTimeline.length === 0 && (
         <Skeleton className="vertical-line-gradient-soft flex h-full min-h-[30rem] w-full items-center justify-center overflow-visible">
           {/* rotate this by 90 degrees */}
           <div
@@ -44,16 +53,16 @@ function DebuggerRunTimelineMinimal() {
       <ScrollArea className="h-full w-full">
         <ScrollAreaViewport className="h-full w-full">
           <div className="flex w-full flex-col items-center justify-center gap-4 pt-2">
-            {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
+            {!attemptIsExecuting && currentAttemptTimeline.length === 0 && (
               <div>-</div>
             )}
-            {workflowRunTimeline?.map((timelineItem, i) => {
+            {currentAttemptTimeline.map((timelineItem, i) => {
               if (isBlockItem(timelineItem)) {
                 return (
                   <div
                     key={timelineItem.block.workflow_run_block_id}
                     className={cn({
-                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                      "animate-pulse": attemptIsExecuting && i === 0,
                     })}
                   >
                     <WorkflowRunTimelineBlockItemMinimal
@@ -68,7 +77,7 @@ function DebuggerRunTimelineMinimal() {
                   <div
                     key={timelineItem.thought.thought_id}
                     className={cn({
-                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                      "animate-pulse": attemptIsExecuting && i === 0,
                     })}
                   >
                     <ThoughtCardMinimal

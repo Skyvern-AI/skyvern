@@ -1,16 +1,13 @@
 // @vitest-environment jsdom
 
-vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
-vi.mock("@/hooks/useCredentialGetter", () => ({
-  useCredentialGetter: () => null,
-}));
-
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import { type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
+import { WorkflowRun } from "../WorkflowRun";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem,
@@ -18,10 +15,14 @@ import type {
 import { WorkflowRunOutput } from "./WorkflowRunOutput";
 
 const mocks = vi.hoisted(() => ({
-  activeItem: null as unknown,
   workflowRun: null as unknown,
   timeline: [] as unknown,
   timelineIsPlaceholder: false,
+}));
+
+vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => null,
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -39,10 +40,6 @@ vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   }),
 }));
 
-vi.mock("./useActiveWorkflowRunItem", () => ({
-  useActiveWorkflowRunItem: () => [mocks.activeItem, vi.fn()],
-}));
-
 vi.mock("../components/CodeEditor", () => ({
   CodeEditor: ({ value }: { value: string }) => (
     <pre data-testid="code-editor">{value}</pre>
@@ -58,6 +55,34 @@ vi.mock("@/components/ui/scroll-area", () => ({
   ScrollAreaViewport: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
   ),
+}));
+
+vi.mock("@/hooks/useApiCredential", () => ({
+  useApiCredential: () => null,
+}));
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => false,
+}));
+vi.mock("../hooks/useCacheKeyValuesQuery", () => ({
+  useCacheKeyValuesQuery: () => ({ data: undefined }),
+}));
+vi.mock("../hooks/useBlockScriptsQuery", () => ({
+  useBlockScriptsQuery: () => ({ data: undefined }),
+}));
+vi.mock("../hooks/useFallbackEpisodesQuery", () => ({
+  useFallbackEpisodesQuery: () => ({ data: undefined }),
+}));
+vi.mock("../hooks/useRefreshOnboardingOnRunCompletion", () => ({
+  useRefreshOnboardingOnRunCompletion: () => undefined,
+}));
+vi.mock("./useRunCompletionToast", () => ({
+  useRunCompletionToast: () => undefined,
+}));
+vi.mock("./WorkflowRunTimeline", () => ({
+  WorkflowRunTimeline: () => null,
+}));
+vi.mock("./WorkflowRunBlockDetail", () => ({
+  WorkflowRunBlockDetail: () => null,
 }));
 
 function buildBlock(
@@ -108,7 +133,6 @@ function buildBlockItem(block: WorkflowRunBlock): WorkflowRunTimelineBlockItem {
 }
 
 function renderWorkflowRunOutput(activeBlock: WorkflowRunBlock) {
-  mocks.activeItem = activeBlock;
   mocks.timeline = [buildBlockItem(activeBlock)];
   mocks.workflowRun = {
     workflow_run_id: activeBlock.workflow_run_id,
@@ -119,14 +143,17 @@ function renderWorkflowRunOutput(activeBlock: WorkflowRunBlock) {
   };
 
   return render(
-    <MemoryRouter initialEntries={["/runs/demo?active=wrb_code"]}>
+    <MemoryRouter
+      initialEntries={[
+        `/runs/demo?active=${activeBlock.workflow_run_block_id}`,
+      ]}
+    >
       <WorkflowRunOutput />
     </MemoryRouter>,
   );
 }
 
 beforeEach(() => {
-  mocks.activeItem = null;
   mocks.workflowRun = null;
   mocks.timeline = [];
   mocks.timelineIsPlaceholder = false;
@@ -137,6 +164,62 @@ afterEach(() => {
 });
 
 describe("WorkflowRunOutput", () => {
+  it.each([
+    { active: "", hasCurrentBlocks: true, expected: '"current output"' },
+    { active: "", hasCurrentBlocks: false, expected: null },
+    {
+      active: "?active=wrb_cleanup_1",
+      hasCurrentBlocks: true,
+      expected: '"historical output"',
+    },
+  ])(
+    "scopes default output to the current attempt ($active, $hasCurrentBlocks)",
+    ({ active, hasCurrentBlocks, expected }) => {
+      const historical = {
+        ...buildBlockItem(
+          buildBlock({
+            workflow_run_block_id: "wrb_cleanup_1",
+            label: "cleanup",
+            block_type: "code",
+            output: { extracted_information: "historical output" },
+          }),
+        ),
+        attempt: 1,
+      };
+      const current = {
+        ...buildBlockItem(
+          buildBlock({
+            workflow_run_block_id: "wrb_cleanup_2",
+            label: "cleanup",
+            block_type: "code",
+            output: { extracted_information: "current output" },
+          }),
+        ),
+        attempt: 2,
+      };
+      mocks.timeline = hasCurrentBlocks ? [historical, current] : [historical];
+      mocks.workflowRun = {
+        workflow_run_id: "wr_default",
+        status: Status.Completed,
+        attempt: 2,
+        workflow: { workflow_definition: { finally_block_label: "cleanup" } },
+      };
+
+      render(
+        <MemoryRouter initialEntries={[`/runs/wr_default${active}`]}>
+          <WorkflowRunOutput />
+        </MemoryRouter>,
+      );
+
+      expect(
+        screen
+          .queryAllByTestId("code-editor")
+          .map((editor) => editor.textContent)
+          .filter(Boolean),
+      ).toEqual(expected ? [expected] : []);
+    },
+  );
+
   it("renders code block extracted information without the raw output wrapper", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_code",
@@ -191,5 +274,81 @@ describe("WorkflowRunOutput with a retained timeline", () => {
 
     expect(container.textContent).toBe("");
     expect(screen.queryByText('"ord_123"')).toBeNull();
+  });
+});
+
+describe("legacy WorkflowRun failure card", () => {
+  it("uses the final attempt's code details and finally-block outcome", () => {
+    const reason = "CodeBlock failed with ValueError at line 8";
+    const body = buildBlock({
+      block_type: "code",
+      label: "body",
+      status: Status.Failed,
+      failure_reason: reason,
+    });
+    const finallyBlock = buildBlock({ label: "cleanup" });
+    mocks.workflowRun = {
+      workflow_run_id: "wr_retry",
+      status: Status.Failed,
+      attempt: 2,
+      failure_reason: reason,
+      task_v2: null,
+      workflow: {
+        title: "Retry workflow",
+        workflow_permanent_id: "wpid_retry",
+        workflow_definition: { blocks: [], finally_block_label: "cleanup" },
+      },
+    };
+    mocks.timeline = [
+      {
+        ...buildBlockItem({
+          ...body,
+          workflow_run_block_id: "wrb_body_1",
+          error_codes: ["runner_unavailable"],
+        }),
+        attempt: 1,
+      },
+      {
+        ...buildBlockItem({
+          ...finallyBlock,
+          workflow_run_block_id: "wrb_cleanup_1",
+          status: Status.Completed,
+        }),
+        attempt: 1,
+      },
+      {
+        ...buildBlockItem({
+          ...body,
+          workflow_run_block_id: "wrb_body_2",
+          error_codes: ["user_code_error"],
+        }),
+        attempt: 2,
+      },
+      {
+        ...buildBlockItem({
+          ...finallyBlock,
+          workflow_run_block_id: "wrb_cleanup_2",
+          status: Status.Failed,
+        }),
+        attempt: 2,
+      },
+    ];
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/runs/wr_retry?embed=true"]}>
+          <WorkflowRun />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(
+      screen.getByText('"Execute on any outcome" block (cleanup) failed.'),
+    ).toBeDefined();
+    expect(
+      screen.getByText("The block's code raised ValueError"),
+    ).toBeDefined();
+    expect(screen.queryByText(/completed successfully/)).toBeNull();
+    expect(screen.queryByText("runner_unavailable")).toBeNull();
   });
 });

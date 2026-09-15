@@ -26,6 +26,7 @@ export type ObserverThought = {
 };
 
 export type WorkflowRunBlock = {
+  attempt_number?: number | null;
   workflow_run_block_id: string;
   workflow_run_id: string;
   parent_workflow_run_block_id: string | null;
@@ -86,6 +87,7 @@ export function isWorkflowRunLoopContainerBlock(block: {
 }
 
 export type WorkflowRunTimelineBlockItem = {
+  attempt?: number;
   type: "block";
   block: WorkflowRunBlock;
   children: Array<WorkflowRunTimelineItem>;
@@ -95,6 +97,7 @@ export type WorkflowRunTimelineBlockItem = {
 };
 
 export type WorkflowRunTimelineThoughtItem = {
+  attempt?: number;
   type: "thought";
   block: null;
   children: Array<WorkflowRunTimelineItem>;

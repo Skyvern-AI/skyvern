@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { RetryPolicyEditor } from "./RetryPolicyEditor";
 import type { WorkflowStartNodeData } from "./types";
 
 const mockUpdateNodeData = vi.fn();
@@ -34,6 +35,7 @@ const startNodeData: WorkflowStartNodeData = {
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
   label: "__start_block__",
   showCode: false,
 };
@@ -53,7 +55,7 @@ vi.mock("@xyflow/react", async () => {
             data: nodeData,
           }
         : null,
-    useNodes: () => [],
+    useNodes: () => [{ id: "start", type: "start", data: nodeData }],
     useEdges: () => [],
     useReactFlow: () => ({
       updateNodeData: mockUpdateNodeData,
@@ -310,4 +312,135 @@ describe("WorkflowSettingsEditor mask secrets setting", () => {
       maskSecrets: true,
     });
   });
+});
+
+describe("WorkflowSettingsEditor retry policy", () => {
+  test("enables, edits, and disables automatic retry", () => {
+    let view = renderSettings({
+      retryPolicy: null,
+      errorCodeMapping: { E_RETRY: "Retryable failure" },
+    });
+
+    function applyUpdate(retryPolicy: WorkflowStartNodeData["retryPolicy"]) {
+      expect(mockUpdateNodeData).toHaveBeenCalledExactlyOnceWith("start", {
+        retryPolicy,
+      });
+      nodeData = { ...nodeData, ...mockUpdateNodeData.mock.calls[0]![1] };
+      mockUpdateNodeData.mockClear();
+      view.unmount();
+      view = renderSettings(nodeData);
+    }
+
+    fireEvent.click(screen.getByRole("switch", { name: "Automatic retry" }));
+    const defaultPolicy: NonNullable<WorkflowStartNodeData["retryPolicy"]> = {
+      max_retries: 1,
+      delay_seconds: 0,
+      webhook_on_retry: "final_only",
+      retry_on: [{ status: "failed" }],
+    };
+    applyUpdate(defaultPolicy);
+
+    const maxRetries = screen.getByLabelText(
+      "Maximum retries",
+    ) as HTMLInputElement;
+    fireEvent.change(maxRetries, { target: { value: "" } });
+    expect(mockUpdateNodeData).not.toHaveBeenCalled();
+    expect(maxRetries.value).toBe("");
+    fireEvent.change(maxRetries, { target: { value: "9" } });
+    applyUpdate({ ...defaultPolicy, max_retries: 5 });
+
+    fireEvent.change(screen.getByLabelText("Maximum retries"), {
+      target: { value: "" },
+    });
+    fireEvent.blur(screen.getByLabelText("Maximum retries"));
+    applyUpdate(defaultPolicy);
+
+    fireEvent.change(screen.getByLabelText("Maximum retries"), {
+      target: { value: "2" },
+    });
+    applyUpdate({ ...defaultPolicy, max_retries: 2 });
+
+    fireEvent.change(
+      screen.getByLabelText("Delay between attempts (seconds)"),
+      {
+        target: { value: "5" },
+      },
+    );
+    const configuredPolicy = {
+      ...defaultPolicy,
+      max_retries: 2,
+      delay_seconds: 5,
+    };
+    applyUpdate(configuredPolicy);
+
+    fireEvent.change(
+      screen.getByLabelText("Delay between attempts (seconds)"),
+      {
+        target: { value: "" },
+      },
+    );
+    fireEvent.blur(screen.getByLabelText("Delay between attempts (seconds)"));
+    applyUpdate({ ...configuredPolicy, delay_seconds: 0 });
+    fireEvent.change(
+      screen.getByLabelText("Delay between attempts (seconds)"),
+      {
+        target: { value: "5" },
+      },
+    );
+    applyUpdate(configuredPolicy);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enter a custom value" }),
+    );
+    fireEvent.change(screen.getByLabelText("Error codes"), {
+      target: { value: "E_RETRY" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Error codes"), { key: "Enter" });
+    applyUpdate({
+      ...configuredPolicy,
+      retry_on: [{ status: "failed", error_codes: ["E_RETRY"] }],
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enter a custom value" }),
+    );
+    fireEvent.change(screen.getByLabelText("Error codes"), {
+      target: { value: "E_CUSTOM" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Error codes"), { key: "Enter" });
+    applyUpdate({
+      ...configuredPolicy,
+      retry_on: [{ status: "failed", error_codes: ["E_RETRY", "E_CUSTOM"] }],
+    });
+
+    fireEvent.click(screen.getByRole("switch", { name: "Automatic retry" }));
+    applyUpdate(null);
+    expect(screen.queryByLabelText("Maximum retries")).toBeNull();
+  });
+});
+
+test("changing a retry status preserves the custom error-code draft", () => {
+  const policy = {
+    max_retries: 1,
+    delay_seconds: 0,
+    webhook_on_retry: "final_only" as const,
+    retry_on: [{ status: "failed" as const }],
+  };
+  const view = (status: "failed" | "terminated") => (
+    <RetryPolicyEditor
+      value={{ ...policy, retry_on: [{ status }] }}
+      onChange={() => {}}
+      knownErrorCodes={[]}
+      readOnly={false}
+    />
+  );
+  const { rerender } = render(view("failed"));
+  fireEvent.click(screen.getByRole("button", { name: "Enter a custom value" }));
+  fireEvent.change(screen.getByLabelText("Error codes"), {
+    target: { value: "E_DRAFT" },
+  });
+  rerender(view("terminated"));
+  expect((screen.getByLabelText("Error codes") as HTMLInputElement).value).toBe(
+    "E_DRAFT",
+  );
 });

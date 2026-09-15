@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const { mockGet, mockGetClient, runState } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockGetClient: vi.fn(),
-  runState: { status: "completed" },
+  runState: { status: "completed", attempt: 1, retry_pending: false },
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -30,7 +30,7 @@ vi.mock("./useGlobalWorkflowsQuery", () => ({
 vi.mock("./useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => ({
     data: {
-      status: runState.status,
+      ...runState,
       workflow: { workflow_permanent_id: "wpid_1" },
     },
     dataUpdatedAt: 0,
@@ -56,9 +56,44 @@ afterEach(() => {
   vi.useRealTimers();
   focusManager.setFocused(undefined);
   runState.status = "completed";
+  runState.attempt = 1;
+  runState.retry_pending = false;
 });
 
 describe("useWorkflowRunTimelineQuery", () => {
+  it("stops polling during a retry delay and fetches the next attempt", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    focusManager.setFocused(true);
+    runState.status = "failed";
+    runState.retry_pending = true;
+    mockGet.mockResolvedValue({ data: [] });
+    mockGetClient.mockResolvedValue({ get: mockGet });
+
+    const { result, rerender } = renderHook(
+      () => useWorkflowRunTimelineQuery(),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const readsBeforeDelay = mockGet.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet).toHaveBeenCalledTimes(readsBeforeDelay);
+
+    runState.status = "queued";
+    runState.attempt = 2;
+    runState.retry_pending = false;
+    rerender();
+    await waitFor(() =>
+      expect(mockGet.mock.calls.length).toBeGreaterThan(readsBeforeDelay),
+    );
+
+    runState.status = "running";
+    rerender();
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    const readsBeforePolling = mockGet.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet.mock.calls.length).toBeGreaterThan(readsBeforePolling);
+  });
+
   it("returns the timeline when the response is an array", async () => {
     mockGet.mockResolvedValue({ data: [] });
     mockGetClient.mockResolvedValue({ get: mockGet });

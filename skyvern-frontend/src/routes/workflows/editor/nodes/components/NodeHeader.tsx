@@ -1,3 +1,6 @@
+import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
 import { AxiosError } from "axios";
 import {
   ChevronDownIcon,
@@ -75,11 +78,7 @@ import {
 } from "@/store/WorkflowSettingsStore";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
-import {
-  statusIsAFailureType,
-  statusIsFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 
 import {
   Tooltip,
@@ -293,7 +292,10 @@ function NodeHeader({
   // switch — that changes the query key while the run id stays the same.
   const runStateIsLive = !statusUnavailable && !isPlaceholderData;
   const workflowRunIsRunningOrQueued =
-    runStateIsLive && workflowRun && statusIsRunningOrQueued(workflowRun);
+    runStateIsLive &&
+    workflowRun &&
+    (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
+  useRunCompletionToast(runStateIsLive ? workflowRun : undefined);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -375,41 +377,6 @@ function NodeHeader({
       });
     }
   });
-
-  useEffect(() => {
-    if (
-      !workflowRun ||
-      !workflowPermanentId ||
-      !activeWorkflowRunId ||
-      // Only block-scoped runs toast per block; full runs report via the run
-      // surfaces (?wr= without ?bl=).
-      targetBlockLabel === undefined
-    ) {
-      return;
-    }
-
-    if (statusIsFinalized(workflowRun)) {
-      if (statusIsAFailureType(workflowRun)) {
-        toast({
-          variant: "destructive",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-          description: `Reason: ${workflowRun.failure_reason}`,
-        });
-      } else if (statusIsFinalized(workflowRun)) {
-        toast({
-          variant: "success",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-        });
-      }
-    }
-  }, [
-    queryClient,
-    targetBlockLabel,
-    navigate,
-    workflowPermanentId,
-    workflowRun,
-    activeWorkflowRunId,
-  ]);
 
   const runBlock = useMutation({
     mutationFn: async (opts?: {
@@ -661,11 +628,15 @@ function NodeHeader({
         debugSessionId: debugSession?.debug_session_id,
         browserSessionId: debugSession?.browser_session_id,
       });
-      toast({
-        variant: "success",
-        title: "Agent Canceled",
-        description: "The agent has been successfully canceled.",
-      });
+      if (activeWorkflowRunId) {
+        claimRunCompletionNotice(activeWorkflowRunId, () => {
+          toast({
+            variant: "success",
+            title: "Agent Canceled",
+            description: "The agent has been successfully canceled.",
+          });
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;

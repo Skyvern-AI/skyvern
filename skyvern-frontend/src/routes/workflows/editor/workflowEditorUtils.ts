@@ -1,3 +1,4 @@
+import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
 import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
@@ -2202,6 +2203,7 @@ function getElements(
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
       errorCodeMapping: settings.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(settings.retryPolicy),
     }),
   );
 
@@ -3794,6 +3796,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
     errorCodeMapping: null,
+    retryPolicy: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3834,6 +3837,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
       errorCodeMapping: data.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(data.retryPolicy),
     };
   }
   return defaultSettings;
@@ -5088,6 +5092,9 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      retry_policy: normalizeRetryPolicy(
+        workflow.workflow_definition.retry_policy,
+      ),
       finally_block_label: workflow.workflow_definition.finally_block_label,
       workflow_system_prompt:
         workflow.workflow_definition.workflow_system_prompt,

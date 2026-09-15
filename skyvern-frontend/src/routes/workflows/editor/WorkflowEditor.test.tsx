@@ -2,10 +2,15 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
+import { ReactFlowProvider } from "@xyflow/react";
+import { useEffect, type ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { Status } from "@/api/types";
+import { WorkflowEditor } from "./WorkflowEditor";
+import { Workspace } from "./Workspace";
+import type { FlowRendererProps } from "./FlowRenderer";
 
 const { workflowQueryMock, runQueryMock, runsQueryMock } = vi.hoisted(() => ({
   workflowQueryMock: vi.fn(),
@@ -27,6 +32,55 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 }));
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: () => runsQueryMock(),
+}));
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => runQueryMock(),
+}));
+vi.mock("../hooks/useBlockScriptsQuery", () => ({
+  useBlockScriptsQuery: () => ({ data: undefined }),
+}));
+vi.mock("../hooks/useCacheKeyValuesQuery", () => ({
+  useCacheKeyValuesQuery: () => ({ data: undefined, isLoading: false }),
+}));
+vi.mock("../hooks/useDebugSessionQuery", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../hooks/useDebugSessionQuery")>()),
+  useDebugSessionQuery: () => ({ data: undefined }),
+}));
+vi.mock("../hooks/useActiveRunSessionQuery", () => ({
+  useActiveRunSessionQuery: () => ({
+    data: { active_run_session_id: "pbs_run" },
+  }),
+}));
+vi.mock("@/hooks/useRuntimeConfig", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useRuntimeConfig")>()),
+  useStreamTransport: () => ({ streamTransport: "vnc" }),
+}));
+vi.mock("./FlowRenderer", () => ({
+  FlowRenderer: ({ onLayoutPhaseChange }: FlowRendererProps) => {
+    useEffect(() => {
+      onLayoutPhaseChange?.("ready");
+    }, [onLayoutPhaseChange]);
+    return null;
+  },
+}));
+vi.mock("@/components/BrowserStream", () => ({
+  BrowserStream: ({ isExecuting }: { isExecuting: boolean }) => (
+    <div data-testid="browser-stream" data-executing={isExecuting} />
+  ),
+}));
+vi.mock("@/components/Splitter", () => ({
+  Splitter: ({ children }: { children: ReactNode }) => <>{children}</>,
+}));
+vi.mock("./WorkflowHeader", () => ({ WorkflowHeader: () => null }));
+vi.mock("../copilot/WorkflowCopilotChat", () => ({
+  WorkflowCopilotChat: () => null,
+}));
+vi.mock("../debugger/DebuggerRun", () => ({ DebuggerRun: () => null }));
+vi.mock("../debugger/DebuggerRunMinimal", () => ({
+  DebuggerRunMinimal: () => null,
+}));
+vi.mock("../debugger/recentActivity/RecentActivityRunSelector", () => ({
+  RecentActivityRunSelector: () => null,
 }));
 // Pane bodies own their data wiring (tested in their own suites); the shell
 // contract under test is which of them mount and how the chrome degrades.
@@ -52,8 +106,6 @@ vi.mock("../studio/runview/RunPaneHeader", () => ({
 vi.mock("@/components/onboarding/ProductTour", () => ({
   ProductTour: () => null,
 }));
-
-import { WorkflowEditor } from "./WorkflowEditor";
 
 const deletedWorkflow = {
   workflow_permanent_id: "wpid_del",
@@ -104,7 +156,10 @@ function renderStudioAt(path: string) {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -211,4 +266,61 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
         .disabled,
     ).toBe(false);
   });
+});
+
+test("the editor browser stops indicating execution during a retry wait and resumes for the next attempt", () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const editor = () => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/agents/wpid_live/edit?wr=wr_1"]}>
+        <Routes>
+          <Route
+            path="/agents/:workflowPermanentId/edit"
+            element={
+              <ReactFlowProvider>
+                <Workspace
+                  initialNodes={[]}
+                  initialEdges={[]}
+                  initialTitle="Live agent"
+                  workflow={liveWorkflow}
+                  showBrowser
+                />
+              </ReactFlowProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  runQueryMock.mockReturnValue({
+    data: {
+      workflow_run_id: "wr_1",
+      status: Status.Failed,
+      retry_pending: true,
+    },
+  });
+  const view = render(editor());
+  expect(
+    screen.getByTestId("browser-stream").getAttribute("data-executing"),
+  ).toBe("false");
+
+  runQueryMock.mockReturnValue({
+    data: { workflow_run_id: "wr_1", status: Status.Running, attempt: 2 },
+  });
+  view.rerender(editor());
+  expect(
+    screen.getByTestId("browser-stream").getAttribute("data-executing"),
+  ).toBe("true");
+  view.unmount();
+  queryClient.clear();
+  vi.unstubAllGlobals();
 });

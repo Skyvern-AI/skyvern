@@ -1,3 +1,8 @@
+import {
+  runIsRetryWaiting,
+  runIsExecuting,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback, useState } from "react";
 import {
   ActivityLogIcon,
@@ -25,7 +30,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { Status } from "@/api/types";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -36,7 +41,6 @@ import { cn } from "@/util/utils";
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
-import { runOutcomeFromStatus } from "../runProjections";
 import { studioPanelId } from "../constants";
 import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
@@ -98,11 +102,11 @@ export function RunPaneViewToggles() {
   if (!workflowRun) {
     return null;
   }
-  const outcome = runOutcomeFromStatus(workflowRun.status);
   const provisioning =
     workflowRun.status === Status.Created ||
     workflowRun.status === Status.Queued;
-  const showLive = !statusUnavailable && outcome === "running" && !provisioning;
+  const showLive =
+    !statusUnavailable && runIsExecuting(workflowRun) && !provisioning;
 
   return (
     <>
@@ -230,7 +234,7 @@ export function RunPaneActions() {
   if (workflowRun.workflow?.deleted_at) {
     return null;
   }
-  const finalized = statusIsFinalized(workflowRun);
+  const finalized = runIsLogicallyFinal(workflowRun);
   return (
     <>
       <ApiWebhookActionsMenu
@@ -273,6 +277,11 @@ export function RunPaneActions() {
             headers,
           } satisfies ApiCommandOptions;
         }}
+        disabledReason={
+          workflowRun && runIsRetryWaiting(workflowRun)
+            ? "Unavailable while a retry is pending"
+            : undefined
+        }
         webhookDisabled={!finalized}
         onTestWebhook={() => setReplayOpen(true)}
       />

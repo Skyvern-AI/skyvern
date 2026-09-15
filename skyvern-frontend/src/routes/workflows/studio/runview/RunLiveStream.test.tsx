@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 let transport: string | undefined = "cdp";
@@ -10,7 +10,9 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
 }));
 
 vi.mock("@/components/BrowserStream", () => ({
-  BrowserStream: () => <div data-testid="vnc-stream" />,
+  BrowserStream: ({ onClose }: { onClose: () => void }) => (
+    <button data-testid="vnc-stream" onClick={onClose} />
+  ),
 }));
 
 vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
@@ -62,4 +64,56 @@ describe("RunLiveStream", () => {
     );
     expect(screen.queryByTestId("run-stream")).not.toBeNull();
   });
+});
+
+test("remounts the whole transport chooser when an attempt changes without a wait frame", () => {
+  transport = "vnc";
+  const run = {
+    workflow_run_id: "wr_attempt",
+    status: "running" as const,
+    attempt: 1,
+  };
+  const { rerender } = render(
+    <RunLiveStream
+      workflowRunId={run.workflow_run_id}
+      run={run}
+      browserSessionId="pbs_same"
+      interactive={false}
+    />,
+  );
+  fireEvent.click(screen.getByTestId("vnc-stream"));
+  expect(screen.queryByTestId("session-stream")).not.toBeNull();
+  rerender(
+    <RunLiveStream
+      workflowRunId={run.workflow_run_id}
+      run={{ ...run, attempt: 2 }}
+      browserSessionId="pbs_same"
+      interactive={false}
+    />,
+  );
+  expect(screen.queryByTestId("vnc-stream")).not.toBeNull();
+  expect(screen.queryByTestId("session-stream")).toBeNull();
+});
+
+test("shows retry waits through the theme-aware status panel", () => {
+  render(
+    <RunLiveStream
+      workflowRunId="wr_wait"
+      run={{
+        workflow_run_id: "wr_wait",
+        status: "failed",
+        retry_pending: true,
+      }}
+      browserSessionId={null}
+      interactive={false}
+    />,
+  );
+  const panel = screen.getByRole("status");
+  expect(panel.textContent).toContain("Retry pending");
+  expect(panel.textContent).toContain(
+    "The browser reconnects when the next attempt starts.",
+  );
+  expect(panel.className).toContain("bg-white");
+  expect(panel.className).toContain("text-neutral-600");
+  expect(screen.queryByTestId("run-stream")).toBeNull();
 });

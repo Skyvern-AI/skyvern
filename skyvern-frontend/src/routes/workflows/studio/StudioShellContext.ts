@@ -14,6 +14,9 @@ type StudioShellContextValue = {
   // The Overview pane registers this for a block run, so the debug-session stream shows
   // there too (same node, view-only); null for a full run keeps it parked.
   setRunStreamSlot: (el: HTMLElement | null) => void;
+  // Pane actions from nested controls leave fullscreen before applying their
+  // own layout change, including when the requested pane is already open.
+  restoreExpandedPane?: () => void;
 };
 
 export const StudioShellContext = createContext<StudioShellContextValue>({
@@ -22,6 +25,7 @@ export const StudioShellContext = createContext<StudioShellContextValue>({
   setEditorStreamSlot: () => {},
   setBrowserStreamSlot: () => {},
   setRunStreamSlot: () => {},
+  restoreExpandedPane: () => {},
 });
 
 export function useStudioShellContext(): StudioShellContextValue {

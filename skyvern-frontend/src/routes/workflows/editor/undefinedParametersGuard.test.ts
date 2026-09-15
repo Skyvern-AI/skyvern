@@ -35,6 +35,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
 };
 
 describe("getElements is robust to blocks with undefined parameters", () => {

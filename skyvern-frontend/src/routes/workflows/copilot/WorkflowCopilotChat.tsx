@@ -3719,6 +3719,7 @@ export function WorkflowCopilotChat({
               version: saveData.workflowDefinitionVersion,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
             },
             is_saved_task: saveData.workflow.is_saved_task,
             status: saveData.workflow.status,
@@ -3748,6 +3749,7 @@ export function WorkflowCopilotChat({
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
             },
           } as WorkflowApiResponse;
         }

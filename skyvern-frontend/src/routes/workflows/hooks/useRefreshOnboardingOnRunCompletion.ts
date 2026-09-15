@@ -1,10 +1,14 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Status } from "@/api/types";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { Status, WorkflowRunRetryFields } from "@/api/types";
+
 import type { OnboardingStateResponse } from "@/store/onboarding/types";
 
-type RunLike = { workflow_run_id: string; status: Status };
+type RunLike = {
+  workflow_run_id: string;
+  status: Status;
+} & WorkflowRunRetryFields;
 
 // The backend stamps first_run_at only when a run reaches a final status, so
 // refresh onboarding once per finalized run. Failed runs share one delayed
@@ -27,7 +31,7 @@ function useRefreshOnboardingOnRunCompletion(
   );
 
   useEffect(() => {
-    if (!workflowRun || !statusIsFinalized(workflowRun)) {
+    if (!workflowRun || !runIsLogicallyFinal(workflowRun)) {
       return;
     }
     const runId = workflowRun.workflow_run_id;

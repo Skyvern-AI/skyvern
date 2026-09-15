@@ -1,4 +1,5 @@
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
+
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -26,7 +27,7 @@ export function useIsGeneratingCode(params: Params): boolean {
   });
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
   const publishedLabelCount = Object.keys(
     blockScriptsPublished?.blocks ?? {},
   ).length;

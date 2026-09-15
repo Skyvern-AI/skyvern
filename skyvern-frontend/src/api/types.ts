@@ -804,6 +804,26 @@ export type DebugLoginBlockCompatibilityResponse = {
   reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
+export type WorkflowRunAttempt = {
+  attempt_number: number;
+  status: Status;
+  failure_reason: string | null;
+  error_codes: Array<string>;
+  started_at: string | null;
+  finished_at: string | null;
+  retry_decision: string | null;
+  decision_reason: string | null;
+  next_attempt_at: string | null;
+  webhook_sent_at: string | null;
+};
+
+export type WorkflowRunRetryFields = {
+  attempt?: number;
+  retry_pending?: boolean;
+  next_attempt_at?: string | null;
+  attempts?: Array<WorkflowRunAttempt>;
+};
+
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
@@ -825,7 +845,10 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_title: string | null;
   retried_from_workflow_run_id?: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export const TaskRunType = {
   TaskV1: "task_v1",
@@ -853,7 +876,10 @@ export type TaskRunListItem = {
   script_run: boolean;
   trigger_type?: TriggerType | null;
   searchable_text: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
@@ -896,7 +922,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+} & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_id: string;
@@ -940,7 +966,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+} & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;

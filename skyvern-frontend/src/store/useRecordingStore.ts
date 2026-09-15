@@ -313,8 +313,9 @@ interface RecordingStore {
   setIsCommitting: (isCommitting: boolean) => void;
   /**
    * Draft steps to commit: snapshot minus user deletions, with user edits
-   * applied. Null when live interpretation never produced a revision (caller
-   * should fall back to raw event processing).
+   * applied. Null when live interpretation produced no draft steps (caller
+   * should fall back to raw event processing). An empty array is reserved for
+   * the intentional case where the user deleted every generated draft.
    */
   getFinalDraftSteps: () => Array<RecordingDraftStep> | null;
   /**
@@ -661,7 +662,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
 
   getFinalDraftSteps: () => {
     const state = get();
-    if (state.sessionRevision === 0) {
+    if (state.sessionRevision === 0 || state.draftSteps.length === 0) {
       return null;
     }
     return applyDraftStepOverlays(

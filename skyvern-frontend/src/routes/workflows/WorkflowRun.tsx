@@ -1,9 +1,18 @@
+import { useRunCompletionToast } from "./workflowRun/useRunCompletionToast";
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import {
+  getRunAttempt,
+  runIsRetryWaiting,
+  runIsCancellable,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { AxiosError } from "axios";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import {
   SwitchBarNavigation,
@@ -48,7 +57,6 @@ import {
   runOverviewScreenshotLocation,
   runViewTabBasePath,
 } from "@/routes/runs/runViewTabBasePath";
-import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
 import { ResizableTimelineSplit } from "./workflowRun/ResizableTimelineSplit";
@@ -56,6 +64,7 @@ import { WorkflowRunBlockDetail } from "./workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import {
+  filterTimelineToAttempt,
   findActiveItem,
   parseActiveIterationParam,
 } from "./workflowRun/workflowTimelineUtils";
@@ -199,6 +208,7 @@ function WorkflowRun() {
   } = useWorkflowRunWithWorkflowQuery();
 
   useRefreshOnboardingOnRunCompletion(workflowRun);
+  useRunCompletionToast(workflowRunIsPlaceholder ? undefined : workflowRun);
   const recoveryGuidanceRetry = getRecoveryGuidanceRetryNavigation(
     location.state,
   );
@@ -234,7 +244,7 @@ function WorkflowRun() {
   const workflowPermanentId =
     workflowPermanentIdParam ?? workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : null;
   const isWorkflowDeleted = Boolean(workflow?.deleted_at);
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
@@ -301,11 +311,15 @@ function WorkflowRun() {
       queryClient.invalidateQueries({
         queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
       });
-      toast({
-        variant: "success",
-        title: "Agent Canceled",
-        description: "The agent has been successfully canceled.",
-      });
+      if (workflowRunId) {
+        claimRunCompletionNotice(workflowRunId, () => {
+          toast({
+            variant: "success",
+            title: "Agent Canceled",
+            description: "The agent has been successfully canceled.",
+          });
+        });
+      }
     },
     onError: (error) => {
       toast({
@@ -318,9 +332,10 @@ function WorkflowRun() {
 
   const statusUnavailable = Boolean(error);
   const workflowRunIsCancellable =
-    !statusUnavailable && workflowRun && statusIsCancellable(workflowRun);
+    !statusUnavailable && workflowRun && runIsCancellable(workflowRun);
 
-  const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
+  const workflowRunIsFinalized =
+    workflowRun && runIsLogicallyFinal(workflowRun);
 
   const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
     workflowPermanentId,
@@ -329,8 +344,13 @@ function WorkflowRun() {
   });
   const finallyBlockLabel =
     workflow?.workflow_definition?.finally_block_label ?? null;
-  const selection = findActiveItem(
+  const currentAttemptTimeline = filterTimelineToAttempt(
     workflowRunTimeline ?? [],
+    workflowRun?.attempts ?? [],
+    getRunAttempt(workflowRun ?? {}),
+  );
+  const selection = findActiveItem(
+    active === null ? currentAttemptTimeline : (workflowRunTimeline ?? []),
     active,
     !!workflowRunIsFinalized,
     finallyBlockLabel,
@@ -365,7 +385,7 @@ function WorkflowRun() {
 
   const codeFailure = findRunCodeBlockFailure(
     failureReason,
-    workflowRunTimeline,
+    currentAttemptTimeline,
     finallyBlockLabel,
   );
 
@@ -377,7 +397,7 @@ function WorkflowRun() {
     "font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200";
 
   const finallyBlockInTimeline = finallyBlockLabel
-    ? workflowRunTimeline?.find(
+    ? currentAttemptTimeline.find(
         (item) => isBlockItem(item) && item.block.label === finallyBlockLabel,
       )
     : null;
@@ -662,6 +682,11 @@ function WorkflowRun() {
               ) : workflowRun && !statusUnavailable ? (
                 <div className="mt-[0.27rem] flex items-center gap-2">
                   <StatusBadge status={workflowRun?.status} />
+                  <WorkflowRunAttemptChip
+                    attempt={workflowRun.attempt}
+                    retryPending={workflowRun.retry_pending}
+                    nextAttemptAt={workflowRun.next_attempt_at}
+                  />
                   <CredentialFallbackRetryBadge
                     retriedFromWorkflowRunId={
                       workflowRun.retried_from_workflow_run_id
@@ -769,6 +794,11 @@ function WorkflowRun() {
                       headers,
                     } satisfies ApiCommandOptions;
                   }}
+                  disabledReason={
+                    workflowRun && runIsRetryWaiting(workflowRun)
+                      ? "Unavailable while a retry is pending"
+                      : undefined
+                  }
                   webhookDisabled={
                     workflowRunIsLoading || !workflowRunIsFinalized
                   }
@@ -851,6 +881,7 @@ function WorkflowRun() {
       {WorkflowRunMilestoneCard &&
       workflowRun &&
       !workflowRunIsPlaceholder &&
+      runIsLogicallyFinal(workflowRun) &&
       workflowRun.status === Status.Completed ? (
         <WorkflowRunMilestoneCard
           workflowRunId={workflowRun.workflow_run_id}
@@ -937,7 +968,7 @@ function WorkflowRun() {
           <SwitchBarNavigation options={switchBarOptions} />
           {workflowRun && (
             <WorkflowRunStatusAlert
-              status={workflowRun.status}
+              run={workflowRun}
               title={workflow?.title}
               visible={!statusUnavailable && !isFinalized}
             />

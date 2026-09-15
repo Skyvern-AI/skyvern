@@ -1,3 +1,4 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import {
   CounterClockwiseClockIcon,
   DotsHorizontalIcon,
@@ -24,7 +25,7 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useProductTourStore } from "@/store/ProductTourStore";
@@ -68,7 +69,7 @@ export function EditorOverflowMenu({
   const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
 
   const workflowRunIsRunningOrQueued = Boolean(
-    workflowRun && statusIsRunningOrQueued(workflowRun),
+    workflowRun && runIsLogicallyActive(workflowRun),
   );
 
   const templateMutation = useMutation({
