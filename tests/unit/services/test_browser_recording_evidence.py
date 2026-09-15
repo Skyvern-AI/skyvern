@@ -86,6 +86,46 @@ def test_typed_values_are_redacted_from_later_target_metadata() -> None:
     assert "[REDACTED_INPUT]" in serialized
 
 
+def test_short_typed_values_do_not_corrupt_unrelated_metadata() -> None:
+    input_action = make_input(1000, "a", selector="#query", input_type="text")
+    input_action.url = "https://example.com/search?q=a"
+    result = make_click(
+        2000,
+        selector='[data-query="a"]',
+        accessible_name="Open a result",
+        texts=["Result a"],
+    )
+
+    packet = build_recording_evidence(
+        [input_action, result],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert packet.actions[0].url == "https://example.com/search?q=[REDACTED_INPUT]"
+    assert packet.actions[1].target is not None
+    assert packet.actions[1].target.selector_candidates == ['[data-query="[REDACTED_INPUT]"]']
+    assert packet.actions[1].target.accessible_name == "Open [REDACTED_INPUT] result"
+    assert packet.actions[1].target.visible_texts == ["Result [REDACTED_INPUT]"]
+
+
+def test_encoded_short_typed_values_only_redact_standalone_matches() -> None:
+    input_action = make_input(1000, "?", selector="#query", input_type="text")
+    input_action.url = "https://example.com/path%3Fhelp?q=%3F"
+
+    packet = build_recording_evidence(
+        [input_action],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert packet.actions[0].url == "https://example.com/path%3Fhelp?q=[REDACTED_INPUT]"
+
+
 def test_draft_overlay_tracks_deleted_actions_and_labels() -> None:
     kept = make_click(1000, selector="#keep")
     deleted = make_click(2000, selector="#delete")
