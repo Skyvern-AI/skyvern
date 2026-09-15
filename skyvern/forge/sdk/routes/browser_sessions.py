@@ -673,7 +673,7 @@ async def process_recording(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
 
-    blocks, parameters, recording_id = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
+    blocks, parameters, recording_id, evidence = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
         organization_id=current_org.organization_id,
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
@@ -685,7 +685,12 @@ async def process_recording(
         interpretation_session_id=recording_request.interpretation_session_id,
     )
 
-    return ProcessBrowserSessionRecordingResponse(recording_id=recording_id, blocks=blocks, parameters=parameters)
+    return ProcessBrowserSessionRecordingResponse(
+        recording_id=recording_id,
+        blocks=blocks,
+        parameters=parameters,
+        evidence=evidence,
+    )
 
 
 @base_router.delete(

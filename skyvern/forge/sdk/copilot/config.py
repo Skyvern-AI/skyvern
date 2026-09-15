@@ -89,6 +89,8 @@ class CopilotConfig:
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     code_block_available: bool = False
     effective_code_block_mode: bool = False
+    # When False, this turn may neither dispatch runs nor acquire or drive a browser session.
+    browser_tools_available: bool = True
     requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
     requested_output_shape_expectations: dict[str, ShapeExpectation] = field(default_factory=dict)
     credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)

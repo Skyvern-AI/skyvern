@@ -23,6 +23,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
+from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
 
 COPILOT_PROPOSAL_METADATA_KEY = "_copilot_proposal"
 CopilotCandidateDisposition = Literal[
@@ -343,12 +344,20 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end", "diagnose_run"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
-            "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id."
+            "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
+            "'refine_recording' infers a reusable workflow from recording_evidence."
+        ),
+    )
+    recording_evidence: RecordingEvidencePacket | None = Field(
+        None,
+        description=(
+            "Observation-only projection of a browser recording, required by the 'refine_recording' "
+            "action. Reaches the model as untrusted evidence, never as part of the turn's message."
         ),
     )
     eval_entrypoint_url: str | None = Field(

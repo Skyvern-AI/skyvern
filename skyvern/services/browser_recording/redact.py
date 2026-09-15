@@ -109,6 +109,16 @@ def texts_are_labels(tag_name: str | None) -> bool:
     return (tag_name or "").lower() in TEXT_IS_LABEL_TAGS
 
 
+# A typing surface's innerText is what the user typed; a <select>'s is its option labels.
+TYPED_TEXT_TAGS = frozenset({"textarea"})
+TYPED_TEXT_ROLES = frozenset({"textbox", "searchbox", "combobox"})
+
+
+def texts_are_typed_input(tag_name: str | None, role: str | None) -> bool:
+    """Whether this element's visible text is the user's own typing rather than page copy."""
+    return (tag_name or "").lower() in TYPED_TEXT_TAGS or (role or "").lower() in TYPED_TEXT_ROLES
+
+
 def _normalized_haystack(*parts: HaystackPart) -> str:
     chunks: list[str] = []
     for part in parts:

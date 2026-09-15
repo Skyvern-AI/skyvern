@@ -1473,6 +1473,7 @@ def _build_user_context(
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
+    untrusted_evidence: str = "",
     attached_files_summary: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
@@ -1496,6 +1497,7 @@ def _build_user_context(
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
+        untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
     )
 
@@ -2613,25 +2615,10 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
-_UNBACKED_WORKFLOW_DELIVERY_REPLY = (
-    "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
-    "from this turn. Please retry with the target site, page, or workflow requirement."
-)
-_UNBACKED_WORKFLOW_DELIVERY_PREFIX = "I wasn't able to produce a workflow proposal in this turn."
-
 _INLINE_REJECT_NOTE_FALLBACK = (
     "This draft didn't pass validation against the live page, so I haven't saved it. "
     "I'll revise it before proposing again."
 )
-_GENERIC_MISSING_CONTEXT_PHRASES = (
-    "missing details",
-    "one more detail",
-)
-_MISSING_CONTEXT_LABELS = {
-    "workflow_run_id": "the workflow run ID",
-    "block_results": "the block run results",
-    "failure_reason": "the failure reason",
-}
 _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Internal workflow names are not the right interface to use when building with Copilot. "
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
@@ -2975,61 +2962,6 @@ def _recorded_failure_is_internal_tool_instruction(ctx: CopilotContext) -> bool:
         if contains_internal_machinery_leak(clean_recorded_failure_text(value, max_chars=240)):
             return True
     return False
-
-
-def _specific_missing_context_question(value: Any) -> str:
-    question = _clean_recorded_failure_text(value, max_chars=320)
-    if not question:
-        return ""
-    lowered = question.lower()
-    if any(phrase in lowered for phrase in _GENERIC_MISSING_CONTEXT_PHRASES):
-        return ""
-    if question[-1] not in ".?!":
-        question += "."
-    return question
-
-
-def _join_human_list(items: list[str]) -> str:
-    if len(items) <= 1:
-        return items[0] if items else ""
-    if len(items) == 2:
-        return f"{items[0]} and {items[1]}"
-    return ", ".join(items[:-1]) + f", and {items[-1]}"
-
-
-def _required_context_label(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return _MISSING_CONTEXT_LABELS.get(value) or _clean_recorded_failure_text(value, max_chars=120)
-
-
-def _diagnosis_missing_context_labels(ctx: CopilotContext) -> list[str]:
-    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-    diagnosis = getattr(contract, "diagnosis_result", None)
-    missing_context = getattr(diagnosis, "missing_context", None)
-    if not isinstance(missing_context, list):
-        return []
-    labels = [_required_context_label(item) for item in missing_context]
-    return list(dict.fromkeys(label for label in labels if label))
-
-
-def _unbacked_workflow_delivery_reply(ctx: CopilotContext) -> str:
-    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    if request_policy is not None:
-        question = _specific_missing_context_question(request_policy.clarification_question)
-        if question:
-            return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} I need this before I can build and test it: {question}"
-
-    missing_context = _diagnosis_missing_context_labels(ctx)
-    if missing_context:
-        items = _join_human_list(missing_context)
-        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} Required context was unavailable: {items}."
-
-    reason, status_sentence = _recorded_failure_summary(ctx)
-    if reason:
-        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} The recorded blocker was: {reason}.{status_sentence}"
-
-    return _UNBACKED_WORKFLOW_DELIVERY_REPLY
 
 
 def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
@@ -3951,7 +3883,6 @@ async def _translate_to_agent_result(
     )
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
-    unbacked_workflow_delivery_rewritten = False
     # The finalization shim overwrites these on a blocker turn — skip the rewrites.
     if not blocker_active:
         if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
@@ -3974,18 +3905,6 @@ async def _translate_to_agent_result(
             )
             soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
             output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
-        # Preserve the unbacked-proposal correction when both soft rewrites apply:
-        # a reply must not imply a workflow exists when no proposal was produced.
-        if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
-            user_response = _unbacked_workflow_delivery_reply(ctx)
-            resp_type = "ASK_QUESTION"
-            output_policy_verdict.output_kind = CopilotOutputKind.CLARIFICATION_REQUEST
-            unbacked_workflow_delivery_rewritten = True
-            soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
-            output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
-        if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
-            soft_rewrite_reasons.append(OutputPolicyReason.MISSING_PROPOSAL_STATE)
-            output_policy_verdict.remove(OutputPolicyReason.MISSING_PROPOSAL_STATE)
     final_output_kind = (
         _blocked_final_output_kind(output_policy_verdict)
         if not output_policy_verdict.allowed
@@ -4064,9 +3983,7 @@ async def _translate_to_agent_result(
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=(resp_type == "ASK_QUESTION" and last_workflow is None),
         proposal_disposition=(
-            "no_proposal"
-            if unbacked_workflow_delivery_rewritten and last_workflow is None
-            else "review_tested"
+            "review_tested"
             if chat_request.product_action == "test_end_to_end"
             and last_workflow is not None
             and ctx.last_full_workflow_test_ok is True
@@ -4974,6 +4891,7 @@ async def run_copilot_agent(
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
     persisted_workflow_yaml: str | None = None,
+    untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
@@ -5021,6 +4939,7 @@ async def run_copilot_agent(
                     prior_turn_outcome=prior_turn_outcome,
                     persist_canonical_user_message=persist_canonical_user_message,
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    untrusted_evidence=untrusted_evidence,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=eval_capture_case_id,
                     eval_mode=eval_mode,
@@ -5123,6 +5042,7 @@ async def _run_copilot_turn_impl(
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
     persisted_workflow_yaml: str | None = None,
+    untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
@@ -5447,6 +5367,7 @@ async def _run_copilot_turn_impl(
         alias_map=alias_map,
         overlays=overlays,
         registered_mcp_tools=registered_mcp_tools,
+        browser_tools_available=copilot_config.browser_tools_available,
     )
     native_tools = list(surface.native_tools)
     alias_map = surface.alias_map
@@ -5515,6 +5436,7 @@ async def _run_copilot_turn_impl(
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
+        untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
     )
     initial_input: str | list[dict[str, str]] = user_message
