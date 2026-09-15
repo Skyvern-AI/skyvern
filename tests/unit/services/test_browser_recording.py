@@ -34,7 +34,6 @@ from skyvern.services.browser_recording.service import (
     _resolve_enrichment_handler,
     build_durable_recording_evidence,
     deterministic_input_text_parameter_key,
-    summarize_exfiltrated_recording_events,
 )
 from skyvern.services.browser_recording.state_machines.press_key import playwright_key
 from skyvern.services.browser_recording.types import (
@@ -746,7 +745,7 @@ def make_focus_event(target: dict[str, t.Any], timestamp: float) -> ExfiltratedC
     return make_console_event(params=params, timestamp=timestamp)
 
 
-def test_wait_suppressed_when_page_idle() -> None:
+def test_elapsed_time_does_not_emit_wait() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
@@ -760,7 +759,7 @@ def test_wait_suppressed_when_page_idle() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK]
 
 
-def test_wait_emitted_and_sized_to_page_busy_span() -> None:
+def test_page_activity_does_not_emit_wait() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
@@ -774,165 +773,7 @@ def test_wait_emitted_and_sized_to_page_busy_span() -> None:
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
     actions = processor.events_to_actions(events)
 
-    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
-    wait_action = actions[1]
-    assert isinstance(wait_action, ActionWait)
-    # busy span = last activity (7000) - click (1000); the 2s idle tail is excluded.
-    assert wait_action.duration_ms == 6000
-
-
-def test_wait_suppressed_when_page_settles_before_threshold() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        make_click_event(target=target, timestamp=1000.0),
-        # page settles ~1.5s in, then a long idle tail — below the wait threshold
-        make_cdp_event("net:activity", timestamp_seconds=2.5, params={"count": 4}),
-        make_focus_event(target=target, timestamp=12000.0),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
     assert [action.kind for action in actions] == [ActionKind.CLICK]
-
-
-def _two_consecutive_wait_events() -> list[t.Any]:
-    # Two busy stretches (focus events produce no action) yield two adjacent waits;
-    # a wait resets the timer, so each stretch needs its own pair of focus events.
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-    return [
-        make_focus_event(target=target, timestamp=1000.0),
-        make_cdp_event("net:activity", timestamp_seconds=6.5, params={"count": 9}),
-        make_focus_event(target=target, timestamp=7000.0),
-        make_focus_event(target=target, timestamp=13000.0),
-        make_cdp_event("net:activity", timestamp_seconds=18.5, params={"count": 9}),
-        make_focus_event(target=target, timestamp=19000.0),
-    ]
-
-
-def test_events_to_actions_keeps_waits_separate_for_live_path() -> None:
-    # events_to_actions feeds the incremental live interpreter, which tracks
-    # actions by index, so it must stay append-only (no collapsing here).
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(_two_consecutive_wait_events())
-
-    assert [action.kind for action in actions] == [ActionKind.WAIT, ActionKind.WAIT]
-
-
-def test_collapse_consecutive_waits_merges_durations() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(_two_consecutive_wait_events())
-
-    collapsed = Processor._collapse_consecutive_waits(actions)
-
-    assert [action.kind for action in collapsed] == [ActionKind.WAIT]
-    wait_action = collapsed[0]
-    assert isinstance(wait_action, ActionWait)
-    # 5500ms + 5500ms busy spans summed into a single wait.
-    assert wait_action.duration_ms == 11000
-
-
-def make_skewed_console_event(
-    event_type: str,
-    target: dict[str, t.Any],
-    client_ms: float,
-    server_skew_seconds: float,
-) -> ExfiltratedConsoleEvent:
-    """A console event whose server clock is offset from the client clock."""
-    params: dict[str, t.Any] = {
-        "type": event_type,
-        "target": target,
-        "timestamp": client_ms,
-        "url": "https://example.com",
-        "activeElement": {"tagName": "BUTTON"},
-        "window": {"height": 800, "width": 1200, "scrollX": 0, "scrollY": 0},
-        "mousePosition": {"xp": 0.5, "yp": 0.5},
-    }
-    return ExfiltratedConsoleEvent(
-        kind="exfiltrated-event",
-        source="console",
-        event_name="user_interaction",
-        params=params,
-        timestamp=client_ms / 1000.0 + server_skew_seconds,
-    )
-
-
-def test_wait_offset_projection_cancels_client_server_clock_skew() -> None:
-    # Server clock runs 60s ahead of the client clock. The Wait machine must
-    # project the server-stamped CDP activity back into the client clock so the
-    # busy span is measured correctly; otherwise the activity falls outside the
-    # client-clock gap and the (real) wait is wrongly suppressed.
-    skew = 60.0
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        make_skewed_console_event("click", target, client_ms=1000.0, server_skew_seconds=skew),
-        # real activity at client 4s/7s -> server-stamped 64s/67s
-        make_cdp_event("net:activity", timestamp_seconds=4.0 + skew, params={"count": 12}),
-        make_cdp_event("net:activity", timestamp_seconds=7.0 + skew, params={"count": 3}),
-        make_skewed_console_event("focus", target, client_ms=9000.0, server_skew_seconds=skew),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
-    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
-    wait_action = actions[1]
-    assert isinstance(wait_action, ActionWait)
-    assert wait_action.duration_ms == 6000
-
-
-def test_wait_ignores_activity_outside_the_idle_gap() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        # activity happened before the gap even started
-        make_cdp_event("net:activity", timestamp_seconds=0.5, params={"count": 3}),
-        make_click_event(target=target, timestamp=1000.0),
-        make_focus_event(target=target, timestamp=8000.0),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
-    assert [action.kind for action in actions] == [ActionKind.CLICK]
-
-
-def test_summarize_exfiltrated_recording_events_mixed() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-    click = make_click_event(target=target, timestamp=1000.0)
-    keypress = make_console_event(
-        params={
-            "type": "keypress",
-            "target": target,
-            "timestamp": 1001.0,
-        },
-        timestamp=1001.0,
-    )
-    cdp_nav = ExfiltratedCdpEvent(
-        kind="exfiltrated-event",
-        event_name="nav:frame_navigated",
-        params=ExfiltratedEventCdpParams(),
-        source="cdp",
-        timestamp=999.0,
-    )
-    cdp_nav_2 = ExfiltratedCdpEvent(
-        kind="exfiltrated-event",
-        event_name="nav:frame_navigated",
-        params=ExfiltratedEventCdpParams(),
-        source="cdp",
-        timestamp=1002.0,
-    )
-
-    summary = summarize_exfiltrated_recording_events([cdp_nav, click, keypress, cdp_nav_2])
-
-    assert summary["recording_exfil_total_events"] == 4
-    assert summary["recording_exfil_cdp_event_count"] == 2
-    assert summary["recording_exfil_console_event_count"] == 2
-    assert summary["recording_exfil_cdp_event_name_counts"] == {"nav:frame_navigated": 2}
-    assert summary["recording_exfil_console_dom_type_counts"] == {"click": 1, "keypress": 1}
-    assert summary["recording_exfil_console_exfil_event_name_counts"] == {"user_interaction": 2}
 
 
 def test_gunzip_bounded_returns_full_payload_under_limit() -> None:
@@ -1538,6 +1379,38 @@ def test_change_on_a_checkbox_records_only_the_click() -> None:
     actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
 
     assert [a.kind for a in actions] == [ActionKind.CLICK]
+
+
+def test_change_on_a_file_input_records_an_upload_without_the_local_path() -> None:
+    target = {
+        "id": "fileInput",
+        "skyId": "sky-file",
+        "tagName": "INPUT",
+        "inputType": "file",
+        "selector": "#fileInput",
+        "value": r"C:\fakepath\equipment_checklist.txt",
+    }
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)])
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], ActionInputText)
+    assert actions[0].target.input_type == "file"
+    assert actions[0].input_value == ""
+
+
+def test_clearing_a_file_input_does_not_record_an_upload() -> None:
+    target = {
+        "id": "fileInput",
+        "tagName": "INPUT",
+        "inputType": "file",
+        "selector": "#fileInput",
+        "value": "",
+    }
+
+    assert (
+        Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)]) == []
+    )
 
 
 def test_select_placeholder_row_records_nothing() -> None:

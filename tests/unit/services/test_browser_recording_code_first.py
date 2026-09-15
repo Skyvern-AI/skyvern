@@ -183,6 +183,22 @@ def test_password_input_becomes_parameter_without_default() -> None:
     assert parameters[0].default_value == ""
 
 
+def test_recorded_targets_get_extended_visibility_waits() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#generate"),
+        make_click(40000, selector="#download"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    readiness = 'await page.locator("#download").wait_for(state="visible", timeout=120000)'
+    click = 'await page.locator("#download").click()'
+    assert readiness in blocks[0].code
+    assert blocks[0].code.index(readiness) < blocks[0].code.index(click)
+
+
 def test_select_element_maps_to_select_option() -> None:
     actions: list[Action] = [
         make_input(1000, "CA", selector="#state", tag_name="SELECT", accessible_name="State"),
@@ -193,6 +209,48 @@ def test_select_element_maps_to_select_option() -> None:
     assert result is not None
     blocks, _ = result
     assert 'await page.locator("#state").select_option("CA")' in blocks[0].code
+
+
+def test_file_input_maps_to_an_authorized_file_attachment() -> None:
+    actions: list[Action] = [
+        make_input(1000, "", selector="#fileInput", tag_name="INPUT", input_type="file"),
+        make_click(2000, selector="#submit", role="button", accessible_name="Submit checklist"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, parameters = result
+    assert 'await attach_authorized_file(page, upload_file, "#fileInput")' in blocks[0].code
+    assert "set_input_files" not in blocks[0].code
+    assert blocks[0].parameter_keys == ["upload_file"]
+    assert len(parameters) == 1
+    assert parameters[0].key == "upload_file"
+    assert parameters[0].workflow_parameter_type == "file_url"
+    assert parameters[0].default_value == ""
+
+
+def test_file_inputs_in_separate_blocks_keep_distinct_parameter_references() -> None:
+    actions: list[Action] = [
+        make_input(1000, "", selector="#firstFile", tag_name="INPUT", input_type="file"),
+        make_url_change(5000, "https://example.com/second"),
+        make_input(
+            6000,
+            "",
+            url="https://example.com/second",
+            selector="#secondFile",
+            tag_name="INPUT",
+            input_type="file",
+        ),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, parameters = result
+    assert 'attach_authorized_file(page, upload_file, "#firstFile")' in blocks[0].code
+    assert 'attach_authorized_file(page, upload_file_2, "#secondFile")' in blocks[1].code
+    assert [parameter.key for parameter in parameters] == ["upload_file", "upload_file_2"]
 
 
 def test_wait_and_hover_emit_deterministic_lines() -> None:
@@ -428,19 +486,17 @@ async def test_process_binds_credentials_only_for_a_caller_that_substitutes_toke
     )
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
 
-    unsupported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts, code_first=True)
-    supported_blocks, _, _ = await processor.process(
-        ["chunk"], draft_steps=drafts, code_first=True, supports_credential_tokens=True
-    )
+    unsupported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts)
+    supported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts, supports_credential_tokens=True)
 
-    # The route defaults to off, so an old frontend never receives code reading a token it
+    # Token substitution defaults to off, so an old frontend never receives code reading a token it
     # cannot rename - which would persist a block that fails at run time with a NameError.
     assert "cred_123" not in unsupported_blocks[0].code
     assert "cred_123.password" in supported_blocks[0].code
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_process_returns_code_blocks_and_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     typed_value = "hunter2-distinct"
     actions: list[Action] = [
         make_input(1000, typed_value, selector="#query", input_type="text"),
@@ -454,7 +510,7 @@ async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: 
     )
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID, recording_attempt_id="rra_test")
-    blocks, _, evidence = await processor.process(["chunk"], code_first=True)
+    blocks, _, evidence = await processor.process(["chunk"])
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"
@@ -468,20 +524,32 @@ async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_falls_back_to_legacy_when_synthesis_empty(
+async def test_process_does_not_fall_back_to_legacy_blocks_when_synthesis_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Processor, "compressed_chunks_to_events", lambda self, chunks: [])
+    action = make_click(1000)
+    monkeypatch.setattr(
+        Processor,
+        "events_to_actions",
+        lambda self, events, machines=None, initial_actions=None: [action],
+    )
+
+    async def fail_legacy_conversion(*args: object, **kwargs: object) -> object:
+        raise AssertionError("legacy draft conversion must not run")
+
+    monkeypatch.setattr(Processor, "create_action_block", fail_legacy_conversion)
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, parameters, _ = await processor.process(["chunk"], code_first=True)
+    blocks, parameters, evidence = await processor.process(["chunk"], draft_steps=[draft_for(action)])
 
     assert blocks == []
     assert parameters == []
+    assert evidence is not None
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
+async def test_process_applies_draft_overlay_before_code_synthesis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kept = make_click(1000, selector="#keep", accessible_name="Keep")
@@ -494,7 +562,7 @@ async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
     )
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, _, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)], code_first=True)
+    blocks, _, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)])
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"

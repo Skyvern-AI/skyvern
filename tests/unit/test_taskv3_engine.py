@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -44,7 +45,12 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _SURFACE_OFF_TOOL_NAMES, _FakePage, _fixed_page_provider
+from tests.unit.test_taskv3_tools import (
+    _SURFACE_OFF_TOOL_NAMES,
+    _DownloadFakePage,
+    _FakePage,
+    _fixed_page_provider,
+)
 
 
 @pytest.mark.asyncio
@@ -1735,3 +1741,64 @@ def test_combobox_bullet_is_pinned_so_every_edit_is_re_derived_against_the_error
     bullet = next(line for line in SYSTEM_PROMPT.splitlines() if "select_combobox` tool" in line)
 
     assert bullet == _COMBOBOX_BULLET
+
+
+@pytest.mark.asyncio
+async def test_engine_restores_a_blank_working_page_before_the_block_hands_it_on(tmp_path: Path) -> None:
+    # `finish` is assembled outside `build_browser_tools` (engine: browser_tools + extras + finish)
+    # and is therefore never wrapped, so a block shaped `click(download) -> finish` reaches the end
+    # of the loop with the tab still on `about:blank`. The next url-less block inherits it and
+    # `resolve_inherited_workflow_task_page` raises InvalidWorkflowTaskURLState (SKY-16322). Only the
+    # post-loop backstop can repair this shape -- the per-call guard has no later call to run on.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    script = [
+        [("click", {"selector": "#dl"})],
+        [("finish", {"status": "completed", "reason": "downloaded the statement"})],
+    ]
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller(script),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+    )
+
+    assert outcome.status == "completed"
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+@pytest.mark.asyncio
+async def test_engine_repairs_a_blank_page_when_the_loop_ends_without_another_tool_call(
+    tmp_path: Path,
+) -> None:
+    # The per-call guard repairs BEFORE a tool runs, so it cannot help when the blanking click is the
+    # last thing that happens -- the turn budget runs out and the loop returns with the page still
+    # blank. Only the post-loop backstop covers that, and the next url-less block is what pays.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller([[("click", {"selector": "#dl"})]]),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+        max_turns=1,
+    )
+
+    assert outcome.status != "completed"  # ran out of turns rather than finishing
+    assert restored == [(page, before)]
+    assert page.url == before
