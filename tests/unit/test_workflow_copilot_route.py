@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -51,8 +52,10 @@ from skyvern.forge.sdk.copilot.interruption import (
     InterruptedTurnFacts,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
+    WorkflowParametersRepository,
     _completed_turn_id_for_idempotency_digest,
     _pending_turn_id_for_idempotency_digest,
 )
@@ -78,6 +81,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotClearProposedWorkflowRequest,
+    WorkflowCopilotDisableAutoAcceptRequest,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
@@ -664,7 +668,9 @@ async def test_auto_accept_does_not_commit_canonical_for_a_superseded_candidate(
     agent_result.proposal_owner_turn_id = "turn-stale"
     agent_result.proposal_revision = 1
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
-    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=SimpleNamespace(proposed_workflow=newer))
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(
+        return_value=SimpleNamespace(proposed_workflow=newer, auto_accept=True)
+    )
     commit = AsyncMock()
     monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
     stream = MagicMock(send=AsyncMock(return_value=True))
@@ -816,6 +822,100 @@ async def test_a_client_without_proposal_tokens_can_still_reject(
 
     assert clear.await_args.kwargs["expected_owner_turn_id"] == "turn-a"
     assert clear.await_args.kwargs["expected_revision"] == 3
+
+
+@pytest.mark.asyncio
+async def test_turning_off_auto_accept_mid_turn_keeps_the_pending_review_and_gates_the_turns_proposal(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reusing the reject route would discard a review the user has not answered yet, and a write that
+    leaves the row alone would auto-apply the next verified fix after the user switched it off."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    monkeypatch.setattr(app, "CACHE", None)
+    canonical = MagicMock()
+    canonical.model_dump.return_value = {"title": "Canonical"}
+    canonical_fingerprint = workflow_content_fingerprint({"title": "Canonical"})
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    organization = SimpleNamespace(organization_id="org-1")
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    chat_id = chat.workflow_copilot_chat_id
+    await repo.publish_workflow_copilot_candidate(
+        "org-1",
+        chat_id,
+        proposal={"title": "Pending review", "_copilot_yaml": "title: Pending review\n"},
+        owner_turn_id="turn-a",
+        canonical_fingerprint=canonical_fingerprint,
+        disposition="review_untested",
+        expected_owner_turn_id=None,
+        expected_revision=None,
+    )
+    await repo.update_workflow_copilot_chat("org-1", chat_id, auto_accept=True)
+    # A turn already running when the user clicks Turn off holds the row it read at turn start.
+    turn_start_chat = await repo.get_workflow_copilot_chat_by_id(
+        organization_id="org-1", workflow_copilot_chat_id=chat_id
+    )
+    assert turn_start_chat is not None and turn_start_chat.auto_accept is True
+
+    await workflow_copilot_route.workflow_copilot_disable_auto_accept(
+        WorkflowCopilotDisableAutoAcceptRequest(workflow_copilot_chat_id=chat_id), organization
+    )
+
+    reloaded = await workflow_copilot_chat_history(
+        credential_recovery_token=None, workflow_copilot_chat_id=chat_id, organization=organization
+    )
+    assert reloaded.auto_accept is False
+    assert reloaded.proposed_workflow_metadata is not None
+    assert reloaded.proposed_workflow_metadata.owner_turn_id == "turn-a"
+
+    # That turn's tool then publishes a verified fix over the candidate.
+    await repo.publish_workflow_copilot_candidate(
+        "org-1",
+        chat_id,
+        proposal={"title": "Verified fix", "_copilot_yaml": "title: Verified fix\n"},
+        owner_turn_id="turn-b",
+        canonical_fingerprint=canonical_fingerprint,
+        disposition="auto_applicable",
+        expected_owner_turn_id="turn-a",
+        expected_revision=1,
+    )
+    updated_workflow = MagicMock(title="Verified fix")
+    updated_workflow.model_dump.return_value = {"title": "Verified fix"}
+    agent_result = AgentResult(
+        user_response="Fixed it.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        proposal_owner_turn_id="turn-b",
+        proposal_revision=1,
+        narrative_payload=_narrative_payload(),
+    )
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=turn_start_chat,
+        organization_id="org-1",
+        original_workflow=SimpleNamespace(workflow_id="wf-canonical"),
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    frame = stream.send.await_args.args[0]
+    assert isinstance(frame, WorkflowCopilotStreamResponseUpdate)
+    assert frame.updated_workflow is not None
+    assert frame.workflow_applied is False
+    after_turn = await workflow_copilot_chat_history(
+        credential_recovery_token=None, workflow_copilot_chat_id=chat_id, organization=organization
+    )
+    assert after_turn.auto_accept is False
+    assert after_turn.proposed_workflow_metadata is not None
+    assert after_turn.proposed_workflow_metadata.owner_turn_id == "turn-b"
 
 
 def test_chat_history_serves_a_saved_envelope_back_untouched() -> None:
