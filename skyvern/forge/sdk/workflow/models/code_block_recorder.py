@@ -93,6 +93,12 @@ _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "reload": ActionType.RELOAD_PAGE,
     "evaluate": ActionType.EXECUTE_JS,
 }
+# Effects a code block has on a tab other than its own. Those pages are raw Playwright objects
+# below this proxy, so the broker hands the call back here to keep them on the action timeline.
+_LISTED_PAGE_ACTION_MAP: dict[str, ActionType] = {
+    "close": ActionType.CLOSE_PAGE,
+    "bring_to_front": ActionType.SWITCH_TAB,
+}
 _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "click": ActionType.CLICK,
     "dblclick": ActionType.CLICK,
@@ -270,6 +276,11 @@ def _recorded_action_fields(
         download_url = _string_value(kwargs.get("download_url", _arg(args, 1)))
         if download_url is not None:
             fields["download_url"] = download_url
+    elif action_type in (ActionType.SWITCH_TAB, ActionType.CLOSE_PAGE):
+        # Required on SwitchTabAction, so without it the typed action degrades to a base Action.
+        tab_index = kwargs.get("tab_index")
+        if isinstance(tab_index, int):
+            fields["tab_index"] = tab_index
     elif action_type == ActionType.SELECT_OPTION:
         option = _select_option(kwargs.get("value", _arg(args, value_index)), kwargs)
         if option is not None:
@@ -794,6 +805,20 @@ class RecordingPage:
                 record_failure_type_only=True,
             ),
         )
+
+    async def _record_listed_page_effect(
+        self,
+        name: str,
+        target: str | None,
+        call: Callable[[], Awaitable[None]],
+        tab_index: int | None = None,
+    ) -> None:
+        """Record a code block's effect on a sibling tab, which is a raw Page this proxy does not wrap."""
+        action_type = _LISTED_PAGE_ACTION_MAP.get(name)
+        if action_type is None:
+            await call()
+            return
+        await self.__recorder.record(action_type, name, target, call, (), {"tab_index": tab_index})
 
     def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
         """Return the trusted timeout that a secure-runner block must restore."""

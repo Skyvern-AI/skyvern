@@ -30,9 +30,9 @@ export type HeroSelection =
 
 /**
  * The selected element's screenshot, fit to the run-hero width and scrollable for
- * long captures. Mirrors the legacy run page: an action shows its own post-action
- * screenshot (by artifact id, falling back to the step's action screenshots), a
- * block shows its representative screenshot via `selectBlockScreenshot`.
+ * long captures. An action shows its own post-action screenshot (by artifact id,
+ * falling back to the step's action screenshots), and a block shows its
+ * representative screenshot via `selectBlockScreenshot`.
  */
 export function HeroScreenshot({
   selection,

@@ -271,6 +271,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         extra_http_headers: extraHttpHeaders,
         cdp_connect_headers: cdpConnectHeaders,
         run_with: saveData.settings.runWith,
+        browser_type: saveData.settings.browserType ?? null,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
         enable_self_healing: saveData.settings.enableSelfHealing ?? false,

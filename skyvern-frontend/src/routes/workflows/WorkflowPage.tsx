@@ -75,7 +75,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { legacyRunDetailPath, workflowEditorPath } from "./studioNavigation";
+import { workflowEditorPath, workflowRunDetailPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
@@ -468,12 +468,9 @@ function WorkflowPage() {
                       const isRowSelected = isSelected(
                         workflowRun.workflow_run_id,
                       );
-                      const runPath = studioEnabled
-                        ? `/runs/${workflowRun.workflow_run_id}`
-                        : legacyRunDetailPath(
-                            workflowPermanentId,
-                            workflowRun.workflow_run_id,
-                          );
+                      const runPath = workflowRunDetailPath(
+                        workflowRun.workflow_run_id,
+                      );
 
                       const mainRow = (kebab: React.ReactNode) => (
                         <TableRow

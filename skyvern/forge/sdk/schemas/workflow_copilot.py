@@ -415,6 +415,7 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    turn_id: str | None = Field(None, description="Turn that owns this row")
     audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
     attached_files: Annotated[list[CopilotAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
         default_factory=list, description="Uploaded files the user attached to this message"
@@ -425,6 +426,10 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
     created_at: datetime = Field(..., description="When the message was created")
+    modified_at: datetime | None = Field(
+        None,
+        description="When this version was persisted; legacy in-process constructors may omit it",
+    )
 
 
 class WorkflowCopilotChatSummary(BaseModel):
@@ -798,6 +803,9 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     question_interactions: list[QuestionInteraction] = Field(default_factory=list)
     pending_question_cancel_token: str | None = None
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
+    request_turn_id: str | None = Field(
+        None, description="Turn matched by request_cancel_token when recovery requests provide one"
+    )
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     proposed_workflow_metadata: CopilotProposalMetadata | None = None

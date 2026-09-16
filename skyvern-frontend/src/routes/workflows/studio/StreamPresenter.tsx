@@ -92,7 +92,7 @@ export function StreamPresenter({
       browserSessionId={browserSessionId}
       interactive={interactive}
       showControlButtons={showControlButtons}
-      exfiltrate={isRecording}
+      exfiltrate={isRecording && !finishRequested}
       hideRecordingIndicator={hideRecordingIndicator}
       // StrictMode remounts this component; the recording must survive that.
       // StudioBrowserStream owns the session-level reset instead.

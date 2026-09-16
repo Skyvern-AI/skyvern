@@ -212,6 +212,7 @@ const SETTINGS_LABELS: Array<{
     fields: ["browserProfileId", "browserProfileKey"],
     label: "Changed browser profile",
   },
+  { fields: ["browserType"], label: "Changed browser type" },
   { fields: ["model"], label: "Changed model" },
   { fields: ["maxScreenshotScrolls"], label: "Changed max screenshot scrolls" },
   { fields: ["maxElapsedTimeMinutes"], label: "Changed max run time" },

@@ -310,7 +310,7 @@ from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnos
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import (
     default_navigation_settle,
-    is_egress_attributable_navigation_error,
+    is_egress_attributable_navigation_failure,
     navigate_with_retry,
     redact_url_secrets,
 )
@@ -2259,7 +2259,7 @@ class BaseTaskBlock(Block):
                     if (
                         isinstance(e, FailedToNavigateToUrl)
                         and not isinstance(e, BlockedNavigationDestination)
-                        and not is_egress_attributable_navigation_error(e.error_message)
+                        and not is_egress_attributable_navigation_failure(e)
                     ):
                         # The target site did not load. Site-caused, and already surfaced on the run
                         # through the failure_reason recorded below. Two classes stay at error
@@ -2267,7 +2267,9 @@ class BaseTaskBlock(Block):
                         # is the SSRF guard tripping, and EGRESS_ATTRIBUTABLE_NAV_ERRORS is our own
                         # egress failing, which get_or_create_page may recover from on a different
                         # proxy node. The block-execution handler above applies only the first of
-                        # those two carve-outs; see the PR discussion.
+                        # those two carve-outs; see the PR discussion. Classify on the exception, not
+                        # its message: a target with no address record borrows an egress-attributable
+                        # error code from the proxy while being as site-caused as a site that 404s.
                         LOG.warning(
                             "Failed to get browser state for first task",
                             task_id=task.task_id,

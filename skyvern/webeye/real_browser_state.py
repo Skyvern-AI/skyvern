@@ -27,6 +27,7 @@ from skyvern.exceptions import (
     FailedToReloadPage,
     FailedToStopLoadingPage,
     MissingBrowserStatePage,
+    UnresolvableNavigationHost,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
@@ -55,6 +56,34 @@ RECOVERABLE_BLANK_PAGE_URLS = {":"}
 
 class _BrowserConnectionProbeFailed(str):
     """Diagnostic reason whose stale driver may be stopped before replacement."""
+
+
+def browser_context_stopped_reason(context: BrowserContext | None) -> str | None:
+    """Why this context's driver is unusable, or None while it still looks live.
+
+    A reused browser state (e.g. a persistent debug session) can have a stopped driver after a
+    prior owner's cleanup; page.goto then raises "Connection closed while reading from the
+    driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
+    _close_was_called, so the shared driver Connection's closed-error is inspected too.
+    """
+    if context is None:
+        return "browser_context_missing"
+    impl = getattr(context, "_impl_obj", None)
+    if getattr(impl, "_close_was_called", False) is True:
+        return "browser_context_close_called"
+    if getattr(impl, "_closed", False) is True:
+        return "browser_context_closed"
+    connection = getattr(impl, "_connection", None)
+    if getattr(connection, "_closed_error", None) is not None:
+        return "playwright_driver_connection_closed"
+    browser = getattr(context, "browser", None)
+    if browser is None:
+        return None
+    try:
+        connected = bool(browser.is_connected())
+    except Exception as exc:
+        return _BrowserConnectionProbeFailed(f"browser_connection_probe_failed:{type(exc).__name__}")
+    return None if connected else "browser_context_disconnected"
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
@@ -505,9 +534,19 @@ class RealBrowserState(BrowserState):
         if max_pages <= 0 or len(pages) <= max_pages:
             return pages
 
-        reserved_pages = pages[-max_pages:]
-
-        closing_pages = pages[: len(pages) - max_pages]
+        # Oldest first, skipping the selected tab: a code block can switch to an older tab, and
+        # closing it here would leave get_working_page resuming on the newest one. Skipping it costs
+        # the next-oldest page instead, so the list still comes back within the cap.
+        active_page = self.__active_page
+        excess = len(pages) - max_pages
+        closing_pages: list[Page] = []
+        for page in pages:
+            if len(closing_pages) == excess:
+                break
+            if page is not active_page:
+                closing_pages.append(page)
+        closing_ids = {id(page) for page in closing_pages}
+        reserved_pages = [page for page in pages if id(page) not in closing_ids]
         LOG.warning(
             "The page number exceeds the limit, closing the oldest pages. It might cause the video missing",
             closing_pages=closing_pages,
@@ -554,10 +593,14 @@ class RealBrowserState(BrowserState):
             self.__active_page = None
             self.__active_page_known_pages = set()
 
-    async def set_active_page(self, page: Page) -> None:
+    async def set_active_page(self, page: Page, *, prune_excess_pages: bool = True) -> None:
         self.__active_page = page
         self.__page = page
-        self.__active_page_known_pages = set(await self.list_valid_pages())
+        # list_valid_pages closes the oldest tabs past the cap, and the snapshot below only needs to
+        # know which pages existed. A caller that is pinning a tab on someone else's behalf passes
+        # False so pinning never closes a tab; max_pages <= 0 lists without pruning.
+        max_pages = settings.BROWSER_MAX_PAGES_NUMBER if prune_excess_pages else 0
+        self.__active_page_known_pages = set(await self.list_valid_pages(max_pages))
 
     async def get_or_create_page(
         self,
@@ -594,6 +637,10 @@ class RealBrowserState(BrowserState):
                 browser_session_id=browser_session_id,
             )
         except Exception as e:
+            # Recreating the context draws a different proxy node, and no proxy node can invent an
+            # address record for a host that has none.
+            if isinstance(e, UnresolvableNavigationHost):
+                raise
             error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
             if is_permanent_navigation_error(error_message):
                 raise
@@ -803,29 +850,8 @@ class RealBrowserState(BrowserState):
         return self._browser_state_diagnostic
 
     def _connection_status(self) -> tuple[bool, str | None]:
-        # A reused browser state (e.g. a persistent debug session) can have a stopped driver
-        # after a prior owner's cleanup; page.goto then raises "Connection closed while reading
-        # from the driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
-        # _close_was_called, so also inspect the shared driver Connection's closed-error.
-        context = self.browser_context
-        if context is None:
-            return False, "browser_context_missing"
-        impl = getattr(context, "_impl_obj", None)
-        if getattr(impl, "_close_was_called", False) is True:
-            return False, "browser_context_close_called"
-        if getattr(impl, "_closed", False) is True:
-            return False, "browser_context_closed"
-        connection = getattr(impl, "_connection", None)
-        if getattr(connection, "_closed_error", None) is not None:
-            return False, "playwright_driver_connection_closed"
-        browser = getattr(context, "browser", None)
-        if browser is None:
-            return True, None
-        try:
-            connected = bool(browser.is_connected())
-        except Exception as exc:
-            return False, _BrowserConnectionProbeFailed(f"browser_connection_probe_failed:{type(exc).__name__}")
-        return connected, None if connected else "browser_context_disconnected"
+        stopped = browser_context_stopped_reason(self.browser_context)
+        return stopped is None, stopped
 
     def is_connected(self) -> bool:
         connected, reason = self._connection_status()

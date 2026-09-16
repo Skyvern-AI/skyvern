@@ -28,6 +28,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
+from urllib.parse import urlparse
 
 import structlog
 from PIL import Image, ImageDraw
@@ -62,6 +63,7 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -4784,6 +4786,11 @@ _OBSERVE_OWN_IDENTITY_ATTRS = ("id", "name", "data-testid")
 # is kept on the control's own: an ancestor with id="row" and one with data-testid="row" are two
 # different statements about the page, and printing both as `within='row'` erases that.
 _OBSERVE_WITHIN_KINDS = tuple(f"within.{attr}" for attr in _OBSERVE_OWN_IDENTITY_ATTRS)
+# The label the page bound to the one form control enclosed with this one -- the field it belongs to.
+# Ranked under the control's own identity and over both `within` and `section`: a wrapper id narrows
+# to the same row a field does, but the task names the field, never `lookupRow1`, so a set told apart
+# only by a framework-minted wrapper id leaves the model exactly where it started.
+_OBSERVE_FIELD_KIND = "field"
 # Each pass appends at most one qualifier per line, so a set that only splits in stages -- a tier
 # that separates a group of three into a pair and a single, then a deeper tier that separates the
 # pair -- still converges. This bounds work, not correctness: whatever is left after the last pass
@@ -4799,10 +4806,11 @@ def _disambiguate_digest_bodies(
     that control sits -- its own identity, the identity of what encloses it, the heading it is filed
     under -- that tells the set apart. Returns the bodies and how many lines are still identical to
     another afterwards, which is what production has to be able to see."""
-    parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None]] = []
+    parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None, str | None]] = []
     for e in elements:
         owns: list[tuple[str, str]] = []
         within: list[tuple[str, str]] = []
+        field_label: str | None = None
         section: str | None = None
         for entry in e.get("placement") or []:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
@@ -4820,21 +4828,26 @@ def _disambiguate_digest_bodies(
                 # compared at different real depths. Both qualifiers are still true of their own
                 # element, which is all the line claims.
                 within.append((kind, value))
+            elif kind == _OBSERVE_FIELD_KIND and field_label is None:
+                field_label = value
             elif kind == "section" and section is None:
                 section = value
-        parsed.append((owns, within, section))
+        parsed.append((owns, within, field_label, section))
 
-    tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _ in parsed), default=1) or 1)]
-    tiers += [("within", i) for i in range(max((len(w) for _, w, _ in parsed), default=0))]
+    tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _, _ in parsed), default=1) or 1)]
+    tiers.append((_OBSERVE_FIELD_KIND, 0))
+    tiers += [("within", i) for i in range(max((len(w) for _, w, _, _ in parsed), default=0))]
     tiers.append(("section", 0))
 
     def candidate(index: int, tier: tuple[str, int]) -> tuple[str, str] | None:
-        owns, within, section = parsed[index]
+        owns, within, field_label, section = parsed[index]
         kind, depth = tier
         if kind == "own":
             return owns[depth] if depth < len(owns) else None
         if kind == "within":
             return within[depth] if depth < len(within) else None
+        if kind == _OBSERVE_FIELD_KIND:
+            return (_OBSERVE_FIELD_KIND, field_label) if field_label else None
         return ("section", section) if section else None
 
     def suffix(index: int, tier: tuple[str, int]) -> str:
@@ -5111,6 +5124,58 @@ async () => {
   }
   const out = [];
   const labelOfControl = new Map();
+  // Only the name the page DECLARED for a control -- aria-label, a bound <label>, aria-labelledby.
+  // Deliberately not rec.label: that falls through to the placeholder and then to the user's typed
+  // value, so a qualifier read from it would promote a shared template hint to an address, and would
+  // change every turn as the agent fills the row.
+  const boundLabelOfControl = new Map();
+  // Element -> every listed element beneath it that COULD be a field. Built after the sweep, from the
+  // records that survived and from their live parents, so a field the page moved during the observer
+  // drain is counted where it now is rather than where it was when its record was made.
+  const fieldsUnder = new Map();
+  // Boxes whose subtree gained or lost a child while observe was running. The census can only count
+  // what it enumerated; a node the page INSERTS during the observer drain is in no collection at all,
+  // so no amount of re-reading the survivors will see it. Rather than enumerate live candidates -- the
+  // fifth patch to the same class, with a sixth behind it -- a box the page changed underneath us is
+  // one whose field count we cannot establish, so the qualifier is withheld there. This subsumes
+  // inserted, moved and removed in one predicate, at the level the leaks actually occur.
+  const boxChangedUnderUs = new Set();
+  // Definitively a command control, decided from the element AS IT STANDS. Read live for the same
+  // reason the ancestry is: a page can flip role="button" to role="combobox", or switch on
+  // contenteditable, in response to a marker write, and the fingerprint tracks neither -- so a
+  // classification captured before the drain survives re-resolution while being wrong.
+  //
+  // "Definitively" is the whole point, and it is the complement of a much smaller, more stable list:
+  // everything else counts as a possible field. The qualifier is DISCARDABLE -- emitting nothing
+  // costs one hint and the lines stay honestly identical, while emitting wrongly names a control
+  // after a field it does not belong to. So this fails CLOSED: anything unrecognised, and anything
+  // that throws, counts as a field and suppresses the qualifier rather than going uncounted and
+  // letting a two-field box read as one.
+  const _isCommandControl = (el) => {
+    try {
+      const tag = String(el.tagName || '').toLowerCase();
+      if (tag === 'button' || tag === 'a' || tag === 'summary') return true;
+      if (tag === 'input' && /^(?:submit|button|reset|image)$/.test(String(el.type || ''))) return true;
+      const role = String(_attr(el, 'role') || '').trim().toLowerCase();
+      return /^(?:button|link|tab|menuitem|menuitemcheckbox|menuitemradio)$/.test(role);
+    } catch (e) { return false; }
+  };
+  // Affirmatively a field: something a value is entered into. This gates NAMING only, never counting.
+  // The two directions are not symmetric, and that is the whole point: widening the census SUPPRESSES
+  // more qualifiers (fail closed), but widening the naming source makes more NON-fields eligible to
+  // lend their text to a neighbour (fail open). So counting stays the complement above -- an
+  // unrecognised widget counts and suppresses -- while naming is this affirmative list, and a
+  // `[role=option]` or a bare `[tabindex]` is neither: it counts, and it never names.
+  const _isFieldControl = (el) => {
+    try {
+      const tag = String(el.tagName || '').toLowerCase();
+      if (tag === 'select' || tag === 'textarea') return true;
+      if (tag === 'input') return !/^(?:submit|button|reset|image)$/.test(String(el.type || ''));
+      if (el.isContentEditable === true) return true;
+      const role = String(_attr(el, 'role') || '').trim().toLowerCase();
+      return /^(?:textbox|combobox|searchbox|spinbutton)$/.test(role);
+    } catch (e) { return false; }
+  };
   // Monotonic across observe() calls (persisted on window), and never reassigned on an element that
   // already has one, so a data-tv3 marker always denotes the same element. Resetting the counter per
   // call let a selector remembered from an earlier observe silently resolve to a different node.
@@ -5292,6 +5357,20 @@ async () => {
         // that share an id and differ only in their test id have already been told apart by the
         // page, and reporting the shared one alone throws that away.
         for (const a of _identitiesOf(n)) { if (kept < 8) { out.push(['within.' + a[0], a[1]]); kept++; } }
+      }
+      // The one named field control the page put in the SAME box as this one. The claim is
+      // CO-LOCATION, not ownership: `label[for]` binds a name to a control, but nothing binds that
+      // control to a neighbouring one, so the box is the direct parent and a box holding a second
+      // field at any depth names neither. Reaching wider would hand every row button of a panel the
+      // name of that panel's filter box -- confidently and wrongly, which is worse than leaving the
+      // lines identical, because duplicate_digest_lines reports identical lines honestly.
+      if (_isCommandControl(el)) {
+        const box = _parentOf.call(el);
+        const under = box && !boxChangedUnderUs.has(box) ? fieldsUnder.get(box) : null;
+        if (under && under.length === 1 && _parentOf.call(under[0]) === box
+            && _isFieldControl(under[0]) && boundLabelOfControl.has(under[0])) {
+          out.push(['field', boundLabelOfControl.get(under[0])]);
+        }
       }
       const h = _headingFor(el);
       if (h) out.push(['section', h]);
@@ -5864,6 +5943,7 @@ async () => {
       for (const l of el.labels) { strongLabel = _labelText(l); if (strongLabel) break; }
     }
     if (!strongLabel) strongLabel = byId('aria-labelledby');
+    const boundName = strongLabel;
     let slottedName = false;
     if (!strongLabel) strongLabel = (el.innerText || '').trim();
     if (!strongLabel && host) { strongLabel = slottedText(el, host); slottedName = !!strongLabel; }
@@ -6013,7 +6093,14 @@ async () => {
     // A submit or button input is named by its caption, and a caption is what a refusal beside it
     // repeats; a field's own control is the only thing a wrapper holds.
     const captioned = rec.tag === 'input' && /^(?:submit|button|reset|image)$/.test(rec.type || '');
-    if ((rec.tag === 'input' && !captioned) || rec.tag === 'select' || rec.tag === 'textarea') labelOfControl.set(el, rec.label.slice(0, 140).replace(/\s+/g, ' ').trim());
+    const isField = (rec.tag === 'input' && !captioned) || rec.tag === 'select' || rec.tag === 'textarea';
+    if (isField) labelOfControl.set(el, rec.label.slice(0, 140).replace(/\s+/g, ' ').trim());
+    // Retained at _RETAIN_WIDTH, not cut to a display width: this value is PRINTED as a qualifier,
+    // and masking is by provenance over the WHOLE minted URL, so a page-side cut leaves a fragment
+    // the masker cannot recognise -- keeping the prefix, where the credential sits. Python masks,
+    // then caps. labelOfControl above is compared, never printed, so its 140 stays. Stored for every
+    // listed element, because what counts as a field is decided later, from the live element.
+    if (boundName) boundLabelOfControl.set(el, boundName.slice(0, _RETAIN_WIDTH).replace(/\s+/g, ' ').trim());
     // The element rides on its OWN record, under a name generated for this call in Python. There is
     // then no second structure to misalign: every manipulation of `out` below carries each element
     // with its own record. A rec->element lookup, or a parallel array, would each be an INDEPENDENT
@@ -6071,14 +6158,14 @@ async () => {
         try { connected = _isConnected.call(c.el); } catch (e) { connected = false; }
         if (!lost && connected) continue;
         const at = c.rec === null ? -1 : out.indexOf(c.rec);
-        if (at !== -1) { out.splice(at, 1); labelOfControl.delete(c.el); dropped++; }
+        if (at !== -1) { out.splice(at, 1); labelOfControl.delete(c.el); boundLabelOfControl.delete(c.el); dropped++; }
       }
       if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
       continue;
     }
     if (rem.rec === null || still !== rem.m) {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
-      if (at !== -1) { out.splice(at, 1); labelOfControl.delete(rem.el); dropped++; }
+      if (at !== -1) { out.splice(at, 1); labelOfControl.delete(rem.el); boundLabelOfControl.delete(rem.el); dropped++; }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
   }
@@ -6111,6 +6198,7 @@ async () => {
       }
     } catch (e) { mutated = true; }
   }
+  const droppedStillLive = [];
   for (let k = out.length - 1; k >= 0; k--) {
     const rec = out[k];
     const el = elOfRec.get(rec);
@@ -6129,7 +6217,14 @@ async () => {
         }
       } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
-    if (!ok) { labelOfControl.delete(el); out.splice(k, 1); dropped++; }
+    if (!ok) {
+      // Dropped from the digest, but the control can still BE there -- a page that changes a second
+      // field's label mid-run fails the fingerprint without detaching it. It must not name anything
+      // (it has no line for the model to read), and it must still COUNT, or the box it sits in reads
+      // as holding one field when it holds two.
+      if (el && connected) droppedStillLive.push(el);
+      labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1); dropped++;
+    }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
       // can change either attribute in response to a marker write, and the line has to describe the
@@ -6141,9 +6236,42 @@ async () => {
         try { now = _a11yRemoved(el); } catch (e) { now = ''; }
         if (now) rec.a11yRemoved = now; else delete rec.a11yRemoved;
       }
-      const place = _placement(el);
-      if (place.length) rec.placement = place;
     }
+  }
+  // The field census, built here and not earlier: from the records that SURVIVED the sweep, and from
+  // each one's parent read now. A registry built while records were made answers about the page as it
+  // was before the observer drain, so a field the page moved into a box afterwards goes uncounted and
+  // the box reads as holding one. No depth bound -- the box is read by "holds no second field at any
+  // depth", so a bound would not bound work, it would make the count silently wrong.
+  for (const m of _witnessed) {
+    if (m.type !== 'childList') continue;
+    try {
+      let n = m.target;
+      while (n && !boxChangedUnderUs.has(n)) { boxChangedUnderUs.add(n); n = _parentOf.call(n); }
+    } catch (e) { /* fail open on the walk; the box itself is already marked */ }
+  }
+  const census = [];
+  for (const rec of out) { const el = elOfRec.get(rec); if (el) census.push(el); }
+  for (const el of droppedStillLive) { if (_isConnected.call(el)) census.push(el); }
+  for (const el of census) {
+    if (_isCommandControl(el)) continue;
+    let anc = el;
+    for (;;) {
+      anc = _parentOf.call(anc);
+      if (!anc) break;
+      const held = fieldsUnder.get(anc);
+      if (held) held.push(el); else fieldsUnder.set(anc, [el]);
+    }
+  }
+  // Placement is read only after the sweep above has finished, because it is the one thing here that
+  // reads OTHER records' controls. Computed inside that loop, a record at a lower index had not been
+  // swept yet, so a field about to be dropped could still name a survivor -- printing `field='X'`
+  // with no line for X anywhere in the digest.
+  for (const rec of out) {
+    const el = elOfRec.get(rec);
+    if (!el) continue;
+    const place = _placement(el);
+    if (place.length) rec.placement = place;
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
   // summaries) live in non-interactive nodes the element list can never carry. Three sources in
@@ -12344,6 +12472,255 @@ def _human_download_size(num_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+# v1's equivalent restore is unbounded, but it runs once per download action while this guard runs
+# before EVERY tool call, so an unbounded navigation here can stall a run in a way v1 cannot. One
+# full page-load attempt plus settle, and then a small number of retries before latching off -- an
+# unreachable URL must not re-burn the timeout on every remaining tool call.
+_BLANK_PAGE_RESTORE_TIMEOUT_SECONDS = 90.0
+_BLANK_PAGE_RESTORE_MAX_FAILURES = 3
+# How many further tool calls a download stays eligible to have opened the tab it is blamed for.
+# Fleet-wide 91.3% of downloads open no second page, so arming that never expires would hand the
+# next legitimately-blank tab -- one the model opened -- to the close path.
+_DOWNLOAD_ARM_TOOL_CALLS = 2
+
+
+def _url_origin(url: str) -> str:
+    """Scheme + host + port, and nothing else. A page URL reaches structured logs here, and its PATH
+    and query routinely carry the secret itself -- a password-reset token, `/verify/<token>`, a
+    signed object path. Built from `hostname`, not `netloc`, so `user:pass@host` credentials cannot
+    ride along. Not a general masker: the provenance masker (`opaque_refs.mask`) rewrites only URLs
+    the payload masker minted, so it is a no-op on a live page URL and cannot cover this (SKY-16337).
+    """
+    # `parsed.port` is lazily evaluated and raises ValueError on an out-of-range port, so it has to
+    # be inside the try: both call sites are in paths documented as unable to raise.
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.hostname:
+            return "unparseable"
+        port = f":{parsed.port}" if parsed.port else ""
+    except Exception:
+        return "unparseable"
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
+class BlankWorkingPageGuard:
+    """Keeps the working page off a blank document a download left behind.
+
+    Two shapes, because the browser produces two and v1 repairs both:
+
+    * **The download opens a second tab** and that tab takes the working-page slot (it is newest, and
+      `list_valid_pages` counts `about:blank` as valid). This is what actually happens in production:
+      on the workflow SKY-16322 was filed against, 1545 of 1546 downloads went from 1 page to 2, and
+      v1 repaired every one of them by CLOSING the extra page, never by navigating. Closing is gated
+      on a download having been seen, and consumes that arming, exactly as v1 scopes its close to one
+      download action -- the gate is what separates a download popup from the model opening a tab,
+      which by URL alone are the same thing.
+    * **The tab is blanked in place**, which v1 repairs by navigating back. Kept because v1 still
+      carries the code, but note it is close to dead: its log fired once in 30 days fleet-wide.
+
+    Either way the next url-less block would otherwise inherit `about:blank` and
+    `resolve_inherited_workflow_task_page` raises `InvalidWorkflowTaskURLState`.
+
+    Checked as a condition before every tool call rather than fired on the download-detection edge:
+    a download is counted once, so an edge-triggered repair can be spent on a call where the page is
+    still fine and then never fire again.
+    """
+
+    def __init__(
+        self,
+        page_provider: PageProvider,
+        restore_page_url: Callable[[Any, str], Awaitable[None]],
+        downloads_dir: str | None = None,
+        remaining_seconds: Callable[[], float | None] | None = None,
+        download_attempts: Callable[[], int | None] | None = None,
+        staged_downloads: set[str] | None = None,
+    ) -> None:
+        self._page_provider = page_provider
+        self._restore_page_url = restore_page_url
+        self._downloads_dir = downloads_dir
+        self._remaining_seconds = remaining_seconds
+        self._download_attempts = download_attempts
+        self._staged_downloads = staged_downloads
+        self._attempts_seen: int | None = None
+        self._live_page: Any = None
+        self._live_url = ""
+        self._failures = 0
+        self._arm_budget = 0
+        self._seen_downloads: set[str] = set()
+        self._baselined = False
+
+    def _bound(self, timeout: float | None = None) -> float:
+        """Every repair is bounded by what is left of the run, not just the post-loop one: this runs
+        before EVERY tool call, so work near the deadline would otherwise push past it."""
+        limits = [_BLANK_PAGE_RESTORE_TIMEOUT_SECONDS]
+        if timeout is not None:
+            limits.append(timeout)
+        if self._remaining_seconds is not None:
+            left = self._remaining_seconds()
+            if left is not None:
+                limits.append(left)
+        return min(limits)
+
+    def _scan_for_new_download(self) -> bool:
+        """Arm from signals this guard reads itself, not from the download-signal wrapper.
+
+        That wrapper only covers the tools `build_browser_tools` builds, but this guard runs over the
+        COMPLETE dispatch list, and the file routinely lands after the click handler has returned. A
+        download followed by `finish` would otherwise arm nothing and the tab would survive -- the
+        original bug, reintroduced through the arming path.
+
+        Two sources, because neither alone is sufficient:
+
+        * The interceptor's attempt counter, which increments in `_resolve_save_path` BEFORE the
+          duplicate check, so it still moves when a download is deduplicated against a byte-identical
+          file already on disk -- a case that leaves the directory completely unchanged and is
+          therefore invisible to any filesystem check.
+        * The directory itself, for download paths that do not run through that interceptor.
+
+        Files `file_upload` staged into the same directory are excluded: they are this run writing its
+        own upload, not the browser downloading anything, and arming on one would hand a tab the model
+        opened to the close path. The first call only baselines -- `downloads_dir` is per run, so a
+        file a previous block downloaded is not this block's.
+        """
+        armed = False
+        if self._download_attempts is not None:
+            try:
+                attempts = self._download_attempts()
+            except Exception:
+                attempts = None
+            if attempts is not None:
+                if self._attempts_seen is not None and attempts > self._attempts_seen:
+                    armed = True
+                self._attempts_seen = attempts
+        if self._downloads_dir:
+            try:
+                names = set(os.listdir(self._downloads_dir))
+            except OSError:
+                names = None
+            if names is not None:
+                if self._staged_downloads:
+                    names -= self._staged_downloads
+                # Through `_download_signal_identity`, or ONE download arms twice: once when
+                # `report.pdf.crdownload` appears and again when it is renamed to `report.pdf`. The
+                # second arming has no tab-opening event behind it and would grant a fresh close
+                # window at an arbitrary later point -- exactly the misfire the decay bound exists to
+                # stop. The invariant is one close per DOWNLOAD, which means per identity.
+                identities = {_download_signal_identity(name) for name in names}
+                new = identities - self._seen_downloads
+                self._seen_downloads = identities
+                if self._baselined and new:
+                    armed = True
+        if not self._baselined:
+            self._baselined = True
+            return False
+        return armed
+
+    async def ensure_live(self, timeout: float | None = None) -> None:
+        armed_now = self._scan_for_new_download()
+        if armed_now:
+            self._arm_budget = _DOWNLOAD_ARM_TOOL_CALLS
+        # Two passes at most: closing an interloper can expose a page that itself needs restoring.
+        for _ in range(2):
+            try:
+                working_page = await self._page_provider()
+            except Exception:
+                # The page is gone, not blank. The handler re-resolves and raises the real error;
+                # logging a "restore failed" traceback on every call would only bury it.
+                return
+            if working_page is None or working_page.is_closed():
+                return
+            url = working_page.url
+            if url and url not in BLANK_PAGE_URLS:
+                # A live working page means this download opened no tab that took the slot. Let the
+                # arming decay rather than saving it for a blank tab the model opens much later.
+                if not armed_now and self._arm_budget > 0:
+                    self._arm_budget -= 1
+                # Track every navigation, not just the first: the repair has to return the tab to
+                # where the download was triggered from, rarely where the block started.
+                if working_page is not self._live_page or url != self._live_url:
+                    self._failures = 0
+                self._live_page = working_page
+                self._live_url = url
+                return
+            if self._live_page is None or not self._live_url:
+                return
+            if working_page is self._live_page:
+                await self._restore_in_place(working_page, timeout)
+                return
+            if not await self._close_interloper(working_page):
+                return
+
+    async def _close_interloper(self, blank_page: Any) -> bool:
+        """Close a blank page that a download opened, so the working page falls back to the live one
+        (`get_working_page` re-derives from the context and takes the newest valid page). Returns
+        whether it closed anything."""
+        if self._arm_budget <= 0:
+            # Without a recent download to account for it, a blank page that is not ours is a tab the
+            # model legitimately opened and has not navigated yet. Closing it would destroy real work.
+            return False
+        if self._live_page.is_closed() or self._live_page.url in BLANK_PAGE_URLS:
+            return False
+        self._arm_budget = 0
+        close_bound = self._bound()
+        if close_bound <= 0:
+            return False
+        LOG.info("taskv3 closing the blank page a download opened", origin=_url_origin(self._live_url))
+        try:
+            # A popup on a stalled CDP connection can leave close() pending forever, and this runs
+            # both before dispatch and during final cleanup -- unbounded, it would block cancellation.
+            async with asyncio.timeout(close_bound):
+                await blank_page.close()
+        except Exception:
+            LOG.warning("taskv3 failed to close the blank page a download opened", exc_info=True)
+            return False
+        return True
+
+    async def _restore_in_place(self, working_page: Any, timeout: float | None) -> None:
+        if self._failures >= _BLANK_PAGE_RESTORE_MAX_FAILURES:
+            # Latched off: this runs before EVERY tool call, so a URL that cannot be reloaded would
+            # otherwise burn the full timeout again on each one for the rest of the block.
+            return
+        bound = self._bound(timeout)
+        if bound <= 0:
+            return
+        LOG.warning("taskv3 restoring a working page left blank", origin=_url_origin(self._live_url))
+        try:
+            async with asyncio.timeout(bound):
+                await self._restore_page_url(working_page, self._live_url)
+            self._failures = 0
+        except Exception:
+            # A run on a blank page is degraded, not broken: never fail a tool call over the repair.
+            self._failures += 1
+            LOG.warning("taskv3 blank working page restore failed", attempts=self._failures, exc_info=True)
+
+
+def apply_blank_page_guard(tools: list[ToolSpec], guard: BlankWorkingPageGuard | None) -> None:
+    """Repair before the handler runs, so the tool acts on -- and the model perceives -- a live
+    document. Applied by the engine to the COMPLETE dispatch list, not just the browser tools: the
+    auth / captcha / code tools and `finish` are appended afterwards and would otherwise be able to
+    inspect and act on `about:blank`.
+
+    No page-change flag is set on the tool result: the loop reads `page_state_changed` as progress
+    evidence (it clears the retry ledger and scores hard progress), and a repair is not progress.
+    That closes the result channel only -- a repair landing mid-batch still moves the loop's own
+    before/after page fingerprint, which the loop scores on the run's behalf. Closing that too means
+    re-baselining the loop's samplers, a change to shared v3 loop behaviour, deliberately not here.
+    Stale observe refs fail closed with a re-observe error, which is the safe degrade.
+    """
+    if guard is None:
+        return
+    for tool_spec in tools:
+
+        async def wrapped(
+            args: dict[str, Any],
+            _handler: Callable[[dict[str, Any]], Awaitable[ToolResult]] = tool_spec.handler,
+        ) -> ToolResult:
+            await guard.ensure_live()
+            return await _handler(args)
+
+        tool_spec.handler = wrapped
 
 
 def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> None:

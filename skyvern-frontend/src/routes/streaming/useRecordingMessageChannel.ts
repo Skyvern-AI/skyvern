@@ -45,6 +45,9 @@ interface CommandCedeControl {
 
 interface CommandEndExfiltration {
   kind: "end-exfiltration";
+  discard: boolean;
+  interpretation_session_id?: string;
+  workflow_permanent_id?: string;
 }
 
 interface CommandTakeControl {
@@ -410,6 +413,10 @@ export function useRecordingMessageChannel(
   const optionsRef = useRef(options);
   const exfiltrateRef = useRef(exfiltrate);
   const beganRef = useRef(false);
+  const retainedFinalizationRef = useRef<{
+    interpretationSessionId: string;
+    workflowPermanentId: string;
+  } | null>(null);
   const previousExfiltrateRef = useRef(false);
   const beginRetryAttemptsRef = useRef(0);
   const beginRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -422,6 +429,38 @@ export function useRecordingMessageChannel(
       beginRetryTimerRef.current = null;
     }
   }, []);
+
+  const sendEndExfiltration = useCallback(
+    (socket: WebSocket, discard: boolean) => {
+      const store = useRecordingStore.getState();
+      const finalizationIdentity = retainedFinalizationRef.current ?? {
+        interpretationSessionId: store.interpretationSessionId,
+        workflowPermanentId: optionsRef.current.workflowPermanentId,
+      };
+      socket.send(
+        JSON.stringify({
+          kind: "end-exfiltration",
+          discard,
+          interpretation_session_id:
+            finalizationIdentity.interpretationSessionId ?? undefined,
+          workflow_permanent_id:
+            finalizationIdentity.workflowPermanentId ?? undefined,
+        }),
+      );
+      if (discard) {
+        retainedFinalizationRef.current = null;
+      } else if (
+        finalizationIdentity.interpretationSessionId &&
+        finalizationIdentity.workflowPermanentId
+      ) {
+        retainedFinalizationRef.current = {
+          interpretationSessionId: finalizationIdentity.interpretationSessionId,
+          workflowPermanentId: finalizationIdentity.workflowPermanentId,
+        };
+      }
+    },
+    [],
+  );
 
   const sendBeginExfiltration = useCallback(() => {
     const socket = messageSocketRef.current;
@@ -549,13 +588,14 @@ export function useRecordingMessageChannel(
       // session resumable (SKY-12429), so it does not send END. Once the store
       // says recording ended, cleanup flushes END for a same-commit panel
       // unmount that prevented the exfiltrate falling-edge effect from running.
-      if (
-        ws?.readyState === WebSocket.OPEN &&
-        beganRef.current &&
-        !useRecordingStore.getState().isRecording
-      ) {
-        ws.send(JSON.stringify({ kind: "end-exfiltration" }));
-        beganRef.current = false;
+      const store = useRecordingStore.getState();
+      if (ws?.readyState === WebSocket.OPEN && !store.isRecording) {
+        if (beganRef.current) {
+          sendEndExfiltration(ws, !store.finishRequested);
+          beganRef.current = false;
+        } else if (retainedFinalizationRef.current && !store.finishRequested) {
+          sendEndExfiltration(ws, true);
+        }
       }
       messageSocketRef.current = null;
       try {
@@ -573,6 +613,7 @@ export function useRecordingMessageChannel(
     enabled,
     reconnectTrigger,
     scheduleBeginRetry,
+    sendEndExfiltration,
     socketUrl,
   ]);
 
@@ -600,7 +641,10 @@ export function useRecordingMessageChannel(
       beginRetryAttemptsRef.current = 0;
       const socket = messageSocketRef.current;
       if (socket?.readyState === WebSocket.OPEN && beganRef.current) {
-        socket.send(JSON.stringify({ kind: "end-exfiltration" }));
+        sendEndExfiltration(
+          socket,
+          !useRecordingStore.getState().finishRequested,
+        );
         beganRef.current = false;
       }
     }
@@ -610,6 +654,7 @@ export function useRecordingMessageChannel(
     messageSocket,
     recordingAttemptId,
     sendBeginExfiltration,
+    sendEndExfiltration,
     workflowPermanentId,
   ]);
 

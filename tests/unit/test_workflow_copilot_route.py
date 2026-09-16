@@ -850,6 +850,88 @@ def test_chat_history_serves_a_saved_envelope_back_untouched() -> None:
     assert served["terminalMessage"] == payload["terminalMessage"]
 
 
+def test_chat_history_correlates_interleaved_turn_openers() -> None:
+    now = datetime.now(timezone.utc)
+    messages = [
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="message-refine",
+            workflow_copilot_chat_id="chat-1",
+            sender=WorkflowCopilotChatSender.PRODUCT,
+            content="Refine the recording (2 actions) into a reusable workflow.",
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="message-later",
+            workflow_copilot_chat_id="chat-1",
+            sender=WorkflowCopilotChatSender.USER,
+            content="Add a confirmation step.",
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="response-later",
+            workflow_copilot_chat_id="chat-1",
+            sender=WorkflowCopilotChatSender.AI,
+            content="Added it.",
+            turn_outcome=TurnOutcome(
+                response_kind=ResponseKind.BUILD,
+                copilot_turn_id="turn-later",
+                user_message_id="message-later",
+            ),
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="response-refine",
+            workflow_copilot_chat_id="chat-1",
+            sender=WorkflowCopilotChatSender.AI,
+            content="Refinement ready.",
+            turn_outcome=TurnOutcome(
+                response_kind=ResponseKind.BUILD,
+                copilot_turn_id="turn-refine",
+                user_message_id="message-refine",
+            ),
+            created_at=now,
+            modified_at=now,
+        ),
+    ]
+
+    history = convert_to_history_messages(messages)
+
+    assert [message.turn_id for message in history] == [
+        "turn-refine",
+        "turn-later",
+        "turn-later",
+        "turn-refine",
+    ]
+
+
+def test_chat_history_correlates_a_pending_turn_opener() -> None:
+    now = datetime.now(timezone.utc)
+    message = WorkflowCopilotChatMessage(
+        workflow_copilot_chat_message_id="message-refine",
+        workflow_copilot_chat_id="chat-1",
+        sender=WorkflowCopilotChatSender.PRODUCT,
+        content="Refine the recording (2 actions) into a reusable workflow.",
+        created_at=now,
+        modified_at=now,
+    )
+
+    history = convert_to_history_messages(
+        [message],
+        {
+            "turn-refine": _make_pending_turn(
+                "turn-refine",
+                10,
+                user_message_id="message-refine",
+            )
+        },
+    )
+
+    assert history[0].turn_id == "turn-refine"
+
+
 @pytest.mark.asyncio
 async def test_cancel_turn_never_applies_the_proposal(
     monkeypatch: pytest.MonkeyPatch,
@@ -2358,26 +2440,45 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "newer_candidate_lands_during_commit",
-    [False, True],
-    ids=["assistant-row-write-fails", "candidate-superseded-then-assistant-row-write-fails"],
+    "scenario",
+    [
+        "assistant-row-write-fails",
+        "candidate-superseded-then-assistant-row-write-fails",
+        "agent-fails-after-newer-candidate-lands",
+    ],
 )
-async def test_route_error_after_auto_accept_commit_keeps_the_committed_workflow(
+async def test_route_error_recovery_keeps_the_committed_workflow_and_other_turns_candidate(
     monkeypatch: pytest.MonkeyPatch,
-    newer_candidate_lands_during_commit: bool,
+    scenario: str,
     api_key_request: MagicMock,
     copilot_stream: MagicMock,
     organization: SimpleNamespace,
 ) -> None:
-    """Recovery after a successful auto-accept commit must not restore the pre-turn workflow over
-    it. A newer candidate landing during the commit discards this turn's proposal, so recovery
-    then sees a result that no longer carries the draft it committed."""
+    """Recovery must not restore the pre-turn workflow over a successful auto-accept commit, nor clear a
+    candidate another turn published, whether or not this turn produced a result."""
     captured = install_fake_create(monkeypatch)
+    agent_fails = scenario == "agent-fails-after-newer-candidate-lands"
+    newer_candidate_lands_during_commit = scenario == "candidate-superseded-then-assistant-row-write-fails"
+
+    def candidate(owner_turn_id: str, *, unvalidated: bool = False) -> dict[str, Any]:
+        return {
+            "_copilot_yaml": "title: Committed draft",
+            **({"_copilot_unvalidated": True} if unvalidated else {}),
+            COPILOT_PROPOSAL_METADATA_KEY: {
+                "owner_turn_id": owner_turn_id,
+                "revision": 1,
+                "canonical_fingerprint": "fp",
+                "disposition": "review_untested" if unvalidated else "review_tested",
+            },
+        }
+
+    # An unvalidated pre-turn draft is what makes auto-accept recovery attempt a clear on the tokenless path.
+    chat_row: dict[str, Any] = {"proposed_workflow": candidate("turn-older", unvalidated=True) if agent_fails else None}
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
         workflow_permanent_id="wpid-1",
         organization_id="org-1",
-        proposed_workflow=None,
+        proposed_workflow=chat_row["proposed_workflow"],
         auto_accept=True,
     )
     original_workflow = _make_copilot_workflow("Saved workflow", _NOW)
@@ -2395,39 +2496,52 @@ async def test_route_error_after_auto_accept_commit_keeps_the_committed_workflow
     real_restore = workflow_copilot_route._restore_workflow_definition
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     monkeypatch.setattr(workflow_copilot_route, "_restore_workflow_definition", real_restore)
-    workflow_params.clear_workflow_copilot_candidate = AsyncMock()
+    chat_reads: list[None] = []
 
-    def candidate(owner_turn_id: str) -> dict[str, Any]:
-        return {
-            "_copilot_yaml": "title: Committed draft",
-            COPILOT_PROPOSAL_METADATA_KEY: {
-                "owner_turn_id": owner_turn_id,
-                "revision": 1,
-                "canonical_fingerprint": "fp",
-                "disposition": "review_tested",
-            },
-        }
+    async def get_chat(*args: object, **kwargs: object) -> SimpleNamespace:
+        # The route's first read is its turn-start load; a candidate reaches its in-memory chat only through
+        # later reads of the row, as in production.
+        chat_reads.append(None)
+        if len(chat_reads) == 1:
+            return chat
+        return SimpleNamespace(**{**vars(chat), "proposed_workflow": chat_row["proposed_workflow"]})
+
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(side_effect=get_chat)
+
+    async def clear_candidate(
+        *, expected_owner_turn_id: str | None, expected_revision: int | None, **_: object
+    ) -> None:
+        token = (chat_row["proposed_workflow"] or {}).get(COPILOT_PROPOSAL_METADATA_KEY, {})
+        if (token.get("owner_turn_id"), token.get("revision")) != (expected_owner_turn_id, expected_revision):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        chat_row["proposed_workflow"] = None
+
+    workflow_params.clear_workflow_copilot_candidate = clear_candidate
 
     if newer_candidate_lands_during_commit:
         agent_result.proposal_owner_turn_id = "turn-this"
         agent_result.proposal_revision = 1
 
-        async def run_agent_publishing_candidate(*args: object, **kwargs: object) -> AgentResult:
-            chat.proposed_workflow = candidate("turn-this")
-            return agent_result
+    async def run_agent(*args: object, **kwargs: object) -> AgentResult:
+        if agent_fails:
+            chat_row["proposed_workflow"] = candidate("turn-newer")
+            raise RuntimeError("agent run failed")
+        if newer_candidate_lands_during_commit:
+            chat_row["proposed_workflow"] = candidate("turn-this")
+        return agent_result
 
-        monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", run_agent_publishing_candidate)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", run_agent)
 
     canonical: dict[str, str] = {original_workflow.workflow_id: original_workflow.title}
 
     async def update_workflow_definition(**kwargs: Any) -> None:
         canonical[kwargs["workflow_id"]] = kwargs["title"]
         if newer_candidate_lands_during_commit and kwargs["title"] == committed.title:
-            chat.proposed_workflow = candidate("turn-newer")
+            chat_row["proposed_workflow"] = candidate("turn-newer")
 
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(update_workflow_definition=update_workflow_definition))
 
-    first_assistant_write_failure = [RuntimeError("assistant row write failed")]
+    first_assistant_write_failure = [] if agent_fails else [RuntimeError("assistant row write failed")]
     assistant_rows: list[dict[str, Any]] = []
 
     async def create_message(**kwargs: Any) -> SimpleNamespace:
@@ -2445,7 +2559,10 @@ async def test_route_error_after_auto_accept_commit_keeps_the_committed_workflow
     await handler(copilot_stream)
 
     assert [row["turn_outcome"].response_kind for row in assistant_rows] == [ResponseKind.RECOVER]
-    assert canonical == {original_workflow.workflow_id: committed.title}
+    assert canonical == {original_workflow.workflow_id: original_workflow.title if agent_fails else committed.title}
+    assert chat_row["proposed_workflow"] == (
+        None if scenario == "assistant-row-write-fails" else candidate("turn-newer")
+    )
 
 
 @pytest.mark.asyncio
@@ -4299,13 +4416,14 @@ async def test_chat_history_shows_the_user_message_while_the_turn_is_still_runni
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reloading mid-turn — a tab refresh — shows the user's message without inventing an outcome."""
-    chat = _make_persisted_chat([_make_pending_turn("turn-a", 30)])
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 30, user_message_id="wccm-0")])
     store, _ = _install_reconcile_store(monkeypatch, chat)
     store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
 
     response = await _load_history()
 
     assert [m.content for m in response.chat_history] == ["build me a scraper"]
+    assert response.chat_history[0].turn_id == "turn-a"
     assert all(m.turn_outcome is None for m in response.chat_history)
     assert "turn-a" in chat.pending_turns
 
@@ -4599,7 +4717,9 @@ async def test_reconcile_drops_the_marker_of_a_turn_that_already_replied(
 @pytest.mark.asyncio
 async def test_persist_turn_messages_is_idempotent_for_one_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     """A second finalizer pass for the same turn adds no duplicate user or assistant row."""
-    chat = _make_persisted_chat([_make_pending_turn("turn-a", 10)])
+    chat = _make_persisted_chat(
+        [_make_pending_turn("turn-a", 10, user_message_id="wccm-0", cancel_token="cancel-turn-a")]
+    )
     store, _ = _install_reconcile_store(monkeypatch, chat)
     store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
 
@@ -4621,6 +4741,8 @@ async def test_persist_turn_messages_is_idempotent_for_one_turn(monkeypatch: pyt
     assert len(store.assistant_messages) == 1
     assert store.assistant_messages[0].turn_outcome is not None
     assert store.assistant_messages[0].turn_outcome.copilot_turn_id == "turn-a"
+    assert store.assistant_messages[0].turn_outcome.user_message_id == "wccm-0"
+    assert store.assistant_messages[0].turn_outcome.request_cancel_token == "cancel-turn-a"
 
 
 @pytest.mark.asyncio
@@ -4644,9 +4766,16 @@ async def test_a_turn_that_never_started_keeps_its_attachments_on_the_recovery_r
         turn_outcome=TurnOutcome(response_kind=ResponseKind.RECOVER),
         narrative_payload=None,
         attached_files=[CopilotAttachedFile(file_id="file_1", filename="targets.xlsx")],
+        request_cancel_token="cancel-turn-a",
     )
 
     assert [f.file_id for f in store.user_messages[0].attached_files] == ["file_1"]
+    assert store.assistant_messages[0].turn_outcome is not None
+    assert (
+        store.assistant_messages[0].turn_outcome.user_message_id
+        == store.user_messages[0].workflow_copilot_chat_message_id
+    )
+    assert store.assistant_messages[0].turn_outcome.request_cancel_token == "cancel-turn-a"
 
 
 @pytest.mark.asyncio
@@ -4654,7 +4783,7 @@ async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Recovery can reach a slow-but-live turn first; when that turn finishes, its reply is the truth."""
-    chat = _make_persisted_chat([_make_pending_turn("turn-a", 10)])
+    chat = _make_persisted_chat([])
     store, _ = _install_reconcile_store(monkeypatch, chat)
     store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
     store.add_message(
@@ -4665,6 +4794,8 @@ async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping
             reason_code=INTERRUPTED_TERMINAL_REASON,
             terminal_reason=INTERRUPTED_TERMINAL_REASON,
             copilot_turn_id="turn-a",
+            user_message_id="wccm-0",
+            request_cancel_token="cancel-turn-a",
         ),
     )
 
@@ -4686,6 +4817,8 @@ async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping
     outcome = store.assistant_messages[0].turn_outcome
     assert outcome is not None
     assert outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
+    assert outcome.user_message_id == "wccm-0"
+    assert outcome.request_cancel_token == "cancel-turn-a"
 
 
 def test_reconcile_threshold_outlasts_the_turn_enforcement_ceiling() -> None:
@@ -5491,6 +5624,20 @@ def _refine_recording_mocks(monkeypatch: pytest.MonkeyPatch, *, session_found: b
         SimpleNamespace(get_session=AsyncMock(return_value=SimpleNamespace() if session_found else None)),
     )
     return workflow_params
+
+
+def test_refine_recording_instruction_balances_simplification_and_interaction_fidelity() -> None:
+    instruction = workflow_copilot_route.REFINE_RECORDING_INSTRUCTION.lower()
+
+    assert len(instruction.split()) < 200
+    assert "collapse a multi-action path" in instruction
+    assert "neither the objective nor any retained interaction" in instruction
+    assert "interaction primitive" in instruction
+    assert "actionable target" in instruction
+    assert "successfully tested" in instruction
+    assert "extraction required by the objective" in instruction
+    assert "prose-only answer" in instruction
+    assert "never answer in prose" not in instruction
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useRef } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -15,9 +15,15 @@ import {
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
-import { SYSTEM_RUN_FOCUS_PARAM } from "./panes";
+import {
+  parsePanesParam,
+  STUDIO_PANES_PARAM,
+  SYSTEM_RUN_FOCUS_PARAM,
+  toReadableSearch,
+} from "./panes";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
+import { useStudioPanes } from "./useStudioPanes";
 
 type BrowserPaneViewState = {
   view: BrowserPaneView;
@@ -44,6 +50,8 @@ type BrowserPaneViewState = {
 export function useBrowserPaneView(): BrowserPaneViewState {
   const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { resolveLivePanes } = useStudioPanes();
   const { runId, explicit } = useStudioInspectedRun();
   const visuals = useRunVisuals(runId);
   const { data: debugSession } = useDebugSessionQuery({
@@ -52,9 +60,10 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   });
   const debugBrowserSessionId = debugSession?.browser_session_id ?? null;
   const intent = useStudioBrowserStore((s) => s.view);
-  const setView = useStudioBrowserStore((s) => s.setView);
+  const setViewIntent = useStudioBrowserStore((s) => s.setView);
   const pinNonce = useRunViewStore((s) => s.pinNonce);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const recordingDeepLink = searchParams.get("view") === "recording";
 
   // Timeline selection outranks a pinned pill: a step click (?active= change or
   // a re-pin of the same step) or a run swap hands the pane back to the machine,
@@ -71,11 +80,53 @@ export function useBrowserPaneView(): BrowserPaneViewState {
       recordingStarted
     ) {
       syncRef.current = { activeParam, pinNonce, runId, isRecording };
-      setView("auto");
+      if (!recordingDeepLink) {
+        setViewIntent("auto");
+      }
     } else if (prev.isRecording !== isRecording) {
       syncRef.current = { activeParam, pinNonce, runId, isRecording };
     }
-  }, [activeParam, pinNonce, runId, isRecording, setView]);
+  }, [
+    activeParam,
+    pinNonce,
+    runId,
+    isRecording,
+    recordingDeepLink,
+    setViewIntent,
+  ]);
+
+  const appliedRecordingDeepLinkRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!recordingDeepLink) {
+      appliedRecordingDeepLinkRef.current = undefined;
+      return;
+    }
+    if (!runId || appliedRecordingDeepLinkRef.current === runId) {
+      return;
+    }
+    appliedRecordingDeepLinkRef.current = runId;
+    setViewIntent("recording");
+  }, [recordingDeepLink, runId, setViewIntent]);
+
+  const setView = useCallback(
+    (nextView: BrowserPaneViewIntent) => {
+      setViewIntent(nextView);
+      const next = new URLSearchParams(searchParams);
+      if (nextView === "recording") {
+        next.set("view", "recording");
+        const panes =
+          parsePanesParam(next.get(STUDIO_PANES_PARAM)) ?? resolveLivePanes();
+        next.set(
+          STUDIO_PANES_PARAM,
+          ["browser", ...panes.filter((pane) => pane !== "browser")].join(","),
+        );
+      } else if (next.get("view") === "recording") {
+        next.delete("view");
+      }
+      navigate({ search: toReadableSearch(next) }, { replace: true });
+    },
+    [navigate, resolveLivePanes, searchParams, setViewIntent],
+  );
 
   const runInDebugSession =
     visuals.workflowRun?.browser_session_id != null &&

@@ -1,12 +1,10 @@
 import { useMutation } from "@tanstack/react-query";
 import { useRef } from "react";
-import { useFeatureFlagEnabled } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
   type RecordingDraftStep,
@@ -46,10 +44,6 @@ const useProcessRecordingMutation = ({
     eventCount: number;
     optimisticStepCount: number;
   } | null>(null);
-  // Per-user opt-in preview; not enrolled reads as false (agent blocks).
-  const codeFirst =
-    useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
-
   const processRecordingMutation = useMutation({
     mutationFn: async (
       variables: {
@@ -132,7 +126,8 @@ const useProcessRecordingMutation = ({
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
-          code_first: codeFirst,
+          // Keep opting in explicitly while older backends still honor this field.
+          code_first: true,
           // This build substitutes credential tokens in a code block's code; a build that
           // does not must not be handed blocks whose code reads a token it cannot rename.
           supports_credential_tokens: true,
@@ -192,13 +187,15 @@ const useProcessRecordingMutation = ({
         }
         toast({
           variant: "success",
-          title: "Recording Processed",
-          description: "The recording has been successfully processed.",
+          title: evidence ? "Recorded steps added" : "Recording processed",
+          description: evidence
+            ? "Copilot is refining the workflow now. Follow its progress in the Copilot pane."
+            : "The recording has been successfully processed.",
         });
 
         onSuccess?.({ recordingId, blocks, parameters: parameters });
 
-        if (codeFirst && evidence) {
+        if (evidence) {
           // One replace-navigation stores the packet and arms the copilot turn that
           // reads it, the same handoff RunTab makes for diagnose_run.
           const nonce = crypto.randomUUID();
@@ -247,8 +244,6 @@ const useProcessRecordingMutation = ({
         error_message: error instanceof Error ? error.message : String(error),
         latency_ms: latencyMs,
       });
-
-      useRecordingStore.setState({ finishRequested: false });
 
       toast({
         variant: "destructive",

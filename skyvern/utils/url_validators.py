@@ -13,6 +13,13 @@ from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, Un
 SAFE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 MAX_SAFE_REDIRECTS = 10
 
+# getaddrinfo codes that mean the resolver answered "this name has no address", as opposed to
+# EAI_AGAIN/EAI_FAIL, which mean the resolver could not answer at all. EAI_NODATA is absent on
+# some platforms and folded into EAI_NONAME on others.
+_NO_SUCH_HOST_DNS_ERRNOS = frozenset(
+    getattr(socket, name) for name in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, name)
+)
+
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
 _LOCAL_BROWSER_HOSTNAMES = frozenset({"localhost", "host.docker.internal"})
@@ -275,6 +282,37 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
     if not resolved_ips:
         raise UnresolvableHost(host=host)
     return tuple(resolved_ips)
+
+
+def host_has_no_address_record(host: str) -> bool:
+    """True only when the resolver answers definitively that ``host`` has no address.
+
+    Deliberately narrower than ``UnresolvableHost``: a timeout or SERVFAIL means the resolver could
+    not answer, and reading that as a dead host would misattribute every navigation failure during
+    a resolver outage. Callers use this to attribute a navigation that already failed, never to
+    decide whether one is allowed -- ``is_blocked_host`` ignores worker-side resolution failures
+    for that reason, since the browser resolves through the run proxy.
+    """
+    normalized = _normalize_host(host)
+    if not normalized:
+        return False
+
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        # A literal address needs no resolution, so DNS can say nothing about it.
+        return False
+
+    try:
+        socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        # gaierror subclasses OSError, so it must be caught first.
+        return error.errno in _NO_SUCH_HOST_DNS_ERRNOS
+    except (OSError, UnicodeError):
+        return False
+    return False
 
 
 def _raise_if_best_effort_fetch_host_is_blocked(url: str) -> None:

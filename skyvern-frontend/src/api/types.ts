@@ -958,6 +958,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   browser_profile_id: string | null;
+  browser_type?: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   workflow: WorkflowApiResponse;

@@ -154,8 +154,6 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
 function getRunNavigationPath(run: TaskRunListItem): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
-      // /runs/{wr} renders the studio run view when the preview is on and the
-      // legacy run page when it is off, so one short path serves both.
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;

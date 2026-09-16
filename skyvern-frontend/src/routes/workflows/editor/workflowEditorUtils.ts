@@ -2191,6 +2191,7 @@ function getElements(
       cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
       runWith: settings.runWith,
+      browserType: settings.browserType ?? null,
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
@@ -3827,6 +3828,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
           ? JSON.stringify(data.cdpConnectHeaders)
           : data.cdpConnectHeaders,
       runWith: data.runWith,
+      browserType: data.browserType ?? null,
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
@@ -5102,6 +5104,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with ?? "agent",
+    browser_type: workflow.browser_type ?? null,
     adaptive_caching: workflow.adaptive_caching ?? undefined,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,

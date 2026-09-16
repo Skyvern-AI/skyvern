@@ -35,6 +35,7 @@ from agents.items import ToolCallItem
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -294,7 +295,7 @@ def _render_code_only_browser_authoring_prompt() -> str:
 
     return (
         _code_only_browser_authoring_prompt()
-        + "\n\nWhen a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page\n"
+        + "\n\nWhen a scouting tool offers a SYNTHESIZED CODE BLOCK, it already encodes the page\n"
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
         "re-derive its locators. Only hand-author the steps it does not cover, such as the\n"
@@ -3374,6 +3375,13 @@ _PROXY_TRANSPORT_NAV_ERROR_CODES = (
 def _non_retriable_nav_reply(error_message: str) -> str:
     _, separator, machine_error = error_message.rpartition(". Error message: ")
     classification_source = machine_error if separator else error_message
+    # Ahead of the proxy-transport branch: a dead domain reaches us wearing a proxy error code, and
+    # answering it with "contact Skyvern Support" sends the user to us over a URL only they can fix.
+    if NO_ADDRESS_RECORD_NAV_ERROR_MARKER in classification_source:
+        return (
+            f"The site's domain has no DNS record, so it cannot be reached from any network. "
+            f"Error: {error_message}. Please check the URL for a typo, or confirm the site is still online."
+        )
     if any(code in classification_source for code in _PROXY_TRANSPORT_NAV_ERROR_CODES):
         return (
             f"The site could not be reached through Skyvern's browser network. Error: {error_message}. "

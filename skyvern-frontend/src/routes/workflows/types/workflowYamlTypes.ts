@@ -30,6 +30,7 @@ export type WorkflowCreateYAMLRequest = {
   cdp_connect_headers?: Record<string, string> | null;
   status?: string | null;
   run_with?: string | null;
+  browser_type?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
   enable_self_healing?: boolean;

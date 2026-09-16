@@ -1,5 +1,6 @@
 import asyncio
 import time
+from dataclasses import dataclass
 
 import structlog
 
@@ -8,7 +9,7 @@ from skyvern.services.browser_recording.interpretation import (
     OnRecordingInterpretationUpdate,
     RecordingInterpretationSession,
 )
-from skyvern.services.browser_recording.types import RecordingDraftStep
+from skyvern.services.browser_recording.types import Action, RecordingDraftStep
 
 LOG = structlog.get_logger(__name__)
 
@@ -17,10 +18,21 @@ LOG = structlog.get_logger(__name__)
 SESSION_TTL_SECONDS = 60 * 30
 
 
+@dataclass(frozen=True)
+class FinalizedRecordingActions:
+    browser_session_id: str
+    organization_id: str
+    workflow_permanent_id: str
+    actions: list[Action]
+
+
 class RecordingInterpretationSessionRegistry:
     def __init__(self) -> None:
         self._sessions: dict[str, RecordingInterpretationSession] = {}
         self._last_seen: dict[str, float] = {}
+        self._finalized_actions: dict[str, FinalizedRecordingActions] = {}
+        self._finalized_last_seen: dict[str, float] = {}
+        self._stopping_sessions: dict[str, asyncio.Future[list[RecordingDraftStep]]] = {}
 
     def start_session(
         self,
@@ -102,16 +114,121 @@ class RecordingInterpretationSessionRegistry:
 
         session.resume_capture()
 
-    async def stop_session(self, browser_session_id: str) -> list[RecordingDraftStep]:
+    async def stop_session(
+        self,
+        browser_session_id: str,
+        *,
+        retain_finalized_actions: bool = True,
+    ) -> list[RecordingDraftStep]:
+        stopping = self._stopping_sessions.get(browser_session_id)
+        if stopping is not None:
+            return await asyncio.shield(stopping)
+
+        stopping = asyncio.get_running_loop().create_future()
+        self._stopping_sessions[browser_session_id] = stopping
+        try:
+            drafts = await self._stop_session(
+                browser_session_id,
+                retain_finalized_actions=retain_finalized_actions,
+            )
+        except asyncio.CancelledError:
+            stopping.cancel()
+            raise
+        except Exception as exc:
+            stopping.set_exception(exc)
+            # The initiating caller receives the exception directly. Mark the
+            # future observed too in case there were no concurrent waiters.
+            stopping.exception()
+            raise
+        else:
+            stopping.set_result(drafts)
+            return drafts
+        finally:
+            if self._stopping_sessions.get(browser_session_id) is stopping:
+                self._stopping_sessions.pop(browser_session_id, None)
+
+    async def _stop_session(
+        self,
+        browser_session_id: str,
+        *,
+        retain_finalized_actions: bool,
+    ) -> list[RecordingDraftStep]:
         session = self._sessions.pop(browser_session_id, None)
         self._last_seen.pop(browser_session_id, None)
         if not session:
             return []
 
         try:
-            return await session.flush()
+            drafts = await session.flush()
+            if retain_finalized_actions:
+                self._finalized_actions[session.interpretation_session_id] = FinalizedRecordingActions(
+                    browser_session_id=session.browser_session_id,
+                    organization_id=session.organization_id,
+                    workflow_permanent_id=session.workflow_permanent_id,
+                    actions=session.recorded_actions(),
+                )
+                self._finalized_last_seen[session.interpretation_session_id] = time.monotonic()
+            return drafts
         finally:
             session.cancel()
+
+    def get_finalized_actions(
+        self,
+        *,
+        interpretation_session_id: str | None,
+        browser_session_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> list[Action] | None:
+        self._prune_expired_sessions()
+        if interpretation_session_id is None:
+            return None
+
+        finalized = self._finalized_actions.get(interpretation_session_id)
+        if finalized is None:
+            return None
+        if (
+            finalized.browser_session_id != browser_session_id
+            or finalized.organization_id != organization_id
+            or finalized.workflow_permanent_id != workflow_permanent_id
+        ):
+            LOG.warning(
+                "Rejected finalized recording actions with mismatched ownership",
+                interpretation_session_id=interpretation_session_id,
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
+        self._finalized_last_seen[interpretation_session_id] = time.monotonic()
+        return list(finalized.actions)
+
+    def discard_finalized_actions(self, interpretation_session_id: str | None) -> None:
+        if interpretation_session_id is None:
+            return
+
+        self._finalized_actions.pop(interpretation_session_id, None)
+        self._finalized_last_seen.pop(interpretation_session_id, None)
+
+    def discard_finalized_actions_if_owned(
+        self,
+        *,
+        interpretation_session_id: str,
+        browser_session_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> bool:
+        actions = self.get_finalized_actions(
+            interpretation_session_id=interpretation_session_id,
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        if actions is None:
+            return False
+        self.discard_finalized_actions(interpretation_session_id)
+        return True
 
     def discard_session(self, browser_session_id: str) -> None:
         session = self._sessions.pop(browser_session_id, None)
@@ -130,11 +247,20 @@ class RecordingInterpretationSessionRegistry:
             LOG.info("Pruning stale recording interpretation session", browser_session_id=browser_session_id)
             self.discard_session(browser_session_id)
 
+        expired_finalized_ids = [
+            interpretation_session_id
+            for interpretation_session_id, last_seen in self._finalized_last_seen.items()
+            if now - last_seen > SESSION_TTL_SECONDS
+        ]
+        for interpretation_session_id in expired_finalized_ids:
+            self._finalized_last_seen.pop(interpretation_session_id, None)
+            self._finalized_actions.pop(interpretation_session_id, None)
+
     async def stop_all(self) -> None:
         await asyncio.gather(*(self.stop_session(browser_session_id) for browser_session_id in list(self._sessions)))
 
 
 # Process-local singleton. Requires sticky routing (or a single worker) so the message
-# WebSocket and interpretation session stay on the same API instance. Multi-pod deployments
-# without affinity need shared session storage (e.g. Redis).
+# WebSocket, final action handoff, and interpretation session stay on the same API instance.
+# Multi-pod deployments without affinity need shared session storage (e.g. Redis).
 interpretation_registry = RecordingInterpretationSessionRegistry()

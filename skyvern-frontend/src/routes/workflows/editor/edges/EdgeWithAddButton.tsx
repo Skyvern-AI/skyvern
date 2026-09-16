@@ -98,7 +98,9 @@ function EdgeWithAddButton({
   const isUploadingSOP = sopToBlocksMutation.isPending;
 
   const isProcessing =
-    processRecordingMutation.isPending || recordingStore.isCommitting;
+    processRecordingMutation.isPending ||
+    recordingStore.finishRequested ||
+    recordingStore.isCommitting;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -152,6 +154,10 @@ function EdgeWithAddButton({
   };
 
   const onEndRecord = () => {
+    if (isProcessing) {
+      return;
+    }
+
     // With live interpretation, the recording panel owns the commit so user
     // edits/deletes to draft steps are honored.
     if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {

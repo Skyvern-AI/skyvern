@@ -7,6 +7,7 @@ offers, and the reason callers use locators instead of handles.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -288,6 +289,11 @@ const __queryAll = (root, selector) => {
 """
 
 
+# Playwright's parseSelectorString: a quote inside an unquoted `text=` body is literal, so `text=Men's >> nth=0`
+# still splits at `>>`.
+_UNQUOTED_TEXT_BODY = re.compile(r"^\s*text\s*=.")
+
+
 def _split_selector_chain(selector: str) -> list[str]:
     """Split a Playwright `a >> b` chain into steps at the top level, leaving quoted `>>` alone."""
     parts: list[str] = []
@@ -296,11 +302,16 @@ def _split_selector_chain(selector: str) -> list[str]:
     i = 0
     while i < len(selector):
         ch = selector[i]
+        if ch == "\\" and i + 1 < len(selector):
+            current.append(ch)
+            current.append(selector[i + 1])
+            i += 2
+            continue
         if quote is not None:
             if ch == quote:
                 quote = None
             current.append(ch)
-        elif ch in "\"'":
+        elif ch in "\"'" and not _UNQUOTED_TEXT_BODY.match("".join(current)):
             quote = ch
             current.append(ch)
         elif selector.startswith(">>", i):
@@ -402,7 +413,17 @@ class _LocatorOperation:
 def _query_operations(selector: str) -> list[_LocatorOperation]:
     if not isinstance(selector, str):
         raise TypeError("selector must be a string")
-    return [_LocatorOperation(kind="query", selector=part) for part in _split_selector_chain(selector)]
+    operations: list[_LocatorOperation] = []
+    for part in _split_selector_chain(selector):
+        if part.startswith("nth="):
+            try:
+                index = int(part[len("nth=") :])
+            except ValueError:
+                raise CdpError(f"invalid nth selector step {part!r}") from None
+            operations.append(_LocatorOperation(kind="nth", index=index))
+        else:
+            operations.append(_LocatorOperation(kind="query", selector=part))
+    return operations
 
 
 def _validate_text_filter(name: str, value: str | None) -> None:

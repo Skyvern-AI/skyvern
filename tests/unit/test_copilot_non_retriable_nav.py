@@ -56,6 +56,16 @@ _PROXY_FAILURE_REPLY = (
     "Please try again later, or contact Skyvern Support if the problem continues."
 )
 _NON_PROXY_FAILURE_REPLY = "The target URL could not be reached. Error: {reason}. Please verify the URL and try again."
+# A host with no address record still carries the proxy's error code, because a proxied browser
+# delegates resolution to the proxy. UnresolvableNavigationHost prefixes the real cause.
+_NO_ADDRESS_RECORD_FAILURE_REASON = (
+    "Failed to navigate to url https://gone.example/. Error message: gone.example has no DNS "
+    "address record: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
+_NO_ADDRESS_RECORD_REPLY = (
+    "The site's domain has no DNS record, so it cannot be reached from any network. "
+    "Error: {reason}. Please check the URL for a typo, or confirm the site is still online."
+)
 
 
 def _fresh_context() -> CopilotContext:
@@ -111,6 +121,7 @@ def _record_and_render_terminal_reply(reason: str, *, block_type: str) -> tuple[
         pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
         pytest.param(_TUNNEL_FAILURE_REASON, id="tunnel_connection_failed"),
         pytest.param(_SOCKS_FAILURE_REASON, id="socks_connection_failed"),
+        pytest.param(_NO_ADDRESS_RECORD_FAILURE_REASON, id="no_dns_address_record"),
         pytest.param(
             "Failed to navigate to url https://x.test. Error message: net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
             id="socks_host_unreachable",
@@ -431,6 +442,17 @@ def test_proxy_transport_full_flow_uses_browser_network_reply(reason: str, block
     assert result.proposal_disposition == "no_proposal"
     assert result.updated_workflow is None
     assert ctx.last_test_non_retriable_nav_error == reason
+
+
+def test_a_host_with_no_address_record_is_not_answered_with_contact_support() -> None:
+    # The proxy error code is still in the reason, so without the marker check this renders the
+    # browser-network reply and sends the user to Support over a URL only they can fix.
+    _, result = _record_and_render_terminal_reply(_NO_ADDRESS_RECORD_FAILURE_REASON, block_type="navigation")
+
+    assert result.user_response == _NO_ADDRESS_RECORD_REPLY.format(reason=_NO_ADDRESS_RECORD_FAILURE_REASON)
+    assert "Skyvern Support" not in result.user_response
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "non_retriable_nav"
 
 
 @pytest.mark.parametrize(

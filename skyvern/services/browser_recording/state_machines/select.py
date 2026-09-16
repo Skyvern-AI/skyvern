@@ -42,8 +42,8 @@ class StateMachineSelect(StateMachine):
         value = target.value
         # A card-expiry month is usually a <select autocomplete="cc-exp-month">, so a select can
         # classify as secret and reach here with its value already nulled by ingest redaction.
-        # Keep the step blank rather than dropping it, as StateMachineInputText does, so the
-        # legacy path still shows the field; code-first drops an empty select_option regardless.
+        # Keep the live draft blank rather than dropping it, as StateMachineInputText does;
+        # final synthesis drops an empty select_option regardless.
         secret = is_secret_field(
             target.inputType,
             target.autocomplete,

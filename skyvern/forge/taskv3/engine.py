@@ -52,7 +52,12 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.tools import PageProvider, build_browser_tools
+from skyvern.forge.taskv3.tools import (
+    BlankWorkingPageGuard,
+    PageProvider,
+    apply_blank_page_guard,
+    build_browser_tools,
+)
 
 LOG = structlog.get_logger()
 
@@ -203,6 +208,8 @@ async def run_task_v3_agent_loop(
     initial_navigation_status: int | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
+    download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
@@ -256,6 +263,27 @@ async def run_task_v3_agent_loop(
     # contract have to agree: with the switch off, a live object would report 0 opportunities for a
     # tier that is turned off rather than saying it was not there.
     semantic_commit_stats = None if page_free or not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY else SemanticCommitStats()
+
+    # Defaulted BEFORE the guard is built: the guard holds this set by reference to exclude files
+    # `file_upload` staged, so it has to be the same object the loop writes into.
+    if staged_downloads is None:
+        staged_downloads = set()
+
+    def _deadline_remaining() -> float | None:
+        return None if deadline_seconds is None else (loop_started_at + deadline_seconds) - time.monotonic()
+
+    blank_page_guard = (
+        None
+        if page_free or restore_page_url is None
+        else BlankWorkingPageGuard(
+            page_provider,
+            restore_page_url,
+            downloads_dir=downloads_dir,
+            remaining_seconds=_deadline_remaining,
+            download_attempts=download_attempts,
+            staged_downloads=staged_downloads,
+        )
+    )
     browser_tools = (
         []
         if page_free
@@ -309,8 +337,6 @@ async def run_task_v3_agent_loop(
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
     submit_watch = SubmitWatch()
-    if staged_downloads is None:
-        staged_downloads = set()
     # A page-free run has no tool that could trigger a download, so a blocker would refuse every
     # completed verdict forever; it has nothing to type a verification code into either.
     if page_free:
@@ -331,6 +357,9 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
+    # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
+    # are appended here and would otherwise be able to inspect and act on a blank page.
+    apply_blank_page_guard(tools, blank_page_guard)
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -383,6 +412,22 @@ async def run_task_v3_agent_loop(
         _exit_ctx = skyvern_context.current()
         if _exit_ctx is not None and _exit_ctx.refresh_working_page:
             _exit_ctx.refresh_working_page = False
+        # Backstop for the handoff the ticket rides on: the loop can end without a further tool call
+        # (budget, cancellation, a raise), leaving the page blank for the next url-less block. In the
+        # `finally` because a raising block can still be followed by another one
+        # (continue-on-failure); `ensure_live` swallows everything, so it cannot turn a success into
+        # a failure or mask the exception on its way out. Bounded by what is left of the run's
+        # deadline, and skipped outright once cancelled -- finalization must not outlive either.
+        if blank_page_guard is not None:
+            _cancelled = False
+            if should_cancel is not None:
+                try:
+                    _cancelled = await should_cancel()
+                except Exception:
+                    _cancelled = False
+            if not _cancelled:
+                # The guard bounds itself by `_deadline_remaining`; no second computation here.
+                await blank_page_guard.ensure_live()
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)

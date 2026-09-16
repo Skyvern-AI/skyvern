@@ -170,6 +170,12 @@ def test_rendered_prompt_keeps_security_ask_telemetry_and_workflow_wide_edit_sco
     assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in new_workflow_prompt
 
 
+def test_rendered_prompt_scopes_verbatim_code_to_scouting_tool_output() -> None:
+    prompt = _render_production_prompt()
+
+    assert "scouting tool offers a SYNTHESIZED CODE BLOCK" in prompt
+
+
 def test_ask_carve_out_gates_money_and_destruction_and_never_a_site_sent_message() -> None:
     prompt = _render_production_prompt()
     carve_out = _sentence_containing(prompt, "spends money")

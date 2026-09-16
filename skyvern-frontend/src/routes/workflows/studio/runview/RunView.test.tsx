@@ -43,17 +43,32 @@ import type {
 } from "../../types/workflowRunTypes";
 import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
 import { StudioPaneCompactContext } from "../StudioShellContext";
-import { RunPaneViewToggles } from "./RunPaneHeader";
+import { RunPaneActions, RunPaneViewToggles } from "./RunPaneHeader";
 import capturedRun from "../__fixtures__/completed-code-block-run.json";
 import { RunView } from "./RunView";
 
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
+  fallbackEpisodes: undefined as unknown,
+  blockScripts: undefined as unknown,
+  onboarding: null as null | {
+    recoveryGuidanceAssignment: {
+      organization_id: string;
+      experiment_version: string;
+      arm: "control" | "treatment";
+      eligible_run_id: string;
+    } | null;
+  },
+  recoverySurfaceEnabled: false,
   codeGenerating: false,
   isPlaceholderData: false,
   statusUnavailable: false,
   refetchRunStatus: vi.fn(),
+  refreshOnboarding: vi.fn(),
+  fallbackEpisodesQuery: vi.fn(),
+  blockScriptsQuery: vi.fn(),
+  posthogCapture: vi.fn(),
 }));
 const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
 
@@ -79,6 +94,43 @@ vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
     isLoading: false,
     isPlaceholderData: mocks.isPlaceholderData,
   }),
+}));
+vi.mock("../../hooks/useRefreshOnboardingOnRunCompletion", () => ({
+  useRefreshOnboardingOnRunCompletion: (run: unknown) =>
+    mocks.refreshOnboarding(run),
+}));
+vi.mock("../../hooks/useFallbackEpisodesQuery", () => ({
+  useFallbackEpisodesQuery: (options: unknown) => {
+    mocks.fallbackEpisodesQuery(options);
+    return { data: mocks.fallbackEpisodes };
+  },
+}));
+vi.mock("../../hooks/useBlockScriptsQuery", () => ({
+  useBlockScriptsQuery: (options: unknown) => {
+    mocks.blockScriptsQuery(options);
+    return { data: mocks.blockScripts };
+  },
+}));
+vi.mock("@/store/onboarding/useOnboardingState", () => ({
+  useOnboardingStateOptional: () => mocks.onboarding,
+}));
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => mocks.recoverySurfaceEnabled,
+}));
+vi.mock("../../workflowRun/ScriptUpdateCard", () => ({
+  ScriptUpdateCard: ({
+    episodes,
+    scriptId,
+  }: {
+    episodes: unknown[];
+    scriptId?: string | null;
+  }) => (
+    <div
+      data-testid="script-update-card"
+      data-episode-count={episodes.length}
+      data-script-id={scriptId}
+    />
+  ),
 }));
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
   useIsGeneratingCode: () => mocks.codeGenerating,
@@ -114,6 +166,9 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 }
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
+}));
+vi.mock("posthog-js", () => ({
+  default: { capture: (...args: unknown[]) => mocks.posthogCapture(...args) },
 }));
 // The header toggles resolve the inspected run themselves; pin it to the same
 // run the RunView under test renders (avoids the latest-run fallback query).
@@ -295,7 +350,13 @@ function seedRunningRun() {
 
 function LocationSpy() {
   const location = useLocation();
-  return <div data-testid="location-search">{location.search}</div>;
+  return (
+    <>
+      <div data-testid="location-pathname">{location.pathname}</div>
+      <div data-testid="location-search">{location.search}</div>
+      <div data-testid="location-state">{JSON.stringify(location.state)}</div>
+    </>
+  );
 }
 
 // Subscribes to the failure card's artifact query so a test can wait for its
@@ -345,9 +406,39 @@ function ReleaseCopilotRunFocus() {
   );
 }
 
+function SameRunSelectionNavigation() {
+  const [params, setParams] = useSearchParams();
+  return (
+    <>
+      <button
+        onClick={() => {
+          const next = new URLSearchParams(params);
+          next.set("active", "wrb_second");
+          next.set("iteration", "2");
+          setParams(next);
+        }}
+      >
+        select second frame in URL
+      </button>
+      <button
+        onClick={() => {
+          const next = new URLSearchParams(params);
+          next.delete("active");
+          next.delete("iteration");
+          setParams(next);
+        }}
+      >
+        clear frame from URL
+      </button>
+    </>
+  );
+}
+
 function renderRunView(
   props: Partial<Parameters<typeof RunView>[0]> = {},
-  initialEntry = "/",
+  initialEntry:
+    | string
+    | { pathname: string; search?: string; state?: unknown } = "/",
   compact = false,
   extra?: ReactNode,
   pageSlots: PageSlots = {},
@@ -369,7 +460,10 @@ function renderRunView(
             <StudioPaneCompactContext.Provider value={compact}>
               <RunPaneViewToggles />
             </StudioPaneCompactContext.Provider>
-            {initialEntry.startsWith("/runs/") ? (
+            {(typeof initialEntry === "string"
+              ? initialEntry
+              : initialEntry.pathname
+            ).startsWith("/runs/") ? (
               <Routes>
                 <Route
                   path="/runs/:runId"
@@ -394,10 +488,18 @@ afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.fallbackEpisodes = undefined;
+  mocks.blockScripts = undefined;
+  mocks.onboarding = null;
+  mocks.recoverySurfaceEnabled = false;
   mocks.codeGenerating = false;
   mocks.isPlaceholderData = false;
   mocks.statusUnavailable = false;
   mocks.refetchRunStatus.mockReset();
+  mocks.refreshOnboarding.mockReset();
+  mocks.fallbackEpisodesQuery.mockReset();
+  mocks.blockScriptsQuery.mockReset();
+  mocks.posthogCapture.mockReset();
 });
 beforeEach(() => {
   getSpy.mockReset();
@@ -407,7 +509,234 @@ beforeEach(() => {
   useStudioBrowserStore.setState({ view: "auto" });
 });
 
+describe("RunView legacy run-page parity", () => {
+  test("refreshes onboarding and carries recovery context into a retry", async () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "The network request timed out",
+      failure_category: [{ category: "NETWORK_TIMEOUT" }],
+      workflow: {
+        workflow_permanent_id: "wpid_1",
+        cache_key: "cache-key",
+        deleted_at: null,
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    });
+    mocks.onboarding = {
+      recoveryGuidanceAssignment: {
+        organization_id: "org_1",
+        experiment_version: "recovery-v1",
+        arm: "treatment",
+        eligible_run_id: "wr_1",
+      },
+    };
+    mocks.recoverySurfaceEnabled = true;
+
+    renderRunView({ onRetry: vi.fn() }, "/?panes=overview");
+
+    expect(mocks.refreshOnboarding).toHaveBeenCalledWith(mocks.workflowRun);
+    expect(
+      await screen.findByTestId("first-run-recovery-guidance"),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry run" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("location-pathname").textContent).toBe(
+        "/agents/wpid_1/run",
+      ),
+    );
+    expect(screen.getByTestId("location-state").textContent).toContain(
+      '"recoveryGuidanceRetry":{"organizationId":"org_1","experimentVersion":"recovery-v1","arm":"treatment","eligibleRunId":"wr_1","failureCategory":"NETWORK_TIMEOUT"}',
+    );
+  });
+
+  test("records retry_started after the recovery retry begins", async () => {
+    seedCompletedRun({
+      workflow_run_id: "wr_retry",
+      status: Status.Running,
+      started_at: "2026-09-15T20:00:00Z",
+    });
+
+    renderRunView(
+      {},
+      {
+        pathname: "/runs/wr_retry",
+        state: {
+          recoveryGuidanceRetry: {
+            organizationId: "org_1",
+            experimentVersion: "recovery-v1",
+            arm: "treatment",
+            eligibleRunId: "wr_1",
+            failureCategory: "NETWORK_TIMEOUT",
+            retryRunId: "wr_retry",
+          },
+        },
+      },
+    );
+
+    await waitFor(() =>
+      expect(mocks.posthogCapture).toHaveBeenCalledWith(
+        "retry_started",
+        expect.objectContaining({
+          eligible_run_id: "wr_1",
+          retry_run_id: "wr_retry",
+        }),
+      ),
+    );
+  });
+
+  test("shows the fallback script update with the published script id", () => {
+    seedCompletedRun({
+      workflow: {
+        workflow_permanent_id: "wpid_1",
+        cache_key: "cache-key",
+        deleted_at: null,
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    });
+    mocks.fallbackEpisodes = {
+      episodes: [
+        {
+          episode_id: "episode_1",
+          new_script_revision_id: "revision_2",
+        },
+      ],
+    };
+    mocks.blockScripts = { script_id: "script_1" };
+
+    renderRunView({}, "/?panes=overview");
+
+    const scriptUpdateCard = screen.getByTestId("script-update-card");
+    expect(scriptUpdateCard.getAttribute("data-episode-count")).toBe("1");
+    expect(scriptUpdateCard.getAttribute("data-script-id")).toBe("script_1");
+    expect(mocks.fallbackEpisodesQuery).toHaveBeenCalledWith({
+      workflowPermanentId: "wpid_1",
+      workflowRunId: "wr_1",
+      enabled: true,
+    });
+  });
+});
+
 describe("RunView view toggles", () => {
+  test("keeps status notification controls for an active run", () => {
+    seedRunningRun();
+    renderRunView(
+      {},
+      "/?wr=wr_1",
+      false,
+      <TooltipProvider delayDuration={0}>
+        <RunPaneActions />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: /Notify/ })).toBeTruthy();
+  });
+
+  test("links to the runs before and after a retry", () => {
+    seedCompletedRun({
+      retried_from_workflow_run_id: "wr_previous",
+      retried_by_workflow_run_id: "wr_next",
+    });
+    renderRunView({}, "/?wr=wr_1");
+
+    expect(
+      screen
+        .getByRole("link", { name: "Retried from wr_previous" })
+        .getAttribute("href"),
+    ).toBe("/runs/wr_previous");
+    expect(
+      screen
+        .getByRole("link", { name: "Retried by wr_next" })
+        .getAttribute("href"),
+    ).toBe("/runs/wr_next");
+  });
+
+  test("opens and replaces the run subview requested by a legacy deep link", async () => {
+    seedCompletedRun();
+    const { container } = renderRunView(
+      {},
+      "/?panes=overview&view=code&active=wrb_loop&iteration=2",
+    );
+
+    expect(within(container).queryByTestId("workflow-run-code")).not.toBeNull();
+    expect(useRunPaneViewStore.getState().view).toBe("code");
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_loop");
+    expect(useRunViewStore.getState().activeIteration).toBe(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Inputs" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toContain(
+        "view=inputs",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toContain(
+        "view=timeline",
+      );
+    });
+  });
+
+  test("reapplies the requested view when switching runs", () => {
+    seedCompletedRun();
+    const props: Partial<Parameters<typeof RunView>[0]> = {
+      workflowRunId: "wr_1",
+    };
+    const view = renderRunView(props, "/?view=inputs");
+    expect(useRunPaneViewStore.getState().view).toBe("inputs");
+
+    props.workflowRunId = "wr_2";
+    view.rerenderRunView();
+
+    expect(useRunPaneViewStore.getState().view).toBe("inputs");
+  });
+
+  test("rehydrates frame selection when same-run URL parameters change", async () => {
+    seedCompletedRun();
+    renderRunView(
+      {},
+      "/?wr=wr_1&active=wrb_first&iteration=1",
+      false,
+      <SameRunSelectionNavigation />,
+    );
+
+    await waitFor(() => {
+      expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_first");
+      expect(useRunViewStore.getState().activeIteration).toBe(1);
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "select second frame in URL" }),
+    );
+    await waitFor(() => {
+      expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_second");
+      expect(useRunViewStore.getState().activeIteration).toBe(2);
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "clear frame from URL" }),
+    );
+    await waitFor(() => {
+      expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+      expect(useRunViewStore.getState().activeIteration).toBeNull();
+    });
+  });
+
+  test("writes the required Overview pane when selecting a run view", async () => {
+    seedCompletedRun();
+    renderRunView({}, "/?wr=wr_1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Inputs" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toContain(
+        "panes=overview,browser",
+      );
+    });
+  });
+
   test("mounts the completion milestone only after a pending retry is final", () => {
     seedCompletedRun({ retry_pending: true });
     const MilestoneCard = vi.fn(() => <div data-testid="milestone-card" />);
@@ -459,9 +788,18 @@ describe("RunView view toggles", () => {
     }
   });
 
-  test("does not render run tags in Studio Overview", () => {
+  test("keeps workflow run tags reachable in Studio Overview", () => {
     seedCompletedRun();
     const { queryByTestId } = renderRunView();
+
+    expect(queryByTestId("run-tags-editor")?.dataset.workflowRunId).toBe(
+      "wr_1",
+    );
+  });
+
+  test("keeps workflow run tags out of embedded surfaces", () => {
+    seedCompletedRun();
+    const { queryByTestId } = renderRunView({}, "/?embed=true");
 
     expect(queryByTestId("run-tags-editor")).toBeNull();
   });
@@ -1101,6 +1439,21 @@ describe("RunView failure presentation", () => {
     expect(within(container).queryByRole("alert")).toBeNull();
   });
 
+  test("keeps mutation controls out of embedded failure views", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Login page rejected the credentials",
+    });
+    const { getByTestId } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?embed=true",
+    );
+    const line = within(getByTestId("run-failure-line"));
+
+    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
+    expect(line.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
   test("Fix passes the failing block's label", () => {
     seedCompletedRun({
       status: Status.Failed,
@@ -1342,6 +1695,46 @@ describe("RunView failure presentation", () => {
     );
     await waitFor(() =>
       expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code"),
+    );
+  });
+
+  test("the embedded screenshot action replaces Overview with Browser", async () => {
+    getSpy.mockResolvedValue({
+      data: [
+        {
+          artifact_id: "art_screenshot",
+          artifact_type: ArtifactType.ActionScreenshot,
+          created_at: "2026-08-27T00:00:00Z",
+          modified_at: "2026-08-27T00:00:00Z",
+          organization_id: "org_1",
+          task_id: "task_1",
+          step_id: "step_1",
+          uri: "s3://bucket/screenshot.png",
+        },
+      ],
+    });
+    seedFailedCodeRun(
+      "CodeBlock failed because a browser operation failed at line 4.",
+      "browser_operation_failed",
+    );
+    const { container, getByTestId } = renderRunView(
+      {},
+      "/?wr=wr_1&embed=true&panes=overview",
+    );
+
+    fireEvent.click(
+      await within(container).findByRole("button", {
+        name: "View block screenshot",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(getByTestId("location-search").textContent).toContain(
+        "panes=browser",
+      ),
+    );
+    expect(getByTestId("location-search").textContent).not.toContain(
+      "panes=overview",
     );
   });
 
@@ -1654,7 +2047,7 @@ describe("RunView live affordances", () => {
 });
 
 describe("RunView iteration selection", () => {
-  test("selecting the loop block after an iteration clears the iteration scope", () => {
+  test("selecting the loop block after an iteration clears the iteration scope", async () => {
     seedForLoopRun();
     // Seed ?active= so the loop is the selected (and expanded) item on mount,
     // making its iteration rows visible.
@@ -1676,6 +2069,11 @@ describe("RunView iteration selection", () => {
     expect(scope.queryByText("alpha")).toBeNull();
     // The iteration scope is shared with the Browser pane via the store.
     expect(useRunViewStore.getState().activeIteration).toBe(1);
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toBe(
+        "?active=wrb_loop&wr=wr_1&iteration=1",
+      );
+    });
 
     // Click the loop block row (descriptor text is timeline-only). The detail
     // must fall back to the loop's own iteration instead of staying on 2.
@@ -1683,6 +2081,11 @@ describe("RunView iteration selection", () => {
     expect(headerMeta()).toContain("Iteration 1");
     expect(scope.getByText("alpha")).not.toBeNull();
     expect(useRunViewStore.getState().activeIteration).toBeNull();
+    await waitFor(() => {
+      expect(screen.getByTestId("location-search").textContent).toBe(
+        "?active=wrb_loop&wr=wr_1",
+      );
+    });
   }, 20_000);
 });
 
@@ -2083,6 +2486,7 @@ describe("finished-run landing", () => {
       `/?wr=wr_1&active=${capturedRun.blocks[1]!.actions[0]!.action_id}`,
     ],
     ["?bl=", "/?wr=wr_1&bl=code_block_2"],
+    ["?view=", "/?wr=wr_1&view=timeline"],
   ])(
     "a completed run deep-linked with %s stays on the timeline",
     async (_label, route) => {

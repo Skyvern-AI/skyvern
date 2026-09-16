@@ -59,10 +59,13 @@ const initialSettings = useSettingsStore.getState();
 const initialRecording = useRecordingStore.getState();
 const initialWorkflowSettings = useWorkflowSettingsStore.getState();
 
-function renderNodeAdder(props: Partial<NodeProps<NodeAdderNodeType>>) {
+function renderNodeAdder(
+  props: Partial<NodeProps<NodeAdderNodeType>>,
+  { debug = false }: { debug?: boolean } = {},
+) {
   return render(
     <DebugStoreContext.Provider
-      value={{ isDebugMode: false, blockRunsEnabled: false }}
+      value={{ isDebugMode: debug, blockRunsEnabled: false }}
     >
       <NodeAdderNode
         {...({
@@ -157,5 +160,49 @@ describe("NodeAdderNode", () => {
       },
     });
     expect(state.data?.branchContext).toBeUndefined();
+  });
+
+  it("shows processing instead of a second stop action after Done", () => {
+    useEdgesMock.mockReturnValue([
+      { id: "edge", source: "start", target: "adder" },
+    ]);
+    useNodesMock.mockReturnValue([
+      { id: "start", parentId: "loop", type: "start", data: {} },
+    ]);
+    useSettingsStore.getState().setIsUsingABrowser(true);
+    useRecordingStore.setState({
+      isRecording: true,
+      finishRequested: true,
+    });
+    useWorkflowPanelStore.setState({
+      workflowPanelState: {
+        active: false,
+        content: "nodeLibrary",
+        data: {
+          previous: "start",
+          next: "adder",
+          parent: "loop",
+          connectingEdgeType: "default",
+        },
+      },
+    });
+
+    renderNodeAdder({}, { debug: true });
+
+    const busyControl =
+      screen.getByTestId("node-adder-button").parentElement?.parentElement;
+    expect(busyControl).toBeTruthy();
+    fireEvent.mouseEnter(busyControl!);
+
+    expect(screen.getAllByText("Processing...").length).toBeGreaterThan(0);
+    expect(
+      screen.queryAllByText("Stop recording & generate blocks"),
+    ).toHaveLength(0);
+
+    fireEvent.click(busyControl!.firstElementChild!);
+    expect(useRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      finishRequested: true,
+    });
   });
 });

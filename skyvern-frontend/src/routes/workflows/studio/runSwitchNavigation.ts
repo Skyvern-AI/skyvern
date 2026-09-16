@@ -38,9 +38,9 @@ export function searchWithRunSwitched(
   }
   params.delete("active");
   params.delete("bl");
-  // A loop-iteration scope belongs to the run being left (WorkflowRun.tsx
-  // forwards it into studio URLs); inert in studio today, but clearing it keeps
-  // this the single, complete home for run-switch navigation.
+  // A loop-iteration scope belongs to the run being left; inert in studio
+  // today, but clearing it keeps this the single, complete home for run-switch
+  // navigation.
   params.delete("iteration");
   return toReadableSearch(params);
 }

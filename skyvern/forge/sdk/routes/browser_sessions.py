@@ -56,6 +56,7 @@ from skyvern.schemas.browser_sessions import (
 )
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 LOG = structlog.get_logger(__name__)
@@ -673,17 +674,40 @@ async def process_recording(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
 
+    # Record Browser now emits Code blocks exclusively. Reject processing before
+    # producing a workflow that this organization cannot execute.
+    await app.AGENT_FUNCTION.validate_code_block(current_org.organization_id)
+
+    recorded_actions = interpretation_registry.get_finalized_actions(
+        interpretation_session_id=recording_request.interpretation_session_id,
+        browser_session_id=browser_session_id,
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=recording_request.workflow_permanent_id,
+    )
+    if recorded_actions is None and recording_request.interpretation_session_id is not None:
+        # Done can reach this route while the websocket is still flushing its
+        # final snapshot. Join that stop task so a successful chunk fallback
+        # cannot leave a late finalized-action cache entry behind.
+        await interpretation_registry.stop_session(browser_session_id)
+        recorded_actions = interpretation_registry.get_finalized_actions(
+            interpretation_session_id=recording_request.interpretation_session_id,
+            browser_session_id=browser_session_id,
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=recording_request.workflow_permanent_id,
+        )
     blocks, parameters, recording_id, evidence = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
         organization_id=current_org.organization_id,
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
         workflow_permanent_id=recording_request.workflow_permanent_id,
         draft_steps=recording_request.draft_steps,
-        code_first=recording_request.code_first,
+        recorded_actions=recorded_actions,
         supports_credential_tokens=recording_request.supports_credential_tokens,
         recording_attempt_id=recording_request.recording_attempt_id,
         interpretation_session_id=recording_request.interpretation_session_id,
     )
+    if recorded_actions is not None:
+        interpretation_registry.discard_finalized_actions(recording_request.interpretation_session_id)
 
     return ProcessBrowserSessionRecordingResponse(
         recording_id=recording_id,

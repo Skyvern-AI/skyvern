@@ -45,6 +45,7 @@ from skyvern.forge.taskv3.tools import (
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
+    BlankWorkingPageGuard,
     _annotate_screenshot,
     _invalid_selector_result,
     _is_host_anchored_selector,
@@ -52,6 +53,7 @@ from skyvern.forge.taskv3.tools import (
 )
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
 from skyvern.forge.taskv3.tools import (
+    apply_blank_page_guard,
     build_browser_tools,
     pending_marker,
 )
@@ -297,6 +299,13 @@ class _FakePage:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.element = _FakeElement(self)
         self._request_listeners: list[Any] = []
+        self._closed = False
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    async def close(self) -> None:
+        self._closed = True
 
     def on(self, event: str, callback: Any) -> None:
         if event == "request":
@@ -4345,10 +4354,15 @@ class _DownloadFakePage(_FakePage):
         self._downloads_dir = downloads_dir
         self._click_writes: str | None = None
         self._observe_writes: str | None = None
+        # A download-intent click strands the tab on a blank document (SKY-16322): Chrome converts
+        # the navigation into a download and the tab it started from is left on `about:blank`.
+        self._click_blanks = False
 
     async def click(self, selector: str, timeout: int | None = None) -> None:
         if self._click_writes:
             (self._downloads_dir / self._click_writes).write_bytes(b"x" * 500)
+        if self._click_blanks:
+            self.url = "about:blank"
         await super().click(selector, timeout=timeout)
 
     async def evaluate(self, js: str) -> str:
@@ -16044,6 +16058,52 @@ async def test_observe_masks_a_minted_url_longer_than_its_display_caps(carrier: 
     assert "opaque_url_" in (r.content if carrier.startswith("alert") else line)
 
 
+# The same URL with a signature carrying no long run of hex characters. The `field=` qualifier is
+# screened by `_OPAQUE_ID_RUN_RE` before it is ever printed, so a signature like the one above is
+# dropped by that screen and a masking test written with it goes green without reaching the masker
+# at all. This one survives the screen, which is what puts the masker under test.
+_LONG_SIGNED_REF_URL_NO_HEX_RUN = (
+    "https://files.example.test/uploads/report.pdf"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260827%2Fus-east-1%2Fs3%2Faws4_request"
+    "&X-Amz-Date=20260827T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
+    "&X-Amz-Signature=QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5QUJDREVGR0hJSkxNTk9Q"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_masks_a_minted_url_carried_into_a_field_qualifier() -> None:
+    # Masking is by provenance over the WHOLE URL, so any cap applied before the masker runs leaves a
+    # fragment it cannot recognise -- and `X-Amz-Credential` sits in the PREFIX, which is the part a
+    # truncation keeps. The qualifier is a print path like any other, so it has to retain wide and let
+    # Python mask before capping. This is the same defect #16858 fixed one qualifier earlier.
+    assert len(_LONG_SIGNED_REF_URL_NO_HEX_RUN) > 200
+    assert not _OPAQUE_ID_RUN_RE.search(_LONG_SIGNED_REF_URL_NO_HEX_RUN), "screened before the masker"
+    # Two boxes, identical buttons: the qualifier only prints where a reading is actually ambiguous.
+    row = (
+        '<div><label for="f{i}">{url}</label>'
+        '<input id="f{i}" type="text" style="width:140px;height:24px">'
+        '<button style="width:60px;height:28px">Search</button></div>'
+    )
+    html = (
+        "<!doctype html><html><body>"
+        + row.format(i=0, url=html_escape(_LONG_SIGNED_REF_URL_NO_HEX_RUN))
+        + row.format(i=1, url="Plain second field")
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_LONG_SIGNED_REF_URL_NO_HEX_RUN))
+        r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok", r.content
+    icons = [ln for ln in _lines(r.content) if "'Search'" in ln]
+    assert len(icons) == 2, r.content
+    named = [ln for ln in icons if "field=" in ln]
+    assert len(named) == 2, r.content
+    # The leak check is over the whole digest, not just the qualifier: a truncated URL keeps its head.
+    assert _LONG_SIGNED_REF_ARTIFACT not in r.content, r.content
+    assert "opaque_url_" in "".join(named), named
+
+
 # A design system's question component: the label lives in the component's root and wraps a <slot>
 # for the light-DOM question text, so `.labels` finds it but its innerText is only the required
 # marker -- the model pattern-completed values from its neighbours. The two ancestor-root shapes in
@@ -22742,6 +22802,409 @@ async def test_observe_says_nothing_past_the_last_heading_a_capped_scan_saw() ->
         assert "section=" not in past, r.content
 
 
+def _lookup_rows(names: tuple[str, ...], label_last: bool = False, noise: str = "") -> str:
+    """A form row repeating one identical icon control beside a labelled field control."""
+    control = (
+        '<div>{noise}<input id="f{i}" type="text" disabled="true" style="width:160px;height:24px">'
+        '<button style="width:24px;height:24px"><span>Search</span></button></div>'
+    )
+    label = '<label for="f{i}">{name}</label>'
+    order = (control + label) if label_last else (label + control)
+    return "".join("<div>" + order.format(i=i, name=n, noise=noise.format(i=i)) + "</div>" for i, n in enumerate(names))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label_last", [False, True], ids=["label-first", "label-last"])
+@pytest.mark.parametrize(
+    "noise",
+    [
+        "",
+        '<input type="hidden" name="key{i}">',
+        '<input type="submit" value="Go" style="width:40px;height:20px">',
+    ],
+    ids=["bare", "hidden-key", "submit-input"],
+)
+async def test_observe_names_a_repeated_icon_control_by_the_field_it_belongs_to(label_last: bool, noise: str) -> None:
+    # SKY-16320. A form repeating one icon control across several labelled fields: the buttons are
+    # strongly AND identically named ('Search'), carry no identity of their own, sit in wrappers that
+    # carry none, and share one heading -- so every address tier found nothing and all three lines
+    # rendered the same bytes. The page bound a label to the field control beside each button, and
+    # that binding is what separates them. Run both DOM orders because a reading that depends on the
+    # label PRECEDING the control answers this shape by accident and the mirrored one not at all.
+    # The noise cases are markup a real lookup widget carries: a hidden input holding the resolved
+    # record id, and a submit control in the row. Neither names a field, so neither may make the row
+    # read as a section holding several -- counting them at all put the bug straight back.
+    names = ("Alpha Contact", "Beta Contact", "Gamma Contact")
+    html = f"""<!doctype html><html><body><h2>Contacts</h2>{_lookup_rows(names, label_last, noise)}</body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 3, r.content
+        # Each icon must answer with the field the page bound beside IT -- three distinct strings
+        # alone would let the icons be told apart while still naming the wrong field.
+        for expected in names:
+            assert sum(f"field={expected!r}" in line for line in icons) == 1, r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_ranks_the_field_over_a_wrapper_id_and_a_heading_but_under_its_own() -> None:
+    # Every set here can be split by BOTH tiers that bracket it unaided, which is what makes rank the
+    # only thing the assertions can be reading: a tier that could not split would fall through
+    # whatever the order and prove nothing. Mutation-check by reordering tiers, not by reverting.
+    rows = "".join(
+        f'<div id="lookupRow{i}"><h3>Section {i}</h3><label for="g{i}">{n}</label><div>'
+        f'<input id="g{i}" type="text" style="width:160px;height:24px">'
+        f'<button style="width:24px;height:24px"><span>Search</span></button></div></div>'
+        for i, n in enumerate(("Alpha Contact", "Beta Contact"))
+    )
+    owned = "".join(
+        f'<h3>{h}</h3><div><label for="d{i}">{h} note</label>'
+        f'<input id="d{i}" type="text" style="width:160px;height:24px">'
+        f'<button id="del-{i}" style="width:70px;height:30px">Delete</button></div>'
+        for i, h in enumerate(("Work", "Study"))
+    )
+    html = f"""<!doctype html><html><body>{rows}{owned}</body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        # A per-row wrapper id and a per-row heading would each split these on their own. Both are
+        # framework bookkeeping; only the field names what the task names, so the field must win.
+        for expected in ("Alpha Contact", "Beta Contact"):
+            assert sum(f"field={expected!r}" in line for line in icons) == 1, r.content
+        assert all("within." not in line and "section=" not in line for line in icons), r.content
+        dels = [line for line in _lines(r.content) if "'Delete'" in line]
+        assert len(dels) == 2, r.content
+        # These carry their own ids AND a field AND a heading -- the control's own address outranks
+        # both, so neither of the other two may be reached.
+        assert "id='del-0'" in dels[0] and "id='del-1'" in dels[1], r.content
+        assert all("field=" not in line and "section=" not in line for line in dels), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filter_nested", [False, True], ids=["rows-nested", "filter-nested"])
+async def test_observe_does_not_name_a_control_by_a_field_it_shares_no_box_with(filter_nested: bool) -> None:
+    # A panel holding one filter box and a list of row buttons. The page bound a name to the box; it
+    # bound nothing between that box and these buttons. Reaching for it anyway hands every row the
+    # filter's name -- confidently, and wrongly -- which is worse than leaving the lines identical,
+    # because the model acts on a qualifier it reads as a semantic claim.
+    #
+    # The filter is a DIRECT CHILD of the panel on purpose. Nested one level deeper, widening the box
+    # by a single level still passes, so the fixture would not discriminate the rule from a looser
+    # one -- and no counter can catch that class, because the wrong name is SHARED and the lines go
+    # on colliding. Only this shape can.
+    # Two arrangements, because the two halves of the rule fail to different shapes. rows-nested puts
+    # the filter beside the row blocks and needs the box NOT to widen outward; filter-nested puts the
+    # buttons beside the filter's wrapper and needs the field to be a direct child of the box. A
+    # fixture with only one of them leaves the other half of the rule free to be deleted.
+    if filter_nested:
+        panel = (
+            '<div><div><label for="q{i}">{name}</label>'
+            '<input id="q{i}" type="text" style="width:160px;height:24px"></div>'
+            '<button style="width:70px;height:30px">Select</button>'
+            '<button style="width:70px;height:30px">Select</button></div>'
+        )
+    else:
+        panel = (
+            '<div><label for="q{i}">{name}</label>'
+            '<input id="q{i}" type="text" style="width:160px;height:24px">'
+            '<div><span>Row one</span><button style="width:70px;height:30px">Select</button></div>'
+            '<div><span>Row two</span><button style="width:70px;height:30px">Select</button></div></div>'
+        )
+    html = (
+        "<!doctype html><html><body>"
+        + panel.format(i=0, name="Search company")
+        + panel.format(i=1, name="Search wholesaler")
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        picks = [line for line in _lines(r.content) if "'Select'" in line]
+        assert len(picks) == 4, r.content
+        assert all("field=" not in line for line in picks), r.content
+        # And the count must still say the reading is unresolved rather than hide it.
+        assert r.data["summary"]["duplicate_digest_lines"] == 4, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_will_not_name_a_box_that_holds_a_second_field_after_the_unnamed_one() -> None:
+    # Whether a box holds one field is a fact about the BOX. A second field that happens to carry no
+    # declared name is still a second field, so the button could belong to either and the page has
+    # not said which -- counting only the named ones would let the survivor name the whole row.
+    # The second field is wrapped in the first row and bare in the second: a validation-state wrapper
+    # appears around exactly the errored field, so a rule that only counted direct children would let
+    # the qualifier blink in and out as the user fixes the form.
+    row = (
+        '<div><label for="a{i}">{name}</label><input id="a{i}" style="width:140px;height:24px">'
+        '{open}<input id="b{i}" placeholder="Account number" style="width:140px;height:24px">{close}'
+        '<button style="width:60px;height:28px">Search</button></div>'
+    )
+    html = (
+        "<!doctype html><html><body>"
+        + row.format(i=0, name="Contact name", open='<div class="has-error">', close="</div>")
+        + row.format(i=1, name="Owner name", open="", close="")
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        assert all("field=" not in line for line in icons), r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "contenteditable-sibling",
+        "moved-in-by-observer",
+        "reclassified-by-observer",
+        "dropped-but-still-live",
+        "inserted-during-drain",
+    ],
+)
+async def test_observe_withholds_the_field_when_the_box_holds_a_second_one_it_almost_missed(
+    source: str,
+) -> None:
+    # The census decides whether the box holds exactly ONE field, so every way it can undercount is a
+    # way to emit a confident wrong name. Three sources that each defeated an earlier version: a field
+    # that is not an <input>; a field the page MOVES into the box while observe is running; a widget
+    # the page RECLASSIFIES from a command to a field mid-run, which the fingerprint does not track,
+    # so it survives re-resolution while its stored classification is stale; and a field whose record
+    # the sweep DROPS while the control stays on the page. Ancestry and classification are read from
+    # the live element after the sweep, the census includes dropped-but-live candidates, a box whose
+    # children changed underneath us is withheld outright, and anything not definitively a command
+    # control counts -- so all five fail closed.
+    if source == "contenteditable-sibling":
+        rows = "".join(
+            f'<div><label for="i{i}">{n}</label><input id="i{i}" style="width:140px;height:24px">'
+            f'<div contenteditable="true" aria-label="Notes {i}" style="width:120px;height:24px">y</div>'
+            f'<button style="width:60px;height:28px">Search</button></div>'
+            for i, n in enumerate(("Alpha Contact", "Beta Contact"))
+        )
+        html = f"<!doctype html><html><body>{rows}</body></html>"
+    elif source == "inserted-during-drain":
+        # The page APPENDS a field to the box on the marker write. It is in no collection the census
+        # can read -- not a survivor, not a dropped original -- so no amount of re-reading what was
+        # enumerated will see it. A box whose children changed underneath us is one whose field count
+        # cannot be established, so the qualifier is withheld there rather than guessed at.
+        rows = "".join(
+            f'<div class="row" id="r{i}"><label for="a{i}">{n}</label>'
+            f'<input id="a{i}" style="width:120px;height:26px">'
+            f'<button style="width:50px;height:26px">Search</button></div>'
+            for i, n in enumerate(("Account", "Policy"))
+        )
+        html = f"""<!doctype html><html><body>{rows}
+          <script>
+          new MutationObserver(function() {{
+            ['r0', 'r1'].forEach(function(id) {{
+              var row = document.getElementById(id);
+              if (row && !row.querySelector('.late')) {{
+                var i = document.createElement('input');
+                i.className = 'late';
+                i.setAttribute('aria-label', 'Late field ' + id);
+                i.style.width = '120px';
+                i.style.height = '26px';
+                row.appendChild(i);
+              }}
+            }});
+          }}).observe(document.documentElement, {{attributes: true, subtree: true,
+                                                  attributeFilter: ['data-tv3']}});
+          </script></body></html>"""
+    elif source == "dropped-but-still-live":
+        # The second field's label changes on the marker write, so it fails the fingerprint and its
+        # record is dropped -- but the control is still in the box. It must not name anything, having
+        # no line for the model to read, and it must still count.
+        rows = "".join(
+            f'<div><label for="a{i}">{n}</label><input id="a{i}" style="width:120px;height:26px">'
+            f'<input id="b{i}" aria-label="Second {i}" style="width:120px;height:26px">'
+            f'<button style="width:50px;height:26px">Search</button></div>'
+            for i, n in enumerate(("Account", "Policy"))
+        )
+        html = f"""<!doctype html><html><body>{rows}
+          <script>
+          new MutationObserver(function() {{
+            ['b0', 'b1'].forEach(function(id) {{
+              var n = document.getElementById(id);
+              if (n && n.getAttribute('aria-label').indexOf('changed') === -1) {{
+                n.setAttribute('aria-label', 'changed ' + id);
+              }}
+            }});
+          }}).observe(document.documentElement, {{attributes: true, subtree: true,
+                                                  attributeFilter: ['data-tv3']}});
+          </script></body></html>"""
+    elif source == "reclassified-by-observer":
+        # role=button at record time, role=combobox by the time the census runs.
+        rows = "".join(
+            f'<div><label for="a{i}">{n}</label><input id="a{i}" style="width:120px;height:26px">'
+            f'<div id="w{i}" role="button" tabindex="0" aria-label="{n} picker"'
+            f' style="width:100px;height:26px">pick</div>'
+            f'<button style="width:50px;height:26px">Search</button></div>'
+            for i, n in enumerate(("Account", "Policy"))
+        )
+        html = f"""<!doctype html><html><body>{rows}
+          <script>
+          new MutationObserver(function() {{
+            ['w0', 'w1'].forEach(function(id) {{
+              var n = document.getElementById(id);
+              if (n && n.getAttribute('role') === 'button') n.setAttribute('role', 'combobox');
+            }});
+          }}).observe(document.documentElement, {{attributes: true, subtree: true,
+                                                  attributeFilter: ['data-tv3']}});
+          </script></body></html>"""
+    else:
+        # The observer fires on observe's own marker write, after the records were made.
+        html = """<!doctype html><html><body>
+          <div class="row" id="r0"><label for="a0">Account</label>
+            <input id="a0" style="width:120px;height:26px">
+            <button style="width:50px;height:26px">Search</button></div>
+          <div class="row" id="r1"><label for="a1">Policy</label>
+            <input id="a1" style="width:120px;height:26px">
+            <button style="width:50px;height:26px">Search</button></div>
+          <div id="park"><label for="x0">Extra one</label>
+            <input id="x0" style="width:120px;height:26px">
+            <label for="x1">Extra two</label>
+            <input id="x1" style="width:120px;height:26px"></div>
+          <script>
+          new MutationObserver(function() {
+            var a = document.getElementById('x0'), b = document.getElementById('x1');
+            if (a && a.parentElement.id === 'park') document.getElementById('r0').appendChild(a);
+            if (b && b.parentElement.id === 'park') document.getElementById('r1').appendChild(b);
+          }).observe(document.documentElement, {attributes: true, subtree: true,
+                                                attributeFilter: ['data-tv3']});
+          </script></body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        assert all("field=" not in line for line in icons), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_will_not_name_an_icon_after_something_that_is_not_a_field() -> None:
+    # The census is deliberately WIDE -- everything not definitively a command control counts -- and
+    # that is fail-closed for COUNTING, because a wider census suppresses more. It is NOT fail-closed
+    # for NAMING: a wider source makes more non-fields eligible to lend their text to a neighbour.
+    # A labelled [role=option] is listed, is not a command control, and is not a field, so it must
+    # count against the box and must never name the icon beside it.
+    rows = "".join(
+        f'<div><div role="option" aria-label="{n}" tabindex="0" style="width:140px;height:26px">x</div>'
+        f'<button style="width:60px;height:26px">Search</button></div>'
+        for n in ("Alpha plan", "Beta plan")
+    )
+    html = f"<!doctype html><html><body>{rows}</body></html>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        assert all("field=" not in line for line in icons), r.content
+        # And the reading stays honestly unresolved rather than being told apart by a false name.
+        assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_names_an_icon_by_a_contenteditable_field_beside_it() -> None:
+    # A field is not only an <input>. The same module lists contenteditable elements and types into
+    # them, so a box whose one field is a labelled contenteditable names its icon like any other --
+    # the complement of the test above, and what stops "fails closed" from meaning "never fires".
+    rows = "".join(
+        f'<div><div contenteditable="true" aria-label="{n}" style="width:160px;height:24px">x</div>'
+        f'<button style="width:60px;height:28px">Search</button></div>'
+        for n in ("Alpha Contact", "Beta Contact")
+    )
+    html = f"<!doctype html><html><body>{rows}</body></html>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        for expected in ("Alpha Contact", "Beta Contact"):
+            assert sum(f"field={expected!r}" in line for line in icons) == 1, r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_sees_a_second_field_in_the_box_however_deeply_it_is_nested() -> None:
+    # The box is read by "holds no second field at any depth", so the registration that answers that
+    # question must not be depth-bounded. A bound does not bound the work here -- it makes the count
+    # WRONG, and silently: a box whose second field sits one level past it reports as holding one and
+    # names a control after it. That turns a refusal to guess back into a confident wrong answer,
+    # which is the failure this tier is built to avoid. Nested well past any plausible bound.
+    deep_open, deep_close = "<div>" * 8, "</div>" * 8
+    row = (
+        '<div><label for="a{i}">{near}</label><input id="a{i}" style="width:140px;height:24px">'
+        '<button style="width:60px;height:28px">Search</button>'
+        + deep_open
+        + '<label for="b{i}">{deep}</label><input id="b{i}" style="width:140px;height:24px">'
+        + deep_close
+        + "</div>"
+    )
+    html = (
+        "<!doctype html><html><body>"
+        + row.format(i=0, near="Contact name", deep="Deep account")
+        + row.format(i=1, near="Owner name", deep="Deep owner")
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        assert all("field=" not in line for line in icons), r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attrs",
+    ['placeholder="Search {name}..."', 'value="{name}"'],
+    ids=["placeholder", "typed-value"],
+)
+async def test_observe_names_a_field_only_from_a_name_the_page_bound(attrs: str) -> None:
+    # The qualifier must come from a DECLARED name. A placeholder is a hint every field of a template
+    # shares, and a typed value changes as the agent fills the row -- either one would make an
+    # unchanged page render a different digest each turn, on exactly these repeated-row forms.
+    rows = "".join(
+        f'<div><div><input id="p{i}" type="text" {attrs.format(name=n)} style="width:160px;height:24px">'
+        f'<button style="width:24px;height:24px"><span>Search</span></button></div></div>'
+        for i, n in enumerate(("Alpha Contact", "Beta Contact"))
+    )
+    html = f"""<!doctype html><html><body><h2>Contacts</h2>{rows}</body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        icons = [line for line in _lines(r.content) if "'Search'" in line]
+        assert len(icons) == 2, r.content
+        assert all("field=" not in line for line in icons), r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+
+
 def _surface_oracle(
     pre: str | None, post: str, chosen: str, rows: list[str] | None
 ) -> taskv3_tools.CommitStatus | None:
@@ -23529,3 +23992,528 @@ async def test_the_isolated_leg_is_recorded_as_isolated(monkeypatch: pytest.Monk
     await _tool(build_browser_tools(_fixed_page_provider(_FakePage())), "click").handler({"selector": "#submit"})
     assert (taskv3_loop._HIT_CLASS.get() or {}).get("isolated") is True
     taskv3_loop._HIT_CLASS.set(None)
+
+
+# --- Blank working-page guard (SKY-16322). A download leaves the working page on a blank document
+# and the next url-less block raises InvalidWorkflowTaskURLState. Production shape, measured: on the
+# affected workflow 1545 of 1546 downloads went 1 page -> 2 (the download opens a tab), and v1
+# repaired every one by CLOSING it. Fleet-wide the reverse dominates -- 91.3% of downloads open no
+# second page at all -- so the no-interloper case is the one the close path must stay off. ---
+
+
+def _guarded(page_provider: Any, tmp_path: Path) -> tuple[list[Any], Any, list[tuple[Any, str]]]:
+    calls: list[tuple[Any, str]] = []
+
+    async def _restore(page: Any, url: str) -> None:
+        calls.append((page, url))
+        page.url = url
+
+    guard = BlankWorkingPageGuard(page_provider, _restore, downloads_dir=str(tmp_path))
+    tools = build_browser_tools(page_provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+    return tools, guard, calls
+
+
+def _newest_open(pages: list[Any]) -> Callable[[], Awaitable[Any]]:
+    """Mirrors get_working_page: newest page that is still open (a closed page leaves context.pages)."""
+
+    async def _provider() -> Any:
+        live = [p for p in pages if not p.is_closed()]
+        return live[-1] if live else None
+
+    return _provider
+
+
+class _PopupDownloadPage(_DownloadFakePage):
+    """A download click that opens a second tab and leaves it blank -- the measured production shape."""
+
+    def __init__(self, downloads_dir: Path, pages: list[Any], popup: Any) -> None:
+        super().__init__(downloads_dir)
+        self._pages = pages
+        self._popup = popup
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        await super().click(selector, timeout=timeout)
+        self._pages.append(self._popup)
+
+
+@pytest.mark.asyncio
+async def test_the_blank_tab_a_download_opens_is_closed_so_the_working_page_falls_back(
+    tmp_path: Path,
+) -> None:
+    # THE production case. Without this the popup is newest, takes the working-page slot, and the
+    # next url-less block inherits about:blank.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    opener._click_writes = "statement.pdf"
+    pages.append(opener)
+    tools, _guard, calls = _guarded(_newest_open(pages), tmp_path)
+
+    r = await _tool(tools, "click").handler({"selector": "#dl"})
+    assert "Downloaded: statement.pdf" in r.content
+    await _tool(tools, "get_html").handler({})
+
+    assert popup.is_closed()
+    assert not opener.is_closed()
+    assert await _newest_open(pages)() is opener
+    assert calls == []  # closing is the repair here; nothing is navigated
+
+
+@pytest.mark.asyncio
+async def test_a_download_that_opens_no_second_page_closes_nothing(tmp_path: Path) -> None:
+    # Fleet-wide this is 91.3% of downloads. The close path must stay completely off.
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf"
+    before = page.url
+    tools, _guard, calls = _guarded(_fixed_page_provider(page), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    await _tool(tools, "get_html").handler({})
+
+    assert not page.is_closed()
+    assert page.url == before
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_second_tab_the_model_opened_is_never_closed(tmp_path: Path) -> None:
+    # The regression this fix could cause: closing a tab the model deliberately opened. A real tab
+    # navigates, so it is not blank when the guard next looks.
+    pages: list[Any] = []
+    real_tab = _DownloadFakePage(tmp_path)
+    real_tab.url = "https://example.test/report"
+    opener = _PopupDownloadPage(tmp_path, pages, real_tab)
+    opener._click_writes = "statement.pdf"
+    pages.append(opener)
+    tools, _guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    await _tool(tools, "get_html").handler({})
+
+    assert not real_tab.is_closed()
+    assert not opener.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_blank_tab_with_no_download_to_account_for_it_is_never_closed(tmp_path: Path) -> None:
+    # No download observed => the blank tab is one the model opened and has not navigated yet.
+    # v1 gates its close on a download for exactly this reason; the gate is the whole safety margin.
+    pages: list[Any] = []
+    fresh_tab = _DownloadFakePage(tmp_path)
+    fresh_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, fresh_tab)
+    pages.append(opener)
+    tools, _guard, calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#link"})  # no file lands
+    await _tool(tools, "get_html").handler({})
+
+    assert not fresh_tab.is_closed()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_one_download_arms_exactly_one_close(tmp_path: Path) -> None:
+    # v1 scopes its close to a single download action. A second blank tab appearing later, with no
+    # new download, must survive.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    opener._click_writes = "statement.pdf"
+    pages.append(opener)
+    tools, _guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    await _tool(tools, "get_html").handler({})
+    assert popup.is_closed()
+
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    pages.append(later_tab)
+    await _tool(tools, "get_html").handler({})
+
+    assert not later_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_tab_blanked_in_place_is_navigated_back(tmp_path: Path) -> None:
+    # The other shape. v1 still carries code for it, though its log fired once in 30 days fleet-wide.
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf"
+    page._click_blanks = True
+    before = page.url
+    tools, _guard, calls = _guarded(_fixed_page_provider(page), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    r2 = await _tool(tools, "get_html").handler({})
+
+    assert calls == [(page, before)]
+    assert page.url == before
+    assert "about:blank" not in r2.content
+
+
+@pytest.mark.asyncio
+async def test_repair_targets_where_the_download_fired_not_where_the_block_started(tmp_path: Path) -> None:
+    # A guard that remembered only the run's FIRST url would pass the other tests and drop the run
+    # back onto the wrong page in production.
+    page = _DownloadFakePage(tmp_path)
+    started_on = page.url
+    tools, _guard, calls = _guarded(_fixed_page_provider(page), tmp_path)
+
+    await _tool(tools, "get_html").handler({})
+    page.url = "https://example.test/statements"
+    page._click_writes = "statement.pdf"
+    page._click_blanks = True
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    await _tool(tools, "get_html").handler({})
+
+    assert calls == [(page, "https://example.test/statements")]
+    assert started_on not in [url for _, url in calls]
+
+
+@pytest.mark.asyncio
+async def test_a_live_working_page_is_never_re_navigated(tmp_path: Path) -> None:
+    # Kills the mutant that drops the blank-URL check: it would re-navigate the live page after every
+    # download, wiping form state mid-run.
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf"
+    tools, _guard, calls = _guarded(_fixed_page_provider(page), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    page.url = "https://example.test/apply?step=2"
+    await _tool(tools, "get_html").handler({})
+    await _tool(tools, "click").handler({"selector": "#next"})
+
+    assert calls == []
+    assert page.url == "https://example.test/apply?step=2"
+
+
+@pytest.mark.asyncio
+async def test_a_restore_that_hangs_is_bounded_and_gives_up_rather_than_retrying_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import skyvern.forge.taskv3.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_BLANK_PAGE_RESTORE_TIMEOUT_SECONDS", 0.01)
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    attempts: list[int] = []
+
+    async def _hang(_page: Any, _url: str) -> None:
+        attempts.append(1)
+        await asyncio.sleep(10)
+
+    guard = BlankWorkingPageGuard(_fixed_page_provider(page), _hang, downloads_dir=str(tmp_path))
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    for _ in range(6):
+        assert (await _tool(tools, "get_html").handler({})).status == "ok"
+
+    assert len(attempts) == tools_mod._BLANK_PAGE_RESTORE_MAX_FAILURES
+    assert page.url == "about:blank"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_page_is_not_navigated(tmp_path: Path) -> None:
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    tools, _guard, calls = _guarded(_fixed_page_provider(page), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    page._closed = True
+    await _tool(tools, "get_html").handler({})
+
+    assert calls == []
+
+
+def test_only_the_origin_of_a_page_url_can_reach_a_log() -> None:
+    # P1: a page URL reaching structlog can carry an OAuth code, a signed token, or customer data in
+    # its PATH or QUERY, and `user:pass@` credentials in its netloc.
+    from skyvern.forge.taskv3.tools import _url_origin
+
+    assert _url_origin("https://site.test/verify/SECRET-TOKEN?code=abc123") == "https://site.test"
+    assert _url_origin("https://user:pw@site.test:8443/a") == "https://site.test:8443"
+    for blank in ("about:blank", ":", ""):
+        assert _url_origin(blank) == "unparseable"
+
+
+@pytest.mark.asyncio
+async def test_the_interloper_is_kept_when_there_is_no_live_page_to_fall_back_to(tmp_path: Path) -> None:
+    # Closing is only a repair because the working page falls back to a live one. If the remembered
+    # page is itself gone or blank there is nothing to fall back TO, and closing would leave the run
+    # with no usable page at all -- strictly worse than the blank page it was fixing.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    opener._click_writes = "statement.pdf"
+    pages.append(opener)
+    tools, _guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    opener._closed = True  # the opener dies before the guard next looks
+    await _tool(tools, "get_html").handler({})
+
+    assert not popup.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_download_landing_after_the_click_still_arms_the_close(tmp_path: Path) -> None:
+    # The arming must not depend on the download-signal wrapper, which covers only the tools
+    # build_browser_tools builds. The file routinely lands after the click handler returns, and if the
+    # next call is `finish` -- which that wrapper never sees -- nothing would arm and the tab would
+    # survive: the original bug, reintroduced through the arming path.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    pages.append(opener)
+    tools, guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})  # opens the tab, writes nothing yet
+    (tmp_path / "statement.pdf").write_bytes(b"x" * 500)  # lands after the handler returned
+
+    # A tool the download-signal wrapper does not wrap at all.
+    await guard.ensure_live()
+
+    assert popup.is_closed()
+    assert not opener.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_download_arming_expires_so_a_later_blank_tab_survives(tmp_path: Path) -> None:
+    # Fleet-wide 91.3% of downloads open no second page, so arming that never expires would be live
+    # for the rest of the block and would close the next tab the model opened before it navigated.
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = "statement.pdf"
+    pages: list[Any] = [page]
+    tools, guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})  # download, no popup
+    for _ in range(4):
+        await _tool(tools, "get_html").handler({})  # live page each time: arming decays
+
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    pages.append(later_tab)
+    await guard.ensure_live()
+
+    assert not later_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_restore_is_bounded_by_what_is_left_of_the_run(tmp_path: Path) -> None:
+    # The per-call wrapper gets no explicit timeout, so without the run-level bound a restore near the
+    # deadline could spend the full allowance before the handler it precedes even starts.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    attempts: list[float] = []
+
+    async def _record(_page: Any, _url: str) -> None:
+        attempts.append(1.0)
+        await asyncio.sleep(10)
+
+    guard = BlankWorkingPageGuard(
+        _fixed_page_provider(page), _record, downloads_dir=str(tmp_path), remaining_seconds=lambda: 0.01
+    )
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    assert (await _tool(tools, "get_html").handler({})).status == "ok"
+
+    assert attempts  # it tried
+    # and gave up on the run's remaining time, not on the 90s allowance
+    guard._remaining_seconds = lambda: 0.0
+    await guard.ensure_live()
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_file_a_previous_block_downloaded_does_not_arm_this_one(tmp_path: Path) -> None:
+    # downloads_dir persists across the blocks of a workflow run. Without a baselining first scan,
+    # every block would start already armed by its predecessor's file and would close the first tab
+    # the model opened.
+    (tmp_path / "statement-from-the-previous-block.pdf").write_bytes(b"x" * 500)
+
+    pages: list[Any] = []
+    fresh_tab = _DownloadFakePage(tmp_path)
+    fresh_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, fresh_tab)
+    pages.append(opener)
+    tools, guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#link"})  # opens a tab, downloads nothing
+    await guard.ensure_live()
+
+    assert not fresh_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_deduplicated_download_still_arms_the_close(tmp_path: Path) -> None:
+    # The CDP interceptor discards a download whose bytes already match a file on disk
+    # (`_existing_file_is_identical` -> `_discard_duplicate_download` -> return), so the directory is
+    # COMPLETELY unchanged. No filesystem check can see it. Its attempt counter still moves, because
+    # it increments in `_resolve_save_path` before the duplicate check.
+    (tmp_path / "statement.pdf").write_bytes(b"x" * 500)  # the earlier, identical copy
+
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    pages.append(opener)
+
+    attempts = [7]
+    calls: list[tuple[Any, str]] = []
+
+    async def _restore(page: Any, url: str) -> None:
+        calls.append((page, url))
+
+    provider = _newest_open(pages)
+    guard = BlankWorkingPageGuard(
+        provider, _restore, downloads_dir=str(tmp_path), download_attempts=lambda: attempts[0]
+    )
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})  # opens the tab; writes no new file
+    attempts[0] += 1  # the interceptor counted the attempt, then deduplicated it
+    await guard.ensure_live()
+
+    assert popup.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_file_staged_by_file_upload_does_not_arm_the_close(tmp_path: Path) -> None:
+    # file_upload writes its own source into the SAME directory. That is this run staging an upload,
+    # not the browser downloading anything, and arming on it would hand a tab the model opened to the
+    # close path.
+    staged: set[str] = set()
+    pages: list[Any] = []
+    fresh_tab = _DownloadFakePage(tmp_path)
+    fresh_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, fresh_tab)
+    pages.append(opener)
+
+    async def _restore(page: Any, url: str) -> None:
+        raise AssertionError("must not restore")
+
+    provider = _newest_open(pages)
+    guard = BlankWorkingPageGuard(provider, _restore, downloads_dir=str(tmp_path), staged_downloads=staged)
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "click").handler({"selector": "#link"})  # opens a blank tab
+    (tmp_path / "resume.pdf").write_bytes(b"x" * 500)
+    staged.add("resume.pdf")  # the loop records it as this run's own staged upload
+    await guard.ensure_live()
+
+    assert not fresh_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_popup_close_that_hangs_does_not_block_the_run(tmp_path: Path) -> None:
+    # A popup on a stalled CDP connection can leave close() pending forever, and this path runs both
+    # before dispatch and during final cleanup.
+    pages: list[Any] = []
+
+    class _HangingClosePage(_DownloadFakePage):
+        async def close(self) -> None:
+            await asyncio.sleep(10)
+
+    popup = _HangingClosePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    opener._click_writes = "statement.pdf"
+    pages.append(opener)
+
+    async def _restore(page: Any, url: str) -> None:
+        return None
+
+    provider = _newest_open(pages)
+    guard = BlankWorkingPageGuard(provider, _restore, downloads_dir=str(tmp_path), remaining_seconds=lambda: 0.01)
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "click").handler({"selector": "#dl"})
+    started = time.monotonic()
+    assert (await _tool(tools, "get_html").handler({})).status == "ok"
+    elapsed = time.monotonic() - started
+
+    # The discriminator is the BOUND, not the return: an unbounded close returns too, ten seconds
+    # later, having held up dispatch (and, at the post-loop site, cancellation) the whole time. The
+    # threshold sits between the two outcomes with margin either side, not at the bound itself.
+    assert elapsed < 4.0, f"the hung close was not bounded: {elapsed:.2f}s"
+    assert not popup.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_one_download_arms_once_across_its_temp_name_and_its_rename(tmp_path: Path) -> None:
+    # A download appears twice in the directory: `report.pdf.<uuid>.crdownload`, then `report.pdf`.
+    # On raw names that is two arming events, and the second has no tab-opening behind it -- it would
+    # grant a fresh close window at an arbitrary later point and close a tab the model opened. The
+    # invariant is one close per DOWNLOAD, so the scan normalises through _download_signal_identity.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    pages.append(opener)
+    tools, guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "get_html").handler({})  # baseline on an empty directory
+
+    temp = "report.pdf." + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" + ".crdownload"
+    (tmp_path / temp).write_bytes(b"partial")
+    await _tool(tools, "click").handler({"selector": "#dl"})  # sees the temp file, arms once
+    await _tool(tools, "get_html").handler({})
+    assert popup.is_closed()
+
+    # The rename lands. It must NOT arm again.
+    (tmp_path / temp).unlink()
+    (tmp_path / "report.pdf").write_bytes(b"x" * 500)
+
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    pages.append(later_tab)
+    await guard.ensure_live()
+
+    assert not later_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_the_baseline_stores_identities_so_a_previous_blocks_temp_name_does_not_arm(
+    tmp_path: Path,
+) -> None:
+    # The one place the identity substitution is not mechanical: the first scan baselines IDENTITIES,
+    # not raw names. A predecessor block that left `report.pdf.<uuid>.crdownload` behind must not arm
+    # this block when that file is renamed to `report.pdf` under it.
+    temp = "report.pdf." + "f0e1d2c3b4a5968778695a4b3c2d1e0f" + ".crdownload"
+    (tmp_path / temp).write_bytes(b"partial")
+
+    pages: list[Any] = []
+    fresh_tab = _DownloadFakePage(tmp_path)
+    fresh_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, fresh_tab)
+    pages.append(opener)
+    tools, guard, _calls = _guarded(_newest_open(pages), tmp_path)
+
+    await _tool(tools, "click").handler({"selector": "#link"})  # baselines on the identity, opens a tab
+    (tmp_path / temp).unlink()
+    (tmp_path / "report.pdf").write_bytes(b"x" * 500)  # the predecessor's file, renamed
+    await guard.ensure_live()
+
+    assert not fresh_tab.is_closed()
+
+
+def test_an_out_of_range_port_does_not_escape_the_origin_helper() -> None:
+    # `parsed.port` is lazy and raises ValueError, and both call sites sit in paths documented as
+    # unable to raise -- including the engine `finally`.
+    from skyvern.forge.taskv3.tools import _url_origin
+
+    assert _url_origin("https://site.test:99999/a") == "unparseable"
+    assert _url_origin("https://site.test:8443/a") == "https://site.test:8443"

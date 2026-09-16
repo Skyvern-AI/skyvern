@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
-    WorkflowDefinitionYamlBlocksItem_Code,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
@@ -77,6 +76,8 @@ class ActionUrlChange(ActionBase):
 
 
 class ActionWait(ActionBase):
+    """Compatibility model for recordings captured before inferred waits were disabled."""
+
     kind: t.Literal[ActionKind.WAIT]
     # --
     duration_ms: int
@@ -123,10 +124,6 @@ OutputBlock = t.Union[
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 ]
-
-# What process_recording can return: legacy interpretable blocks, plus code blocks
-# when code-first mode is enabled. The live interpreter only ever sees OutputBlock.
-ProcessedBlock = t.Union[OutputBlock, WorkflowDefinitionYamlBlocksItem_Code]
 
 
 class RecordingDraftStep(BaseModel):
