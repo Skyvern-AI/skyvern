@@ -79,6 +79,7 @@ import {
   CopilotProductAction,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { AutoAcceptChip } from "./AutoAcceptChip";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -89,7 +90,6 @@ import {
   resolveSendAction,
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
-import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
@@ -165,6 +165,30 @@ const MAX_TURN_SNAPSHOTS = 20;
 // A stream that closes with no terminal frame is usually a lost client
 // connection while the server handler runs on to persist the real reply, so the
 // ladder is sized to the server's own turn budget rather than to a short wait.
+// How long Turn off waits for a chat's in-flight Accepts before giving up and reporting failure, so an
+// apply that never answers cannot leave that chat's gate without its Accept actions. Accept p95 is ~11s.
+export const ACCEPT_SETTLE_CEILING_MS = 30_000;
+
+async function settledWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const RECOVERY_POLL_DELAYS_MS = [2_000, 3_000, 5_000, 8_000, 12_000, 20_000];
 const RECOVERY_POLL_STEADY_MS = 30_000;
 // The server's RECONCILE_ABANDON_AFTER_SECONDS is 1_320_000ms. The margin holds
@@ -1073,6 +1097,29 @@ export function WorkflowCopilotChat({
     new Set(),
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
+  // A running turn's stream handler reads this, so Turn off reaches the turn already in flight.
+  const autoAcceptRef = useRef(autoAccept);
+  useEffect(() => {
+    autoAcceptRef.current = autoAccept;
+  }, [autoAccept]);
+  // Counts the user's own auto-accept writes, so a chat-row read that started before one cannot undo it.
+  const autoAcceptWrites = useRef(0);
+  // Accepts still running, per chat. Each apply writes its chat's auto_accept when it lands, so that chat's
+  // Turn off must go after it; another chat's Accept cannot write it and must not hold it back.
+  const acceptsInFlight = useRef(new Map<string, Promise<void>>());
+  // How many Turn offs are in flight per chat. Their review gates offer no Accept until every one finishes, so
+  // no Accept can start after a disable and write auto_accept back on. Counted, not a flag: one chat's Turn off
+  // must not free another's, and a chip that remounts on a chat switch must not free the request still running.
+  const [turningOffCounts, setTurningOffCounts] = useState<
+    ReadonlyMap<string, number>
+  >(() => new Map());
+  const noteAutoAcceptWrite = () => {
+    autoAcceptWrites.current += 1;
+  };
+  const setAutoAcceptFromWrite = (value: boolean) => {
+    noteAutoAcceptWrite();
+    setAutoAccept(value);
+  };
   const [inputValue, setInputValue] = useState("");
   const [attachments, setAttachments] = useState<CopilotAttachedFile[]>([]);
   // A file returned to the tray after a failed send may already be saved on that message, so
@@ -1731,27 +1778,6 @@ export function WorkflowCopilotChat({
     },
     [respondToCredentialPause, continueAfterTerminalConnect],
   );
-  // Explore/Draft boundary is unobservable (the LLM writes code with no
-  // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
-  // run, assume Draft has started. Re-arms per narrative update; the reducer
-  // guard makes a stale or double-fired timer a no-op.
-  const DRAFTING_GAP_MS = 8000;
-  useEffect(() => {
-    if (!shouldArmDraftingGapTimer(narrative)) return;
-    const wait = Math.max(
-      0,
-      DRAFTING_GAP_MS - (Date.now() - narrative.lastActivityAtMs!),
-    );
-    const t = setTimeout(
-      () =>
-        applyStoredNarrativeEvent({
-          type: "client_phase_hint",
-          hintedAtMs: Date.now(),
-        }),
-      wait,
-    );
-    return () => clearTimeout(t);
-  }, [narrative, applyStoredNarrativeEvent]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -1888,6 +1914,7 @@ export function WorkflowCopilotChat({
     setMessages([]);
     discardQueuedPrompt();
     setWorkflowCopilotChatId(null);
+    workflowCopilotChatIdRef.current = null;
     setProposedWorkflow(null);
     setPendingProposalMetadata(null);
     setPendingProposalRun(null);
@@ -1915,6 +1942,8 @@ export function WorkflowCopilotChat({
         messageId: string;
         status: RecordingRefinementStatus;
       },
+      // Pass for a re-read of the chat on screen; a chat switch or first load always takes the row's value.
+      autoAcceptWritesAtRead?: number,
     ) => {
       setRecoveredPauseFrames(data.pending_credential_requests ?? []);
       setQuestionInteractions(data.question_interactions ?? []);
@@ -2074,7 +2103,12 @@ export function WorkflowCopilotChat({
       setPendingProposalTurnId(
         data.proposed_workflow ? restoredPendingProposalTurnId : null,
       );
-      setAutoAccept(data.auto_accept ?? false);
+      if (
+        autoAcceptWritesAtRead === undefined ||
+        autoAcceptWritesAtRead === autoAcceptWrites.current
+      ) {
+        setAutoAccept(data.auto_accept ?? false);
+      }
       setWorkPlan(data.work_plan ?? []);
     },
     // Only stable state setters and refs are referenced, so the callback never needs to change.
@@ -2201,6 +2235,7 @@ export function WorkflowCopilotChat({
           return;
         }
         const sendEpochBeforeRead = sendEpoch.current;
+        const autoAcceptWritesBeforeRead = autoAcceptWrites.current;
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           const controller = new AbortController();
@@ -2351,6 +2386,7 @@ export function WorkflowCopilotChat({
                       status: recoveredStatus,
                     }
                   : undefined,
+                autoAcceptWritesBeforeRead,
               );
               setIsLoading(false);
             }
@@ -2600,11 +2636,36 @@ export function WorkflowCopilotChat({
     setPendingProposalTurnId(null);
   };
 
-  const handleAcceptWorkflow = async (
+  const handleAcceptWorkflow = (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
   ) => {
+    const chatKey = workflowCopilotChatIdRef.current?.trim() ?? "";
+    const accepting = acceptWorkflow(workflow, alwaysAccept);
+    // Chain rather than replace: a second click must not let Turn off skip the first apply.
+    acceptsInFlight.current.set(
+      chatKey,
+      Promise.allSettled([
+        acceptsInFlight.current.get(chatKey),
+        accepting,
+      ]).then(() => undefined),
+    );
+    return accepting;
+  };
+
+  const acceptWorkflow = async (
+    workflow: WorkflowApiResponse,
+    alwaysAccept: boolean,
+  ) => {
     let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    // The pane can move to another chat, or to a blank New chat, while this runs. Their proposal and
+    // auto-accept are their own, so the per-chat state below is skipped unless the pane still shows the chat
+    // this accept began on (null included: a pane that had no chat id yet still does not).
+    const startedOnChatId = chatId;
+    const stillOnAcceptedChat = () => {
+      const shown = workflowCopilotChatIdRef.current?.trim() || null;
+      return shown === startedOnChatId || shown === chatId;
+    };
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -2630,14 +2691,18 @@ export function WorkflowCopilotChat({
       if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      setPendingProposalMetadata(null);
-      setPendingProposalRun(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
+      if (stillOnAcceptedChat()) {
+        markProposalAccepted();
+        setProposedWorkflow(null);
+        setPendingProposalMetadata(null);
+        setPendingProposalRun(null);
+        if (alwaysAccept) {
+          setAutoAcceptFromWrite(true);
+        }
+        // This accept never resolved a chat id, so it has none to name. Only attempt the best-effort clear
+        // while the pane still has none either: any id it holds now is one this accept cannot claim.
+        await clearProposedWorkflow(alwaysAccept);
       }
-      void clearProposedWorkflow(alwaysAccept);
       return;
     }
 
@@ -2658,12 +2723,22 @@ export function WorkflowCopilotChat({
       ) {
         return;
       }
+      if (!stillOnAcceptedChat()) {
+        return;
+      }
       markProposalAccepted();
       setProposedWorkflow(null);
       setPendingProposalMetadata(null);
       setPendingProposalRun(null);
       if (alwaysAccept) {
-        setAutoAccept(true);
+        setAutoAcceptFromWrite(true);
+      } else {
+        // A plain Accept writes auto_accept=false on the row, so reads taken before it are stale too.
+        noteAutoAcceptWrite();
+      }
+      if (alwaysAccept !== autoAcceptRef.current) {
+        // Apply writes auto-accept best-effort after creating the version, so show what the chat row kept.
+        void resyncProposalFromChatRow();
       }
     } catch (applyError) {
       if (getErrorStatus(applyError) === 409) {
@@ -2701,14 +2776,17 @@ export function WorkflowCopilotChat({
         });
         return;
       }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      setPendingProposalMetadata(null);
-      setPendingProposalRun(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
+      if (stillOnAcceptedChat()) {
+        markProposalAccepted();
+        setProposedWorkflow(null);
+        setPendingProposalMetadata(null);
+        setPendingProposalRun(null);
+        if (alwaysAccept) {
+          setAutoAcceptFromWrite(true);
+        }
       }
-      void clearProposedWorkflow(alwaysAccept);
+      // The row write belongs to the accepted chat even if the pane has moved on.
+      await clearProposedWorkflow(alwaysAccept, chatId ?? undefined);
     }
   };
 
@@ -3044,18 +3122,26 @@ export function WorkflowCopilotChat({
     if (!chatId) {
       return;
     }
+    const writesAtRead = autoAcceptWrites.current;
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.get<WorkflowCopilotChatHistoryResponse>(
         "/workflow/copilot/chat-history",
         { params: { workflow_copilot_chat_id: chatId } },
       );
+      // The read can outlive a switch to another chat, whose pane this row does not describe.
+      if (workflowCopilotChatIdRef.current?.trim() !== chatId) {
+        return;
+      }
       const nextProposal = response.data.proposed_workflow ?? null;
       setProposedWorkflow(nextProposal);
       setPendingProposalMetadata(
         response.data.proposed_workflow_metadata ?? null,
       );
       setPendingProposalRun(response.data.proposed_workflow_run ?? null);
+      if (autoAcceptWrites.current === writesAtRead) {
+        setAutoAccept(response.data.auto_accept ?? false);
+      }
       setPendingProposalTurnId((currentTurnId) =>
         nextProposal
           ? (response.data.proposed_workflow_metadata?.owner_turn_id ??
@@ -3070,8 +3156,15 @@ export function WorkflowCopilotChat({
 
   const clearProposedWorkflow = async (
     autoAcceptValue: boolean,
+    // The chat this clear belongs to. Passed by a caller whose chat may no longer be the one on screen,
+    // so the write still lands on the right row; omitted, it clears the chat the pane shows.
+    forChatId?: string,
   ): Promise<boolean> => {
-    const clearProposalByChatId = async (chatId: string) => {
+    // Resolves false when the pane switched to a chat this write did not touch, so callers leave it alone.
+    // A pane still resolving its chat id reads null, or either id, until the next render; that is no switch.
+    const startingChatId =
+      forChatId?.trim() || workflowCopilotChatIdRef.current?.trim() || null;
+    const clearProposalByChatId = async (chatId: string): Promise<boolean> => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
         "/workflow/copilot/clear-proposed-workflow",
@@ -3082,9 +3175,15 @@ export function WorkflowCopilotChat({
           revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotClearProposedWorkflowRequest,
       );
+      const shownChatId = workflowCopilotChatIdRef.current?.trim() || null;
+      if (shownChatId !== chatId && shownChatId !== startingChatId) {
+        return false;
+      }
+      setAutoAcceptFromWrite(autoAcceptValue);
+      return true;
     };
 
-    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    let chatId = startingChatId;
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -3102,16 +3201,16 @@ export function WorkflowCopilotChat({
     }
 
     try {
-      await clearProposalByChatId(chatId);
-      return true;
+      return await clearProposalByChatId(chatId);
     } catch (error) {
       const status = getErrorStatus(error);
-      if (status === 404) {
+      // A caller that named its chat has no fallback target: the latest chat is someone else's row,
+      // and clearing it would delete that chat's pending review.
+      if (status === 404 && !forChatId) {
         try {
           const refreshedChatId = await fetchLatestChatId();
           if (refreshedChatId && refreshedChatId !== chatId) {
-            await clearProposalByChatId(refreshedChatId);
-            return true;
+            return await clearProposalByChatId(refreshedChatId);
           }
         } catch (retryError) {
           console.error("Retry to clear proposed workflow failed:", retryError);
@@ -4376,11 +4475,7 @@ export function WorkflowCopilotChat({
             : null;
           if (
             response.updated_workflow &&
-            shouldAutoApplyWorkflowResponse(
-              response,
-              autoAccept,
-              userCancelledThisTurn,
-            )
+            shouldAutoApplyWorkflowResponse(response, userCancelledThisTurn)
           ) {
             applyWorkflowUpdate(response.updated_workflow, { applied: true });
             // This turn's auto-commit already moved canonical past any earlier
@@ -4870,7 +4965,6 @@ export function WorkflowCopilotChat({
       applyWorkflowUpdate,
       armStop,
       authoringInProgress,
-      autoAccept,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       credentialGetter,
@@ -5425,6 +5519,11 @@ export function WorkflowCopilotChat({
   // restore, so gate actions wait for idle.
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
+  const turningOffThisChat =
+    workflowCopilotChatId !== null &&
+    (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
+  // Only the two accepts wait for Turn off; Review and Reject write no auto_accept.
+  const gateAcceptsEnabled = !turningOffThisChat;
   // A staged attachment counts as content: with only a file in the tray the button would
   // otherwise read as Stop during a turn, and clicking Send would cancel the turn instead.
   const hasComposerText =
@@ -5898,6 +5997,7 @@ export function WorkflowCopilotChat({
                                   : null
                             }
                             actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
                             onAccept={() =>
                               proposedWorkflow &&
                               handleAcceptWorkflow(proposedWorkflow)
@@ -6068,6 +6168,7 @@ export function WorkflowCopilotChat({
                             )}
                             settled={null}
                             actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
                             onAccept={() =>
                               proposedWorkflow &&
                               handleAcceptWorkflow(proposedWorkflow)
@@ -6104,6 +6205,7 @@ export function WorkflowCopilotChat({
                   verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
                   settled={null}
                   actionsEnabled={gateActionable}
+                  acceptsEnabled={gateAcceptsEnabled}
                   onAccept={() => handleAcceptWorkflow(proposedWorkflow)}
                   onAlwaysAccept={() =>
                     handleAcceptWorkflow(proposedWorkflow, true)
@@ -6258,58 +6360,119 @@ export function WorkflowCopilotChat({
       {/* Input */}
       <div className="border-t border-border p-3">
         {codeOptionAvailable ? (
-          <div className="mb-2">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  title="Switch mode"
-                  aria-label="Switch mode"
-                  className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {codeOptionAvailable ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ModeGlyph glow={codeStateActive} />
+                    <span className="text-foreground">
+                      {codeStateActive ? "Build with code" : "Build"}
+                    </span>
+                    <ChevronDownIcon className="h-3 w-3" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  side="top"
+                  align="start"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
                 >
-                  <span>Mode:</span>
-                  <ModeGlyph glow={codeStateActive} />
-                  <span className="text-foreground">
-                    {codeStateActive ? "Build with code" : "Build"}
-                  </span>
-                  <ChevronDownIcon className="h-3 w-3" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                side="top"
-                align="start"
-                className="w-[272px] p-1.5"
-                onCloseAutoFocus={(event) => event.preventDefault()}
-              >
-                {modeMenuItems}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {modeMenuItems}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
           </div>
         ) : null}
-        {proposedWorkflow &&
-        pendingProposalTurnId &&
-        (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
-          <button
-            type="button"
-            onClick={() => {
-              if (!pendingProposalTurnId) return;
-              document
-                .getElementById(`copilot-gate-${pendingProposalTurnId}`)
-                ?.scrollIntoView({ behavior: "smooth", block: "center" });
-              if (gateFlashTimer.current !== null) {
-                clearTimeout(gateFlashTimer.current);
-              }
-              setGateFlashTurnId(pendingProposalTurnId);
-              gateFlashTimer.current = setTimeout(() => {
-                setGateFlashTurnId(null);
-                gateFlashTimer.current = null;
-              }, 1100);
-            }}
-            className="mb-2 flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-[10.5px] text-muted-foreground hover:bg-slate-elevation3"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />1 proposal
-            pending · Review
-          </button>
+        {(proposedWorkflow &&
+          pendingProposalTurnId &&
+          (gateOwnerIndex !== lastTurnIndex || isLoading)) ||
+        (autoAccept && workflowCopilotChatId) ? (
+          // One status strip: what Copilot is doing, separate from the mode control above it.
+          <div className="mb-2 flex items-center gap-2 border-t border-border/60 pt-1.5 text-[10.5px] text-muted-foreground">
+            {proposedWorkflow &&
+            pendingProposalTurnId &&
+            (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!pendingProposalTurnId) return;
+                  document
+                    .getElementById(`copilot-gate-${pendingProposalTurnId}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  if (gateFlashTimer.current !== null) {
+                    clearTimeout(gateFlashTimer.current);
+                  }
+                  setGateFlashTurnId(pendingProposalTurnId);
+                  gateFlashTimer.current = setTimeout(() => {
+                    setGateFlashTurnId(null);
+                    gateFlashTimer.current = null;
+                  }, 1100);
+                }}
+                className="flex min-w-0 items-center gap-1.5 rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400"
+                  aria-hidden="true"
+                />
+                <span className="truncate">1 proposal pending</span>
+                <span className="shrink-0 text-foreground underline underline-offset-2">
+                  Review
+                </span>
+              </button>
+            ) : null}
+            {autoAccept && workflowCopilotChatId ? (
+              <div className="ml-auto flex min-w-0 items-center">
+                <AutoAcceptChip
+                  key={workflowCopilotChatId}
+                  chatId={workflowCopilotChatId}
+                  pendingFromChat={turningOffThisChat}
+                  waitForAccept={async (turnOffChatId) => {
+                    // An Accept clicked while Turn off waits joins the chain, so wait until it stops growing.
+                    const deadline = Date.now() + ACCEPT_SETTLE_CEILING_MS;
+                    let settled: Promise<void> | undefined;
+                    do {
+                      settled = acceptsInFlight.current.get(turnOffChatId);
+                      if (
+                        settled &&
+                        !(await settledWithin(settled, deadline - Date.now()))
+                      ) {
+                        throw new Error("Accept is still running");
+                      }
+                    } while (
+                      settled !== acceptsInFlight.current.get(turnOffChatId)
+                    );
+                  }}
+                  onPendingChange={(pendingChatId, pending) =>
+                    setTurningOffCounts((current) => {
+                      const next = new Map(current);
+                      const count =
+                        (next.get(pendingChatId) ?? 0) + (pending ? 1 : -1);
+                      if (count > 0) {
+                        next.set(pendingChatId, count);
+                      } else {
+                        next.delete(pendingChatId);
+                      }
+                      return next;
+                    })
+                  }
+                  onTurnedOff={(turnedOffChatId) => {
+                    // The request can land after a switch to a chat whose setting it did not change.
+                    if (turnedOffChatId !== workflowCopilotChatIdRef.current) {
+                      return;
+                    }
+                    setAutoAcceptFromWrite(false);
+                    textareaRef.current?.focus();
+                  }}
+                />
+              </div>
+            ) : null}
+          </div>
         ) : null}
         {showWorkingRow ? (
           <CopilotWorkingStatus

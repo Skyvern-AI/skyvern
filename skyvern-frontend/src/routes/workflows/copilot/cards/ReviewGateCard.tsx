@@ -82,6 +82,9 @@ interface ReviewGateCardProps {
   verdict: ReviewGateVerdict;
   settled?: ReviewGateSettled;
   actionsEnabled: boolean;
+  // False only while this chat's Turn off is in flight: an Accept started then could write auto_accept
+  // back on after it. Review and Reject write no auto_accept and stay available.
+  acceptsEnabled?: boolean;
   onAccept: () => void;
   onAlwaysAccept: () => void;
   onReject: () => void;
@@ -127,6 +130,7 @@ export function ReviewGateCard({
   verdict,
   settled = null,
   actionsEnabled,
+  acceptsEnabled = true,
   onAccept,
   onAlwaysAccept,
   onReject,
@@ -255,20 +259,24 @@ export function ReviewGateCard({
           >
             Review
           </button>
-          <button
-            type="button"
-            onClick={onAccept}
-            className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
-          >
-            Accept
-          </button>
-          <button
-            type="button"
-            onClick={onAlwaysAccept}
-            className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
-          >
-            Always accept
-          </button>
+          {acceptsEnabled ? (
+            <>
+              <button
+                type="button"
+                onClick={onAccept}
+                className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
+              >
+                Accept
+              </button>
+              <button
+                type="button"
+                onClick={onAlwaysAccept}
+                className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
+              >
+                Always accept
+              </button>
+            </>
+          ) : null}
           <button
             type="button"
             onClick={onReject}

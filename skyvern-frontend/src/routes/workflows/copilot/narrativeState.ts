@@ -97,15 +97,6 @@ export interface CopilotBlockActionsEvent {
   receivedAtMs: number;
 }
 
-// Client-synthesized event marking that the drafting silence (no frames
-// while the LLM writes code) has lasted long enough to assume Draft has
-// started. Idempotent in the reducer so a re-armed timer or StrictMode
-// double-fire is a no-op.
-export interface CopilotPhaseHintEvent {
-  type: "client_phase_hint";
-  hintedAtMs: number;
-}
-
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -120,8 +111,7 @@ export type NarrativeEvent =
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | CopilotBlockActionsEvent
-  | CopilotPhaseHintEvent;
+  | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out) under one chip and
@@ -409,15 +399,6 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
-  // Client-only phase-progress state (never persisted): epoch ms of the most
-  // recent tool_call/tool_result/narration, and when the 8s drafting-gap
-  // heuristic fired. Grafted across the terminal payload swap by turnId so a
-  // cancel-mid-silence doesn't visually un-check the Draft phase.
-  lastActivityAtMs: number | null;
-  draftingSignaledAt: number | null;
-  // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
-  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap.
-  authoringCount: number;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -469,9 +450,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
-  lastActivityAtMs: null,
-  draftingSignaledAt: null,
-  authoringCount: 0,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
@@ -650,8 +628,7 @@ export function parseGoogleConnectionNotices(
 
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
-// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
-// activity lands in the Test phase bucket, not Draft — see copilotPhases.ts).
+// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member.
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
@@ -1277,13 +1254,9 @@ export function applyNarrativeEvent(
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
-      const authoringCount =
-        prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
       if (!entry) {
         return {
           ...prev,
-          lastActivityAtMs: nowMs,
-          authoringCount,
         };
       }
       const { blocks, designActivity } = appendActivity(
@@ -1295,14 +1268,12 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
-        authoringCount,
       };
     }
 
     case "tool_result": {
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev, lastActivityAtMs: nowMs };
+      if (!entry) return { ...prev };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1312,7 +1283,6 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
     }
 
@@ -1327,23 +1297,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
-    }
-
-    case "client_phase_hint": {
-      // No-op once drafting is already signaled or the turn has moved past
-      // pure exploration — idempotent by construction so a re-armed timer or
-      // a StrictMode double-fire never overwrites an earlier timestamp.
-      if (
-        prev.draftingSignaledAt !== null ||
-        prev.draft !== null ||
-        prev.designEnded ||
-        prev.blocks.some((b) => b.state !== "drafted")
-      ) {
-        return prev;
-      }
-      return { ...prev, draftingSignaledAt: event.hintedAtMs };
     }
 
     case "response": {
@@ -1388,18 +1342,6 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
-          // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads never
-          // carry these client-only fields). authoringCount is grafted too so a
-          // turn whose only authoring entry aged out of the capped activity
-          // list still completes Explore at the swap. lastRunOutcome remains
-          // sourced from the hydrated terminal payload.
-          draftingSignaledAt:
-            hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
-          authoringCount:
-            hydrated.turnId === prev.turnId
-              ? prev.authoringCount
-              : hydrated.authoringCount,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:

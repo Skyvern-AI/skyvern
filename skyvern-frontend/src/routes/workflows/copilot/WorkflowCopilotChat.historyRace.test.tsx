@@ -178,11 +178,16 @@ vi.mock("./WorkflowCopilotHistory", () => ({
   }: {
     onSelect: (chat: { workflow_copilot_chat_id: string }) => void;
   }) => (
-    <button
-      onClick={() => onSelect({ workflow_copilot_chat_id: "chat_other" })}
-    >
-      mock-select-history-chat
-    </button>
+    <>
+      <button
+        onClick={() => onSelect({ workflow_copilot_chat_id: "chat_other" })}
+      >
+        mock-select-history-chat
+      </button>
+      <button onClick={() => onSelect({ workflow_copilot_chat_id: "chat-1" })}>
+        mock-select-history-chat-1
+      </button>
+    </>
   ),
 }));
 
@@ -372,6 +377,419 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
   });
 });
 
+describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", () => {
+  it.each([
+    { action: "Turn off", button: /Auto-accepting/ },
+    { action: "Reject", button: "Reject" },
+  ])(
+    "leaves the new chat's auto-accept and pending review alone when the old chat's $action lands late",
+    async ({ button }) => {
+      await renderChat();
+      await flushHistory(
+        historyData({
+          auto_accept: true,
+          proposed_workflow: {
+            workflow_id: "wf_pending",
+            title: "Pending draft",
+            _copilot_unvalidated: true,
+          },
+          chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+        }),
+      );
+      let finishRequest: (value: unknown) => void = () => {};
+      cancelPost.mockImplementationOnce(
+        () => new Promise((resolve) => (finishRequest = resolve)),
+      );
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", { name: button }));
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText("mock-select-history-chat"));
+        await Promise.resolve();
+      });
+      await flushHistory(
+        historyData({
+          workflow_copilot_chat_id: "chat_other",
+          auto_accept: true,
+          proposed_workflow: {
+            workflow_id: "wf_other_pending",
+            title: "Other chat draft",
+            _copilot_unvalidated: true,
+          },
+          chat_history: [aiHistoryMessage(null, "Other chat draft.")],
+        }),
+      );
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      await act(async () => {
+        finishRequest({});
+        await Promise.resolve();
+      });
+
+      expect(cancelPost).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\/workflow\/copilot\/(disable-auto-accept|clear-proposed-workflow)/,
+        ),
+        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      );
+      expect(
+        screen.getByRole("button", { name: /Auto-accepting/ }),
+      ).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    },
+  );
+
+  it("keeps a chat's Accept withheld while its own Turn off is still pending, after another chat's Turn off starts", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    const heldDisables: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => heldDisables.push(resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    // A second chat's Turn off starts while the first one is still in flight.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+
+    // Back to the first chat, whose disable has still not answered.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat-1"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat-1"));
+
+    expect(heldDisables).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("shows the chat's Turn off still pending after a round trip to another chat, and refuses a second one", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    const heldDisables: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => heldDisables.push(resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+    expect(heldDisables).toHaveLength(1);
+
+    // Away and back while chat-1's disable is still in flight: the chip remounts.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat-1"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat-1"));
+
+    const chip = await screen.findByRole("button", {
+      name: /Auto-accepting/,
+    });
+    expect(chip.getAttribute("aria-disabled")).toBe("true");
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    expect(heldDisables).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    await act(async () => {
+      heldDisables[0]!({});
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
+  });
+
+  it("does not clear the new chat's pending review when the old chat's Accept lands late", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    let finishApply: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((resolve) => (finishApply = resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+
+    await act(async () => {
+      finishApply({ data: { workflow_id: "wf_chat-1" } });
+    });
+
+    // chat_other's proposal is untouched on the server, so its gate must survive.
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+  });
+
+  it("clears the accepted chat's server proposal even when the user switched away", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    // The atomic apply fails, so Accept falls back to applying locally and clearing the row itself.
+    let failApply: (reason: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((_resolve, reject) => (failApply = reject))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+
+    await act(async () => {
+      failApply({ response: { status: 500 } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/clear-proposed-workflow",
+        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      ),
+    );
+    // The chat now on screen keeps its own pending review.
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not retry an accepted chat's clear against the chat the user switched to", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    let failApply: (reason: unknown) => void = () => {};
+    const clearBodies: Array<Record<string, unknown>> = [];
+    cancelPost.mockImplementation(
+      (path: string, body: Record<string, unknown>) => {
+        if (path === "/workflow/copilot/apply-proposed-workflow") {
+          return new Promise((_resolve, reject) => (failApply = reject));
+        }
+        if (path === "/workflow/copilot/clear-proposed-workflow") {
+          clearBodies.push(body);
+          // The accepted chat's row is gone by the time the fallback clear lands.
+          return Promise.reject({ response: { status: 404 } });
+        }
+        return Promise.resolve({});
+      },
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+
+    await act(async () => {
+      failApply({ response: { status: 500 } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearBodies.length).toBeGreaterThan(0));
+    // The 404 branch looks up the latest chat; answer it with the chat now on screen.
+    if (historyQueue.length > 0) {
+      await flushHistory(pendingChat("chat_other"));
+    }
+
+    // The retry must not fall back to whatever chat is current: that would delete its pending review.
+    expect(clearBodies.map((body) => body.workflow_copilot_chat_id)).toEqual([
+      "chat-1",
+    ]);
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not hold one chat's Turn off behind an Accept still running in another chat", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: "wf_pending",
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise(() => {})
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_other",
+        auto_accept: true,
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/disable-auto-accept",
+        { workflow_copilot_chat_id: "chat_other" },
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+  });
+
+  it("does not let a late post-Accept read of the old chat overwrite the chat the user switched to", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: "wf_pending",
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+    // A plain Accept reads chat-1's row back; that read is still open when the user switches.
+    await waitFor(() => expect(historyQueue.length).toBe(1));
+    const lateChatOneRead = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_other",
+        auto_accept: true,
+      }),
+    );
+    await act(async () => {
+      lateChatOneRead({
+        data: historyData({
+          auto_accept: false,
+          proposed_workflow: { workflow_id: "wf_chat_one", title: "Chat one" },
+        }),
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+  });
+});
+
 // Item 2 (SKY-12384): a live_browser prompt queued before the initial history
 // load must keep one owner — footer while the bubble exists, else the chip.
 describe("WorkflowCopilotChat — queued prompt survives initial history load (item 2)", () => {
@@ -548,6 +966,34 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
       await Promise.resolve();
     });
   }
+
+  it("does not let a recovery read that started before Turn off turn the chip back on", async () => {
+    await renderChat();
+    await flushHistory(historyData({ auto_accept: true }));
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    expect(historyQueue.length).toBe(1);
+    const stalePoll = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    await advance(0);
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+
+    await act(async () => {
+      stalePoll({ data: { ...recoveredHistory(), auto_accept: true } });
+      await Promise.resolve();
+    });
+
+    expect(renderedText()).toContain(capturedAiText);
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+  });
 
   it("renders the assistant row the server persisted, replacing the error bubble", async () => {
     await startTurn();
