@@ -119,6 +119,12 @@ describe("RecordingPanel", () => {
     cleanup();
   });
 
+  it("uses task language while recording", () => {
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+
+    expect(screen.getByText("Recording task")).toBeTruthy();
+  });
+
   it("keeps Done disabled and never calls process_recording while the browser session id has not resolved", () => {
     render(<RecordingPanel browserSessionId={null} />);
 
