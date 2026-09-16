@@ -75,6 +75,7 @@ from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
     _composition_get_structured_evidence,
     _fallback_page_info,
+    attribute_navigation_failure,
 )
 from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -894,7 +895,7 @@ async def _navigate_post_hook(
             source_tool="navigate_browser",
             captured_url=source_url,
         )
-    return result
+    return await attribute_navigation_failure(ctx, result)
 
 
 async def _navigate_pre_hook(

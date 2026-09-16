@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.schemas.proxy_location import ProxyLocationInput
 
 LOG = structlog.get_logger()
 
@@ -1250,10 +1251,7 @@ class CopilotContext(AgentContext):
     # (the same source that powers run_outcome SSE frames). Append-only across
     # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
     run_outcome_trace: list[RecordedRunOutcome] = field(default_factory=list)
-    # Consecutive failed runs where navigation completed but the scraper
-    # could not read the page (generic "failed to load the website" template).
-    # Resets on any non-matching run outcome. Streak crosses workflow-shape
-    effective_workflow_proxy_location: Any | None = None
+    effective_workflow_proxy_location: ProxyLocationInput = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -1278,11 +1276,8 @@ class CopilotContext(AgentContext):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
-    # Set by _record_run_blocks_result when the most recent failed run matches
-    # SKIP_INNER_NAV_RETRY_ERRORS (DNS / cert / SSL / invalid URL). Drives the
-    # one-shot non-retriable-nav stop nudge and the deterministic exit-path
-    # exception in run_with_enforcement. Cleared at the top of every call to
-    # _record_run_blocks_result so stale state can't leak across runs.
+    # Set by _record_run_blocks_result when the last failed run blames the target (DNS / cert / SSL / invalid URL),
+    # never Skyvern's own proxy hop; cleared at the top of every call so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
     # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
     # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.

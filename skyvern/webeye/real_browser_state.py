@@ -165,6 +165,9 @@ class RealBrowserState(BrowserState):
         # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
         # response). Read by the Task V3 loop to classify a dead/removed starting URL; v1 ignores it.
         self.last_navigation_status: int | None = None
+        # The proxy this browser was actually built with. Downstream layers see only a flattened
+        # sentence, which cannot say which hop it went through.
+        self.built_with_proxy_location: ProxyLocationInput = None
         self._ever_connected = browser_context is not None
         self._close_requested = False
         if browser_context is not None:
@@ -395,6 +398,7 @@ class RealBrowserState(BrowserState):
                 _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
                 _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
             )
+            self.built_with_proxy_location = proxy_location
             self.browser_context = browser_context
             self.browser_context_route_policy_url = effective_route_policy_url
             self.browser_artifacts = browser_artifacts

@@ -3315,9 +3315,13 @@ class ForgeAgent:
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
-            # Fail the task if we can't navigate to the URL and send the response.
-            # Navigation failures are target-site/customer-caused and are surfaced on the run
-            # via failure_reason below, so this is expected-and-handled, not an error.
+            # Fail the task if we can't navigate to the URL and send the response. Who owns the
+            # failure is decided downstream from the driver's code, not from this text: Skyvern's
+            # own egress can fail here too.
+            if e.nav_error_code:
+                nav_context = skyvern_context.current()
+                if nav_context is not None:
+                    nav_context.task_nav_error_codes[task.task_id] = e.nav_error_code
             LOG.warning(
                 "Failed to navigate to URL, marking task as failed, and sending webhook response",
                 url=e.url,

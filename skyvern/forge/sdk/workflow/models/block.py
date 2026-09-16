@@ -106,6 +106,7 @@ from skyvern.exceptions import (
     UnexpectedTaskStatus,
     UnresolvableHost,
     WorkflowNotFound,
+    WorkflowRunContextNotInitialized,
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
@@ -310,6 +311,7 @@ from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnos
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import (
     default_navigation_settle,
+    driver_nav_error_code,
     is_egress_attributable_navigation_failure,
     navigate_with_retry,
     redact_url_secrets,
@@ -813,6 +815,9 @@ def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str
         "failure_reason": reasoning,
         "errors": [error.model_dump(mode="json")],
         "failure_category": user_defined_failure_category(error),
+        # Names the code as the author's own, so a reader deciding who owns a failure can tell it
+        # from one a driver reported. Both land in the block's error_codes.
+        "declared_error_code": error_code,
     }
 
 
@@ -1747,13 +1752,28 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_id, current_index, include_missing_value_guard=True
             )
 
+            error_codes = self.get_failure_error_codes()
+            # The driver's verdict, carried as a code rather than left only in failure_reason: that
+            # text can be model-authored, so a consumer reading it cannot tell a real browser error
+            # from a sentence describing one.
+            if isinstance(e, FailedToNavigateToUrl) and e.nav_error_code:
+                # Looked up inside the failure handler, so a run torn down while this block awaited
+                # must not raise here and lose the failure being reported. Without the run's secrets
+                # the code cannot be cleared for reporting, so it is left off.
+                try:
+                    nav_run_context = self.get_workflow_run_context(workflow_run_id)
+                except WorkflowRunContextNotInitialized:
+                    nav_run_context = None
+                if nav_run_context is not None and not is_registered_secret(e.nav_error_code, nav_run_context):
+                    error_codes = [*error_codes, e.nav_error_code]
+
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+                error_codes=error_codes or None,
             )
 
     @abc.abstractmethod
@@ -2471,6 +2491,10 @@ class BaseTaskBlock(Block):
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # A task that terminates right after a failed navigation ends on that failure.
+                    error_codes=None
+                    if success
+                    else _recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                 )
             elif updated_task.status == TaskStatus.canceled:
                 LOG.info(
@@ -2584,6 +2608,7 @@ class BaseTaskBlock(Block):
                         status=block_status_mapping[updated_task.status],
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        error_codes=_recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                     )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
@@ -2597,7 +2622,20 @@ class BaseTaskBlock(Block):
             ),
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=(
+                _recorded_task_nav_error_codes(current_running_task.task_id, workflow_run_context)
+                if current_running_task
+                else None
+            ),
         )
+
+
+def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
+    context = skyvern_context.current()
+    code = context.task_nav_error_codes.get(task_id) if context is not None else None
+    if not code or is_registered_secret(code, workflow_run_context):
+        return None
+    return [code]
 
 
 class TaskBlock(BaseTaskBlock):
@@ -4707,6 +4745,16 @@ def _code_block_safe_print(
     print(app.AGENT_FUNCTION.redact_codeblock_parameter_values(rendered.getvalue(), parameters), end="", flush=flush)
 
 
+def is_registered_secret(value: str, workflow_run_context: WorkflowRunContext) -> bool:
+    """Whether this exact string is one of the run's registered secret values.
+
+    A driver code is kept through masking, because an ordinary value occurring inside one ("net")
+    would otherwise cut the verdict out of it, and a workflow may legitimately hold a code-shaped
+    literal. A code that *is* a secret is the one case where reporting it would store that secret.
+    """
+    return value in Block._registered_secret_values(workflow_run_context)
+
+
 def _redact_codeblock_failure_text(
     value: str | None,
     parameters: dict[str, Any],
@@ -4724,8 +4772,65 @@ def _redact_codeblock_failure_text(
     return redacted
 
 
+# Bounded like the runner's own walk rather than recursive: this runs inside failure handling, where
+# a raise would replace the failure being reported.
+_PARAMETER_STRING_WALK_LIMIT = 10_000
+
+
+def parameter_strings(parameters: object) -> set[str] | None:
+    """Every string a parameter carries, keys included, or None when the walk did not finish.
+
+    An unfinished walk cannot answer whether a code is one of those strings, and answering from a
+    partial set would preserve a code that should have been masked.
+    """
+    strings: set[str] = set()
+    stack: list[object] = [parameters]
+    visited = 0
+    while stack:
+        if visited >= _PARAMETER_STRING_WALK_LIMIT:
+            return None
+        node = stack.pop()
+        visited += 1
+        if isinstance(node, str):
+            strings.add(node)
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend(node)
+    return strings
+
+
+def _declared_error_code_of(result: BlockResult) -> str | None:
+    """The code this block's author declared, which is theirs to spell and so never preserved."""
+    output = result.output_parameter_value
+    declared = output.get("declared_error_code") if isinstance(output, dict) else None
+    return declared if isinstance(declared, str) and declared else None
+
+
 def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
+    # A driver code survives masking whole: a parameter value occurring inside one ("net") would cut
+    # the verdict out of it, and the code carries nothing of its own to mask. A code that *is* a
+    # parameter value is left to the mask, which is the one case where keeping it would disclose.
+    carried_strings = parameter_strings(parameters)
+    declared = _declared_error_code_of(result)
+    preserved = (
+        {}
+        if carried_strings is None
+        else {
+            index: code
+            for index, code in enumerate(result.error_codes or [])
+            if isinstance(code, str)
+            and driver_nav_error_code(code) == code
+            and code != declared
+            and code not in carried_strings
+        }
+    )
     redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(result.error_codes, parameters)
+    if isinstance(redacted_error_codes, list):
+        for index, code in preserved.items():
+            if index < len(redacted_error_codes):
+                redacted_error_codes[index] = code
     return replace(
         result,
         failure_reason=_redact_codeblock_failure_text(result.failure_reason, parameters),
@@ -8423,6 +8528,10 @@ async def wrapper({default_args}):
                             secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
+                            if secure_failure.nav_error_code and not is_registered_secret(
+                                secure_failure.nav_error_code, workflow_run_context
+                            ):
+                                secure_error_codes.append(secure_failure.nav_error_code)
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
                             if secure_failure_page_state:
                                 failure_output["failure_page_state"] = secure_failure_page_state
@@ -8877,6 +8986,14 @@ async def wrapper({default_args}):
                 ),
             )
 
+            # ``e`` is unbound once the except block exits, so the driver's code is captured here
+            # rather than read inside the deferred closure below. It comes from the recorder, never
+            # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
+            inline_nav_code = recording_page.failure_nav_error_code(e)
+            if inline_nav_code and is_registered_secret(inline_nav_code, workflow_run_context):
+                inline_nav_code = None
+            driver_nav_codes = [inline_nav_code] if inline_nav_code else None
+
             async def build_legacy_failure_result() -> BlockResult:
                 failure_output = None
                 if inline_failure_page_state:
@@ -8911,6 +9028,10 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # This block catches its own failures, so the driver's code never reaches the
+                    # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
+                    # real browser error from a sentence describing one.
+                    error_codes=driver_nav_codes,
                 )
 
             return await self._resolve_failure_with_heal(
