@@ -456,6 +456,73 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     expect(onEnableEditValues).toHaveBeenCalledOnce();
   });
 
+  it("lets users enter an unset authenticator key without clicking the edit button", async () => {
+    const onChangeSpy = vi.fn();
+    const onEnableEditValues = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "user@example.com",
+            password: "",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+          editMode
+          editingGroups={{ name: false, values: false }}
+          onEnableEditValues={onEnableEditValues}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    const authenticatorKeyInput = screen.getByPlaceholderText(
+      "e.g. JBSWY3DPEHPK3PXP",
+    );
+    expect(screen.getByRole("button", { name: "Scan QR" })).toBeTruthy();
+
+    fireEvent.change(authenticatorKeyInput, {
+      target: { value: "JBSWY3DPEHPK3PXP" },
+    });
+
+    expect(onEnableEditValues).toHaveBeenCalledOnce();
+    expect(onChangeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totp: "JBSWY3DPEHPK3PXP",
+        totp_type: "authenticator",
+      }),
+    );
+  });
+
+  it("keeps a configured authenticator key masked while credential values are locked", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "user@example.com",
+            password: "",
+            totp: "",
+            totp_type: "authenticator",
+            totp_identifier: "",
+          }}
+          onChange={vi.fn()}
+          editMode
+          editingGroups={{ name: false, values: false }}
+          onEnableEditValues={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByDisplayValue("••••••••")).toHaveLength(2);
+    expect(screen.queryByPlaceholderText("e.g. JBSWY3DPEHPK3PXP")).toBeNull();
+  });
+
   it("marks Authenticator App as the selected 2FA method when a new credential opens the 2FA section", async () => {
     const onChangeSpy = vi.fn();
 
