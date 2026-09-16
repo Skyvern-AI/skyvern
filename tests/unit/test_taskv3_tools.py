@@ -44,6 +44,7 @@ from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
+    OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
     _annotate_screenshot,
@@ -1474,6 +1475,34 @@ async def test_select_option_diverts_custom_combobox_to_shared_commit(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_select_option_refuses_a_set_on_a_custom_combobox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A custom combobox commits one picked suggestion at a time, so a requested set cannot be
+    # honoured here. It must refuse and name the remedy rather than commit element [0] and report
+    # success -- the whole point of the set-valued path is that a partial commit never reads as done.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text",
+        node_name="input",
+        suggestion={"text": "Analytics", "score": 2},
+        committed="Analytics",
+        match_count=1,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "labels": ["Analytics", "Finance"]})
+    assert r.status == "error", r.content
+    assert "not a native <select>" in r.content and "select one option per call" in r.content
+    assert not page.clicked_suggestion  # nothing was committed
+    assert not any(c[0] == "select_option" for c in page.calls)
+
+    # One option in the array is still a single commit, not a refusal.
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "labels": ["Analytics"]})
+    assert r.status == "ok", r.content
+    assert page.clicked_suggestion
+
+
+@pytest.mark.asyncio
 async def test_select_option_native_select_uses_native_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real <select> (nodeName == 'select') keeps the native path — dispatch page.select_option, no typing.
     import asyncio as _a
@@ -2777,6 +2806,244 @@ async def test_observe_renders_text_digest_and_pressed_state() -> None:
     assert "note: 3 more page message(s) did not fit the text digest" in r.content
     assert "*invalid='Enter a URL.'" in r.content
     assert "pressed=True" in r.content
+
+
+@pytest.mark.asyncio
+async def test_observe_selection_readout_distinguishes_partial_from_whole() -> None:
+    # A truncated list that reads as the whole set is the same false readout the selection set
+    # replaced el.value to fix: the model reasons about a selection it believes it can see entire.
+    held = [f"v{i:02d}|Option {i:02d}" for i in range(60)]
+    # The cap is on the RENDERED line, so the boundary sits where repr stops fitting -- quotes and
+    # separators, not just the raw strings.
+    fits = 35
+    assert len(repr(held[:fits])) <= OBSERVE_SELECTED_OPTIONS_TOTAL_CAP < len(repr(held[: fits + 1]))
+
+    class _SelectionPage(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps(
+                {
+                    "url": self.url,
+                    "title": "Skills",
+                    "elements": [
+                        {
+                            "i": 0,
+                            "tag": "select",
+                            "type": "select-multiple",
+                            "selector": "#whole",
+                            "label": "Whole",
+                            "selectedOptions": ["a|Alpha", "b|Beta"],
+                            "selectedTotal": 2,
+                        },
+                        {
+                            "i": 1,
+                            "tag": "select",
+                            "type": "select-multiple",
+                            "selector": "#partial",
+                            "label": "Partial",
+                            "selectedOptions": held,
+                            "selectedTotal": 75,
+                        },
+                    ],
+                }
+            )
+
+    tools = build_browser_tools(_fixed_page_provider(_SelectionPage()))
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    whole, partial = (ln for ln in r.content.splitlines() if "selected_options=" in ln)
+    # A complete readout names every option held and claims nothing about a cap.
+    assert "selected_options=['a|Alpha', 'b|Beta']" in whole, whole
+    assert "showing" not in whole, whole
+    # A partial one says so, and says how much of the selection it is: both the prefix it shows and
+    # the size actually held, so the two readouts can never be read the same way.
+    assert f"selected_options={held[:fits]} (showing {fits} of 75 selected)" in partial, partial
+    assert 0 < fits < len(held)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_bounds_each_selected_option_and_reports_the_whole_count() -> None:
+    # The digest rides in the persistent conversation prefix, so a set-valued control holding long
+    # labels is paid for on every later turn. Cap the item like the scalar branch caps el.value --
+    # but keep the true count, which is what makes a capped readout self-disclosing downstream.
+    options = "".join(f'<option value="v{i}" selected>{"L" * 3000}-{i}</option>' for i in range(75))
+    html_doc = f'<!doctype html><html><body><select multiple id="skills" size="4">{options}</select></body></html>'
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    sel = next(e for e in data["elements"] if e["tag"] == "select")
+    assert sel["selectedTotal"] == 75
+    assert len(sel["selectedOptions"]) == 60
+    assert max(len(o) for o in sel["selectedOptions"]) <= taskv3_tools.OBSERVE_RETAIN_WIDTH_MIN
+    # el.value would have named exactly one of the 75, which is the readout this replaced.
+    assert "value" not in sel, sel.get("value")
+
+
+_EMPTY_VALUE_SELECT = (
+    "<!doctype html><html><body>"
+    '<select multiple id="s" size="4">'
+    '<option value="">(none specified)</option><option value="x">Ex</option>'
+    '<option value="y">Why</option>'
+    "</select></body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_keeps_an_empty_option_value_in_the_requested_set() -> None:
+    # `<option value="">` is a real selectable value. Dropping it narrowed the request -- and the
+    # expected set the readback verifies against is built from the SAME narrowed list, so the check
+    # agreed with itself and reported committed a set the control never held.
+    async with _content_page(_EMPTY_VALUE_SELECT) as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+
+        async def _run(args: dict[str, Any]) -> tuple[str, str, list[str]]:
+            await page.set_content(_EMPTY_VALUE_SELECT)
+            r = await handler(args)
+            held = await page.evaluate(
+                "() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)"
+            )
+            return r.status, r.content, held
+
+        status, report, held = await _run({"selector": "#s", "values": ["", "x"]})
+        assert (status, held) == ("ok", ["", "x"])
+        assert "holds 2 option(s): ['', 'x']" in report, report
+
+        status, report, held = await _run({"selector": "#s", "values": [""]})
+        assert (status, held) == ("ok", [""])
+        assert "holds 1 option(s): ['']" in report, report
+
+        # A declared-but-empty array asks for no option and must stay distinguishable from an array
+        # that names the empty value -- the two collapsed together before. It is still a DECLARED
+        # array, so it wins over a scalar exactly as a non-empty one does.
+        assert (await _run({"selector": "#s", "values": [], "value": "x"}))[::2] == ("ok", [])
+        assert await _run({"selector": "#s", "values": []}) == (
+            "ok",
+            "selected on #s — it now holds 0 option(s): []",
+            [],
+        )
+
+        # Non-strings are still not options.
+        status, _, held = await _run({"selector": "#s", "values": [None, "x"]})
+        assert (status, held) == ("ok", ["x"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_reports_a_page_added_duplicate_as_uncommitted() -> None:
+    # Two SETS lose multiplicity. A change handler that also selects a duplicate-VALUED sibling
+    # leaves the control holding an option the form submits twice, and a set comparison called that
+    # the requested selection exactly. Only the HELD side carries multiplicity: asking for the same
+    # option twice is still one request, so the ask is deduped rather than both sides.
+    dup_value = (
+        '<select multiple id="s" size="4">'
+        '<option value="x">Alpha</option><option value="x">Beta</option>'
+        '<option value="y">Gamma</option></select>'
+    )
+    dup_label = (
+        '<select multiple id="s" size="4">'
+        '<option value="v1">Alpha</option><option value="v2">Alpha</option>'
+        '<option value="v3">Gamma</option></select>'
+    )
+    unique = (
+        '<select multiple id="s" size="4"><option value="x">Alpha</option><option value="y">Gamma</option></select>'
+    )
+    page_adds_dup = dup_value + (
+        "<script>document.getElementById('s').addEventListener('change', () => {"
+        " const o = document.getElementById('s').options;"
+        " if (o[0].selected) o[1].selected = true; });</script>"
+    )
+
+    async with _content_page("<!doctype html><html><body></body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+
+        async def _run(markup: str, args: dict[str, Any]) -> tuple[str, str, int]:
+            await page.set_content(f"<!doctype html><html><body>{markup}</body></html>")
+            r = await handler(args)
+            n = await page.evaluate("() => document.getElementById('s').selectedOptions.length")
+            return r.status, r.content, n
+
+        # The driver picks ONE option per requested value/label, so a duplicate in the DOM alone
+        # never over-selects -- these are the cases a multiplicity check must NOT start rejecting.
+        assert (await _run(dup_value, {"selector": "#s", "values": ["x"]}))[::2] == ("ok", 1)
+        assert (await _run(dup_label, {"selector": "#s", "labels": ["Alpha"]}))[::2] == ("ok", 1)
+        # The same option asked for twice is one request, not two.
+        assert (await _run(unique, {"selector": "#s", "values": ["x", "x"]}))[::2] == ("ok", 1)
+
+        status, report, n = await _run(page_adds_dup, {"selector": "#s", "values": ["x"]})
+        assert (status, n) == ("error", 2), (status, n, report)
+        assert "did NOT commit the requested set" in report, report
+        assert "it now holds ['x', 'x']" in report, report
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_verifies_against_the_key_it_selected_by() -> None:
+    # The action chain is labels -> values -> label -> value. Deriving the verification separately let
+    # `values` plus a stray scalar `label` select by value and check by label, so a call that did
+    # exactly what was asked reported `asked for ['Gamma'], it now holds ['Alpha']`.
+    markup = (
+        '<select multiple id="s" size="4"><option value="x">Alpha</option><option value="y">Gamma</option></select>'
+    )
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "values": ["x"], "label": "Gamma"})
+        held = await page.evaluate("() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)")
+        assert (r.status, held) == ("ok", ["x"]), r.content
+        assert "holds 1 option(s): ['x']" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_bounds_the_selection_it_reports() -> None:
+    # The readback names options the PAGE chose the text of, in a tool result that is never
+    # compacted. Both the count and each option are bounded, and a cut is marked, so a truncated
+    # report cannot be read as the whole selection.
+    long_text = "L" * 500
+    options = "".join(f'<option value="v{i:02d}">{long_text}{i:02d}</option>' for i in range(30))
+    markup = f'<select multiple id="s" size="4">{options}</select>'
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "values": [f"v{i:02d}" for i in range(30)]})
+    assert r.status == "ok", r.content[:300]
+    shown = [f"v{i:02d}" for i in range(taskv3_tools.SELECTION_REPORT_MAX_OPTIONS)]
+    assert r.content == (
+        f"selected on #s — it now holds 30 option(s): {shown!r} "
+        f"(showing {taskv3_tools.SELECTION_REPORT_MAX_OPTIONS} of 30)"
+    )
+
+    # Selected by label, each item is the page's own text and is cut at the width, marked.
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "labels": [f"{long_text}00", f"{long_text}01"]})
+    width = taskv3_tools.SELECTION_REPORT_OPTION_WIDTH
+    assert r.status == "ok", r.content[:300]
+    assert r.content == f"selected on #s — it now holds 2 option(s): {['L' * width + '…'] * 2!r}"
+    assert long_text not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_label_readback_agrees_with_the_driver_across_whitespace_forms() -> None:
+    # `option.label` is stripped and collapsed by the UA, which is the same normalisation Playwright
+    # matches `label=` under -- so asking for the collapsed form commits AND verifies. Read the raw
+    # `textContent` here instead and the verifier starts REJECTING selections that did commit.
+    forms = ["New   York", "  Boston", "Chicago  ", "San\t\nJose"]
+    async with _content_page("<!doctype html><html><body></body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        for dom_text in forms:
+            asked = " ".join(dom_text.split())
+            await page.set_content(
+                f'<!doctype html><html><body><select multiple id="s" size="2">'
+                f'<option value="v1">{dom_text}</option><option value="v2">Other</option>'
+                "</select></body></html>"
+            )
+            r = await handler({"selector": "#s", "labels": [asked]})
+            held = await page.evaluate(
+                "() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)"
+            )
+            assert held == ["v1"], (dom_text, held)
+            assert r.status == "ok", (dom_text, r.content)
+            assert "did NOT commit" not in r.content, (dom_text, r.content)
 
 
 @pytest.mark.asyncio
