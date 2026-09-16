@@ -7,7 +7,10 @@ import {
   getOrgScopedQueryKey,
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
-import { ONBOARDING_PROGRESS_FLAG } from "@/util/featureFlags";
+import {
+  ONBOARDING_PROGRESS_FLAG,
+  ONBOARDING_TRACK_FLAG,
+} from "@/util/featureFlags";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 type ProgressActionKey = "first_agent_created" | "first_successful_run";
 type OnboardingProgressItemV1 = {
@@ -113,15 +116,17 @@ function useOnboardingProgress() {
   const activeOrgId = useActiveOrgId();
   const activeUserId = useUser().get()?.id;
   const queryClient = useQueryClient();
+  const trackFlag = useFeatureFlag(ONBOARDING_TRACK_FLAG);
+  const progressFlag = useFeatureFlag(ONBOARDING_PROGRESS_FLAG);
+  const flagOn = trackFlag === true || progressFlag === true;
+  const flagOff = trackFlag === false && progressFlag === false;
   const enabled =
-    useFeatureFlag(ONBOARDING_PROGRESS_FLAG) === true &&
-    activeOrgId !== undefined &&
-    activeUserId !== undefined;
+    flagOn && activeOrgId !== undefined && activeUserId !== undefined;
   const queryKey = getOrgScopedQueryKey(
     ["onboarding-progress", activeUserId],
     getActiveOrgQueryKeyScope(activeOrgId),
   );
-  const { data, isError } = useQuery<OnboardingProgressV1 | null>({
+  const { data, isError, refetch } = useQuery<OnboardingProgressV1>({
     queryKey,
     queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
@@ -129,7 +134,10 @@ function useOnboardingProgress() {
         "/users/me/onboarding/progress",
         { signal },
       );
-      return parseOnboardingProgress(response.data);
+      const progress = parseOnboardingProgress(response.data);
+      if (progress === null)
+        throw new Error("invalid onboarding progress payload");
+      return progress;
     },
     enabled,
     retry: false,
@@ -146,11 +154,22 @@ function useOnboardingProgress() {
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey, exact: true }),
   });
+  const status: "disabled" | "loading" | "error" | "ready" = !enabled
+    ? flagOff
+      ? "disabled"
+      : "loading"
+    : data !== undefined
+      ? "ready"
+      : isError
+        ? "error"
+        : "loading";
   return {
-    progress: enabled && !isError ? (data ?? null) : null,
+    progress: data ?? null,
+    status,
     isPending,
+    refetch,
     dismiss: () => mutate("dismiss"),
     restore: () => mutate("restore"),
   };
 }
-export { useOnboardingProgress };
+export { isTimestampOrNull, useOnboardingProgress };

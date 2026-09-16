@@ -1,12 +1,16 @@
+from datetime import datetime
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
-from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
-from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
+from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
 from skyvern.services.browser_recording.types import RecordingDraftStep
 from skyvern.utils.url_validators import validate_url
 
@@ -99,6 +103,20 @@ class UpdateBrowserSessionRequest(BaseModel):
     )
 
 
+class ExtendBrowserSessionRequest(BaseModel):
+    # No pydantic `le=` bound: the route grants what remains under MAX_EXTENDED_TIMEOUT and returns a warning
+    # on the response instead of failing the request with pydantic's 422.
+    additional_minutes: int = Field(
+        description=(
+            "Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total "
+            f"lifetime of {MAX_EXTENDED_TIMEOUT} minutes ({MAX_EXTENDED_TIMEOUT // 60} hours) counted from when it "
+            "started; a request for more than the remaining headroom is granted the remainder and the response "
+            "carries a warning."
+        ),
+        ge=1,
+    )
+
+
 class ProcessBrowserSessionRecordingRequest(BaseModel):
     compressed_chunks: list[str] = Field(
         default=[],
@@ -112,18 +130,54 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
         default=None,
         description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
     )
-    code_first: bool = Field(
+    supports_credential_tokens: bool = Field(
         default=False,
-        description="When true, synthesize deterministic code blocks from the recording instead of agent blocks.",
+        description=(
+            "Whether the caller substitutes credential tokens in a code block's code. A frontend that "
+            "does not would save the renamed parameters beside code still reading the token, which fails "
+            "at run time; recorded credentials stay unbound for those callers."
+        ),
+    )
+    recording_attempt_id: str | None = Field(
+        default=None,
+        description="Client-generated ID for the Record Browser attempt.",
+    )
+    interpretation_session_id: str | None = Field(
+        default=None,
+        description="Server-generated ID for the logical live-interpretation session.",
     )
 
 
 class ProcessBrowserSessionRecordingResponse(BaseModel):
+    recording_id: str | None = Field(
+        description="ID of the durable, redacted recording created when processing produced workflow blocks."
+    )
     blocks: list[WorkflowDefinitionYamlBlocksItem] = Field(
         default=[],
         description="List of workflow blocks generated from the processed browser session recording.",
     )
-    parameters: list[WorkflowDefinitionYamlParametersItem_Workflow] = Field(
+    parameters: list[WorkflowDefinitionYamlParametersItem] = Field(
         default=[],
         description="List of workflow parameters generated from the processed browser session recording.",
     )
+    evidence: RecordingEvidencePacket | None = Field(
+        default=None,
+        description=(
+            "Observation-only projection of the recorded actions, returned for code-first "
+            "processing so a refinement request can reuse it instead of re-uploading the recording."
+        ),
+    )
+
+
+class BrowserRecording(BaseModel):
+    recording_id: str
+    organization_id: str
+    recording_attempt_id: str
+    browser_session_id: str
+    workflow_permanent_id: str
+    workflow_id: str | None = None
+    workflow_version: int | None = None
+    evidence: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    created_at: datetime
+    modified_at: datetime

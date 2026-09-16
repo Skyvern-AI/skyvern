@@ -18,8 +18,9 @@ from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     CredentialResolution,
     CredentialResolutionTier,
@@ -47,6 +48,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
+    raw_secret_spans_for_prompt,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -56,7 +58,9 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_origins,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    TURN_OPENER_SENDERS,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
@@ -239,12 +243,96 @@ async def _exonerate_saved_credential_citations(citations: list[str], organizati
 
 
 _MIN_RAW_SECRET_EVIDENCE_CHARS = 4
+_RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES = "=?&#"
+_RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES = "&#"
+_RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION = ".,;:!?"
+_RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES = ")]\"}'"
+
+
+def _redact_raw_secrets_outside_url_candidates(message: str) -> str:
+    """Keep independently occurring URL tokens intact for the model-backed disclosure decision."""
+    deterministic_secret_spans = raw_secret_spans_for_prompt(message)
+    pieces: list[str] = []
+    cursor = 0
+    for candidate in URL_CANDIDATE_RE.finditer(message):
+        if any(
+            start < candidate.end()
+            and candidate.start() < end
+            and not (candidate.start() <= start and end <= candidate.end())
+            for start, end in deterministic_secret_spans
+        ):
+            continue
+        pieces.append(redact_raw_secrets_for_prompt(message[cursor : candidate.start()]))
+        pieces.append(candidate.group(0))
+        cursor = candidate.end()
+    pieces.append(redact_raw_secrets_for_prompt(message[cursor:]))
+    return "".join(pieces)
+
+
+def _raw_secret_evidence_uri_candidate_end(
+    message: str,
+    index: int,
+    end: int,
+    url_candidate_spans: tuple[tuple[int, int], ...],
+) -> int | None:
+    for candidate_start, candidate_end in url_candidate_spans:
+        if candidate_start >= index or end > candidate_end:
+            continue
+        before = message[index - 1]
+        if before in _RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES:
+            return candidate_end
+    return None
+
+
+def _raw_secret_evidence_is_url_userinfo_password(
+    message: str,
+    index: int,
+    end: int,
+    url_candidate_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    for candidate_start, candidate_end in url_candidate_spans:
+        if index < candidate_start or end > candidate_end:
+            continue
+        candidate = message[candidate_start:candidate_end]
+        scheme_end = candidate.find("://")
+        if scheme_end < 0:
+            continue
+        authority_start = scheme_end + 3
+        authority_end = min(
+            (position for delimiter in "/?#" if (position := candidate.find(delimiter, authority_start)) >= 0),
+            default=len(candidate),
+        )
+        userinfo_end = candidate.rfind("@", authority_start, authority_end)
+        if userinfo_end < 0:
+            continue
+        password_start = candidate.find(":", authority_start, userinfo_end)
+        if password_start < 0:
+            continue
+        if index == candidate_start + password_start + 1 and end == candidate_start + userinfo_end:
+            return True
+    return False
+
+
+def _raw_secret_evidence_after_is_boundary(evidence: str, message: str, end: int) -> bool:
+    if end >= len(message):
+        return True
+    after = message[end]
+    if after.isspace() or after in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+        return True
+    if after in _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION:
+        following = message[end + 1] if end + 1 < len(message) else ""
+        if not following or following.isspace() or following in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+            return True
+    return not evidence[-1].isalnum() and after in ".,;:?"
 
 
 def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[tuple[int, int]]:
     if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
         return []
     message = user_message or ""
+    url_candidate_spans = tuple(
+        (candidate.start(), candidate.end()) for candidate in URL_CANDIDATE_RE.finditer(message)
+    )
     spans: list[tuple[int, int]] = []
     start = 0
     while True:
@@ -253,11 +341,25 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
             return spans
         end = index + len(evidence)
         before = message[index - 1] if index else ""
-        after = message[end] if end < len(message) else ""
-        before_is_boundary = not before or before.isspace() or before in "([{\"'"
-        after_is_boundary = (
-            not after or after.isspace() or after in ")]\"}'" or (not evidence[-1].isalnum() and after in ".,;:?")
+        uri_candidate_end = _raw_secret_evidence_uri_candidate_end(message, index, end, url_candidate_spans)
+        is_userinfo_password = _raw_secret_evidence_is_url_userinfo_password(
+            message,
+            index,
+            end,
+            url_candidate_spans,
         )
+        before_is_boundary = (
+            not before
+            or before.isspace()
+            or before in "([{\"'"
+            or uri_candidate_end is not None
+            or is_userinfo_password
+        )
+        after_is_uri_boundary = is_userinfo_password or (
+            uri_candidate_end is not None
+            and (end == uri_candidate_end or message[end] in _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES)
+        )
+        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(evidence, message, end)
         if before_is_boundary and after_is_boundary:
             spans.append((index, end))
         start = index + 1
@@ -290,7 +392,7 @@ async def _screen_raw_secret_safety(
     *,
     organization_id: str,
 ) -> _RawSecretSafetyScreen:
-    deterministic_safe_message = redact_raw_secrets_for_prompt(user_message)
+    deterministic_safe_message = _redact_raw_secrets_outside_url_candidates(user_message)
     if handler is None:
         return _screen_unavailable("missing_handler")
     try:
@@ -355,8 +457,9 @@ async def _screen_raw_secret_safety(
 
 
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
-# Only deterministic post-resolution code may mint these; a classifier emission would
-# skip the concrete-target and credential-reachability checks the reason stands for.
+# The server owns these in model-authored JSON. safety_screen_unavailable is minted
+# deterministically; login_credentials_unresolved names a pause frame, and a model-emitted one
+# would still stamp a credential CTA on the terminal reply.
 _DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
     {"login_credentials_unresolved", "safety_screen_unavailable"}
 )
@@ -382,11 +485,6 @@ _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "missing_conditional_condition",
     "missing_target_context",
 }
-# A failed credential lookup under explicit login intent is the same condition
-# login_credentials_unresolved names, so it may be upgraded; other planes may not.
-_LOGIN_CREDENTIAL_OVERRIDABLE_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"none", "credential_name_unresolved"}
-)
 _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "ambiguous_loop_edit",
     "invalid_conditional_container",
@@ -411,22 +509,7 @@ SAFETY_SCREEN_UNAVAILABLE_QUESTION = (
     "I couldn't finish safety screening on that message, so I never read it. "
     "That's a problem on my side, not something wrong with what you sent — please send it again."
 )
-_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
-_SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
-_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX = (
-    "This request needs to sign in, and no saved credential for it is available yet. "
-    "Please connect one, or reply with its exact saved credential name or a credential ID beginning with cred_."
-)
-_LOGIN_CREDENTIAL_QUESTION = f"{_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
-_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
-    "Which website or login page should I use to look up the stored credential?"
-)
-_STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
-_AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION = (
-    "I found multiple saved credentials, and none of them is bound to that login page. Which one should I use?"
-)
-_SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -792,6 +875,27 @@ class LivePageResolutionRecord:
     page_url: str = ""
 
 
+@dataclass(frozen=True)
+class UserMessageSiteURLSource:
+    message_index: int
+    kind: Literal["user_message"] = field(default="user_message", init=False)
+
+
+@dataclass(frozen=True)
+class QuestionResponseSiteURLSource:
+    interaction_id: str
+    kind: Literal["question_response"] = field(default="question_response", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+
+
+@dataclass(frozen=True)
+class _SiteURLText:
+    text: str
+    source: SiteURLSource
+
+
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
@@ -819,6 +923,14 @@ class RequestPolicy:
     live_page_admitted_urls: dict[str, str] = field(default_factory=dict)
     live_page_resolution: LivePageResolutionRecord | None = None
     live_page_logged_urls: set[str] = field(default_factory=set)
+    # Ids that reached auto_bound_credentials from a carried proposal rather than from a page this
+    # turn admitted. Without it the recorder cannot tell its own hydration from fresh evidence and
+    # re-mints the carry every turn, so it never expires.
+    seeded_proposal_credential_ids: set[str] = field(default_factory=set)
+    # Ids whose citation passed on the carry this turn. Whether that stands as the user's answer is
+    # settled at turn end. Kept apart from current_turn_named_credential_ids, whose claim is that
+    # the user wrote the identifier out themselves.
+    carry_cited_credential_ids: set[str] = field(default_factory=set)
     # Approves persisting a bound credential, not running it: run authority stays
     # scoped to resolved_credentials (ADR 0002).
     discovered_credentials: list[Credential] = field(default_factory=list)
@@ -833,23 +945,22 @@ class RequestPolicy:
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
-    # `clarification_reason` cannot say this on its own: credential_name_unresolved is also raised
-    # by raw-secret, invention and invalid-id asks the credential card cannot answer.
-    credential_ask_card_answerable: bool = False
-    # The server-held login page URLs this ask was formed against; the only origin source the
-    # connected resume may bind from.
+    # The validated login URLs the credential card asked the user to select a login for. The
+    # connected resume falls back to classifier-authored login_page_urls when this is empty.
     credential_ask_login_page_urls: list[str] = field(default_factory=list)
     # Credentials this turn resolved from an explicit user reference — an exact saved name or a
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # Explicit user approvals hydrated from the existing trusted structured chat context.
+    prior_approved_credential_ids: set[str] = field(default_factory=set)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
     user_provided_site_urls: list[str] = field(default_factory=list)
-    # Which user message (1-based) each of those URLs came from, so a release records its provenance.
-    user_site_url_sources: dict[str, int] = field(default_factory=dict)
-    credential_ask_candidate_ids: list[str] = field(default_factory=list)
+    # The ordinary user message or accepted interactive response each URL came from, so a release
+    # records truthful provenance without retaining or logging the response text.
+    user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
@@ -875,6 +986,18 @@ class RequestPolicy:
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
+
+    def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
+        project_question_response_sites(self, interaction)
+
+    def apply_raw_secret_redacted_draft(self) -> None:
+        self.raw_secret_detected = True
+        self.raw_secret_handling = "redacted_draft"
+        self.raw_secret_safety_status = "detected"
+        self.testing_intent = "skip_test"
+        self.allow_run_blocks = False
+        self.allow_missing_credentials_in_draft = True
+        self.credential_draft_deferred_explicitly = True
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -1199,7 +1322,7 @@ def build_transcript_context(
     current_stripped = (current_user_message or "").strip()
     if (
         filtered
-        and filtered[-1].sender == WorkflowCopilotChatSender.USER
+        and filtered[-1].sender in TURN_OPENER_SENDERS
         and (filtered[-1].content or "").strip() == current_stripped
         and current_stripped
     ):
@@ -1207,7 +1330,7 @@ def build_transcript_context(
 
     filtered = redact_refused_secret_turns(filtered)
 
-    user_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.USER]
+    user_indices = [i for i, m in enumerate(filtered) if m.sender in TURN_OPENER_SENDERS]
     ai_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.AI]
 
     earliest_idx = user_indices[0] if user_indices else None
@@ -1238,7 +1361,7 @@ def build_transcript_context(
     for i, message in enumerate(filtered):
         if i in anchor_indices:
             continue
-        role = "user" if message.sender == WorkflowCopilotChatSender.USER else "assistant"
+        role = "user" if message.sender in TURN_OPENER_SENDERS else "assistant"
         candidate_lines.append((i, f"[{i + 1}] {role}: {_safe_slot(message.content, anchor_char_cap)}"))
 
     keep: list[str] = []
@@ -4027,38 +4150,87 @@ def credential_candidate_label(credential: Credential) -> str:
     return f"{label} - {'; '.join(facts)}"
 
 
-def _ground_user_provided_sites(
-    policy: RequestPolicy,
-    user_message: str,
-    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
-) -> None:
-    """Record every site the user themselves gave this chat, so the fill seam can release a credential
-    onto one of them and never onto a site only a model produced.
+def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> list[_SiteURLText]:
+    response = interaction.response
+    if interaction.status != "resolved" or response is None or response.skipped or response.raw_secret_detected:
+        return []
+    source = QuestionResponseSiteURLSource(interaction_id=interaction.interaction_id)
+    texts = [response.text] if response.text else []
+    texts.extend(answer.text for answer in response.answers if answer.text)
+    return [_SiteURLText(text=text, source=source) for text in texts]
 
-    Linking a later "log into pathfold" back to a URL from an earlier turn is the agent's job, not
-    this function's: it reads the whole conversation. What is recorded here is only the deterministic
-    part — the origins the user actually wrote.
-    """
-    user_texts = [
-        message.content
-        for message in full_chat_history
-        if message.sender == WorkflowCopilotChatSender.USER and message.content
-    ]
-    user_texts.append(user_message or "")
-    seen_origins: set[str] = set()
-    urls: list[str] = []
-    sources: dict[str, int] = {}
-    for index, text in enumerate(user_texts, start=1):
-        for candidate in URL_CANDIDATE_RE.findall(text):
+
+def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        interaction = QuestionInteraction.model_validate(raw_interaction)
+    except ValidationError:
+        return []
+    return _accepted_question_response_url_texts(interaction)
+
+
+def _project_user_provided_sites(
+    policy: RequestPolicy,
+    url_texts: Sequence[_SiteURLText],
+    *,
+    reset: bool,
+) -> None:
+    """Project literal user-authored URL facts while preserving first-origin provenance."""
+    if reset:
+        policy.user_provided_site_urls = []
+        policy.user_site_url_sources = {}
+    seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
+    for item in url_texts:
+        for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
             if parts is None or parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
-            urls.append(cleaned)
-            sources[cleaned] = index
-    policy.user_provided_site_urls = urls
-    policy.user_site_url_sources = sources
+            policy.user_provided_site_urls.append(cleaned)
+            policy.user_site_url_sources[cleaned] = item.source
+
+
+def project_question_response_sites(policy: RequestPolicy, interaction: QuestionInteraction) -> None:
+    if interaction.response is not None and interaction.response.raw_secret_detected:
+        policy.apply_raw_secret_redacted_draft()
+        return
+    _project_user_provided_sites(policy, _accepted_question_response_url_texts(interaction), reset=False)
+
+
+def _ground_user_provided_sites(
+    policy: RequestPolicy,
+    user_message: str,
+    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> None:
+    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+
+    Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
+    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    PRODUCT or AI prose never become credential-origin authority.
+    """
+    url_texts: list[_SiteURLText] = []
+    user_message_index = 0
+    for message in full_chat_history:
+        if message.sender == WorkflowCopilotChatSender.USER and message.content:
+            user_message_index += 1
+            url_texts.append(
+                _SiteURLText(
+                    text=message.content,
+                    source=UserMessageSiteURLSource(message_index=user_message_index),
+                )
+            )
+        if message.sender != WorkflowCopilotChatSender.AI or message.narrative_payload is None:
+            continue
+        for raw_interaction in message.narrative_payload.get("questionInteractions", []):
+            url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+    if user_message:
+        url_texts.append(
+            _SiteURLText(
+                text=user_message,
+                source=UserMessageSiteURLSource(message_index=user_message_index + 1),
+            )
+        )
+    _project_user_provided_sites(policy, url_texts, reset=True)
 
 
 def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
@@ -4082,6 +4254,13 @@ async def _seed_prior_approved_credentials(
     global_llm_context: str,
 ) -> None:
     approved_ids = _prior_approved_credential_ids(global_llm_context)
+    policy.prior_approved_credential_ids = approved_ids
+    # An approval minted from a carry recorded the page that vouched for the credential; restoring it
+    # keeps the fill pinned there instead of falling through to any site named in the conversation.
+    for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
+        if record.credential_id in approved_ids and record.admitted_url:
+            policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
@@ -4094,6 +4273,47 @@ async def _seed_prior_approved_credentials(
             *policy.resolved_credentials,
             *(credential for credential in credentials if credential.credential_id in approved_ids),
         ]
+    )
+
+
+def _proposed_credential_seed(global_llm_context: str) -> ProposedCredential | None:
+    seed = StructuredContext.from_json_str(global_llm_context).proposed_credential
+    if seed is None or not seed.credential_id.startswith("cred_") or not seed.admitted_url:
+        return None
+    return seed
+
+
+async def _seed_proposed_credential(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    seed = _proposed_credential_seed(global_llm_context)
+    if seed is None:
+        return
+    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        [seed.credential_id],
+        organization_id=organization_id,
+    )
+    credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
+    if credential is None:
+        return
+    policy.resolved_credentials = _deduplicate_credentials([*policy.resolved_credentials, credential])
+    # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
+    # still skips it rather than promoting a one-turn carry to durable approval.
+    policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.seeded_proposal_credential_ids.add(seed.credential_id)
+    # The server bound this and the user did not name it, so it enters through the auto-bound record:
+    # a write to current_turn_named_credential_ids would refuse the user's own later answer.
+    if seed.credential_id not in {item.credential_id for item in policy.auto_bound_credentials}:
+        policy.auto_bound_credentials.append(credential)
+    LOG.info(
+        "copilot_credential_proposal_hydrated",
+        organization_id=organization_id,
+        credential_id=seed.credential_id,
+        origin_arm=seed.origin_arm,
+        admitted_url=loggable_origin(seed.admitted_url),
     )
 
 
@@ -4314,14 +4534,17 @@ async def admit_credential_for_live_page(
         )
         return LiveCredentialAdmission(
             False,
-            steer=f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Ask the user which one to use, then fill it.",
+            steer=(
+                f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Call `request_credential` with this sign-in page URL "
+                "so the user can select or add the credential in Copilot."
+            ),
         )
     if resolution.verdict == "resolved":
         return LiveCredentialAdmission(
             False,
             steer=(
-                f"`{credential_id}` is not the saved credential for this login page. Ask the user which "
-                "saved credential to use here."
+                f"`{credential_id}` does not match this login page. The page uniquely matches saved credential "
+                f"`{resolution.candidates[0].credential_id}`; use that credential to continue."
             ),
         )
     return LiveCredentialAdmission(False)
@@ -4462,10 +4685,8 @@ async def _build_request_policy_bootstrap(
         credential_id for credential_id in policy.persisted_workflow_credential_ids if credential_id.startswith("goac_")
     }
     google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
-    if selected_connected_account_id is not None:
-        policy.selected_connected_account_id = selected_connected_account_id
-        google_connection_candidates.add(selected_connected_account_id)
-    if google_connection_candidates:
+    policy.selected_connected_account_id = None
+    if google_connection_candidates or selected_connected_account_id is not None:
         try:
             active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
         except Exception:
@@ -4476,6 +4697,22 @@ async def _build_request_policy_bootstrap(
             )
         else:
             active_ids = {connection.id for connection in active_connections}
+            # Picker metadata can refresh after OAuth, independently of the previous turn.
+            # Validate the explicit selection before it becomes durable run authority.
+            selected = next(
+                (
+                    connection
+                    for connection in active_connections
+                    if connection.id == selected_connected_account_id
+                    and connection.organization_id == organization_id
+                    and connection.state == STATE_ACTIVE
+                    and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+                ),
+                None,
+            )
+            if selected is not None:
+                policy.selected_connected_account_id = selected.id
+                google_connection_candidates.add(selected.id)
             policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:
@@ -4487,6 +4724,18 @@ async def _build_request_policy_bootstrap(
     except Exception:
         LOG.warning(
             "request-policy prior approved credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+    try:
+        await _seed_proposed_credential(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy proposed credential seeding failed",
             organization_id=organization_id,
             exc_info=True,
         )

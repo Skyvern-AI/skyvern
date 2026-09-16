@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from skyvern.exceptions import StaleFrameSelectionError
+
 PASSWORD_PATTERN = re.compile(
     r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\bcredential\b|\bpin\s*(?:code)?\b|\bpwd\b|\bpasswd\b",
     re.IGNORECASE,
@@ -19,6 +21,23 @@ CREDENTIAL_HINT = (
     "Create credentials via CLI: skyvern credentials add. "
     "Never pass passwords through tool calls."
 )
+
+STALE_FRAME_HINT = (
+    "The selected iframe belongs to another tab: call skyvern_tab_list and skyvern_tab_switch back to that tab, "
+    "then skyvern_frame_main to clear the stale selection and skyvern_frame_switch to reselect it."
+)
+
+
+def stale_frame_selection_in(exc: BaseException | None) -> bool:
+    """Callers re-wrap the refusal (a poll loop reports its last error), so match the cause chain too."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, StaleFrameSelectionError):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 VALID_WAIT_UNTIL = ("load", "domcontentloaded", "networkidle", "commit")
 VALID_BUTTONS = ("left", "right", "middle")

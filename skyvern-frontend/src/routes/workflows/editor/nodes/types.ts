@@ -101,4 +101,5 @@ export const workflowBlockTitle: {
   google_sheets_write: "Google Sheets Write",
   pdf_fill: "PDF Fill",
   split_pdf: "Split PDF",
+  data_export: "Data Export",
 };

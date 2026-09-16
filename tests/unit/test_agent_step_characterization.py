@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -25,12 +27,14 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
+    TerminateAction,
     WaitAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _click(element_id: str = "node-1") -> ClickAction:
@@ -126,7 +130,6 @@ def make_agent_step_rig(
         action_handler = AsyncMock(return_value=[ActionSuccess()])
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", action_handler)
     agent.record_artifacts_after_action = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
     agent.check_user_goal_complete = AsyncMock()
 
     llm_handler = AsyncMock(return_value=json_response)
@@ -139,7 +142,7 @@ def make_agent_step_rig(
         AsyncMock(return_value=injected_actions),
     )
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
     # Wait-time optimization is a cloud experiment (OSS/killswitch-off returns None).
@@ -447,3 +450,39 @@ async def test_parallel_verification_marks_speculative_original_status(monkeypat
 
     assert step.status == StepStatus.completed
     assert step.speculative_original_status == StepStatus.completed
+
+
+# SKY-15xxx: TaskStatus.terminated requires a non-empty failure_reason (Task.validate_update).
+# get_failure_reason_for_task is the only source of that reason for a terminated task; either
+# empty path below used to return None, which handle_completed_step then handed straight to
+# update_task, tripping the invariant and crashing the step as an "unexpected exception".
+@pytest.mark.asyncio
+async def test_get_failure_reason_for_task_falls_back_when_terminate_reasoning_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    terminate = TerminateAction(reasoning=None, organization_id=organization.organization_id, task_id=task.task_id)
+    output = AgentStepOutput(actions_and_results=[(terminate, [])])
+    step = make_step(now, task, step_id="step-0", status=StepStatus.completed, order=0, output=output)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", AsyncMock(return_value=[step]))
+
+    reason = await ForgeAgent().get_failure_reason_for_task(task)
+
+    assert reason
+
+
+@pytest.mark.asyncio
+async def test_get_failure_reason_for_task_falls_back_when_no_terminate_action_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-0", status=StepStatus.completed, order=0, output=None)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", AsyncMock(return_value=[step]))
+
+    reason = await ForgeAgent().get_failure_reason_for_task(task)
+
+    assert reason

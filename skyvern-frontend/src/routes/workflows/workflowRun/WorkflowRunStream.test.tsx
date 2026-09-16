@@ -19,14 +19,23 @@ vi.mock("@/hooks/useFirstParam", () => ({
   useFirstParam: () => "wr_test",
 }));
 
+// Mirrors the hook's own resolution: an options object naming an absent run
+// means no run, while omitted options defer to the route's :workflowRunId.
+const { runQueryMock } = vi.hoisted(() => ({
+  runQueryMock: vi.fn((options?: { workflowRunId?: string }) => ({
+    data:
+      options && !options.workflowRunId
+        ? undefined
+        : {
+            status: "running",
+            workflow_run_id: "wr_test",
+            workflow: { workflow_permanent_id: "wpid_test" },
+          },
+  })),
+}));
+
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => ({
-    data: {
-      status: "running",
-      workflow_run_id: "wr_test",
-      workflow: { workflow_permanent_id: "wpid_test" },
-    },
-  }),
+  useWorkflowRunWithWorkflowQuery: runQueryMock,
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({
@@ -147,5 +156,25 @@ describe("WorkflowRunStream lifecycle", () => {
     });
     await act(async () => vi.advanceTimersByTimeAsync(1000));
     expect(FakeStreamSocket.instances).toHaveLength(1);
+  });
+
+  it("streams the route's run when rendered without a run id", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunStream />
+      </QueryClientProvider>,
+    );
+    await act(async () => Promise.resolve());
+
+    act(() => {
+      FakeStreamSocket.instances[0]!.emitStreamMessage({
+        status: "running",
+        screenshot: "live-frame",
+      });
+    });
+    expect(screen.getByTestId("stream-frame")).toBeTruthy();
   });
 });

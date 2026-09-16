@@ -110,7 +110,7 @@ The interaction blocks differ by how specifically you describe the step — from
 
 For non-interaction steps, use the purpose-built block directly: goto_url (load a known URL), wait, conditional, for_loop/while_loop, http_request, file_url_parser, file_upload, send_email, text_prompt.
 
-For connected-service outcomes, use the purpose-built integration helper directly rather than automating that service through its browser UI. For Google Sheets, use google_sheets_read to read rows and google_sheets_write to append or update rows. Resolve a compatible connection with list_integrations, then inspect the selected block schema. When the request identifies an active, scope-compatible row, bind its exact connection_id as the native block's credential_id; do not ask the user to repeat an opaque ID already returned by the tool. For a build-and-test request, use the available native workflow update-and-run surface in the same turn; do not stop at a draft.
+For connected-service outcomes, use the purpose-built integration helper directly rather than automating that service through its browser UI. For Google Sheets, use google_sheets_read to read rows and google_sheets_write to append or update rows. Resolve a compatible connection with list_integrations, then inspect the selected block schema. When the request identifies an active, scope-compatible row, bind its exact connection_id as the native block's credential_id; do not ask the user to repeat an opaque ID already returned by the tool. A connection name or account email the user wrote in this turn is also accepted in credential_id: the server resolves it, rewrites the slot to the connection_id, and reports resolved/ambiguous/not_found with the eligible rows. For a build-and-test request, use the available native workflow update-and-run surface in the same turn; do not stop at a draft.
 
 Rule of thumb: if you can name the exact action or purpose, use the specific block; fall back to navigation only when the step is genuinely a goal the agent must work out itself. The specific block also carries the right semantics (login handles 2FA, file_download detects completion, extraction enforces a schema) and runs tighter — a loose navigation_goal re-runs the full browser agent (scrape -> plan -> act) for every step it takes, so it is the block most likely to exhaust the per-tool-call run budget on a heavy page.
 
@@ -709,6 +709,7 @@ sender: <email_address>                         # Required: Sender email address
 recipients: [<email_address>]                   # Required: Recipient list
 subject: <subject_line>                         # Required: Email subject
 body: <email_body>                              # Required: Email body
+body_format: <text|html>                        # Optional: "text" (default) sends the body as plain text; "html" sends it as a formatted HTML email with a generated plain-text fallback
 file_attachments: [<file_path>]                 # Optional: Local file paths to attach
 custom_smtp_host: <hostname>                    # Optional: Send through this SMTP server instead of the platform default (public hostnames only; private/internal addresses are blocked)
 custom_smtp_port: <port_number>                 # Optional: Custom SMTP port (defaults to 587; port 465 uses implicit TLS, other ports use STARTTLS)
@@ -749,6 +750,7 @@ timeout_seconds: <number>                       # Optional: How long to wait for
 sender: <email_address>                         # Optional: A copy is BCC'd here as the record of the send (default: "hello@skyvern.com")
 subject: <subject_line>                         # Optional: Notification subject (default: "Human interaction required for workflow run")
 body: <email_body>                              # Optional: Notification body (default: "Your interaction is required for a workflow run!")
+body_format: <text|html>                        # Optional: "text" (default) or "html"; in html mode the run link and instructions are appended as an HTML footer
 instructions: <text>                            # Optional: What the person should do, shown beside the approve/reject controls (default: "Please review and approve or reject to continue the workflow.")
 positive_descriptor: <text>                     # Optional: Label on the approve control (default: "Approve")
 negative_descriptor: <text>                     # Optional: Label on the reject control (default: "Reject")
@@ -765,6 +767,28 @@ blocks:
     instructions: "Review the order total and line items, then approve to submit or reject to cancel the run."
     positive_descriptor: "Approve order"
     negative_descriptor: "Cancel"
+
+** CAPTCHA SOLVER (captcha_solver) **
+
+Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), a DataDome or Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
+
+How a run reaches it:
+- Task-shaped blocks (navigation, login, action) invoke the solver automatically when a challenge is detected.
+- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A failed solve raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+
+Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+
+** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **
+
+Purpose: A workflow's `proxy_location` chooses the network exit the browser uses (for example RESIDENTIAL, or a country-specific residential pool); a browser profile carries a persisted, fingerprint-aligned session. These are the levers for walls that key on network identity rather than a widget: "your IP address is blocked", "unusual traffic" rate limits, or a challenge page whose widget never renders. They do not solve an interactive captcha and do not bypass account security.
+
+Structure:
+proxy_location: <ProxyLocation>          # Top-level workflow field, set at authoring time; the copilot can change it on the draft
+browser_profile_id: <id>                 # Optional: reuse a saved browser profile (session cookies, fingerprint) across runs
+
+Notes:
+- Changing `proxy_location` takes effect on the next run; a block cannot change its own exit mid-run.
+- Ask which region the site serves before choosing a country pool; a mismatch between proxy region and account region is itself a signal some sites block on.
 
 ** TEXT PROMPT BLOCK (text_prompt) **
 
@@ -883,10 +907,14 @@ There are TWO types of references:
 
 IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either raises "dict object has no attribute 'output'" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
 
-* Browser-task blocks (navigation, extraction, goto_url, login, action, file_download):
-  - `{{ label.output }}` — the full TaskOutput envelope.
-  - `{{ label.output.extracted_information }}` — the extracted payload.
-  - Example: `{{ extract_items.output }}` inside a downstream prompt.
+* Browser-task blocks (navigation, extraction, goto_url, login, action):
+  - `{{ label.output }}` — the extracted payload (an alias for extracted_information). Use this in a value field.
+  - `{{ label.extracted_information }}` — the extracted payload (also available).
+  - `{{ label }}` — the full TaskOutput envelope (status, failure_reason, the payload). Use it to inspect what a block returned, not as the value you want to write.
+  - Example: `{{ extract_items.output }}` or `{{ extract_items.extracted_information }}` inside a downstream prompt.
+
+* File download blocks (file_download):
+  - `{{ fetch_report.downloaded_file_urls }}` — the URLs of the downloaded files; `{{ fetch_report.downloaded_files }}` holds the full file records. Use these, NOT `{{ fetch_report.output.downloaded_file_urls }}`: a download has no extracted payload, so `.output` holds nothing to read from and renders blank on its own.
 
 * Non-task blocks (text_prompt, http_request, file_url_parser):
   - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.

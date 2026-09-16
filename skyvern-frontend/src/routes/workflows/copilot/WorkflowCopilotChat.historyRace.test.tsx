@@ -8,28 +8,71 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+
+import type {
+  QuestionInteraction,
+  WorkflowCopilotCredentialRequiredUpdate,
+} from "./workflowCopilotTypes";
 
 type HistoryData = {
+  question_interactions?: QuestionInteraction[];
+  pending_question_cancel_token?: string | null;
+  pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   workflow_copilot_chat_id: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
   auto_accept: boolean;
 };
 
+type StreamCall = {
+  onMessage: (payload: unknown) => boolean;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
+
 // Only chat-history GETs are deferred (held here so a test controls
-// isLoadingHistory); every other GET resolves immediately.
-const { postStreaming, cancelPost, historyQueue, boolFlags } = vi.hoisted(
-  () => ({
-    postStreaming: vi.fn(() => new Promise<void>(() => {})),
+// isLoadingHistory); every other GET resolves immediately. Streams are held
+// open too, so a test drives each one to its own ending.
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyQueue,
+  historyRejects,
+  historyParams,
+  workflowGets,
+  hasLocalChanges,
+  historySignals,
+  boolFlags,
+  routeWpid,
+  announceRef,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  return {
+    streamCalls: calls,
+    postStreaming: vi.fn(
+      (
+        _path: string,
+        _body: unknown,
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve, reject) => {
+          calls.push({ onMessage, resolve, reject });
+        }),
+    ),
     cancelPost: vi.fn().mockResolvedValue({}),
     historyQueue: [] as Array<(resp: { data: HistoryData }) => void>,
+    historyRejects: [] as Array<(reason?: unknown) => void>,
+    workflowGets: [] as string[],
+    hasLocalChanges: { current: false },
+    historyParams: [] as Array<Record<string, unknown> | undefined>,
+    historySignals: [] as Array<AbortSignal | undefined>,
     boolFlags: { current: {} as Record<string, boolean> },
-  }),
-);
+    routeWpid: { current: "wpid_1" },
+    announceRef: { current: null as ((message: unknown) => void) | null },
+  };
+});
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -37,14 +80,26 @@ vi.mock("@/api/sse", () => ({
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn().mockResolvedValue({
-    get: vi.fn((path: string) => {
-      if (path === "/workflow/copilot/chat-history") {
-        return new Promise((resolve) => {
-          historyQueue.push(resolve as (resp: { data: HistoryData }) => void);
-        });
-      }
-      return Promise.resolve({ data: [] });
-    }),
+    get: vi.fn(
+      (
+        path: string,
+        config?: { params?: Record<string, unknown>; signal?: AbortSignal },
+      ) => {
+        if (path === "/workflow/copilot/chat-history") {
+          historyParams.push(config?.params);
+          historySignals.push(config?.signal);
+          return new Promise((resolve, reject) => {
+            historyQueue.push(resolve as (resp: { data: HistoryData }) => void);
+            historyRejects.push(reject);
+          });
+        }
+        if (path.startsWith("/workflows/")) {
+          workflowGets.push(path);
+          return Promise.resolve({ data: { workflow_permanent_id: "wpid_1" } });
+        }
+        return Promise.resolve({ data: [] });
+      },
+    ),
     post: cancelPost,
   }),
 }));
@@ -60,7 +115,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return {
     ...actual,
     useParams: () => ({
-      workflowPermanentId: "wpid_1",
+      workflowPermanentId: routeWpid.current,
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
@@ -75,8 +130,8 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const useWorkflowHasChangesStore = () => ({
     getSaveData: () => ({
       title: "Test WF",
       workflow: {
@@ -92,11 +147,27 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
       blocks: [],
       workflowDefinitionVersion: 1,
     }),
-  }),
-}));
+  });
+  // The real store is a zustand store; the recovery re-read reads hasChanges
+  // off getState() so it never overwrites unsaved local edits.
+  useWorkflowHasChangesStore.getState = () => ({
+    hasChanges: hasLocalChanges.current,
+  });
+  return { useWorkflowHasChangesStore };
+});
 
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
+}));
+
+vi.mock("./useRunLifecycleAnnouncements", () => ({
+  useRunLifecycleAnnouncements: ({
+    announce,
+  }: {
+    announce: (message: unknown) => void;
+  }) => {
+    announceRef.current = announce;
+  },
 }));
 
 // The real selector needs an infinite-query + debounced Popover; a plain button
@@ -107,15 +178,23 @@ vi.mock("./WorkflowCopilotHistory", () => ({
   }: {
     onSelect: (chat: { workflow_copilot_chat_id: string }) => void;
   }) => (
-    <button
-      onClick={() => onSelect({ workflow_copilot_chat_id: "chat_other" })}
-    >
-      mock-select-history-chat
-    </button>
+    <>
+      <button
+        onClick={() => onSelect({ workflow_copilot_chat_id: "chat_other" })}
+      >
+        mock-select-history-chat
+      </button>
+      <button onClick={() => onSelect({ workflow_copilot_chat_id: "chat-1" })}>
+        mock-select-history-chat-1
+      </button>
+    </>
   ),
 }));
 
+import capturedHistory from "./recoveryPoll.chatHistory.fixture.json";
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+
+const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
 
 const narrativePayload = (
   overrides: Record<string, unknown> = {},
@@ -169,34 +248,34 @@ function chatUi(props: {
 }) {
   return (
     <FeatureFlagContext.Provider value={(name) => boolFlags.current[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat
-          docked={props.docked ?? false}
-          portalTarget={props.portalTarget}
-          requiresLiveBrowser={props.requiresLiveBrowser}
-          isLiveBrowserReady={props.isLiveBrowserReady}
-        />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat
+        docked={props.docked ?? false}
+        portalTarget={props.portalTarget}
+        requiresLiveBrowser={props.requiresLiveBrowser}
+        isLiveBrowserReady={props.isLiveBrowserReady}
+      />
     </FeatureFlagContext.Provider>
   );
 }
 
 async function renderChat(
   props: Parameters<typeof chatUi>[0] = {},
-): Promise<void> {
+): Promise<ReturnType<typeof render>> {
   let portalTarget: HTMLElement | undefined;
   if (props.docked) {
     portalTarget = document.createElement("div");
     document.body.appendChild(portalTarget);
     portalTargets.push(portalTarget);
   }
-  render(chatUi({ ...props, portalTarget }));
+  const result = render(chatUi({ ...props, portalTarget }));
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+  return result;
 }
 
 async function flushHistory(data: HistoryData): Promise<void> {
   await waitFor(() => expect(historyQueue.length).toBeGreaterThan(0));
   const resolve = historyQueue.shift()!;
+  historyRejects.shift();
   await act(async () => {
     resolve({ data });
     await Promise.resolve();
@@ -217,14 +296,22 @@ async function submit(value: string): Promise<void> {
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
+  streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
   cancelPost.mockResolvedValue({});
   historyQueue.length = 0;
+  historyRejects.length = 0;
+  historyParams.length = 0;
+  workflowGets.length = 0;
+  hasLocalChanges.current = false;
   boolFlags.current = {};
+  routeWpid.current = "wpid_1";
+  announceRef.current = null;
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   portalTargets.splice(0).forEach((el) => el.remove());
 });
@@ -290,11 +377,424 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
   });
 });
 
+describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", () => {
+  it.each([
+    { action: "Turn off", button: /Auto-accepting/ },
+    { action: "Reject", button: "Reject" },
+  ])(
+    "leaves the new chat's auto-accept and pending review alone when the old chat's $action lands late",
+    async ({ button }) => {
+      await renderChat();
+      await flushHistory(
+        historyData({
+          auto_accept: true,
+          proposed_workflow: {
+            workflow_id: "wf_pending",
+            title: "Pending draft",
+            _copilot_unvalidated: true,
+          },
+          chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+        }),
+      );
+      let finishRequest: (value: unknown) => void = () => {};
+      cancelPost.mockImplementationOnce(
+        () => new Promise((resolve) => (finishRequest = resolve)),
+      );
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", { name: button }));
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText("mock-select-history-chat"));
+        await Promise.resolve();
+      });
+      await flushHistory(
+        historyData({
+          workflow_copilot_chat_id: "chat_other",
+          auto_accept: true,
+          proposed_workflow: {
+            workflow_id: "wf_other_pending",
+            title: "Other chat draft",
+            _copilot_unvalidated: true,
+          },
+          chat_history: [aiHistoryMessage(null, "Other chat draft.")],
+        }),
+      );
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      await act(async () => {
+        finishRequest({});
+        await Promise.resolve();
+      });
+
+      expect(cancelPost).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\/workflow\/copilot\/(disable-auto-accept|clear-proposed-workflow)/,
+        ),
+        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      );
+      expect(
+        screen.getByRole("button", { name: /Auto-accepting/ }),
+      ).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    },
+  );
+
+  it("keeps a chat's Accept withheld while its own Turn off is still pending, after another chat's Turn off starts", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    const heldDisables: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => heldDisables.push(resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    // A second chat's Turn off starts while the first one is still in flight.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+
+    // Back to the first chat, whose disable has still not answered.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat-1"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat-1"));
+
+    expect(heldDisables).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("shows the chat's Turn off still pending after a round trip to another chat, and refuses a second one", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    const heldDisables: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => heldDisables.push(resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+    expect(heldDisables).toHaveLength(1);
+
+    // Away and back while chat-1's disable is still in flight: the chip remounts.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat-1"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat-1"));
+
+    const chip = await screen.findByRole("button", {
+      name: /Auto-accepting/,
+    });
+    expect(chip.getAttribute("aria-disabled")).toBe("true");
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    expect(heldDisables).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    await act(async () => {
+      heldDisables[0]!({});
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
+  });
+
+  it("does not clear the new chat's pending review when the old chat's Accept lands late", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    let finishApply: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((resolve) => (finishApply = resolve))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+
+    await act(async () => {
+      finishApply({ data: { workflow_id: "wf_chat-1" } });
+    });
+
+    // chat_other's proposal is untouched on the server, so its gate must survive.
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+  });
+
+  it("clears the accepted chat's server proposal even when the user switched away", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    // The atomic apply fails, so Accept falls back to applying locally and clearing the row itself.
+    let failApply: (reason: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((_resolve, reject) => (failApply = reject))
+        : Promise.resolve({}),
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+
+    await act(async () => {
+      failApply({ response: { status: 500 } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/clear-proposed-workflow",
+        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      ),
+    );
+    // The chat now on screen keeps its own pending review.
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not retry an accepted chat's clear against the chat the user switched to", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    let failApply: (reason: unknown) => void = () => {};
+    const clearBodies: Array<Record<string, unknown>> = [];
+    cancelPost.mockImplementation(
+      (path: string, body: Record<string, unknown>) => {
+        if (path === "/workflow/copilot/apply-proposed-workflow") {
+          return new Promise((_resolve, reject) => (failApply = reject));
+        }
+        if (path === "/workflow/copilot/clear-proposed-workflow") {
+          clearBodies.push(body);
+          // The accepted chat's row is gone by the time the fallback clear lands.
+          return Promise.reject({ response: { status: 404 } });
+        }
+        return Promise.resolve({});
+      },
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat_other"));
+
+    await act(async () => {
+      failApply({ response: { status: 500 } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearBodies.length).toBeGreaterThan(0));
+    // The 404 branch looks up the latest chat; answer it with the chat now on screen.
+    if (historyQueue.length > 0) {
+      await flushHistory(pendingChat("chat_other"));
+    }
+
+    // The retry must not fall back to whatever chat is current: that would delete its pending review.
+    expect(clearBodies.map((body) => body.workflow_copilot_chat_id)).toEqual([
+      "chat-1",
+    ]);
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not hold one chat's Turn off behind an Accept still running in another chat", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: "wf_pending",
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise(() => {})
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_other",
+        auto_accept: true,
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/disable-auto-accept",
+        { workflow_copilot_chat_id: "chat_other" },
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+  });
+
+  it("does not let a late post-Accept read of the old chat overwrite the chat the user switched to", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        auto_accept: true,
+        proposed_workflow: {
+          workflow_id: "wf_pending",
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+    // A plain Accept reads chat-1's row back; that read is still open when the user switches.
+    await waitFor(() => expect(historyQueue.length).toBe(1));
+    const lateChatOneRead = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_other",
+        auto_accept: true,
+      }),
+    );
+    await act(async () => {
+      lateChatOneRead({
+        data: historyData({
+          auto_accept: false,
+          proposed_workflow: { workflow_id: "wf_chat_one", title: "Chat one" },
+        }),
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+  });
+});
+
 // Item 2 (SKY-12384): a live_browser prompt queued before the initial history
 // load must keep one owner — footer while the bubble exists, else the chip.
 describe("WorkflowCopilotChat — queued prompt survives initial history load (item 2)", () => {
   it("keeps the queued status + Cancel visible after the history load lands", async () => {
-    boolFlags.current = { ENABLE_WORKFLOW_COPILOT_V2: true };
+    boolFlags.current = {};
     await renderChat({ requiresLiveBrowser: true, isLiveBrowserReady: false });
 
     // Queue while the initial history GET is still pending (isLoadingHistory).
@@ -331,5 +831,878 @@ describe("WorkflowCopilotChat — queued prompt survives initial history load (i
         screen.queryByText("Prompt queued. Waiting for live browser..."),
       ).toBeNull(),
     );
+  });
+});
+
+// The server keeps the copilot handler running after a client disconnect, so a
+// stream that closes with no terminal frame usually still ends in a persisted
+// assistant row. The fixture is the last turn of a captured chat-history response.
+describe("WorkflowCopilotChat — recovery poll after a non-terminal stream close", () => {
+  const capturedAiRow =
+    capturedHistory.chat_history[capturedHistory.chat_history.length - 1]!;
+  const turnId = capturedAiRow.turn_outcome!.copilot_turn_id;
+  // Markdown renders away, and the row runs to a bulleted summary, so only its
+  // opening line is matched against normalized rendered text.
+  const capturedAiText = normalize(
+    capturedAiRow.content.replace(/[`*]/g, "").split(/\n/)[0]!,
+  );
+  const interruptedText = "This turn was interrupted before it could finish.";
+
+  function renderedText(): string {
+    return normalize(document.body.textContent ?? "");
+  }
+
+  function historyWithRow(row: Record<string, unknown>): HistoryData {
+    return {
+      workflow_copilot_chat_id: capturedHistory.workflow_copilot_chat_id,
+      chat_history: [...capturedHistory.chat_history.slice(0, -1), row],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+  }
+
+  // The server's own clock, deliberately far behind the client's: correlation
+  // must not depend on comparing it to Date.now().
+  function recoveredHistory(): HistoryData {
+    return historyWithRow({
+      ...capturedAiRow,
+      created_at: "2025-01-01T00:00:00",
+    });
+  }
+
+  function interruptedHistory(): HistoryData {
+    return historyWithRow({
+      sender: "ai",
+      content: interruptedText,
+      created_at: "2025-01-01T00:00:00",
+      narrative_payload: null,
+      turn_outcome: {
+        response_kind: "recover",
+        terminal_reason: "interrupted",
+        copilot_turn_id: turnId,
+      },
+    });
+  }
+
+  // A reply persisted with no turn outcome at all: nothing to correlate on but
+  // its position and its clock.
+  function untaggedHistory(): HistoryData {
+    return historyWithRow({
+      ...capturedAiRow,
+      created_at: new Date(Date.now() + 60_000).toISOString().replace("Z", ""),
+      turn_outcome: null,
+    });
+  }
+
+  // Another tab's turn, persisted after this send: newest row, wrong turn.
+  function otherTurnHistory(): HistoryData {
+    return historyWithRow({
+      ...capturedAiRow,
+      created_at: new Date(Date.now() + 60_000).toISOString().replace("Z", ""),
+      turn_outcome: { ...capturedAiRow.turn_outcome, copilot_turn_id: "other" },
+    });
+  }
+
+  async function emitTurnStart(index = 0): Promise<void> {
+    await act(async () => {
+      streamCalls[index]!.onMessage({
+        type: "turn_start",
+        turn_id: turnId,
+        turn_index: index,
+        timestamp: "2026-09-02T06:33:30Z",
+      });
+      await Promise.resolve();
+    });
+  }
+
+  async function startTurn(
+    chatId: string | null = "chat-1",
+  ): Promise<ReturnType<typeof render>> {
+    const handle = await renderChat();
+    await flushHistory(historyData({ workflow_copilot_chat_id: chatId }));
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    return handle;
+  }
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  async function closeStreamWithoutTerminal(index = 0): Promise<void> {
+    await act(async () => {
+      streamCalls[index]!.reject(
+        new Error("SSE stream ended without terminal event"),
+      );
+      await Promise.resolve();
+    });
+  }
+
+  async function emitTerminalResponse(index = 0): Promise<void> {
+    await act(async () => {
+      streamCalls[index]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "All done.",
+        updated_workflow: null,
+        response_time: "2026-08-16T02:02:13Z",
+        proposal_disposition: "no_proposal",
+      });
+      streamCalls[index]!.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  async function resolveNextHistory(data: HistoryData): Promise<void> {
+    expect(historyQueue.length).toBeGreaterThan(0);
+    const resolve = historyQueue.shift()!;
+    historyRejects.shift();
+    await act(async () => {
+      resolve({ data });
+      await Promise.resolve();
+    });
+  }
+
+  it("does not let a recovery read that started before Turn off turn the chip back on", async () => {
+    await renderChat();
+    await flushHistory(historyData({ auto_accept: true }));
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    expect(historyQueue.length).toBe(1);
+    const stalePoll = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    await advance(0);
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+
+    await act(async () => {
+      stalePoll({ data: { ...recoveredHistory(), auto_accept: true } });
+      await Promise.resolve();
+    });
+
+    expect(renderedText()).toContain(capturedAiText);
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+  });
+
+  it("renders the assistant row the server persisted, replacing the error bubble", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    expect(
+      screen.getByText(
+        "The connection dropped, so Copilot is checking whether this turn finished.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText("Sorry, I encountered an error. Please try again."),
+    ).toBeNull();
+    expect(historyQueue.length).toBe(0);
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+
+    expect(renderedText()).toContain(capturedAiText);
+    expect(
+      screen.queryByText(
+        "The connection dropped, so Copilot is checking whether this turn finished.",
+      ),
+    ).toBeNull();
+  });
+
+  it("recovers a brand-new chat's first turn, whose id never arrived", async () => {
+    await startTurn(null);
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_permanent_id: "wpid_1",
+    });
+
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("can answer a recovered first question whose chat id never arrived", async () => {
+    await startTurn(null);
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    const interaction: QuestionInteraction = {
+      interaction_id: "recovered-question",
+      turn_id: turnId,
+      tool_call_id: "call",
+      status: "pending",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "format",
+          prompt: "Which format?",
+          choices: [{ choice_id: "csv", text: "CSV" }],
+        },
+      ],
+    };
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      chat_history: [],
+      question_interactions: [interaction],
+      pending_question_cancel_token: "stop",
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: { ...interaction, status: "resolved", response: { skipped: true } },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/question-response",
+      {
+        workflow_copilot_chat_id: capturedHistory.workflow_copilot_chat_id,
+        interaction_id: "recovered-question",
+        skipped: true,
+      },
+    );
+  });
+
+  it("keeps polling while the only assistant row belongs to another turn", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    await resolveNextHistory(otherTurnHistory());
+    expect(renderedText()).not.toContain(capturedAiText);
+
+    await advance(3_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("keeps reading past the reconcile threshold and lets the real reply supersede the interrupted row", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    // Each pass is one poll cycle; 45 of them carry virtual time past the
+    // server's ~1320s reconcile threshold with nothing persisted yet.
+    const startedAt = Date.now();
+    for (let i = 0; i < 45; i += 1) {
+      await advance(30_000);
+      await resolveNextHistory(historyData({ chat_history: [] }));
+    }
+    expect(Date.now() - startedAt).toBeGreaterThan(1_320_000);
+
+    await advance(30_000);
+    await resolveNextHistory(interruptedHistory());
+    expect(renderedText()).toContain(interruptedText);
+
+    await advance(30_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("reads on its own timer only, and stops once the budget elapses", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(historyQueue.length).toBe(0);
+
+    // Each pass is one poll cycle; enough of them carry virtual time past the
+    // poll's own 1_500_000ms budget with nothing ever persisted. The budget
+    // fires on its own timer, so the last cycle stops mid-loop rather than
+    // after a fixed count.
+    const startedAt = Date.now();
+    let reads = 0;
+    for (let i = 0; i < 64; i += 1) {
+      await advance(30_000);
+      if (historyQueue.length === 0) {
+        break;
+      }
+      await resolveNextHistory(historyData({ chat_history: [] }));
+      reads += 1;
+    }
+    expect(reads).toBeGreaterThan(40);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500_000);
+
+    await advance(300_000);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("keeps an earlier turn's recovery alive across a later send", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await submit("another one");
+    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+      await advance(10);
+    }
+    expect(streamCalls.length).toBe(2);
+    await emitTerminalResponse(1);
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("claims ownership when recovery discovers a credential pause", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    await resolveNextHistory(
+      historyData({
+        pending_credential_requests: [
+          {
+            type: "credential_required",
+            turn_id: turnId,
+            workflow_copilot_chat_id: "chat-1",
+            resume_token: "resume-token",
+            reason: "workflow_credential_inputs_unbound",
+            message: "",
+            login_page_urls: ["https://example.com/login"],
+            credential_refs: [],
+            timeout_seconds: 300,
+            expires_at: new Date(Date.now() + 300_000).toISOString(),
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }),
+    );
+
+    await submit("another one");
+    await advance(10);
+
+    expect(streamCalls.length).toBe(1);
+  });
+
+  it("does not re-read history when the stream ends on a terminal frame", async () => {
+    await startTurn();
+    await emitTerminalResponse();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("does not re-read history when the user stopped the turn", async () => {
+    await startTurn();
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+    await closeStreamWithoutTerminal();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("does not re-read history for a stream that never announced a turn", async () => {
+    // Without a turn id there is nothing to correlate a row against, so the
+    // poll must not arm at all rather than match on position.
+    await renderChat();
+    await flushHistory(historyData());
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("gives up and shows the plain failure once reads keep failing", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    expect(renderedText()).toContain(
+      "Copilot is checking whether this turn finished",
+    );
+
+    // The usual cause of a severed stream is a client that lost the network, so
+    // every recovery read fails too; it must not hold the notice for 25 minutes.
+    for (let i = 0; i < 3; i += 1) {
+      await advance(30_000);
+      expect(historyQueue.length).toBeGreaterThan(0);
+      historyQueue.shift();
+      const failRead = historyRejects.shift()!;
+      await act(async () => {
+        failRead(new Error("offline"));
+        await Promise.resolve();
+      });
+    }
+
+    await advance(120_000);
+    expect(historyQueue.length).toBe(0);
+    expect(renderedText()).not.toContain(
+      "Copilot is checking whether this turn finished",
+    );
+    expect(renderedText()).toContain("Sorry, I encountered an error");
+  });
+
+  it("does not re-read history for a turn whose chat the user left mid-stream", async () => {
+    await startTurn();
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    const switchLoad = historyQueue.shift()!;
+    await act(async () => {
+      switchLoad({
+        data: historyData({ workflow_copilot_chat_id: "chat_other" }),
+      });
+      await Promise.resolve();
+    });
+    await closeStreamWithoutTerminal();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("stops the poll when the route moves to another workflow", async () => {
+    const handle = await startTurn();
+    await closeStreamWithoutTerminal();
+
+    routeWpid.current = "wpid_2";
+    await act(async () => {
+      handle.rerender(chatUi({}));
+      await Promise.resolve();
+    });
+    await advance(1);
+    await resolveNextHistory(
+      historyData({ workflow_copilot_chat_id: "chat_other_workflow" }),
+    );
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("arms the poll on the connected-account refresh, which is the same severed stream", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Which account should I use?",
+            created_at: "2026-07-15T00:00:00Z",
+            narrative_payload: narrativePayload({ turnId: "turn-choice" }),
+            turn_outcome: {
+              response_kind: "clarify",
+              connected_account_choices: [
+                {
+                  connection_id: "conn_12345678",
+                  name: "Work account",
+                  state: "active",
+                  email_address: "work@example.com",
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Work account/ }));
+    });
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+
+    // The catch branch's own in-place refresh reads once, far too early.
+    await resolveNextHistory(historyData({ chat_history: [] }));
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("does not arm when a chat switch lands during the connected-account refresh", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Which account should I use?",
+            created_at: "2026-07-15T00:00:00Z",
+            narrative_payload: narrativePayload({ turnId: "turn-choice" }),
+            turn_outcome: {
+              response_kind: "clarify",
+              connected_account_choices: [
+                {
+                  connection_id: "conn_12345678",
+                  name: "Work account",
+                  state: "active",
+                  email_address: "work@example.com",
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Work account/ }));
+    });
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+
+    // The refresh forgives its own single generation bump. Here the user also
+    // leaves for another chat while it is still awaiting, so the turn belongs
+    // to a chat that is no longer on screen and must not arm.
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    while (historyQueue.length > 0) {
+      await act(async () => {
+        historyQueue.shift()!({
+          data: historyData({ workflow_copilot_chat_id: "chat_other" }),
+        });
+        await Promise.resolve();
+      });
+    }
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("recovers a reply the server persisted with no turn outcome", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    await resolveNextHistory(untaggedHistory());
+    expect(renderedText()).toContain(capturedAiText);
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("will not adopt an untagged row while polling by workflow id", async () => {
+    // No chat id means the read resolves "the workflow's latest chat", which can
+    // be another tab's. An untagged row there carries nothing tying it to this
+    // turn, so only an id match may end the poll.
+    await startTurn(null);
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_permanent_id: "wpid_1",
+    });
+    await resolveNextHistory(untaggedHistory());
+    expect(renderedText()).not.toContain(capturedAiText);
+
+    await advance(3_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("aborts the read in flight when the budget elapses", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    const inFlight = historySignals[historySignals.length - 1];
+    expect(inFlight?.aborted).toBe(false);
+
+    // Past the budget with the read still unresolved: the deadline must reach
+    // the request, not just the timer that scheduled it.
+    await advance(1_500_000);
+    expect(inFlight?.aborted).toBe(true);
+
+    // The aborted read rejects; that rejection must not reschedule the ladder.
+    await act(async () => {
+      historyQueue.shift();
+      await Promise.resolve();
+    });
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("stays on the chat it first resolved when polling by workflow id", async () => {
+    await startTurn(null);
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_permanent_id: "wpid_1",
+    });
+    // Another tab can create a newer chat, and "the workflow's latest" would
+    // then resolve away from this turn's chat for every later read.
+    await resolveNextHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_of_this_turn",
+        chat_history: [],
+      }),
+    );
+
+    await advance(3_000);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_copilot_chat_id: "chat_of_this_turn",
+    });
+  });
+
+  it("does not apply history fetched before a send that came and went", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    expect(historyQueue.length).toBe(1);
+    const staleRead = historyQueue.shift()!;
+
+    // A whole send begins and ends while that read is outstanding, so the
+    // in-flight flag is false at both ends of it.
+    await submit("another one");
+    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+      await advance(10);
+    }
+    expect(streamCalls.length).toBe(2);
+    await act(async () => {
+      streamCalls[1]!.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      staleRead({ data: recoveredHistory() });
+      await Promise.resolve();
+    });
+    // Applying it would rebuild the transcript without the send that just ran.
+    expect(renderedText()).toContain("another one");
+
+    await advance(30_000);
+    expect(historyQueue.length).toBeGreaterThan(0);
+  });
+
+  it("drops the refreshing notice when the budget runs out", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    expect(renderedText()).toContain(
+      "Copilot is checking whether this turn finished",
+    );
+
+    for (let i = 0; i < 64; i += 1) {
+      await advance(30_000);
+      if (historyQueue.length === 0) {
+        break;
+      }
+      await resolveNextHistory(historyData({ chat_history: [] }));
+    }
+
+    // Recovery has stopped, so a notice saying it is still refreshing is stale.
+    expect(renderedText()).not.toContain(
+      "Copilot is checking whether this turn finished",
+    );
+    expect(renderedText()).toContain("Sorry, I encountered an error");
+  });
+
+  it("stops watching for a supersede well short of the budget", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    // A turn cancelled by a worker drain writes this row and never finishes, so
+    // waiting out the budget would have every open chat polling through a
+    // deploy.
+    await advance(2_000);
+    await resolveNextHistory(interruptedHistory());
+    expect(renderedText()).toContain(interruptedText);
+
+    let reads = 0;
+    for (let i = 0; i < 30; i += 1) {
+      await advance(30_000);
+      if (historyQueue.length === 0) {
+        break;
+      }
+      await resolveNextHistory(interruptedHistory());
+      reads += 1;
+    }
+    expect(reads).toBeLessThan(10);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("re-reads the workflow once a recovered turn lands", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+
+    // The turn may have committed a build the editor never saw, and its terminal
+    // frame never arrived to apply it; a stale graph here is what a later save
+    // would write back over the commit.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(workflowGets.some((url) => url === "/workflows/wpid_1")).toBe(true);
+  });
+
+  it("leaves the workflow alone when the editor has unsaved edits", async () => {
+    hasLocalChanges.current = true;
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // Losing edits the user can see is worse than the stale graph being fixed.
+    expect(workflowGets).toEqual([]);
+  });
+
+  it("re-arming the same turn replaces its ladder instead of adding one", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await submit("another one");
+    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+      await advance(10);
+    }
+    expect(streamCalls.length).toBe(2);
+    await emitTurnStart(1);
+    await closeStreamWithoutTerminal(1);
+
+    await advance(2_500);
+    expect(historyQueue.length).toBe(1);
+  });
+
+  it("keeps this chat's run-lifecycle lines when the recovered row lands", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    await act(async () => {
+      announceRef.current!({
+        id: "run-lifecycle-wr_1-start",
+        sender: "ai",
+        kind: "run_lifecycle",
+        content: "Run started - watching it now.",
+      });
+      await Promise.resolve();
+    });
+
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+
+    expect(renderedText()).toContain(capturedAiText);
+    expect(screen.getByText("Run started - watching it now.")).toBeTruthy();
+  });
+
+  it("discards a response that lands after the user switched chats", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    expect(historyQueue.length).toBe(1);
+    const stalePoll = historyQueue.shift()!;
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    const switchLoad = historyQueue.shift()!;
+    await act(async () => {
+      switchLoad({
+        data: historyData({
+          workflow_copilot_chat_id: "chat_other",
+          chat_history: [aiHistoryMessage(null, "Other chat reply.")],
+        }),
+      });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      stalePoll({ data: recoveredHistory() });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Other chat reply.")).toBeTruthy();
+    expect(renderedText()).not.toContain(capturedAiText);
+  });
+});
+
+describe("WorkflowCopilotChat — question transport", () => {
+  it("hydrates the persisted question and routes the composer to its interaction", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [{ part_id: "part", prompt: "Which store?", choices: [] }],
+          },
+        ],
+        pending_question_cancel_token: "cancel",
+        chat_history: [],
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("textbox", { name: "Your response" }),
+      ).toBeTruthy(),
+    );
+    await act(async () => {
+      announceRef.current?.({
+        id: "lifecycle-1",
+        sender: "ai",
+        content: "Run started",
+        kind: "run_lifecycle",
+      });
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        interaction_id: "interaction",
+        turn_id: "turn-ask",
+        tool_call_id: "call",
+        status: "resolved",
+        parts: [],
+        response: { text: "why do you need this?" },
+      },
+    });
+    const composer = screen.getByPlaceholderText("Answer Copilot…");
+    fireEvent.change(composer, { target: { value: "why do you need this?" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalled());
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(cancelPost.mock.calls[0]?.[0]).toBe(
+      "/workflow/copilot/question-response",
+    );
+    expect(cancelPost.mock.calls[0]?.[1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+      interaction_id: "interaction",
+      text: "why do you need this?",
+    });
   });
 });

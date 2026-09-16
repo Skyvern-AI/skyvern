@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -14,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { Switch } from "@/components/ui/switch";
+import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
@@ -27,8 +29,14 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError, type AxiosResponse } from "axios";
-import { useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import {
+  forwardRef,
+  type ForwardedRef,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   generatePhoneNumber,
   generateUniqueEmail,
@@ -42,6 +50,7 @@ import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { ImprovePrompt } from "@/components/ImprovePrompt";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
@@ -107,10 +116,16 @@ const exampleCases = [
       "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
     icon: <GearIcon className="size-6" />,
   },
-];
+] as const;
+
+type ExamplePromptKey = (typeof exampleCases)[number]["key"];
 
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
+};
+
+type PromptBoxHandle = {
+  focusAndPrefillExample: (key: ExamplePromptKey) => void;
 };
 
 const HANDOFF_TITLE_MAX_LEN = 80;
@@ -169,10 +184,31 @@ function describeResponseEnvelope(response: AxiosResponse<unknown>): string {
   return `status=${response.status} content_type=${contentType} body_length=${bodyLength} parsed_as_json=${parsedAsJson}`;
 }
 
-function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
+function showCreateErrorToast(title: string, error: unknown) {
+  if (isPaymentRequiredError(error)) {
+    toast({
+      variant: "destructive",
+      title: "Not enough credits",
+      description: getErrorDetail(error),
+      action: (
+        <ToastAction altText="Go to Billing" asChild>
+          <Link to="/billing">Go to Billing</Link>
+        </ToastAction>
+      ),
+    });
+    return;
+  }
+  toast({ variant: "destructive", title, description: getErrorDetail(error) });
+}
+
+function PromptBoxImpl(
+  { enableCopilotHandoff = false }: PromptBoxProps,
+  ref: ForwardedRef<PromptBoxHandle>,
+) {
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
   const [prompt, setPrompt] = useState<string>("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -198,6 +234,17 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   // react-query isPending only flips on the next render, so a same-frame
   // double-click can slip past it; the ref is the synchronous guard.
   const submitInFlightRef = useRef(false);
+
+  useImperativeHandle(ref, () => ({
+    focusAndPrefillExample: (key) => {
+      const examplePrompt =
+        exampleCases.find((example) => example.key === key)?.prompt ??
+        exampleCases[0].prompt;
+      setPrompt((current) => (current.trim() ? current : examplePrompt));
+      textareaRef.current?.scrollIntoView?.({ block: "center" });
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+  }));
 
   const generateWorkflowMutation = useMutation({
     mutationFn: async ({ prompt }: { prompt: string }) => {
@@ -281,11 +328,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       );
     },
     onError: (error: Error) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating agent from prompt",
-        description: error.message,
-      });
+      showCreateErrorToast("Error creating agent from prompt", error);
     },
     onSettled: () => {
       submitInFlightRef.current = false;
@@ -337,11 +380,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       );
     },
     onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating agent",
-        description: error.message,
-      });
+      showCreateErrorToast("Error creating agent", error);
     },
     onSettled: () => {
       submitInFlightRef.current = false;
@@ -405,6 +444,8 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 iconClassName="h-5 w-5"
               />
               <AutoResizingTextarea
+                ref={textareaRef}
+                id="discover-prompt-input"
                 className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
@@ -676,4 +717,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   );
 }
 
+const PromptBox = forwardRef(PromptBoxImpl);
+
 export { PromptBox };
+export type { ExamplePromptKey, PromptBoxHandle };

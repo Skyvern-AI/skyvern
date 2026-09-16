@@ -1,3 +1,4 @@
+import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
 import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
@@ -29,6 +30,7 @@ import {
   BlockYAML,
   CodeBlockYAML,
   ConditionalBlockYAML,
+  DataExportBlockYAML,
   DownloadToS3BlockYAML,
   FileUrlParserBlockYAML,
   ForLoopBlockYAML,
@@ -74,6 +76,7 @@ import {
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
+import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
   isFileParserNode,
@@ -121,6 +124,7 @@ import {
   MAX_STEPS_DEFAULT,
 } from "./nodes/NavigationNode/types";
 import {
+  extractionExportDataSchemaDefault,
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
@@ -770,6 +774,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -841,6 +846,7 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           sender: block.sender,
         },
       };
@@ -865,6 +871,13 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
+          exportEnabled: block.export_enabled ?? false,
+          exportDataSchema:
+            block.export_data_schema == null
+              ? extractionExportDataSchemaDefault
+              : JSON.stringify(block.export_data_schema, null, 2),
+          exportFileName: block.export_file_name ?? "",
+          exportRecords: block.export_records ?? "",
         },
       };
     }
@@ -974,6 +987,7 @@ function convertToNode(
         data: {
           ...commonData,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           fileAttachments: block.file_attachments.join(", "),
           recipients: block.recipients.join(", "),
           subject: block.subject,
@@ -1002,6 +1016,20 @@ function convertToNode(
           ...commonData,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "data_export": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "dataExport",
+        data: {
+          ...commonData,
+          data: block.data,
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          fileName: block.file_name ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -2163,6 +2191,7 @@ function getElements(
       cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
       runWith: settings.runWith,
+      browserType: settings.browserType ?? null,
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
@@ -2175,6 +2204,7 @@ function getElements(
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
       errorCodeMapping: settings.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(settings.retryPolicy),
     }),
   );
 
@@ -2617,6 +2647,17 @@ function createNode(
         },
       };
     }
+    case "dataExport": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "dataExport",
+        data: {
+          ...dataExportNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "download": {
       return {
         ...identifiers,
@@ -3039,6 +3080,7 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
+        engine: node.data.engine,
       };
     }
     case "human_interaction": {
@@ -3054,6 +3096,7 @@ function getWorkflowBlock(
           .map((recipient) => recipient.trim()),
         subject: node.data.subject,
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
       };
     }
@@ -3137,6 +3180,14 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
+        // export_data_schema (like export_file_name/export_records below) is
+        // saved regardless of export_enabled -- the backend already no-ops on
+        // all three while export is off, and gating persistence here would
+        // silently drop an authored schema the next time the toggle flips.
+        export_enabled: node.data.exportEnabled ?? false,
+        export_data_schema: JSONParseSafe(node.data.exportDataSchema),
+        export_file_name: node.data.exportFileName || null,
+        export_records: node.data.exportRecords || null,
       };
     }
     case "login": {
@@ -3242,6 +3293,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "send_email",
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         file_attachments: node.data.fileAttachments
           .split(",")
           .map((attachment) => attachment.trim()),
@@ -3276,6 +3328,16 @@ function getWorkflowBlock(
         ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
+      };
+    }
+    case "dataExport": {
+      return {
+        ...base,
+        block_type: "data_export",
+        data: node.data.data,
+        data_schema: JSONParseSafe(node.data.dataSchema) ?? {},
+        file_name: node.data.fileName || null,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "download": {
@@ -3735,6 +3797,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
     errorCodeMapping: null,
+    retryPolicy: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3765,6 +3828,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
           ? JSON.stringify(data.cdpConnectHeaders)
           : data.cdpConnectHeaders,
       runWith: data.runWith,
+      browserType: data.browserType ?? null,
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
@@ -3775,6 +3839,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
       errorCodeMapping: data.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(data.retryPolicy),
     };
   }
   return defaultSettings;
@@ -4269,6 +4334,77 @@ function getAvailableOutputParameterKeys(
   return outputParameterKeys;
 }
 
+// Mirrors google_drive_service.extract_file_reference, which accepts a bare file id as
+// well as a Drive URL, and lowercases the host before comparing it. A templated URL can
+// still resolve to a Drive link at run time, so treat it as a maybe.
+const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
+
+function urlMayBeGoogleDrive(url: string): boolean {
+  const candidate = url.trim();
+  if (candidate.includes("{{") || bareDriveFileId.test(candidate)) {
+    return true;
+  }
+
+  try {
+    const parsed = new URL(candidate);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname === "drive.google.com" &&
+      parsed.pathname.startsWith("/file/d/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Mirrors the blocks in block.py that actually reach BaseTaskBlock.execute and so leave
+// a browser page behind. Subclassing BaseTaskBlock is not enough on its own, so two of
+// them are absent: HumanInteractionBlock overrides execute and never calls up, and
+// ValidationBlock terminates at task order 0 rather than running — and when it is not
+// first, whatever browser block preceded it already answers this question.
+function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
+  switch (node.type) {
+    case "task":
+    case "action":
+    case "extraction":
+    case "login":
+    case "url":
+      return true;
+    case "fileDownload":
+      // A Drive source download is fetched through the Drive API and skips
+      // super().execute entirely, so it leaves no page for a later block to
+      // start from. A maybe counts as the Drive path, which keeps the warning.
+      return !(
+        node.data.downloadTarget !== "website" &&
+        Boolean(node.data.googleCredentialId) &&
+        urlMayBeGoogleDrive(node.data.url)
+      );
+    case "navigation":
+      return node.data.engine !== RunEngine.SkyvernV2;
+    case "loop":
+    case "conditional":
+      // A container itself navigates nothing; its children do.
+      return nodes.some(
+        (child) =>
+          child.parentId === node.id && leavesBrowserState(child, nodes),
+      );
+    default:
+      return false;
+  }
+}
+
+function isFirstBrowserTaskBlock(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  return !getPreviousNodeIds(nodes, edges, id).some((nodeId) => {
+    const node = nodes.find((node) => node.id === nodeId);
+    if (!node) return false;
+    return leavesBrowserState(node, nodes);
+  });
+}
+
 function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
@@ -4478,6 +4614,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
+          engine: block.engine,
         };
         return blockYaml;
       }
@@ -4510,6 +4647,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
         };
         return blockYaml;
       }
@@ -4570,6 +4708,10 @@ function convertBlocksToBlockYAML(
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
+          export_enabled: block.export_enabled ?? false,
+          export_data_schema: block.export_data_schema ?? null,
+          export_file_name: block.export_file_name ?? null,
+          export_records: block.export_records ?? null,
         };
         return blockYaml;
       }
@@ -4708,6 +4850,17 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "data_export": {
+        const blockYaml: DataExportBlockYAML = {
+          ...base,
+          block_type: "data_export",
+          data: block.data,
+          data_schema: block.data_schema,
+          file_name: block.file_name,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "download_to_s3": {
         const blockYaml: DownloadToS3BlockYAML = {
           ...base,
@@ -4786,6 +4939,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
           file_attachments: block.file_attachments,
         };
         return blockYaml;
@@ -4940,6 +5094,9 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      retry_policy: normalizeRetryPolicy(
+        workflow.workflow_definition.retry_policy,
+      ),
       finally_block_label: workflow.workflow_definition.finally_block_label,
       workflow_system_prompt:
         workflow.workflow_definition.workflow_system_prompt,
@@ -4947,6 +5104,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with ?? "agent",
+    browser_type: workflow.browser_type ?? null,
     adaptive_caching: workflow.adaptive_caching ?? undefined,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
@@ -5362,6 +5520,8 @@ export {
   getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
+  isFirstBrowserTaskBlock,
+  urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,

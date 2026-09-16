@@ -35,7 +35,11 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 )
 from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
-from tests.unit.copilot_test_helpers import make_model_input_data
+from tests.unit.copilot_test_helpers import (
+    install_get_run_results_harness,
+    make_model_input_data,
+    run_result_block_row,
+)
 
 
 def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> None:
@@ -1005,6 +1009,20 @@ class TestAttachFailedBlockScreenshots:
 
         monkeypatch.setattr(run_execution_module, "app", _AppStub())
 
+    def _add_artifact_store(self, *, run_block_artifact: object | None) -> None:
+        """Bolt an artifact store onto whatever app stub is already installed.
+
+        The run-results harness installs its own app, so replacing it here would strip the
+        collaborators ``_get_run_results`` needs.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        artifacts = MagicMock()
+        artifacts.get_artifact_by_entity_id = AsyncMock(return_value=run_block_artifact)
+        artifacts.get_artifacts_for_task_v2 = AsyncMock(return_value=[])
+        run_execution_module.app.DATABASE.artifacts = artifacts
+        run_execution_module.app.ARTIFACT_MANAGER = MagicMock(retrieve_artifact=AsyncMock(return_value=self.PNG_BYTES))
+
     @pytest.mark.asyncio
     async def test_failed_code_block_carries_screenshot_and_final_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The regression: a code block's screenshot lives on the workflow_run_block.
@@ -1090,7 +1108,7 @@ class TestAttachFailedBlockScreenshots:
             packet["current_url"] = end_url
 
         assert results[0]["at_failure_evidence"] == (
-            "No at-failure screenshot or final URL was persisted for this block."
+            "No at-failure screenshot or final URL is available for this block."
         )
         assert "final_url" not in results[0]
         assert "screenshot_b64" not in results[0]
@@ -1100,59 +1118,72 @@ class TestAttachFailedBlockScreenshots:
         assert packet["screenshot_base64"] is None
 
     @pytest.mark.asyncio
+    async def test_credential_run_failure_still_reaches_the_model_with_its_at_failure_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-15899: a saved credential must not blind the repair loop.
+
+        Pins the call site with the real attach, because the regression was a guard around it:
+        every credential-bearing run had its captured frame and masked URL dropped, and the model
+        was told no evidence was persisted while the frame sat in the artifact store.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", "https://dash.example.com/board")
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=MagicMock())
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert failed_block["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert failed_block["final_url"] == "https://dash.example.com/board"
+        assert "at_failure_evidence" not in failed_block
+        assert _resolve_run_screenshot_b64(
+            live_capture=None, results=result["data"]["blocks"], run_ok=False
+        ) == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+
+    @pytest.mark.asyncio
+    async def test_credential_run_without_captured_evidence_says_so_without_inventing_a_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of SKY-15899: delivering evidence must not mean claiming it always exists."""
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", None)
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=None)
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert "screenshot_b64" not in failed_block
+        assert failed_block["at_failure_evidence"] == (
+            "No at-failure screenshot or final URL is available for this block."
+        )
+        assert _resolve_run_screenshot_b64(live_capture=None, results=result["data"]["blocks"], run_ok=False) is None
+
+    @pytest.mark.asyncio
     async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Pins the call site, not the helper: reverting the dispatched branch to ("", "") must fail here."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "accept_notice"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = None
-        block.output = None
-        block.task_id = None
-        block.final_url = "https://example.com/step-2"
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[run_result_block_row("accept_notice", "failed", "https://example.com/step-2")],
         )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow_for_workflow_run = AsyncMock(
-                        return_value=SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[]))
-                    )
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=True)
-
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-        monkeypatch.setattr(
-            run_execution_module,
-            "_attach_registered_output_parameter_values",
-            AsyncMock(return_value={}),
-        )
-        monkeypatch.setattr(
-            run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None)
-        )
-
-        ctx = SimpleNamespace(organization_id="org-1", workflow_permanent_id="wpid-1")
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
         assert result["data"]["current_url"] == "https://example.com/step-2"
@@ -1166,50 +1197,21 @@ class TestAttachFailedBlockScreenshots:
         """Pins the call site: dropping error_codes or the line from the cold projection fails here."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "extract_failure_rate"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = "code error at line 6"
-        block.error_codes = ["user_code_error"]
-        block.output = None
-        block.task_id = "tsk-1"
-        block.final_url = None
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
-        )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow = AsyncMock(return_value=None)
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=True)
-
-        async def _stamp_trace(_blocks: object, results: list, _org: str) -> None:
+        async def _stamp_trace(_blocks: object, results: list, _org: str, include_completed: bool = False) -> None:
             results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 6}]
 
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", _stamp_trace)
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-
-        ctx = SimpleNamespace(
-            organization_id="org-1",
-            workflow_permanent_id="wpid-1",
-            copilot_total_timeout_exceeded=False,
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[
+                run_result_block_row(
+                    "extract_failure_rate",
+                    "failed",
+                    failure_reason="code error at line 6",
+                    error_codes=["user_code_error"],
+                    task_id="tsk-1",
+                )
+            ],
+            attach_action_traces=_stamp_trace,
         )
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
@@ -1222,52 +1224,15 @@ class TestAttachFailedBlockScreenshots:
         live page read resolves the chat's own browser and reports its page as the run's."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "extract"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = None
-        block.error_codes = []
-        block.output = None
-        block.task_id = None
-        block.final_url = None
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
-        )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow = AsyncMock(return_value=None)
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
-
         async def _no_live_read(*args: object, **kwargs: object) -> tuple[str, str]:
             raise AssertionError("read the live page while hydrating a prior run")
 
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_fallback_page_info", _no_live_read)
-
-        ctx = SimpleNamespace(
-            organization_id="org-1",
-            workflow_permanent_id="wpid-1",
-            copilot_total_timeout_exceeded=False,
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[run_result_block_row("extract", "failed")],
+            dispatch_to_worker=False,
         )
+        monkeypatch.setattr(run_execution_module, "_fallback_page_info", _no_live_read)
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
 
         assert "current_url" not in result["data"]
@@ -1345,17 +1310,42 @@ class TestAttachFailedBlockScreenshots:
 
         assert _dispatched_end_url([terminal]) is None
 
-    def test_a_runtime_token_in_the_end_url_is_screened(self) -> None:
+    def test_a_runtime_token_in_the_end_url_is_refused_rather_than_rewritten(self) -> None:
+        """A redacted URL still parses, so reporting it would name a page the run never reached."""
         terminal = self._make_block(
             workflow_run_block_id="wrb-tok",
             task_id="tsk-tok",
             final_url="https://example.com/cb?access_token=abcdef1234567890xyz",
         )
 
-        end_url = _dispatched_end_url([terminal])
+        assert _dispatched_end_url([terminal]) is None
 
-        assert end_url is not None
-        assert "abcdef1234567890xyz" not in end_url
+    def test_the_end_url_screen_reduces_a_query_bearing_url_to_its_path(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-code",
+            task_id="tsk-code",
+            final_url="https://example.com/directory/results?access_code=4A0XF9&page=2",
+        )
+
+        assert _dispatched_end_url([terminal]) == "https://example.com/directory/results"
+
+    def test_the_end_url_screen_refuses_a_netloc_credential_whole(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-userinfo",
+            task_id="tsk-userinfo",
+            final_url="https://svc:hunter2@example.com/directory/results",
+        )
+
+        assert _dispatched_end_url([terminal]) is None
+
+    def test_the_end_url_screen_reports_a_query_free_url_whole(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-plain",
+            task_id="tsk-plain",
+            final_url="https://example.com/results/90210",
+        )
+
+        assert _dispatched_end_url([terminal]) == "https://example.com/results/90210"
 
     def test_a_secret_masked_url_is_not_reported_as_a_resumable_page(self) -> None:
         terminal = self._make_block(
@@ -1403,14 +1393,15 @@ class TestRunScreenshotResolution:
         results = [{"status": "failed", "screenshot_b64": "block-b64"}]
         assert self._resolve("live-b64", results, run_ok=False) == "live-b64"
 
-    def test_failed_run_promotes_first_failed_block(self) -> None:
-        """The dispatched path: no live capture, so the block's at-failure shot is all there is."""
+    def test_failed_run_promotes_newest_failed_block(self) -> None:
+        """The dispatched path: no live capture, so the block's at-failure shot is all there is. Rows
+        arrive chronologically, and the image has to match the failure the run is attributed to."""
         results = [
             {"label": "start", "status": "completed"},
-            {"label": "login", "status": "failed", "screenshot_b64": "first-b64"},
-            {"label": "extract", "status": "failed", "screenshot_b64": "second-b64"},
+            {"label": "login", "status": "failed", "screenshot_b64": "earlier-b64"},
+            {"label": "extract", "status": "failed", "screenshot_b64": "newest-b64"},
         ]
-        assert self._resolve(None, results, run_ok=False) == "first-b64"
+        assert self._resolve(None, results, run_ok=False) == "newest-b64"
 
     def test_successful_run_never_promotes_a_failure_screenshot(self) -> None:
         """A healed or continue_on_failure block leaves a failure screenshot behind on a run

@@ -153,7 +153,11 @@ function WorkflowsFlat() {
   const studioEnabled = useWorkflowStudioEnabled();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [search, setSearch] = useState("");
+  const searchParam = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(searchParam);
+  useEffect(() => {
+    setSearch(searchParam);
+  }, [searchParam]);
   const [debouncedSearch] = useDebounce(search, 250);
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
@@ -471,7 +475,13 @@ function WorkflowsFlat() {
 
   function setParamPatch(patch: Record<string, string>) {
     const params = new URLSearchParams(searchParams);
-    Object.entries(patch).forEach(([k, v]) => params.set(k, v));
+    Object.entries(patch).forEach(([key, value]) => {
+      if (value === "") {
+        params.delete(key);
+      } else {
+        params.set(key, value);
+      }
+    });
     setSearchParams(params, { replace: true });
   }
 
@@ -636,7 +646,7 @@ function WorkflowsFlat() {
 
   return (
     <div className="space-y-10">
-      <div className="flex h-32 justify-between gap-6">
+      <div className="flex flex-col justify-between gap-6 xl:h-32 xl:flex-row">
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
@@ -647,7 +657,7 @@ function WorkflowsFlat() {
             Define a series of actions, set it, and forget it.
           </p>
         </div>
-        <div className="flex gap-5">
+        <div className="flex flex-wrap gap-5 xl:flex-nowrap">
           <NarrativeCard
             index={1}
             description="Save browser sessions and reuse them in subsequent runs"
@@ -752,7 +762,7 @@ function WorkflowsFlat() {
               value={search}
               onChange={(value) => {
                 setSearch(value);
-                setParamPatch({ page: "1" });
+                setParamPatch({ search: value, page: "1" });
               }}
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"
@@ -928,7 +938,7 @@ function WorkflowsFlat() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-0.5">
-                              <Button size="icon" variant="default" disabled>
+                              <Button size="icon" variant="secondary" disabled>
                                 <Pencil2Icon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
@@ -1102,7 +1112,7 @@ function WorkflowsFlat() {
                                       <TooltipTrigger asChild>
                                         <Button
                                           size="icon"
-                                          variant="default"
+                                          variant="secondary"
                                           onClick={(event) => {
                                             handleIconClick(
                                               event,

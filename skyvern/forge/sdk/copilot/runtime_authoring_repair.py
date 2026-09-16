@@ -16,15 +16,19 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     is_carrier_backed_category_entry,
     typed_challenge_kind,
 )
+from skyvern.forge.sdk.copilot.code_block_preflight import wrapper_scope_facts
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
+    clearable_dismiss_texts,
     has_bounded_page_schema,
     model_visible_composition_evidence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
+from skyvern.forge.sdk.copilot.output_extraction_plan import candidate_relations_from_packet, page_value_binding_text
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
@@ -35,15 +39,38 @@ _RUNTIME_AUTHORING_REASON_CODE = "runtime_block_failure"
 _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
+# Shared across result regions rather than spent on one, and tied to the scrape's region cap so no
+# region can be dropped before its first item is projected. At the cap a page gets one item per
+# region, which is the ceiling of this allocation.
+_RUNTIME_RESULT_SUMMARY_MAX_ITEMS = MAX_RESULT_CONTAINERS
 _OBSERVED_STATE_MAX_CHARS = 60
 _RENDERED_VALUE_EXCERPT_MAX_CHARS = 300
+_PAGE_VALUE_BINDING_MAX_ITEMS = 8
+_PAGE_VALUE_BINDING_MAX_CHARS = 80
+PAGE_VALUE_BINDING_TEXT_MAX_CHARS = 2 * _PAGE_VALUE_BINDING_MAX_CHARS + len("=")
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _OBSTRUCTION_KEYS = ("kind", "text", "visual_location")
 _OBSTRUCTION_CONTROL_KEYS = ("text",)
 _OBSTRUCTION_FIELD_MAX_CHARS = 160
 OBSTRUCTION_SUMMARY_MAX_CHARS = 1200
+# A runner denial names its sanctioned replacement after the denied call (a listener denial runs to
+# ~600 characters); a bound below that hands the repair turn the refusal without the route.
+RUNTIME_FAILURE_REASON_MAX_CHARS = 640
+REPAIR_INSTRUCTION_MAX_CHARS = 260
 _NO_DISMISS_CONTROL_SUMMARY = "obstruction present, no dismiss control found in page evidence"
 _KEY_ERROR_RE = re.compile(r"KeyError(?:\s*:|\()\s*['\"]([^'\"]+)['\"]")
+# The runner's own reason format ("CodeBlock failed with <Class> at line N: <message>") and the
+# interpreter's quoted name in a NameError / UnboundLocalError message.
+_RUNNER_NAME_FAILURE_RE = re.compile(
+    r"CodeBlock failed with (?P<cls>NameError|UnboundLocalError) at line (?P<line>\d+): (?P<message>.*)"
+)
+_QUOTED_NAME_RE = re.compile(r"'(?P<name>[^']+)'")
+WRAPPER_SCOPE_FAILURE_CLASS = "wrapper_scope_name_resolution"
+WRAPPER_SCOPE_REPAIR_INSTRUCTION = (
+    "the block body is a wrapper function's body, so top-level names are locals `global` cannot reach; "
+    "NameError and UnboundLocalError there are one scope defect. Use a flat top-level loop, or in the "
+    "helper `nonlocal`, a return value, or a list/dict accumulator."
+)
 
 
 def is_runtime_authoring_repair_context(repair_context: object) -> TypeGuard[CodeAuthoringRepairContext]:
@@ -76,14 +103,13 @@ def _missing_key_from_key_error(reason: str) -> str | None:
 
 def _missing_output_dependency_context(
     *,
-    copilot_ctx: Any,
+    workflow_yaml: str | None,
     block_label: str,
     failed_block_status: str | None,
     failure_reason: str,
     run_id: str,
 ) -> CodeAuthoringRepairContext | None:
     missing_key = _missing_key_from_key_error(failure_reason)
-    workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     if not missing_key or not isinstance(workflow_yaml, str) or not workflow_yaml.strip():
         return None
     contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
@@ -119,6 +145,41 @@ def _missing_output_dependency_context(
             "parameter for this missing output key."
         ),
     )
+
+
+def _wrapper_scope_failure_class(workflow_yaml: str | None, block_label: str, failure_reason: str) -> str | None:
+    """NameError on a nested ``global`` for a block-bound name, or UnboundLocalError where a helper
+    declaring neither ``global`` nor ``nonlocal`` reads that name while rebinding it: one defect, the
+    block body being a wrapper function's body rather than a module. A helper that merely initializes
+    a same-named local on some paths and reads it on others has a local bug, not a scope one."""
+    match = _RUNNER_NAME_FAILURE_RE.search(failure_reason)
+    if match is None:
+        return None
+    name_match = _QUOTED_NAME_RE.search(match.group("message"))
+    if name_match is None:
+        return None
+    contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
+    if contract is None:
+        return None
+    facts = wrapper_scope_facts(contract.code, parameter_keys=contract.parameter_keys)
+    if facts is None:
+        return None
+    name = name_match.group("name")
+    line = int(match.group("line"))
+    if name not in facts.bound_names:
+        return None
+    if match.group("cls") == "NameError":
+        if any(name in hit.names and hit.helper.contains_line(line) for hit in facts.globals):
+            return WRAPPER_SCOPE_FAILURE_CLASS
+        return None
+    helper = facts.innermost_helper_at(line)
+    if helper is None:
+        return None
+    if name in helper.global_names or name in helper.nonlocal_names:
+        return None
+    if (name, line) not in helper.read_write_bindings:
+        return None
+    return WRAPPER_SCOPE_FAILURE_CLASS
 
 
 def _origin_from_runtime_url(value: Any) -> str | None:
@@ -259,22 +320,34 @@ def _runtime_action_summaries(navigation_targets: Any, clickable_controls: Any) 
     return merged[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
+def _region_fair_summaries(regions: list[list[str]], max_items: int) -> list[str]:
+    """Order rank by rank across regions so a long region cannot evict a later one, and every
+    downstream prefix of this list stays as evenly spread as its length allows. The sibling
+    `_balanced_by_region` walks the same way but returns document order whenever the input fits its
+    cap, which would leave the narrower slices downstream taking a region-major prefix."""
+    depth = max((len(region) for region in regions), default=0)
+    ranked = [region[rank] for rank in range(depth) for region in regions if rank < len(region)]
+    return ranked[:max_items]
+
+
 def _runtime_result_summaries(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    summaries: list[str] = []
+    regions: list[list[str]] = []
     for container in value:
         if not isinstance(container, dict):
             continue
+        region: list[str] = []
         primary = _runtime_summary_entry(container, ("text_excerpt",))
         if primary:
-            summaries.append(primary)
+            region.append(primary)
         for row in container.get("sample_rows") or []:
             summary = _bounded_runtime_text(row, 80)
             if summary:
-                summaries.append(summary)
-                break
-    return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
+                region.append(summary)
+        if region:
+            regions.append(region)
+    return _region_fair_summaries(regions, _RUNTIME_RESULT_SUMMARY_MAX_ITEMS)
 
 
 def _raw_obstruction_entries(evidence: dict[str, Any]) -> tuple[list[Any], list[str]]:
@@ -324,6 +397,19 @@ def _has_rendered_value_excerpt(evidence: dict[str, Any]) -> bool:
     return bool(_bounded_runtime_text(evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS))
 
 
+def _runtime_page_value_bindings(evidence: Mapping[str, Any]) -> list[str]:
+    """The page's own label/value pairs; the producer redacts and bounds them, and no selector crosses."""
+    return [
+        page_value_binding_text(label, value)
+        for label, value in candidate_relations_from_packet(
+            evidence,
+            dismiss_texts=clearable_dismiss_texts(evidence),
+            limit=_PAGE_VALUE_BINDING_MAX_ITEMS,
+            max_chars=_PAGE_VALUE_BINDING_MAX_CHARS,
+        )
+    ]
+
+
 def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
     """Admit only a bounded, scrubbed page fact that can ground a repair.
 
@@ -362,6 +448,7 @@ def build_test_page_state_from_evidence(
         observed_after_workflow_run=True,
         rendered_value_excerpt=rendered_value_excerpt or None,
         form_summaries=_runtime_form_summaries(evidence.get("forms")),
+        value_bindings=_runtime_page_value_bindings(evidence),
         result_summaries=_runtime_result_summaries(evidence.get("result_containers")),
         action_summaries=_runtime_action_summaries(
             evidence.get("navigation_targets"), evidence.get("clickable_controls")
@@ -379,6 +466,7 @@ def build_test_page_state_from_evidence(
                 page_state.title,
                 page_state.rendered_value_excerpt,
                 page_state.form_summaries,
+                page_state.value_bindings,
                 page_state.result_summaries,
                 page_state.action_summaries,
                 page_state.challenge_summaries,
@@ -492,11 +580,13 @@ def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
     return has_indicators and has_interactive_controls
 
 
-def _first_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
+def _newest_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The run's newest failed block. ``blocks`` arrives chronologically, so the newest failure is
+    the last match: repair context has to name the failure the run stopped on."""
     blocks = data.get("blocks")
     if not isinstance(blocks, list):
         return None
-    for block in blocks:
+    for block in reversed(blocks):
         if not isinstance(block, dict):
             continue
         status = str(block.get("status") or "").lower()
@@ -505,7 +595,11 @@ def _first_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, Any]) -> None:
+def record_pending_runtime_authoring_repair_context(
+    copilot_ctx: CopilotContext, result: dict[str, Any], *, workflow_yaml: str | None = None
+) -> None:
+    """``workflow_yaml`` is the snapshot the run executed; the context's copy can already be a
+    later draft by the time the result lands."""
     if bool(result.get("ok", False)):
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
@@ -517,23 +611,27 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if not isinstance(run_id, str) or not run_id:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
-    block = _first_runtime_failed_block(data)
+    block = _newest_runtime_failed_block(data)
     failure_reason = ""
     block_label = _bounded_runtime_text(data.get("frontier_start_label"), 80)
     failed_block_status = _bounded_runtime_text(data.get("overall_status"), 40)
     if block is not None:
         block_label = _bounded_runtime_text(block.get("label"), 80) or block_label
         failed_block_status = _bounded_runtime_text(block.get("status"), 40) or failed_block_status
-        failure_reason = _bounded_runtime_text(block.get("failure_reason"), 240)
-    failure_reason = failure_reason or _bounded_runtime_text(data.get("failure_reason"), 240)
-    failure_reason = failure_reason or _bounded_runtime_text(result.get("error"), 240)
+        failure_reason = _bounded_runtime_text(block.get("failure_reason"), RUNTIME_FAILURE_REASON_MAX_CHARS)
+    failure_reason = failure_reason or _bounded_runtime_text(
+        data.get("failure_reason"), RUNTIME_FAILURE_REASON_MAX_CHARS
+    )
+    failure_reason = failure_reason or _bounded_runtime_text(result.get("error"), RUNTIME_FAILURE_REASON_MAX_CHARS)
     if not block_label or not failure_reason:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
-    if is_runtime_authoring_repair_context(getattr(copilot_ctx, "last_code_authoring_repair_context", None)):
+    if is_runtime_authoring_repair_context(copilot_ctx.last_code_authoring_repair_context):
         copilot_ctx.last_code_authoring_repair_context = None
+    if workflow_yaml is None:
+        workflow_yaml = copilot_ctx.workflow_yaml
     missing_output_context = _missing_output_dependency_context(
-        copilot_ctx=copilot_ctx,
+        workflow_yaml=workflow_yaml,
         block_label=block_label,
         failed_block_status=failed_block_status or None,
         failure_reason=failure_reason,
@@ -542,16 +640,21 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if missing_output_context is not None:
         copilot_ctx.pending_code_authoring_runtime_repair_context = missing_output_context
         return
+    failure_class = _wrapper_scope_failure_class(workflow_yaml, block_label, failure_reason)
+    repair_instruction = (
+        "adapt the next code block to the observed page state and do not re-emit the same failing selector "
+        "or name path."
+    )
+    if failure_class == WRAPPER_SCOPE_FAILURE_CLASS:
+        repair_instruction = WRAPPER_SCOPE_REPAIR_INSTRUCTION
     copilot_ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
         block_label=block_label,
         reason_code=_RUNTIME_AUTHORING_REASON_CODE,
         runtime_failure_reason=failure_reason,
+        runtime_failure_class=failure_class,
         failed_block_status=failed_block_status or None,
         workflow_run_id=run_id,
-        repair_instruction=(
-            "adapt the next code block to the observed page state and do not re-emit the same failing selector "
-            "or name path."
-        ),
+        repair_instruction=repair_instruction,
     )
 
 
@@ -572,6 +675,11 @@ def _error_text_requires_stop(copilot_ctx: Any, data: dict[str, Any], result: di
     text_values = [data.get("failure_reason"), data.get("skip_reason")]
     if result is not None:
         text_values.append(result.get("error"))
+    # A failure in Skyvern's own egress is not a defect in the block, so authoring repair must not
+    # rewrite working code to chase it. This is the precedence the terminal-nav condition used to
+    # supply for these codes before that condition narrowed to target-owned failures.
+    if getattr(copilot_ctx, "last_test_proxy_owned_failure", False):
+        return True
     text = " ".join(str(value).lower() for value in text_values if value)
     return (
         "browser session not found" in text
@@ -680,6 +788,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
         evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS
     )
     page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
+    page_value_bindings = _runtime_page_value_bindings(evidence)
     page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
     page_action_summaries = _runtime_action_summaries(
         evidence.get("navigation_targets"), evidence.get("clickable_controls")
@@ -695,6 +804,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             "page_evidence_source": _bounded_runtime_text(evidence.get("source_tool"), 80) or None,
             "observed_after_workflow_run": bool(
                 page_form_summaries
+                or page_value_bindings
                 or page_result_summaries
                 or page_action_summaries
                 or page_challenge_summaries
@@ -703,6 +813,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             ),
             "rendered_value_excerpt": rendered_value_excerpt or None,
             "page_form_summaries": page_form_summaries,
+            "page_value_bindings": page_value_bindings,
             "page_result_summaries": page_result_summaries,
             "page_action_summaries": page_action_summaries,
             "page_challenge_summaries": page_challenge_summaries,
@@ -742,6 +853,7 @@ def inject_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, 
         observed_after_workflow_run=repair_context.observed_after_workflow_run,
         workflow_run_id=repair_context.workflow_run_id,
         page_form_summary_count=len(repair_context.page_form_summaries),
+        page_value_binding_count=len(repair_context.page_value_bindings),
         page_result_summary_count=len(repair_context.page_result_summaries),
         page_action_summary_count=len(repair_context.page_action_summaries),
         page_obstruction_summary_count=len(repair_context.page_obstruction_summaries),

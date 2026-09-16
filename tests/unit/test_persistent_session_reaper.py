@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.run_enums import RunType
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
@@ -45,6 +46,7 @@ def _make_manager(uncompleted_sessions: list, owned_ids: list[str] | None = None
     db = MagicMock()
     db.browser_sessions = MagicMock()
     db.browser_sessions.get_uncompleted_persistent_browser_sessions = AsyncMock(return_value=uncompleted_sessions)
+    db.browser_sessions.record_persistent_browser_session_close_reason = AsyncMock()
     db.workflow_runs = MagicMock()
     db.tasks = MagicMock()
     # Default: the owning run row is gone (stale). Tests that need a live/terminal owner override this.
@@ -118,7 +120,7 @@ async def test_reaps_only_sessions_past_timeout_and_grace() -> None:
 
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_expired")
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_expired", reason=BrowserSessionCloseReason.expired)
 
 
 @pytest.mark.asyncio
@@ -218,7 +220,7 @@ async def test_reaps_expired_session_whose_owning_run_is_terminal(terminal_statu
 
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_stuck")
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_stuck", reason=BrowserSessionCloseReason.expired)
     manager.database.workflow_runs.get_workflow_run.assert_awaited_once_with(
         workflow_run_id="wr_dead",
         organization_id="org_test",
@@ -243,7 +245,7 @@ async def test_reaps_expired_session_whose_owning_run_is_missing() -> None:
 
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_orphan")
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_orphan", reason=BrowserSessionCloseReason.expired)
 
 
 @pytest.mark.asyncio
@@ -288,7 +290,9 @@ async def test_reaps_expired_session_with_unresolvable_runnable_type(unresolvabl
 
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_unresolvable")
+    manager.close_session.assert_awaited_once_with(
+        "org_test", "pbs_unresolvable", reason=BrowserSessionCloseReason.expired
+    )
     # No per-type liveness semantics were invented: neither known-owner lookup was attempted.
     manager.database.workflow_runs.get_workflow_run.assert_not_awaited()
     manager.database.tasks.get_task.assert_not_awaited()
@@ -366,7 +370,7 @@ async def test_reaps_expired_session_once_its_lease_is_released(browser_manager:
     browser_manager._persistent_session_leases.pop("s_done")
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_released")
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_released", reason=BrowserSessionCloseReason.expired)
 
 
 @pytest.mark.asyncio
@@ -391,7 +395,7 @@ async def test_lease_does_not_protect_a_session_owned_by_a_terminal_workflow_run
 
     await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_wr_dead")
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_wr_dead", reason=BrowserSessionCloseReason.expired)
 
 
 @pytest.mark.asyncio
@@ -499,7 +503,9 @@ async def test_reap_pass_survives_close_failure_without_dropping_session() -> No
 
     await manager.reap_expired_sessions()  # must not raise
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_flaky_close")
+    manager.close_session.assert_awaited_once_with(
+        "org_test", "pbs_flaky_close", reason=BrowserSessionCloseReason.expired
+    )
 
 
 @pytest.mark.asyncio
@@ -559,7 +565,9 @@ async def test_reclaims_cdp_connect_request_level_session_after_run_dies() -> No
     ):
         await manager.reap_expired_sessions()
 
-    manager.close_session.assert_awaited_once_with("org_test", "pbs_request_level")
+    manager.close_session.assert_awaited_once_with(
+        "org_test", "pbs_request_level", reason=BrowserSessionCloseReason.expired
+    )
     manager.database.workflow_runs.get_workflow_run.assert_awaited_once_with(
         workflow_run_id="wr_request_level",
         organization_id="org_test",

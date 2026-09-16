@@ -4602,6 +4602,12 @@ class _ConsentRepoDouble:
             client_id=row.get("client_id"),
         )
 
+    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
+        for row in self.rows.values():
+            if row["organization_id"] == organization_id and row["credential_id"] == credential_id:
+                return google_oauth_service.STATE_PENDING_CONSENT
+        return None
+
     async def promote_pending_to_active(
         self,
         organization_id: str,
@@ -4733,3 +4739,46 @@ async def test_google_oauth_callback_rejects_unusable_state(
 
     assert exc_info.value.status_code == 400
     exchange_mock.assert_not_awaited()
+
+
+def _connection(connection_id: str, name: str, state: str = "active", email: str | None = None) -> Any:
+    now = datetime.datetime(2026, 9, 1)
+    return GoogleOAuthCredentialBase(
+        id=connection_id,
+        organization_id="org_1",
+        credential_name=name,
+        email_address=email,
+        state=state,
+        scopes_requested=[],
+        scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected_status", "expected_id"),
+    [
+        ("Sheets Writer", "resolved", "goac_active"),
+        ("sheets writer", "resolved", "goac_active"),
+        ("writer@example.test", "resolved", "goac_active"),
+        ("Shared Account", "ambiguous", None),
+        ("No Such Connection", "not_found", None),
+    ],
+)
+def test_connection_reference_resolution_prefers_active_rows_and_reports_ambiguity(
+    reference: str,
+    expected_status: str,
+    expected_id: str | None,
+) -> None:
+    rows = [
+        _connection("goac_active", "Sheets Writer", email="writer@example.test"),
+        _connection("goac_stale", "sheets writer", state="error"),
+        _connection("goac_twin_a", "Shared Account"),
+        _connection("goac_twin_b", "shared account"),
+    ]
+
+    resolution = google_oauth_service.resolve_connection_reference(rows, reference)
+
+    assert resolution.status == expected_status
+    assert (resolution.credential.id if resolution.credential else None) == expected_id

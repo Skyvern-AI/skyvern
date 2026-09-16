@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import aiofiles
 import pdfplumber
@@ -159,6 +159,8 @@ class PdfFillBlock(Block):
     llm_key: str | None = None
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url", "llm_key", "payload", "prompt"})
+
     def _own_llm_key(self) -> str | None:
         return self.llm_key
 
@@ -172,12 +174,8 @@ class PdfFillBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        template_kwargs = {"force_include_secrets": True}
-
-        def _render_string(value: str) -> str:
-            return self.format_block_parameter_template_from_workflow_run_context(
-                value, workflow_run_context, **template_kwargs
-            )
+        def _render_string(field: str, value: str) -> str:
+            return self.render_templatable_field(field, value, workflow_run_context, force_include_secrets=True)
 
         if (
             self.file_url
@@ -192,12 +190,13 @@ class PdfFillBlock(Block):
                 # treating the literal parameter key as a URL.
                 self.file_url = ""
 
-        self.file_url = _render_string(self.file_url)
-        self.prompt = _render_string(self.prompt)
+        self.file_url = _render_string("file_url", self.file_url)
+        self.prompt = _render_string("prompt", self.prompt)
         if self.llm_key:
-            self.llm_key = _render_string(self.llm_key)
+            self.llm_key = _render_string("llm_key", self.llm_key)
         self.payload = cast(
-            dict[str, Any] | list | str | None, render_templates_in_json_value(self.payload, _render_string)
+            dict[str, Any] | list | str | None,
+            render_templates_in_json_value(self.payload, lambda value: _render_string("payload", value)),
         )
 
         extracted_url = extract_file_url_from_block_output(self.file_url)
@@ -1044,7 +1043,9 @@ class PdfFillBlock(Block):
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=workflow_run_id)
+                return await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=workflow_run_id
+                )
         except Exception:
             return []
 
@@ -1064,12 +1065,13 @@ class PdfFillBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self._record_failure(
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
-                f"Failed to format jinja template: {str(e)}",
             )
 
         try:
@@ -1214,6 +1216,7 @@ class PdfFillBlock(Block):
             downloaded_files = filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 current_context.loop_internal_state if current_context else None,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
             # The run-level download list can hold other blocks' files; narrow to this block's filled PDF so a
             # downstream block consuming `{{ this_output }}` resolves to the right file (extract_file_url reads [0]).

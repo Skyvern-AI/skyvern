@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 
 import structlog
@@ -22,6 +23,7 @@ from skyvern.schemas.workflows import (
     BlockYAML,
     CodeBlockYAML,
     ConditionalBlockYAML,
+    DataExportBlockYAML,
     DownloadToS3BlockYAML,
     EmailInboxBlockYAML,
     ExtractionBlockYAML,
@@ -79,6 +81,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.FILE_UPLOAD.value: FileUploadBlockYAML,
     BlockType.GOTO_URL.value: UrlBlockYAML,
     BlockType.DOWNLOAD_TO_S3.value: DownloadToS3BlockYAML,
+    BlockType.DATA_EXPORT.value: DataExportBlockYAML,
     BlockType.UPLOAD_TO_S3.value: UploadToS3BlockYAML,
     BlockType.FILE_URL_PARSER.value: FileParserBlockYAML,
     BlockType.PDF_PARSER.value: PDFParserBlockYAML,
@@ -114,6 +117,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "file_upload": "Upload a file from S3/Azure to a page element",
     "goto_url": "Navigate directly to a URL without additional instructions",
     "download_to_s3": "Download a URL directly to S3 storage",
+    "data_export": "Write schema-defined workflow records to a Parquet file",
     "upload_to_s3": "Upload local content to S3",
     "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
     "pdf_parser": "Extract structured data from a PDF document",
@@ -156,6 +160,22 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
                 },
             },
         },
+    },
+    "data_export": {
+        "block_type": "data_export",
+        "label": "export_records",
+        "data": "{{ extract_records_output.extracted_information }}",
+        "data_schema": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "price": {"type": "number"},
+                },
+            },
+        },
+        "file_name": "records",
     },
     "for_loop": {
         "block_type": "for_loop",
@@ -353,6 +373,8 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "file_parser_block": "** FILE PARSER BLOCK (file_url_parser) **",
     "send_email_block": "** SEND EMAIL BLOCK (send_email) **",
     "human_interaction_block": "** HUMAN INTERACTION BLOCK (human_interaction) **",
+    "captcha_solver": "** CAPTCHA SOLVER (captcha_solver) **",
+    "proxy_location": "** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **",
     "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
     "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
     "parameter_templating": "** PARAMETER TEMPLATING **",
@@ -366,6 +388,33 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
 
 _kb_cache: dict[str, dict[str, Any]] | None = None
 _knowledge_topic_cache: dict[str, dict[str, str]] | None = None
+
+CODE_BLOCK_RUNTIME_TOPIC = "code_block_runtime"
+
+
+def _code_block_runtime_topic() -> dict[str, str]:
+    """Render the names a CodeBlock may use from the executor's own namespace declaration."""
+    # Keep workflow model imports deferred for the lightweight-install import contract.
+    from skyvern.forge.sdk.workflow.models.block import CodeBlock  # noqa: PLC0415
+
+    safe_vars = CodeBlock.build_safe_vars()
+    builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
+    shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
+    helpers = sorted(name for name in safe_vars if name != "__builtins__" and name not in shims)
+    lines = [
+        "Names a code block's Python may use. Imports are blocked; the runtime binds everything listed here.",
+        "",
+        "Builtins: " + ", ".join(builtin_names),
+        "",
+        "Module shims (only the listed attributes exist, e.g. datetime.datetime.now(), not datetime.now()):",
+        *(f"- {name}: {', '.join(attrs)}" for name, attrs in sorted(shims.items())),
+        "",
+        "Helpers: page, " + ", ".join(helpers),
+        "",
+        "For a date in a template field use {{current_date}}; inside code use datetime.date.today() "
+        "or datetime.datetime.now(datetime.UTC).",
+    ]
+    return {"topic": CODE_BLOCK_RUNTIME_TOPIC, "title": "CODE BLOCK RUNTIME", "content": "\n".join(lines)}
 
 
 def _parse_knowledge_topics() -> dict[str, dict[str, str]]:
@@ -506,7 +555,8 @@ async def skyvern_workflow_knowledge(
             description=(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
-                "common_patterns, and best_practices."
+                "common_patterns, best_practices, captcha_solver, proxy_location, and code_block_runtime "
+                "(the builtins, module shims, and helpers a code block's Python may use)."
             )
         ),
     ] = None,
@@ -520,8 +570,7 @@ async def skyvern_workflow_knowledge(
 
     action = "skyvern_workflow_knowledge"
     knowledge = _parse_knowledge_topics()
-    catalog = list(knowledge)
-    if not catalog:
+    if not knowledge:
         return make_result(
             action,
             ok=False,
@@ -531,6 +580,8 @@ async def skyvern_workflow_knowledge(
                 "Use get_block_schema for exact block fields and retry workflow knowledge later.",
             ),
         )
+    knowledge = {**knowledge, CODE_BLOCK_RUNTIME_TOPIC: _code_block_runtime_topic()}
+    catalog = list(knowledge)
 
     if topics is None:
         return make_result(action, data={"topics": catalog, "count": len(catalog)})

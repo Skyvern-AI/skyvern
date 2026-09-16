@@ -63,6 +63,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     page_evidence_needs_visual_fallback,
     parse_composition_html,
     parse_composition_structured,
+    unresolved_requested_targets,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
@@ -1935,6 +1936,148 @@ def test_composition_gate_rejects_hollow_interaction_observation_without_schema(
     assert composition_page_evidence_error(ctx, workflow_yaml) is not None
 
 
+def test_composition_gate_credits_current_page_read_after_schema_less_scout_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_finding_reuses_reached_page_evidence_independent_of_block_order() -> None:
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"read_results": 2},
+    )
+    auto_credited = {
+        "block_type": "action",
+        "label": "inspect_result",
+        "navigation_goal": "Inspect the result opened during scouting.",
+    }
+    explicitly_credited = {
+        "block_type": "action",
+        "label": "read_results",
+        "navigation_goal": "Read the first result.",
+    }
+
+    for page_blocks in ([auto_credited, explicitly_credited], [explicitly_credited, auto_credited]):
+        workflow_yaml = _yaml(
+            {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+            {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+            *page_blocks,
+        )
+
+        assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_current_page_read_credited_by_a_later_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=1),
+            _flow_entry("https://example.com/results", reached_via="interaction", step=2),
+        ],
+        block_observation_refs={"open_results": 2, "read_results": 1},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_finding_reuses_one_interaction_observation_for_multiple_blocks() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+        {"block_type": "action", "label": "read_more", "navigation_goal": "Read the second result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"read_results": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_left_and_reopened() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/cart", reached_via="navigate", step=2),
+            _flow_entry("https://example.com/results", reached_via="navigate", step=3),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=4),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 4},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_gate_rejects_current_page_read_after_same_url_navigation_reopened_page() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="navigate", step=2),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=3),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 3},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_gate_rejects_current_page_read_without_a_same_location_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_cart", "navigation_goal": "Read the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/cart", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"open_results": 1, "read_cart": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
 def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -> None:
     # SKY-10712 option 1: a click-reached action block with NO block_observation_refs entry is
     # auto-credited from the most-recent interaction-reached observation; the agent need not thread it.
@@ -1971,9 +2114,9 @@ def test_composition_gate_rejects_click_reached_block_with_no_interaction_observ
     assert "add_to_cart (action)" in error
 
 
-def test_composition_gate_auto_credit_consumes_each_interaction_once() -> None:
-    # Two click-reached blocks need two distinct interaction observations (consume-once); the
-    # SPA URL is identical across both, so binding is by trajectory order, never by url.
+def test_composition_finding_auto_credit_does_not_consume_interaction_observations() -> None:
+    # Page evidence is a reusable observation. It must not become an order-sensitive authority
+    # token merely because multiple authored blocks depend on the same observed page.
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
@@ -1985,7 +2128,7 @@ def test_composition_gate_auto_credit_consumes_each_interaction_once() -> None:
     one = _Ctx(
         flow_evidence=base + [_scout_interaction_entry("https://example.com/", step=1)], block_observation_refs={}
     )
-    assert composition_page_evidence_error(one, workflow_yaml) is not None
+    assert composition_page_evidence_error(one, workflow_yaml) is None
 
     two = _Ctx(
         flow_evidence=base
@@ -3560,7 +3703,7 @@ async def _capture_live_dom(
             await route.abort()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         context = await browser.new_context()
         await context.route("**/*", _handle)
         page = await context.new_page()
@@ -4304,7 +4447,9 @@ async def test_blocking_layer_twins_report_exact_omitted_control_count() -> None
 @pytest.mark.asyncio
 async def test_rendered_snapshot_skips_hit_testing_for_non_viewport_fixed_layers() -> None:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         try:
             page = await browser.new_page(viewport={"width": 1280, "height": 720})
             await page.set_content(
@@ -4801,7 +4946,9 @@ async def test_capture_reports_oversize_structured_dict_without_calling_get_html
 @pytest.mark.asyncio
 async def test_capture_compacts_dense_live_structured_packet_before_the_python_bound() -> None:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_oversized_structured_html())
         server = _LiveCompositionServer(page)
@@ -4862,7 +5009,9 @@ async def test_capture_preserves_python_under_limit_astral_packet_byte_for_byte(
     assert unbounded_expression != COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_astral_structured_html())
         expected_raw = await page.evaluate(unbounded_expression)
@@ -4897,7 +5046,9 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     )
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
         page = await browser.new_page()
         await page.set_content(_dense_astral_structured_html(value_chars=145, text_chars=105))
         expected_raw = await page.evaluate(unbounded_expression)
@@ -5028,7 +5179,7 @@ async def test_capture_retains_rendered_disclosure_facts_on_a_standalone_control
     </body></html>
     """
     server = _RecordingCompositionServer(structured_json=rendered, html=html, reject_html=True)
-    ctx = SimpleNamespace(discovery_mcp_server=server)
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None)
 
     evidence, error = await tools_module._capture_composition_evidence(
         ctx,
@@ -5110,7 +5261,7 @@ async def test_capture_prefers_html_parse_over_hollow_structured_on_fallback(mon
     )
     html = "<html><head><title>Notice</title></head><body><p>Welcome notice text</p></body></html>"
     server = _RecordingCompositionServer(structured_json=hollow, html=html)
-    ctx = SimpleNamespace(discovery_mcp_server=server)
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None)
 
     evidence, error = await tools_module._capture_composition_evidence(
         ctx, inspected_url="https://example.com/p", current_url="https://example.com/p"
@@ -5702,7 +5853,7 @@ def _playwright_chromium_available() -> bool:
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
         with sync_playwright() as runner:
-            browser = runner.chromium.launch()
+            browser = runner.chromium.launch(args=["--use-mock-keychain", "--password-store=basic"])
             browser.close()
         return True
     except Exception:
@@ -5733,7 +5884,7 @@ async def test_browser_twin_spends_the_container_budget_on_containers_a_value_ca
     # page: an icon sprite sheet sits at the top of the document, so a substring test that reads "row"
     # out of "arrow" claims every slot of the bounded budget before any real result is reached.
     async with async_playwright() as runner:
-        browser = await runner.chromium.launch()
+        browser = await runner.chromium.launch(args=["--use-mock-keychain", "--password-store=basic"])
         try:
             page = await browser.new_page()
             await page.set_content(_ICON_SPRITE_SHEET_PAGE)
@@ -7008,6 +7159,59 @@ async def test_field_state_the_agent_produced_survives_capture_while_markup_attr
         "Notes date",
     ]
 
+    for marked in (True, False):
+        values = ["654321", "54", "4", "3", "2", "1"]
+        placeholders = ["654321", "9", "Digit 3", "3", "2", "1"]
+        marker = ' data-skyvern-otp-box="1"' if marked else ""
+        html = (
+            '<html data-skyvern-otp-filled="6"><body><form id="otp">'
+            + "".join(
+                f'<div><input id="otp-{index}" name="otp-{index}" type="text" maxlength="1"'
+                f'{marker} value="{value}" placeholder="{placeholders[index]}"></div>'
+                for index, value in enumerate(values)
+            )
+            + '<input id="ordinary" name="ordinary" maxlength="32" value="ordinary text" placeholder="Name">'
+            + '<input id="verify" type="submit" value="Verify">'
+            + '<textarea name="message" value="notes-value" placeholder="2468">Notes</textarea>'
+            + '<select name="choice"><option value="a1" selected>Alpha</option></select>'
+            + "</form></body></html>"
+        )
+        raw, content = await _capture_live_dom(
+            _OBSERVED_STATE_URL,
+            html,
+            "#otp-0",
+            interact=lambda page: page.evaluate("document.querySelector('#otp-0').value = '987654'"),
+        )
+        packet = json.loads(raw)
+        fields = {field["name"]: field for field in packet["forms"][0]["fields"]}
+        for index, value in enumerate(values):
+            field = fields[f"otp-{index}"]
+            assert field["value"] == "*" * len(value)
+            assert field["observed_value"] == "*" * len(value)
+            assert field["placeholder"] == ("Digit 3" if index == 2 else "*" * len(placeholders[index]))
+            assert field["filled"] is True
+            assert field["label"] == "*" * len(value)
+            assert all(
+                candidate["source"] not in {"name_value", "class_value"} for candidate in field["selector_candidates"]
+            )
+        assert fields["ordinary"]["value"] == "ordinary text"
+        assert fields["ordinary"]["placeholder"] == "Name"
+        assert "observed_value" not in fields["ordinary"]
+        assert fields["message"]["value"] == "notes-value"
+        assert fields["message"]["placeholder"] == "2468"
+        assert "observed_value" not in fields["message"]
+        assert fields["choice"]["options"][0]["value"] == "a1"
+        assert packet["forms"][0]["submit_controls"][0]["value"] == "Verify"
+        assert "654321" not in raw and "987654" not in raw
+        assert 'value="654321"' in content
+        parsed = parse_composition_structured(
+            packet, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL
+        )
+        assert parsed is not None
+        parsed_fields = {field["name"]: field for field in parsed["forms"][0]["fields"]}
+        assert all(parsed_fields[f"otp-{index}"]["value"] == "*" * len(value) for index, value in enumerate(values))
+        assert all(parsed_fields[f"otp-{index}"]["filled"] is True for index in range(6))
+
 
 def test_a_structured_packet_claiming_an_observed_password_value_is_not_admitted() -> None:
     payload = {
@@ -7090,3 +7294,50 @@ def test_a_structured_packet_claiming_an_observed_option_on_a_non_select_is_not_
     assert all("observed_selected" not in option for option in fields["liar"]["options"])
     assert fields["depart"]["options"][0]["observed_selected"] is True
     assert fields["liar"]["option_count"] == 1
+
+
+def test_composition_gate_falls_back_to_observed_page_for_a_stale_ref_on_an_unrequired_block() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={"search_product": 99},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_merge_visual_composition_evidence_keeps_only_typed_requested_value_pairs() -> None:
+    parsed = parse_composition_html(
+        "<html><body><div>Sessions Started</div></body></html>",
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "One metric panel.",
+            "requested_values": [
+                {"label": "Sessions Started", "value": "72.51k"},
+                {"label": "Failure rate", "value": ""},
+                {"label": 7, "value": "3"},
+                "Sessions Started=72.51k",
+            ],
+        },
+    )
+
+    assert merged["requested_values"] == [{"label": "Sessions Started", "value": "72.51k"}]
+
+
+def test_unresolved_requested_targets_ignores_case_and_invisible_relations() -> None:
+    evidence = {
+        "key_value_relations": [
+            {"key_text": "sessions started", "value_text": "72.51k", "visible": True, "value_visible": True},
+            {"key_text": "Failure rate", "value_text": "0.4%", "visible": True, "value_visible": False},
+        ]
+    }
+
+    assert unresolved_requested_targets(evidence, ("Sessions Started", "Failure rate", "  ")) == ("Failure rate",)

@@ -167,6 +167,37 @@ async def test_new_cdp_session_attaches_a_dedicated_session_for_the_caller() -> 
         await connection.close()
 
 
+@pytest.mark.parametrize(
+    ("browser_context_id", "scope"),
+    [("ctx-1", {"browserContextId": "ctx-1"}), (None, {})],
+    ids=["created_context", "default_context"],
+)
+async def test_cookie_calls_act_on_the_facade_context_not_the_default_one(
+    browser_context_id: str | None, scope: dict[str, str]
+) -> None:
+    # Storage.* without browserContextId acts on the browser's default context, so a run in a created
+    # context would read, set, or clear someone else's cookie jar and report success.
+    sent: list[tuple[str, dict | None]] = []
+
+    async def send(method: str, params: dict | None = None) -> dict:
+        sent.append((method, params))
+        return {"cookies": []}
+
+    browser = SimpleNamespace(connection=SimpleNamespace(transport=SimpleNamespace(send=send)))
+    context = BrowserContext(browser=browser, browser_context_id=browser_context_id)
+    cookie = {"name": "session", "value": "x", "url": "https://portal.example/"}
+
+    await context.clear_cookies()
+    await context.add_cookies([cookie])
+    await context.cookies("https://portal.example/")
+
+    assert sent == [
+        ("Storage.clearCookies", scope),
+        ("Storage.setCookies", {**scope, "cookies": [cookie]}),
+        ("Storage.getCookies", {**scope, "urls": ["https://portal.example/"]}),
+    ]
+
+
 async def test_target_destruction_reaps_supplementary_sessions_too() -> None:
     # _target_sessions holds only the primary, so reaping by the mapping alone leaves a
     # supplementary session alive in bookkeeping and on the transport's subscriber index after

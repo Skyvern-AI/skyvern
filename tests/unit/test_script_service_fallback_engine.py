@@ -14,12 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
 
 MODULE = "skyvern.services.script_service"
 
@@ -192,6 +195,92 @@ def test_resolver_finds_loop_nested_block_engine() -> None:
     assert script_service._resolve_original_block_engine("missing", workflow) is None
 
 
+def _make_run_context(values: dict[str, object]) -> MagicMock:
+    workflow_run_context = MagicMock()
+    workflow_run_context.values = dict(values)
+    workflow_run_context.get_block_metadata.return_value = {}
+    workflow_run_context.workflow_title = "test workflow"
+    workflow_run_context.workflow_id = "w_test"
+    workflow_run_context.workflow_permanent_id = "wpid_test"
+    workflow_run_context.workflow_run_id = "wr_test"
+    workflow_run_context.browser_session_id = None
+    return workflow_run_context
+
+
+async def _resolve_otp(
+    workflow: Workflow,
+    values: dict[str, object],
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+) -> tuple[tuple[str | None, str | None], MagicMock]:
+    app = _make_app(workflow)
+    app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = _make_run_context(values)
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+    ):
+        resolved = await script_service._resolve_block_otp_config("my_block", totp_identifier, totp_url)
+    return resolved, app
+
+
+@pytest.mark.asyncio
+async def test_otp_config_inherited_from_block_definition_when_call_site_omits_it() -> None:
+    # Static-script run signatures omit the block's totp fields (SKY-15221); the task the
+    # script path creates must still poll the identifier the workflow block configured.
+    block = _make_task_block("my_block")
+    block.totp_identifier = "{{ email }}"
+    workflow = _make_workflow([block])
+
+    (identifier, url), _ = await _resolve_otp(workflow, {"email": "candidate+x@gmail.com"})
+
+    assert identifier == "candidate+x@gmail.com"
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_otp_template_yields_none_not_the_literal() -> None:
+    # A literal "{{ email }}" as identifier would match nothing for the whole poll —
+    # worse than no identifier, because the failure reads as "code never arrived".
+    block = _make_task_block("my_block")
+    block.totp_identifier = "{{ email }}"
+    workflow = _make_workflow([block])
+
+    (identifier, _), _ = await _resolve_otp(workflow, {})
+
+    assert identifier is None
+
+
+@pytest.mark.asyncio
+async def test_call_site_otp_values_pass_through_without_workflow_lookup() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+
+    (identifier, url), app = await _resolve_otp(workflow, {}, totp_identifier="direct@example.com")
+
+    assert identifier == "direct@example.com"
+    assert url is None
+    app.DATABASE.workflows.get_workflow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_otp_inheritance_finds_loop_nested_block() -> None:
+    from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+
+    nested = _make_task_block("my_block")
+    nested.totp_identifier = "{{ email }}"
+    loop = ForLoopBlock(
+        label="outer_loop",
+        loop_blocks=[nested],
+        loop_over=None,
+        loop_variable_reference="items",
+        output_parameter=nested.output_parameter,
+    )
+    workflow = _make_workflow([loop])
+
+    (identifier, _), _ = await _resolve_otp(workflow, {"email": "candidate+x@gmail.com"})
+
+    assert identifier == "candidate+x@gmail.com"
+
+
 @pytest.mark.asyncio
 async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     # A block that runs before a browser exists, or never needs one, has no screenshot to take;
@@ -209,3 +298,66 @@ async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypat
     log.warning.assert_not_called()
     log.info.assert_called_once()
     assert log.info.call_args.args[0] == "No browser state found when creating workflow_run_block"
+
+
+@pytest.mark.asyncio
+async def test_block_screenshot_timeout_is_logged_and_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pre-block capture is best effort: a capture that runs out of budget must not abort the block setup
+    # that already persisted its rows, mirroring Block.execute_safe.
+    log = MagicMock()
+    monkeypatch.setattr(script_service, "LOG", log)
+    browser_state = SimpleNamespace(take_fullpage_screenshot=AsyncMock(side_effect=TimeoutError()))
+    monkeypatch.setattr(script_service.app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_a, **_k: browser_state)
+    create_artifact = AsyncMock()
+    monkeypatch.setattr(script_service.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
+
+    await script_service._take_workflow_run_block_screenshot(
+        "wr_test", "o_test", SimpleNamespace(workflow_run_block_id="wrb_test")
+    )
+
+    log.warning.assert_called_once()
+    create_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fallback_episode_excludes_decision_row_from_agent_action_count() -> None:
+    # Twin pin of the workflow/service.py count-filter test: _fallback_to_ai_run keeps its own copy
+    # of the decision-row exclusion, and a verdict row must not count as agent activity here either.
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v1)])
+    workflow.run_with = "code"
+    workflow.code_version = 2
+    app = _make_app(workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(ai_fallback=True, run_with=None)
+    )
+    app.DATABASE.tasks.get_task = AsyncMock(
+        return_value=SimpleNamespace(url="https://example.com", status=TaskStatus.completed, failure_reason=None)
+    )
+    app.DATABASE.scripts.create_fallback_episode = AsyncMock(return_value=SimpleNamespace(episode_id="cep_1"))
+    update_episode = AsyncMock()
+    app.DATABASE.scripts.update_fallback_episode = update_episode
+    app.DATABASE.tasks.get_task_actions = AsyncMock(
+        return_value=[Action(action_type=ActionType.COMPLETE, status=ActionStatus.completed, step_id="stp_ai_1")]
+    )
+
+    # create_fallback_episode only fires when the context carries a workflow_permanent_id
+    # (is_adaptive_caching's gate); _make_context() leaves it unset for the other tests in
+    # this file, so this test needs its own context with it filled in.
+    context = _make_context()
+    context.workflow_permanent_id = "wpid_test"
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+        )
+
+    update_episode.assert_awaited_once()
+    assert update_episode.await_args.kwargs["fallback_succeeded"] is False
+    assert (
+        update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
+        == script_service.VERIFIER_SWAP_FAILURE_REASON
+    )

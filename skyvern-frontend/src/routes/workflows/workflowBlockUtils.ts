@@ -168,6 +168,22 @@ export function isRecorderCallText(
   return text !== null && RECORDER_CALL_TEXT.test(text);
 }
 
+// Task V3 stamps every persisted action's `description` as "task_v3 <tool> <argument>", where the
+// argument is usually a model-authored CSS selector (skyvern/webeye/actions/actions.py
+// TASK_V3_ACTION_DESCRIPTION_PREFIX). Like the recorder trace above it is machine syntax, so it
+// belongs on hover and in the inspector, never on a row's main line.
+const TASK_V3_CALL_PREFIX = "task_v3 ";
+
+export function taskV3CallText(
+  description: string | null | undefined,
+): string | null {
+  const text = normalizeInlineText(description);
+  if (text === null || !text.startsWith(TASK_V3_CALL_PREFIX)) {
+    return null;
+  }
+  return normalizeInlineText(text.slice(TASK_V3_CALL_PREFIX.length));
+}
+
 /**
  * Reader-facing text for one recorded action, in descending order of specificity: the definition
  * step it fired from, whatever prose the action carries, the author's own prompt, then the one

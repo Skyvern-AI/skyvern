@@ -16,10 +16,12 @@ from skyvern.browser_extension.errors import BrowserExtensionBrokerError, Extens
 _HEADER = struct.Struct("!I")
 
 BROKER_PROTOCOL_VERSION = 1
-BROKER_GENERATION = 1
+# Bump whenever an upgraded client depends on a broker.status field a still-running,
+# pre-upgrade daemon won't populate, so the client rejects the stale daemon as
+# INCOMPATIBLE_BROKER instead of silently reading an incomplete status from it.
+BROKER_GENERATION = 2
 PREAUTH_FRAME_LIMIT = 8 * 1024
 CONTROL_FRAME_LIMIT = 64 * 1024
-# MAX_CLIENT_OUTPUT_BYTES is derived from this payload limit so a valid encoded operation frame always fits.
 OPERATION_FRAME_LIMIT = 32 * 1024 * 1024
 MAX_ENCODED_CONTROL_FRAME_BYTES = _HEADER.size + CONTROL_FRAME_LIMIT
 MAX_ENCODED_OPERATION_FRAME_BYTES = _HEADER.size + OPERATION_FRAME_LIMIT
@@ -27,14 +29,24 @@ READ_TIMEOUT_SECONDS = 10.0
 MAX_PENDING_CONNECTIONS = 16
 MAX_AUTHENTICATED_CLIENTS = 32
 MAX_REQUESTS_PER_CLIENT = 32
-MAX_REQUESTS_PER_TAB = 16
-MAX_QUEUED_FRAMES_PER_CLIENT = 256
+MAX_QUEUED_REQUESTS_PER_CLIENT = 128
+MAX_REQUESTS_PER_TAB = 32
+MAX_QUEUED_REQUESTS_PER_TAB = 128
+TAB_REQUEST_QUEUE_WAIT_SECONDS = 10.0
 MAX_CLIENT_INBOUND_BYTES = 32 * 1024 * 1024
-# One maximum operation frame plus one control-frame headroom must fit; queued large frames still backpressure.
-MAX_CLIENT_OUTPUT_BYTES = MAX_ENCODED_OPERATION_FRAME_BYTES + MAX_ENCODED_CONTROL_FRAME_BYTES
+# This is a soft threshold. Output remains admitted up to the shared global cap, while
+# selected high-volume debugger events are shed for clients whose output is over pressure.
+MAX_CLIENT_OUTPUT_BYTES = 16 * 1024 * 1024
+CLIENT_OUTPUT_RECOVERY_BYTES = MAX_CLIENT_OUTPUT_BYTES // 2
 MAX_GLOBAL_INBOUND_BYTES = 128 * 1024 * 1024
 MAX_GLOBAL_OUTPUT_BYTES = 64 * 1024 * 1024
+CLIENT_OUTPUT_STALL_SECONDS = 15.0
+CLIENT_CLOSE_GRACE_SECONDS = 1.0
+SHEDDABLE_EVENT_METHODS = frozenset({"Network.dataReceived", "Network.resourceChangedPriority"})
 MAX_GLOBAL_REQUESTS = 256
+MAX_GLOBAL_QUEUED_REQUESTS = 512
+MAX_OUTSTANDING_REQUESTS_PER_CLIENT = 160
+MAX_GLOBAL_OUTSTANDING_REQUESTS = 768
 
 _SENSITIVE_KEYS = frozenset(
     {

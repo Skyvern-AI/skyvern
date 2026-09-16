@@ -3,8 +3,8 @@
 A bounded, engine-agnostic ladder that detects a visible captcha challenge and drives the platform
 solver arms (DOM checkbox, reCAPTCHA anchor in-frame click, the solver extension, and the reCAPTCHA
 token route). Detection keys off DOM/iframe markers, so it sees the challenge even when the widget
-renders in a cross-origin iframe (the ``<iframe>`` element is a main-frame node a targeted locator
-can find, though its content is not enumerable as an interactive element).
+renders in a cross-origin iframe (the ``<iframe>`` element is a main-frame node a targeted locator can
+find); a caller that opts in with ``probe_child_frames`` also has visible child frames' documents probed.
 
 Solving routes through the ``AGENT_FUNCTION`` seam (``auto_solve_captchas`` / ``solve_recaptcha_token``),
 so this module stays OSS-clean: the OSS bases return False and the cloud overrides do the real solve.
@@ -79,10 +79,13 @@ _HCAPTCHA_ARM_TIMEOUT_SECONDS = 90
 # of the pair, which only ends at its own 180s timeout.
 _TOKEN_ARM_TIMEOUT_SECONDS = 90
 _WIDGET_RESET_TIMEOUT_SECONDS = 3
+# Whole child-frame scan, on top of each frame's own 1s bound: a frame-heavy page must not spend the ladder's
+# budget probing frames before any solver arm starts.
+_CHILD_FRAME_SCAN_BUDGET_SECONDS = 3
 # Sum of the bounded arms on a non-hCaptcha page (anchor 5 + reset 3 + extension 12 + token 90); the token
-# arm is clamped to what remains so a 90s hCaptcha extension arm cannot push the bounded arms past the v3
-# tool's 120s ceiling. On a page carrying both hCaptcha and reCAPTCHA markers the token arm may therefore
-# get less than a full solve needs; hCaptcha is the visible gate there.
+# arm is clamped to whatever global budget remains, and a deployment may widen the extension arm
+# (resolve_captcha_solver_extension_timeout); a widened extension can never push the bounded arms past the
+# v3 tool's 120s ceiling — the token arm then gets less than a full solve needs, and the wider arm gates.
 _LADDER_BUDGET_SECONDS = 110
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
@@ -103,6 +106,69 @@ async def _bounded_locator_count(locator: Any) -> int:
         return await asyncio.wait_for(locator.count(), timeout=1.0)
     except Exception:
         return 0
+
+
+def _intersects_viewport(box: Any, viewport: Any) -> bool:
+    """Whether an element box (top-level viewport coordinates) overlaps the viewport; `is_visible()` alone
+    accepts an element parked off-screen. An unknown viewport keeps the visibility verdict."""
+    if box is None:
+        return False
+    if viewport is None:
+        return True
+    return (
+        box["x"] < viewport["width"]
+        and box["x"] + box["width"] > 0
+        and box["y"] < viewport["height"]
+        and box["y"] + box["height"] > 0
+    )
+
+
+async def _frame_has_visible_match(frame: Any, selector: str, viewport: Any) -> bool:
+    async with asyncio.timeout(1.0):
+        if not await (await frame.frame_element()).is_visible():
+            return False
+        # Every match, not a prefix: stale hidden widgets can precede the live one; the timeout bounds the walk.
+        matches = frame.locator(selector)
+        for index in range(await matches.count()):
+            match = matches.nth(index)
+            if await match.is_visible() and _intersects_viewport(await match.bounding_box(), viewport):
+                return True
+    return False
+
+
+async def _visible_child_frame_match(page: Page | RecordingPage, selector: str) -> bool:
+    """True when a visible child frame holds a visible `selector` match; each frame's probe is bounded, and a
+    frame that fails it (detached, wedged, no element) is skipped so one broken frame cannot blind the rest."""
+    # A frame probe must never be able to break the ladder: an unreadable page reads as "no nested challenge",
+    # logged apart from a clean scan so a systematically blind page type stays countable.
+    try:
+        main_frame, frames = page.main_frame, list(page.frames)
+    except Exception:
+        LOG.info("CAPTCHA child-frame scan could not enumerate frames", arm="nested_presence", exc_info=True)
+        return False
+    try:
+        viewport = page.viewport_size
+    except Exception:
+        viewport = None
+    # Frames are probed concurrently under one deadline, so the frame that matters is found regardless of
+    # where it sits in frame order; a sequential walk let earlier wedged frames spend the budget first.
+    probes = [
+        asyncio.ensure_future(_frame_has_visible_match(f, selector, viewport)) for f in frames if f is not main_frame
+    ]
+    try:
+        for probe in asyncio.as_completed(probes, timeout=_CHILD_FRAME_SCAN_BUDGET_SECONDS):
+            try:
+                if await probe:
+                    return True
+            except Exception:
+                continue
+    except TimeoutError:
+        LOG.info("CAPTCHA child-frame scan stopped at its budget", arm="nested_presence", frames=len(frames))
+    finally:
+        for probe in probes:
+            probe.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
+    return False
 
 
 def _is_trusted_recaptcha_anchor_url(frame_url: str | None) -> bool:
@@ -135,6 +201,32 @@ async def solve_challenge_ladder(
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
+    probe_child_frames: bool = False,
+) -> bool:
+    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
+
+    Thin public entry: it enters the ``AGENT_FUNCTION`` captcha-solver lifecycle scope exactly once
+    around the ladder, so a deployment can bind a page-scoped solver lifecycle for the whole solve
+    (its self-heal/teardown owned by that scope). ``probe_child_frames`` opts a caller into also
+    detecting a challenge inside visible child frames; the default keeps the main-document-only check.
+    """
+    async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(page):
+        return await _solve_challenge_ladder_impl(
+            page,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+            probe_child_frames=probe_child_frames,
+        )
+
+
+async def _solve_challenge_ladder_impl(
+    page: Page | RecordingPage,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
+    probe_child_frames: bool = False,
 ) -> bool:
     """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
 
@@ -148,7 +240,16 @@ async def solve_challenge_ladder(
     checkbox_count = await _bounded_locator_count(checkbox)
     marker = page.locator(_CAPTCHA_MARKER_SELECTOR)
     marker_count = await _bounded_locator_count(marker)
-    if checkbox_count == 0 and marker_count == 0:
+    # A challenge nested in a child frame only widens this presence check: the DOM-checkbox arm below
+    # clicks through a page-level locator and can never drive a nested checkbox.
+    if (
+        checkbox_count == 0
+        and marker_count == 0
+        and not (
+            probe_child_frames
+            and await _visible_child_frame_match(page, f"{_CAPTCHA_CHECKBOX_SELECTOR}, {_CAPTCHA_MARKER_SELECTOR}")
+        )
+    ):
         return False
 
     if checkbox_count == 1:
@@ -208,6 +309,7 @@ async def solve_challenge_ladder(
                     await candidate.get_attribute("aria-checked") == "true"
                     and token_was_populated is False
                     and token_is_populated is True
+                    and await app.AGENT_FUNCTION.is_captcha_solver_completion_confirmed(page, default_result=True)
                 ):
                     LOG.info("CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
                     return True
@@ -237,8 +339,13 @@ async def solve_challenge_ladder(
         except Exception:
             LOG.info("CAPTCHA widget reset did not run", arm="recaptcha_anchor_frame")
 
-    hcaptcha_present = await _bounded_locator_count(page.locator(_HCAPTCHA_MARKER_SELECTOR)) > 0
-    extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
+    hcaptcha_present = await _bounded_locator_count(page.locator(_HCAPTCHA_MARKER_SELECTOR)) > 0 or (
+        probe_child_frames and await _visible_child_frame_match(page, _HCAPTCHA_MARKER_SELECTOR)
+    )
+    default_extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
+    # Resolved inside the already-entered lifecycle scope so a deployment can widen this arm for a solver
+    # it armed on scope entry, instead of cutting a slow legitimate solve at the generic bound.
+    extension_timeout = app.AGENT_FUNCTION.resolve_captcha_solver_extension_timeout(page, default_extension_timeout)
     try:
         async with asyncio.timeout(extension_timeout):
             if await app.AGENT_FUNCTION.auto_solve_captchas(page):

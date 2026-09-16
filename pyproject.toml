@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.51"
+version = "1.0.52"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.15"
@@ -59,6 +59,7 @@ local = [
     "json-repair>=0.63.2,<0.64",
     "pypdf>=6.16.1,<7",
     "pdfplumber>=0.11.10,<0.12",
+    "beautifulsoup4>=4.14.3,<5",
     "psutil>=7.0.0",
     "tiktoken>=0.13.0",
     "anthropic>=0.122.0,<0.123",
@@ -70,6 +71,7 @@ local = [
     "libcst>=1.9.0,<2",
     "curlparser>=0.1.0,<0.2",
     "pandas>=3.0.5,<4",
+    "pyarrow>=18.0.0,<24",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.11.1,<5",
     "google-cloud-secret-manager>=2.30.0,<3",
@@ -136,6 +138,7 @@ server = [
     "json-repair>=0.63.2,<0.64",
     "pypdf>=6.16.1,<7",
     "pdfplumber>=0.11.10,<0.12",
+    "beautifulsoup4>=4.14.3,<5",
     # <3.4: 3.4.3 enables HostOriginGuardMiddleware by default (421 on public hosts, SKY-12003).
     # cloud_app passes allowed_hosts/allowed_origins when supported; validate against 3.4.x before raising.
     "fastmcp>=3.4.7,<3.5",
@@ -151,6 +154,7 @@ server = [
     "libcst>=1.9.0,<2",
     "curlparser>=0.1.0,<0.2",
     "pandas>=3.0.5,<4",
+    "pyarrow>=18.0.0,<24",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.11.1,<5",
     "google-cloud-secret-manager>=2.30.0,<3",

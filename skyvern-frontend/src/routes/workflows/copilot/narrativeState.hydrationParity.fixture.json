@@ -5,22 +5,56 @@
     "designStarted": true,
     "designEnded": true,
     "draft": {
-      "blockCount": 1,
+      "blockCount": 20,
       "blockLabels": [
-        "log_in"
+        "block_01",
+        "block_02",
+        "block_03",
+        "block_04",
+        "block_05",
+        "block_06",
+        "block_07",
+        "block_08",
+        "block_09",
+        "block_10",
+        "block_11",
+        "block_12",
+        "block_13",
+        "block_14",
+        "block_15",
+        "block_16",
+        "block_17",
+        "block_18",
+        "block_19",
+        "block_20"
       ],
       "summary": null
     },
     "blocks": [
       {
-        "label": "log_in",
+        "label": "block_19",
+        "workflowRunBlockId": "wrb_first",
+        "blockType": "task",
+        "state": "failed",
+        "lastSeenIteration": 0,
+        "activity": [],
+        "startedAt": "2026-09-08T23:09:45.412765+00:00",
+        "endedAt": "2026-09-08T23:09:45.413021+00:00",
+        "outcome": "not_demonstrated",
+        "outcomeRole": "recorded",
+        "outcomeReason": "The first attempt failed."
+      },
+      {
+        "label": "block_19",
+        "workflowRunBlockId": "wrb_retry",
         "blockType": "task",
         "state": "completed",
-        "lastSeenIteration": 1,
+        "lastSeenIteration": 0,
         "activity": [],
-        "startedAt": null,
-        "endedAt": "2026-08-20T23:13:50.173506+00:00",
-        "workflowRunBlockId": "wrb_replay"
+        "startedAt": "2026-09-08T23:09:45.414086+00:00",
+        "endedAt": "2026-09-08T23:09:45.414104+00:00",
+        "outcome": "not_evaluated",
+        "outcomeRole": "recorded"
       }
     ],
     "terminal": "response",
@@ -30,157 +64,317 @@
     "designActivity": [
       {
         "kind": "tool_call",
-        "text": "Updating workflow\u2026",
+        "text": "Editing block \"Block 19\"\u2026",
         "iteration": 0,
-        "toolName": "update_workflow",
-        "displayLabel": "Updating workflow",
-        "id": "tc-c1",
-        "timestamp": "2026-08-20T23:13:50.173271+00:00"
+        "toolName": "edit_block",
+        "displayLabel": "Editing block \"Block 19\"",
+        "id": "tc-author-1",
+        "timestamp": "2026-09-08T23:09:45.412043+00:00"
       },
       {
         "kind": "tool_result",
-        "text": "Workflow updated (2 blocks)",
+        "text": "Editing block \"Block 19\"",
         "iteration": 0,
-        "toolName": "update_workflow",
-        "displayLabel": "Updating workflow",
-        "success": true,
-        "id": "tr-c1",
-        "timestamp": "2026-08-20T23:13:50.173320+00:00"
-      },
-      {
-        "kind": "tool_call",
-        "text": "Editing block \"Log In\"\u2026",
-        "iteration": 1,
         "toolName": "edit_block",
-        "displayLabel": "Editing block \"Log In\"",
-        "id": "tc-c2",
-        "timestamp": "2026-08-20T23:13:50.173387+00:00"
-      },
-      {
-        "kind": "narration",
-        "text": "Refining the workflow's code",
-        "iteration": 1,
-        "id": "n-1-2026-08-20T23:13:50.173435+00:00",
-        "timestamp": "2026-08-20T23:13:50.173435+00:00"
+        "displayLabel": "Editing block \"Block 19\"",
+        "success": true,
+        "id": "tr-author-1",
+        "timestamp": "2026-09-08T23:09:45.412308+00:00"
       },
       {
         "kind": "tool_call",
         "text": "Testing workflow\u2026",
-        "iteration": 2,
+        "iteration": 0,
         "toolName": "update_and_run_blocks",
         "displayLabel": "Testing workflow",
-        "id": "tc-c3",
-        "timestamp": "2026-08-20T23:13:50.173449+00:00"
+        "id": "tc-run-first",
+        "timestamp": "2026-09-08T23:09:45.412722+00:00"
+      },
+      {
+        "kind": "tool_result",
+        "text": "Couldn't complete that step.",
+        "iteration": 0,
+        "toolName": "update_and_run_blocks",
+        "displayLabel": "Testing workflow",
+        "success": false,
+        "id": "tr-run-first",
+        "timestamp": "2026-09-08T23:09:45.413198+00:00"
+      },
+      {
+        "kind": "tool_call",
+        "text": "Editing block \"Block 19\"\u2026",
+        "iteration": 0,
+        "toolName": "edit_block",
+        "displayLabel": "Editing block \"Block 19\"",
+        "id": "tc-author-2",
+        "timestamp": "2026-09-08T23:09:45.413757+00:00"
+      },
+      {
+        "kind": "narration",
+        "text": "Refining the workflow's code",
+        "iteration": 0,
+        "id": "n-0-2026-09-08T23:09:45.413803+00:00",
+        "timestamp": "2026-09-08T23:09:45.413803+00:00"
+      },
+      {
+        "kind": "tool_call",
+        "text": "Testing workflow\u2026",
+        "iteration": 0,
+        "toolName": "update_and_run_blocks",
+        "displayLabel": "Testing workflow",
+        "id": "tc-run-retry",
+        "timestamp": "2026-09-08T23:09:45.414064+00:00"
       },
       {
         "kind": "tool_result",
         "text": "Updated the workflow and ran it",
-        "iteration": 2,
+        "iteration": 0,
         "toolName": "update_and_run_blocks",
         "displayLabel": "Testing workflow",
         "success": true,
-        "id": "tr-c3",
-        "timestamp": "2026-08-20T23:13:50.173462+00:00"
-      },
-      {
-        "kind": "tool_result",
-        "text": "Updated the workflow and ran it",
-        "iteration": 1,
-        "toolName": "update_and_run_blocks",
-        "displayLabel": "Testing workflow",
-        "success": true,
-        "id": "tr-c4",
-        "timestamp": "2026-08-20T23:13:50.173482+00:00"
+        "id": "tr-run-retry",
+        "timestamp": "2026-09-08T23:09:45.414164+00:00"
       }
     ],
     "startedAt": null,
-    "endedAt": "2026-08-20T23:13:50.173521+00:00"
+    "endedAt": "2026-09-08T23:09:45.414184+00:00"
   },
   "updates": [
     {
+      "type": "turn_start",
+      "turn_id": "turn-replay",
+      "turn_index": 0,
+      "timestamp": "2026-09-08T23:09:45.409410Z",
+      "prior_block_count": 20
+    },
+    {
       "type": "design_start",
-      "timestamp": "2026-08-20T23:13:50.173245Z"
-    },
-    {
-      "type": "tool_call",
-      "tool_name": "update_workflow",
-      "display_label": "Updating workflow",
-      "tool_input": {},
-      "iteration": 0,
-      "tool_call_id": "c1",
-      "timestamp": "2026-08-20T23:13:50.173271Z"
-    },
-    {
-      "type": "tool_result",
-      "tool_name": "update_workflow",
-      "display_label": "Updating workflow",
-      "success": true,
-      "summary": "Workflow updated (2 blocks)",
-      "iteration": 0,
-      "tool_call_id": "c1",
-      "detail": null,
-      "workflow_run_id": null,
-      "timestamp": "2026-08-20T23:13:50.173320Z"
+      "timestamp": "2026-09-08T23:09:45.411845Z"
     },
     {
       "type": "tool_call",
       "tool_name": "edit_block",
-      "display_label": "Editing block \"Log In\"",
+      "display_label": "Editing block \"Block 19\"",
       "tool_input": {
-        "label": "log_in"
+        "label": "block_19"
       },
-      "iteration": 1,
-      "tool_call_id": "c2",
-      "timestamp": "2026-08-20T23:13:50.173387Z"
+      "iteration": 0,
+      "tool_call_id": "author-1",
+      "timestamp": "2026-09-08T23:09:45.412043Z"
     },
     {
-      "type": "narration",
-      "narration": "Refining the workflow's code",
-      "iteration": 1,
-      "timestamp": "2026-08-20T23:13:50.173435Z"
+      "type": "tool_result",
+      "tool_name": "edit_block",
+      "display_label": "Editing block \"Block 19\"",
+      "success": true,
+      "summary": "",
+      "iteration": 0,
+      "tool_call_id": "author-1",
+      "code_diffs": null,
+      "detail": null,
+      "workflow_run_id": null,
+      "timestamp": "2026-09-08T23:09:45.412308Z"
+    },
+    {
+      "type": "workflow_draft",
+      "block_count": 20,
+      "block_labels": [
+        "block_01",
+        "block_02",
+        "block_03",
+        "block_04",
+        "block_05",
+        "block_06",
+        "block_07",
+        "block_08",
+        "block_09",
+        "block_10",
+        "block_11",
+        "block_12",
+        "block_13",
+        "block_14",
+        "block_15",
+        "block_16",
+        "block_17",
+        "block_18",
+        "block_19",
+        "block_20"
+      ],
+      "summary": null,
+      "timestamp": "2026-09-08T23:09:45.412355Z",
+      "workflow": null,
+      "code_diffs": null,
+      "tool_call_id": "author-1"
     },
     {
       "type": "tool_call",
       "tool_name": "update_and_run_blocks",
       "display_label": "Testing workflow",
       "tool_input": {},
-      "iteration": 2,
-      "tool_call_id": "c3",
-      "timestamp": "2026-08-20T23:13:50.173449Z"
-    },
-    {
-      "type": "tool_result",
-      "tool_name": "update_and_run_blocks",
-      "display_label": "Testing workflow",
-      "success": true,
-      "summary": "Updated the workflow and ran it",
-      "iteration": 2,
-      "tool_call_id": "c3",
-      "detail": null,
-      "workflow_run_id": null,
-      "timestamp": "2026-08-20T23:13:50.173462Z"
-    },
-    {
-      "type": "tool_result",
-      "tool_name": "update_and_run_blocks",
-      "display_label": "Testing workflow",
-      "success": true,
-      "summary": "Updated the workflow and ran it",
-      "iteration": 1,
-      "tool_call_id": "c4",
-      "detail": null,
-      "workflow_run_id": null,
-      "timestamp": "2026-08-20T23:13:50.173482Z"
+      "iteration": 0,
+      "tool_call_id": "run-first",
+      "timestamp": "2026-09-08T23:09:45.412722Z"
     },
     {
       "type": "block_progress",
-      "workflow_run_block_id": "wrb_replay",
-      "workflow_run_id": "wr_replay",
-      "block_label": "log_in",
+      "workflow_run_block_id": "wrb_first",
+      "workflow_run_id": "wr_first",
+      "block_label": "block_19",
+      "block_type": "task",
+      "status": "running",
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.412765Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_first",
+      "workflow_run_id": "wr_first",
+      "block_label": "block_19",
+      "block_type": "task",
+      "status": "failed",
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.413021Z"
+    },
+    {
+      "type": "run_outcome",
+      "workflow_run_id": "wr_first",
+      "workflow_run_block_ids": ["wrb_first"],
+      "block_labels": ["block_19"],
+      "verdict": "not_demonstrated",
+      "role": "recorded",
+      "reason_code": null,
+      "display_reason": "The first attempt failed.",
+      "browser_session_id": null,
+      "workflow_permanent_id": null,
+      "turn_id": null,
+      "workflow_copilot_chat_id": null,
+      "continuity_source": "workflow_run",
+      "terminal_disposition": null,
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.413156Z"
+    },
+    {
+      "type": "tool_result",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "success": false,
+      "summary": "Couldn't complete that step.",
+      "iteration": 0,
+      "tool_call_id": "run-first",
+      "code_diffs": null,
+      "detail": "Unknown error",
+      "workflow_run_id": null,
+      "timestamp": "2026-09-08T23:09:45.413198Z"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "edit_block",
+      "display_label": "Editing block \"Block 19\"",
+      "tool_input": {
+        "label": "block_19"
+      },
+      "iteration": 0,
+      "tool_call_id": "author-2",
+      "timestamp": "2026-09-08T23:09:45.413757Z"
+    },
+    {
+      "type": "narration",
+      "narration": "Refining the workflow's code",
+      "active_label": null,
+      "outcome_label": null,
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.413803Z"
+    },
+    {
+      "type": "workflow_draft",
+      "block_count": 20,
+      "block_labels": [
+        "block_01",
+        "block_02",
+        "block_03",
+        "block_04",
+        "block_05",
+        "block_06",
+        "block_07",
+        "block_08",
+        "block_09",
+        "block_10",
+        "block_11",
+        "block_12",
+        "block_13",
+        "block_14",
+        "block_15",
+        "block_16",
+        "block_17",
+        "block_18",
+        "block_19",
+        "block_20"
+      ],
+      "summary": null,
+      "timestamp": "2026-09-08T23:09:45.413831Z",
+      "workflow": null,
+      "code_diffs": null,
+      "tool_call_id": "author-2"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "tool_input": {},
+      "iteration": 0,
+      "tool_call_id": "run-retry",
+      "timestamp": "2026-09-08T23:09:45.414064Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_retry",
+      "workflow_run_id": "wr_retry",
+      "block_label": "block_19",
+      "block_type": "task",
+      "status": "running",
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.414086Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_retry",
+      "workflow_run_id": "wr_retry",
+      "block_label": "block_19",
       "block_type": "task",
       "status": "completed",
-      "iteration": 1,
-      "timestamp": "2026-08-20T23:13:50.173506Z"
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.414104Z"
+    },
+    {
+      "type": "run_outcome",
+      "workflow_run_id": "wr_retry",
+      "workflow_run_block_ids": ["wrb_retry"],
+      "block_labels": ["block_19"],
+      "verdict": "not_evaluated",
+      "role": "recorded",
+      "reason_code": null,
+      "display_reason": null,
+      "browser_session_id": null,
+      "workflow_permanent_id": null,
+      "turn_id": null,
+      "workflow_copilot_chat_id": null,
+      "continuity_source": "workflow_run",
+      "terminal_disposition": null,
+      "iteration": 0,
+      "timestamp": "2026-09-08T23:09:45.414153Z"
+    },
+    {
+      "type": "tool_result",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "success": true,
+      "summary": "Updated the workflow and ran it",
+      "iteration": 0,
+      "tool_call_id": "run-retry",
+      "code_diffs": null,
+      "detail": null,
+      "workflow_run_id": null,
+      "timestamp": "2026-09-08T23:09:45.414164Z"
     }
   ]
 }

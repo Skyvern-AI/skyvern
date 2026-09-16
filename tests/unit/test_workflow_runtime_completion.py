@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -270,6 +271,31 @@ async def test_finalize_grades_the_version_the_run_executed(monkeypatch: pytest.
     )
 
     assert seen == [run.workflow_id]
+
+
+@pytest.mark.asyncio
+async def test_finalize_grades_the_version_execution_loaded_when_it_is_soft_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution resolves the pinned version deleted-inclusive; grading must not re-read it through the
+    active-only lookup and wave the contract through once that version has been soft-deleted."""
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=[])
+
+    async def _soft_deleted(workflow_id: str, organization_id: str | None = None):
+        raise WorkflowNotFound(workflow_id=workflow_id)
+
+    monkeypatch.setattr(service, "get_workflow", _soft_deleted)
+    executed = SimpleNamespace(workflow_definition={**_DEFINITION_BASE, "completion_contract": _DERIVED_CONTRACT})
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        workflow=executed,
+    )
+
+    assert statuses == [WorkflowRunStatus.terminated]
 
 
 def test_contract_comes_from_the_request_not_the_code() -> None:

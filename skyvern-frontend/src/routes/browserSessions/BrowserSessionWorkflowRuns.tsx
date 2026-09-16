@@ -18,7 +18,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import * as env from "@/util/env";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
@@ -99,9 +98,7 @@ function BrowserSessionWorkflowRuns() {
           </TableHeader>
           <TableBody>
             {runs.map((workflowRun) => {
-              const url = env.useNewRunsUrl
-                ? `/runs/${workflowRun.workflow_run_id}`
-                : `/agents/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`;
+              const url = `/runs/${workflowRun.workflow_run_id}`;
               return (
                 <TableRow
                   key={workflowRun.workflow_run_id}

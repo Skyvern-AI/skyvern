@@ -140,6 +140,44 @@ async def test_caller_provided_run_keeps_general_task_type(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_is_live_here", "expected_attempt"),
+    [(False, 2), (True, 3)],
+    ids=["run_owned_by_another_process", "run_live_in_this_process"],
+)
+async def test_caller_provided_run_stamps_the_current_attempt(
+    mock_request: Any, mock_organization: Any, mock_app: Any, run_is_live_here: bool, expected_attempt: int
+) -> None:
+    """A retried run owned by another process has no local context; the durable rows decide."""
+    mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=run_is_live_here)
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number = MagicMock(return_value=3)
+    mock_app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(
+        return_value=[MagicMock(attempt_number=1), MagicMock(attempt_number=2)]
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock()
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop inside action"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop inside action"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert mock_app.DATABASE.tasks.create_task.await_args.kwargs["attempt_number"] == expected_attempt
+    assert mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs["attempt_number"] == expected_attempt
+    assert mock_app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context.await_args.kwargs["attempt_number"] == (
+        expected_attempt
+    )
+    assert mock_app.DATABASE.workflow_run_attempts.get_attempts.await_count == (0 if run_is_live_here else 1)
+
+
+@pytest.mark.asyncio
 async def test_minted_sdk_action_uses_inline_dispatch_without_generic_executor(
     mock_request: Any, mock_organization: Any, mock_app: Any
 ) -> None:

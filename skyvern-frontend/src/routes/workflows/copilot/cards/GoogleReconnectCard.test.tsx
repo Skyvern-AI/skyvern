@@ -11,6 +11,7 @@ const { hookState, startAuthorize, storeIntegration, toast } = vi.hoisted(
           id: string;
           state: string;
           scopes_granted?: string[];
+          credential_name?: string;
         }>,
         isLoading: false,
         isFetching: false,
@@ -207,5 +208,96 @@ describe("GoogleReconnectCard", () => {
     expect(startAuthorize).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalled();
     open.mockRestore();
+  });
+
+  it("connects without an existing id and becomes a picker after credential refresh", async () => {
+    const onSelect = vi.fn();
+    const popup = {
+      location: { assign: vi.fn() },
+      close: vi.fn(),
+      opener: window,
+      sessionStorage: { setItem: vi.fn() },
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "new-account",
+    });
+    const unbound = {
+      provider: "google" as const,
+      connectionId: null,
+      displayName: null,
+      condition: "unbound" as const,
+      choices: [],
+    };
+    const { rerender } = render(
+      <GoogleReconnectCard notice={unbound} onSelect={onSelect} disabled />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(popup.location.assign).toHaveBeenCalled());
+    expect(startAuthorize.mock.calls[0]?.[0]).not.toHaveProperty(
+      "credential_id",
+    );
+    expect(popup.opener).toBeNull();
+
+    hookState.current.credentials = [
+      {
+        id: "goac_new",
+        credential_name: "New Sheets",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/spreadsheets"],
+      },
+      {
+        id: "goac_mail",
+        credential_name: "Mail only",
+        state: "active",
+        scopes_granted: [],
+      },
+    ];
+    rerender(<GoogleReconnectCard notice={unbound} onSelect={onSelect} />);
+    expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
+    expect(screen.queryByText("Mail only")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /New Sheets/ }));
+    expect(onSelect).toHaveBeenCalledWith("goac_new");
+
+    onSelect.mockClear();
+    rerender(
+      <GoogleReconnectCard notice={unbound} onSelect={onSelect} disabled />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New Sheets/ }));
+    expect(onSelect).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+  it("allows saved choices during a list-fetch error but keeps historical choices disabled", () => {
+    hookState.current.error = new Error("offline");
+    const onSelect = vi.fn();
+    const unbound = {
+      provider: "google" as const,
+      connectionId: null,
+      displayName: null,
+      condition: "unbound" as const,
+      choices: [
+        {
+          connection_id: "goac_saved",
+          name: "Saved Sheets",
+          state: "active",
+          email_address: null,
+        },
+      ],
+    };
+    const { rerender } = render(
+      <GoogleReconnectCard notice={unbound} onSelect={onSelect} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Saved Sheets/ }));
+    expect(onSelect).toHaveBeenCalledWith("goac_saved");
+    onSelect.mockClear();
+    rerender(
+      <GoogleReconnectCard notice={unbound} onSelect={onSelect} disabled />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Saved Sheets/ }));
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

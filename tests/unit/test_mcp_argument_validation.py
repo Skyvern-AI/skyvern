@@ -129,6 +129,19 @@ async def test_workflow_run_list_comma_separated_status_is_split_for_list_parame
 
 
 @pytest.mark.asyncio
+async def test_workflow_run_list_bare_status_string_is_wrapped_into_list_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_runs = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
+
+    payload = await _call("skyvern_workflow_run_list", {"workflow_id": "wpid_test", "status": "completed"})
+
+    assert payload["ok"] is True
+    assert _awaited_kwargs(list_runs)["status"] == ["completed"]
+
+
+@pytest.mark.asyncio
 async def test_comma_separated_string_is_not_split_for_non_list_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
     list_runs = AsyncMock(return_value=[])
     monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
@@ -154,7 +167,7 @@ async def test_comma_separated_string_is_not_split_for_unapproved_list_parameter
 
 @pytest.mark.parametrize(
     "value",
-    ['["terminated","failed"]', "terminated,,failed", "terminated"],
+    ['["terminated","failed"]', "terminated,,failed", ""],
 )
 def test_csv_list_repair_leaves_structured_or_ambiguous_strings_for_other_validation(value: str) -> None:
     assert _split_comma_separated_list(value) == value
@@ -212,3 +225,20 @@ async def test_type_repair_preserves_structured_missing_key_rejection() -> None:
     assert error["code"] == "INVALID_INPUT"
     assert error["details"]["unsupported_arguments"] == []
     assert error["details"]["missing_required_arguments"] == ["workflow_id"]
+
+
+@pytest.mark.asyncio
+async def test_out_of_schema_value_gets_structured_error_instead_of_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+    list_runs = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
+
+    # SKY-15319: page below the tool's documented 1-based minimum. Before the fix, FastMCP's own
+    # pydantic validation raised fastmcp.exceptions.ValidationError out of call_next, uncaught here.
+    payload = await _call("skyvern_workflow_run_list", {"workflow_id": "wpid_test", "page": 0})
+
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert error["code"] == "INVALID_INPUT"
+    assert "page" in error["message"]
+    assert "skyvern_workflow_run_list" in error["hint"]
+    list_runs.assert_not_awaited()

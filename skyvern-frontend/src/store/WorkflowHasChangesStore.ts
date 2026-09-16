@@ -1,5 +1,5 @@
 import { AxiosError } from "axios";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
@@ -33,6 +33,8 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
+  pendingRecordingId: string | null;
+  pendingRecordingWorkflowPermanentId: string | null;
   // Reference-counted flag: multiple concurrent internal updates won't
   // accidentally clear each other. Gate on > 0 in consumers.
   internalUpdateCount: number;
@@ -41,6 +43,11 @@ type WorkflowHasChangesStore = {
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
+  setPendingRecording: (
+    recordingId: string,
+    workflowPermanentId: string,
+  ) => void;
+  clearPendingRecording: (recordingId: string) => void;
   beginInternalUpdate: () => void;
   endInternalUpdate: () => void;
 };
@@ -49,19 +56,44 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
+class WorkflowSaveValidationError extends Error {}
+
+const deleteDiscardedRecordingCallbacks = new Set<
+  (recordingId: string) => void
+>();
+
 const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
     hasChanges: false,
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
+    pendingRecordingId: null,
+    pendingRecordingWorkflowPermanentId: null,
     internalUpdateCount: 0,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
     },
     setHasChanges: (hasChanges: boolean) => {
-      set({ hasChanges });
+      // Recording attachment is part of the unsaved editor draft. Every caller
+      // that accepts or discards that draft by clearing the dirty flag also
+      // discards its pending attachment handshake.
+      set((state) => {
+        if (!hasChanges && state.pendingRecordingId !== null) {
+          deleteDiscardedRecordingCallbacks
+            .values()
+            .next()
+            .value?.(state.pendingRecordingId);
+        }
+        return hasChanges
+          ? { hasChanges }
+          : {
+              hasChanges,
+              pendingRecordingId: null,
+              pendingRecordingWorkflowPermanentId: null,
+            };
+      });
     },
     setSaveIsPending: (isPending: boolean) => {
       set({ saveIsPending: isPending });
@@ -71,6 +103,28 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     },
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
+    },
+    setPendingRecording: (recordingId, workflowPermanentId) => {
+      set((state) =>
+        state.pendingRecordingId === null ||
+        (state.pendingRecordingId === recordingId &&
+          state.pendingRecordingWorkflowPermanentId === workflowPermanentId)
+          ? {
+              pendingRecordingId: recordingId,
+              pendingRecordingWorkflowPermanentId: workflowPermanentId,
+            }
+          : {},
+      );
+    },
+    clearPendingRecording: (recordingId) => {
+      set((state) =>
+        state.pendingRecordingId === recordingId
+          ? {
+              pendingRecordingId: null,
+              pendingRecordingWorkflowPermanentId: null,
+            }
+          : {},
+      );
     },
     beginInternalUpdate: () => {
       set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
@@ -87,6 +141,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const postHog = usePostHog();
+  const attachedRecordingIdRef = useRef<string | null>(null);
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -95,6 +150,18 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
     setSaidOkToCodeCacheDeletion,
     setShowConfirmCodeCacheDeletion,
   } = useWorkflowHasChangesStore();
+
+  useEffect(() => {
+    const deleteRecording = (recordingId: string) => {
+      void getClient(credentialGetter, "sans-api-v1")
+        .then((client) => client.delete(`/browser_recordings/${recordingId}`))
+        .catch(() => undefined);
+    };
+    deleteDiscardedRecordingCallbacks.add(deleteRecording);
+    return () => {
+      deleteDiscardedRecordingCallbacks.delete(deleteRecording);
+    };
+  }, [credentialGetter]);
 
   const saveWorkflowMutation = useMutation({
     mutationFn: async (override?: Partial<SaveData>) => {
@@ -143,7 +210,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             )}`,
             variant: "destructive",
           });
-          return;
+          throw new WorkflowSaveValidationError();
         }
       }
 
@@ -178,7 +245,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             )}`,
             variant: "destructive",
           });
-          return;
+          throw new WorkflowSaveValidationError();
         }
       }
 
@@ -204,6 +271,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         extra_http_headers: extraHttpHeaders,
         cdp_connect_headers: cdpConnectHeaders,
         run_with: saveData.settings.runWith,
+        browser_type: saveData.settings.browserType ?? null,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
         enable_self_healing: saveData.settings.enableSelfHealing ?? false,
@@ -220,12 +288,24 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           workflow_system_prompt:
             saveData.settings.workflowSystemPrompt ?? undefined,
           error_code_mapping: saveData.settings.errorCodeMapping ?? undefined,
+          retry_policy: saveData.settings.retryPolicy ?? null,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,
         run_sequentially: saveData.settings.runSequentially,
         sequential_key: saveData.settings.sequentialKey,
       };
+
+      const changesState = useWorkflowHasChangesStore.getState();
+      const recordingId =
+        changesState.pendingRecordingWorkflowPermanentId ===
+        saveData.workflow.workflow_permanent_id
+          ? changesState.pendingRecordingId
+          : null;
+      attachedRecordingIdRef.current = recordingId;
+      if (recordingId !== null) {
+        requestBody.recording_id = recordingId;
+      }
 
       const yaml = convertToYAML(requestBody);
 
@@ -249,6 +329,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       // every persist path (top bar, nav blocker, YAML mode), so a later save
       // can't silently delete cached code without re-prompting.
       setSaidOkToCodeCacheDeletion(false);
+      const attachedRecordingId = attachedRecordingIdRef.current;
+      attachedRecordingIdRef.current = null;
+      if (attachedRecordingId !== null) {
+        useWorkflowHasChangesStore
+          .getState()
+          .clearPendingRecording(attachedRecordingId);
+      }
 
       const saveData = getSaveData();
 
@@ -283,7 +370,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
 
       setHasChanges(false);
     },
-    onError: (error: AxiosError) => {
+    onError: (error: AxiosError | WorkflowSaveValidationError) => {
+      attachedRecordingIdRef.current = null;
+      if (error instanceof WorkflowSaveValidationError) {
+        return;
+      }
       const responseData = error.response?.data as
         | {
             detail?:

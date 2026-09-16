@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
@@ -32,6 +33,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.signing import parse_artifact_content_url
+from skyvern.forge.sdk.artifact.storage.base import is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
@@ -60,7 +62,21 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]+$")
+# Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
+_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+_LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
+
+
+def register_local_download_root(download_root: str) -> None:
+    _LOCAL_DOWNLOAD_ROOTS.add(os.path.realpath(download_root))
+
+
+def local_file_requires_organization(file_url: str) -> bool:
+    scheme = urlparse(file_url).scheme
+    if scheme not in ("", "file"):
+        return False
+    path = parse_uri_to_path(file_url) if scheme == "file" else file_url
+    return not Path(path).resolve().is_relative_to((Path(REPO_ROOT_DIR) / "downloads").resolve())
 
 
 def is_uploaded_file_id(value: str) -> bool:
@@ -248,6 +264,22 @@ class GuardedFileResponse:
 GuardedFileFetchHopResult: TypeAlias = GuardedFileRedirect | GuardedFileResponse
 
 
+def _origin_authorizable_url(url: str) -> str:
+    """Return *url* with query/fragment backslashes percent-encoded so the origin guard does not
+    refuse a benign Windows-style path carried there. Scheme, authority, and path keep their
+    backslashes so this stays fail-closed on an authority-parse divergence; at the download seam that
+    is defense-in-depth, because validate_and_pin (AnyHttpUrl/WHATWG) already normalizes authority and
+    path backslashes before the origin check. Only for the origin check — never the fetched URL."""
+    cut = len(url)
+    for separator in ("?", "#"):
+        index = url.find(separator)
+        if index != -1 and index < cut:
+            cut = index
+    if cut == len(url):
+        return url
+    return url[:cut] + url[cut:].replace("\\", "%5C")
+
+
 async def fetch_file_bytes(
     url: str,
     *,
@@ -258,6 +290,7 @@ async def fetch_file_bytes(
     authorize_request_hop: RedirectHopAuthorizer[GuardedFileFetchHopResult],
     download_scope: str | None = None,
     approved_initial_url: str | None = None,
+    normalize_query_backslashes: bool = False,
 ) -> GuardedFileResponse:
     """Fetch a bounded HTTP file through the validated, pinned, per-hop authorization seam.
 
@@ -272,10 +305,20 @@ async def fetch_file_bytes(
 
     resolver = SSRFGuardedResolver()
     current_url = await validate_and_pin_fetch_url(url, resolver)
-    if canonicalize_origin(current_url) is None:
+    origin_source = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
+    if canonicalize_origin(origin_source) is None:
         raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
     if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
         raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+
+    # The run-scoped authorizer canonicalizes target_url/initial_url via canonicalize_effect_target,
+    # which refuses a backslash exactly like the precheck above. Present it the same query-normalized
+    # form; current_url below stays raw so the encoded wire request and SSRF pinning are unchanged.
+    authz_initial_url = (
+        _origin_authorizable_url(approved_initial_url)
+        if normalize_query_backslashes and approved_initial_url is not None
+        else approved_initial_url
+    )
 
     request_headers = dict(headers or {})
     source_url: str | None = None
@@ -283,6 +326,7 @@ async def fetch_file_bytes(
     async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
         for _ in range(MAX_SAFE_REDIRECTS + 1):
             encoded_url = encode_url(current_url)
+            authz_target_url = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
 
             async def dispatch(_resolved_values: tuple[str, ...]) -> GuardedFileFetchHopResult:
                 async with session.get(
@@ -312,10 +356,10 @@ async def fetch_file_bytes(
                 authorize_request_hop,
                 RedirectHopAuthorization(
                     source_url=source_url,
-                    target_url=current_url,
+                    target_url=authz_target_url,
                     method="GET",
                     download_scope=download_scope,
-                    initial_url=approved_initial_url,
+                    initial_url=authz_initial_url,
                 ),
                 dispatch,
             )
@@ -323,7 +367,8 @@ async def fetch_file_bytes(
                 return result
 
             next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
-            if canonicalize_origin(next_url) is None:
+            next_origin_source = _origin_authorizable_url(next_url) if normalize_query_backslashes else next_url
+            if canonicalize_origin(next_origin_source) is None:
                 raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
             if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(allowed_redirect_origin):
                 raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
@@ -338,8 +383,8 @@ async def fetch_file_bytes(
     raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
 
 
-def _resolve_legacy_download_path(candidate_path: str) -> str:
-    """Resolve a legacy file:// path and confirm it is inside the repository downloads directory.
+def _resolve_legacy_download_path(candidate_path: str, *, organization_id: str | None = None) -> str:
+    """Resolve a legacy file:// path inside repository downloads or registered download snapshots.
 
     Containment is checked on the realpath with commonpath, so dot segments, percent-decoded dot
     segments, symlinks, and sibling directories such as ``downloads-evil`` cannot escape.
@@ -347,18 +392,36 @@ def _resolve_legacy_download_path(candidate_path: str) -> str:
     allowed_dir = os.path.realpath(os.path.join(REPO_ROOT_DIR, "downloads"))
     resolved_path = os.path.realpath(candidate_path)
     try:
-        inside_allowed_dir = os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir
+        if os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir:
+            return resolved_path
     except ValueError:
-        inside_allowed_dir = False
-    if not inside_allowed_dir:
-        LOG.warning(
-            "Legacy local file path traversal blocked",
-            candidate_path=candidate_path,
-            resolved_path=resolved_path,
-            allowed_dir=allowed_dir,
-        )
-        raise PermissionError("Local file path is outside the downloads directory")
-    return resolved_path
+        pass
+    if (
+        organization_id
+        and organization_id not in (".", "..")
+        and not os.path.isabs(organization_id)
+        and "/" not in organization_id
+        and "\\" not in organization_id
+    ):
+        for root in _LOCAL_DOWNLOAD_ROOTS:
+            root = os.path.realpath(root)
+            try:
+                organization_root = os.path.realpath(os.path.join(root, settings.ENV, organization_id))
+                if (
+                    os.path.commonpath((root, organization_root)) == root
+                    and os.path.commonpath((root, resolved_path)) == root
+                    and os.path.commonpath((organization_root, resolved_path)) == organization_root
+                ):
+                    return resolved_path
+            except ValueError:
+                continue
+    LOG.warning(
+        "Legacy local file path traversal blocked",
+        candidate_path=candidate_path,
+        resolved_path=resolved_path,
+        allowed_dir=allowed_dir,
+    )
+    raise PermissionError("Local file path is outside the downloads directory")
 
 
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
@@ -397,14 +460,16 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
             except (PermissionError, RuntimeError):
                 return False
 
-        # Allow file:// URLs only in local environment
         if scheme == "file":
+            # An uploaded file is named by its id, handled above. A raw path is a legacy local-only
+            # value: sharing the organization's storage prefix does not authorize reading it, since
+            # those prefixes also hold artifacts and browser-session files.
             if settings.ENV != "local":
                 return False
 
             # Validate the file path is within allowed directories
             try:
-                _resolve_legacy_download_path(parse_uri_to_path(url))
+                _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
                 return True
             except (ValueError, PermissionError):
                 return False
@@ -412,6 +477,20 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
         # Reject unsupported schemes
         return False
 
+    except Exception:
+        return False
+
+
+def _storage_manages_file(url: str, organization_id: str | None) -> bool:
+    """Whether the configured storage backend owns this file:// URI for this organization.
+
+    Ownership skips the legacy downloads-directory guard, so only an explicit True counts: a
+    backend, stub, or mock that merely fails to raise must never authorize an arbitrary path.
+    """
+    if organization_id is None:
+        return False
+    try:
+        return app.STORAGE.manages_local_file_uri(url, organization_id) is True
     except Exception:
         return False
 
@@ -431,7 +510,8 @@ async def download_file(
 
     # Resolved before the try below so a missing or cross-org file id fails loudly instead of
     # falling through to the HTTP fetch path with an id as the URL.
-    if is_uploaded_file_id(url):
+    names_uploaded_file = is_uploaded_file_id(url)
+    if names_uploaded_file:
         url = await resolve_uploaded_file_id(url, organization_id)
 
     requested_url = url
@@ -445,9 +525,13 @@ async def download_file(
                 LOG.info("Converting Google Drive link to direct download", url=url)
         is_google_drive_download = _is_google_drive_download_url(url)
 
-        # Check if URL is a cloud storage URI handled by the configured storage backend.
+        # Check if URL is a storage URI handled by the configured storage backend. A file:// URI
+        # reaches storage only when it came from an uploaded file's id: the org's storage prefixes
+        # also hold artifacts and browser-session files, so sharing a prefix authorizes nothing.
         parsed = urlparse(url)
-        if parsed.scheme in ("s3", "gs", "azure"):
+        if parsed.scheme in ("s3", "gs", "azure") or (
+            parsed.scheme == "file" and names_uploaded_file and _storage_manages_file(url, organization_id)
+        ):
             if organization_id is None:
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
@@ -462,7 +546,9 @@ async def download_file(
             data = await app.STORAGE.download_managed_file(url, organization_id)
             if data is None:
                 raise Exception(f"Failed to download managed storage file: {url}")
-            filename = url.split("/")[-1]
+            # A local upload's URI percent-encodes its name, which can triple a non-ASCII name's
+            # length past the filesystem limit; the decoded name is the one storage already wrote.
+            filename = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.scheme == "file" else url.split("/")[-1]
             temp_file = create_named_temporary_file(delete=False, file_name=filename)
             LOG.info(f"Downloaded file to {temp_file.name}")
             temp_file.write(data)
@@ -472,7 +558,7 @@ async def download_file(
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            local_path = _resolve_legacy_download_path(parse_uri_to_path(url))
+            local_path = _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
             LOG.info("Downloading file from local file system", url=url)
             return local_path
 
@@ -920,10 +1006,15 @@ def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: s
     return fallback_run_id
 
 
-def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
+def list_files_in_directory(
+    directory: Path, recursive: bool = False, *, attempt_started_at: datetime | None = None
+) -> list[str]:
     listed_files: list[str] = []
     for root, dirs, files in os.walk(directory):
-        listed_files.extend([os.path.join(root, file) for file in files])
+        for file in files:
+            path = os.path.join(root, file)
+            if attempt_started_at is None or is_file_from_retry_attempt(path, attempt_started_at):
+                listed_files.append(path)
         if not recursive:
             break
 
@@ -966,11 +1057,11 @@ def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:
 
 
 def list_downloading_files_in_directory(
-    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
+    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX, *, attempt_started_at: datetime | None = None
 ) -> list[str]:
     # check if there's any file is still downloading
     downloading_files: list[str] = []
-    for file in list_files_in_directory(directory):
+    for file in list_files_in_directory(directory, attempt_started_at=attempt_started_at):
         path = Path(file)
         if path.suffix == downloading_suffix:
             downloading_files.append(file)
@@ -1012,9 +1103,11 @@ async def check_downloading_files_and_wait_for_download_to_complete(
     organization_id: str,
     browser_session_id: str | None = None,
     timeout: float = BROWSER_DOWNLOAD_TIMEOUT,
+    *,
+    attempt_started_at: datetime | None = None,
 ) -> None:
     # check if there's any file is still downloading
-    downloading_files = list_downloading_files_in_directory(download_dir)
+    downloading_files = list_downloading_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
     if browser_session_id:
         files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
             organization_id=organization_id, browser_session_id=browser_session_id

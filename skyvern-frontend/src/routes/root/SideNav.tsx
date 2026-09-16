@@ -1,3 +1,4 @@
+import { DOCS_MCP_URL } from "@/util/externalLinks";
 import {
   BookmarkIcon,
   CalendarIcon,
@@ -244,7 +245,7 @@ function SideNav({ collapsed }: Props = {}) {
       children: [
         {
           label: "MCP",
-          to: "https://www.skyvern.com/docs/developers/getting-started/mcp",
+          to: DOCS_MCP_URL,
           external: true,
           icon: <RobotIcon className="size-3.5" />,
         },

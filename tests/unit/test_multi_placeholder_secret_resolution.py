@@ -17,6 +17,7 @@ def _make_context(secrets: dict[str, str]) -> WorkflowRunContext:
     ctx.values = {}
     ctx.parameters = {}
     ctx.workflow_run_outputs = {}
+    ctx.carried_block_labels = set()
     ctx.credential_totp_identifiers = {}
     return ctx
 

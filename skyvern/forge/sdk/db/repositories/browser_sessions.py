@@ -37,6 +37,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
+    resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
@@ -846,6 +847,23 @@ class BrowserSessionsRepository(BaseRepository):
             )
             await session.commit()
 
+    @db_operation("record_persistent_browser_session_close_reason")
+    async def record_persistent_browser_session_close_reason(
+        self, session_id: str, organization_id: str, close_reason: str
+    ) -> None:
+        """Write-once like close_requested_at, and only while the row is open: the reason that started
+        the teardown is the one that explains it, and a row that ended on its own keeps NULL."""
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.organization_id == organization_id)
+                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                .where(PersistentBrowserSessionModel.completed_at.is_(None))
+                .values(close_reason=func.coalesce(PersistentBrowserSessionModel.close_reason, close_reason))
+            )
+            await session.commit()
+
     @db_operation("is_persistent_browser_session_close_requested")
     async def is_persistent_browser_session_close_requested(self, session_id: str, organization_id: str) -> bool:
         """Whether a close has been requested. Narrow single-column read: the session activity calls
@@ -965,7 +983,9 @@ class BrowserSessionsRepository(BaseRepository):
                 raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
 
             if status:
-                persistent_browser_session.status = status
+                persistent_browser_session.status = resolve_terminal_status(
+                    status, persistent_browser_session.close_reason
+                )
                 if status in FINAL_STATUSES:
                     # A session that has reached a final status is no longer producing downloads, so the
                     # producer key must not survive it even when the caller omits completed_at.
@@ -1253,7 +1273,9 @@ class BrowserSessionsRepository(BaseRepository):
                 if persistent_browser_session.completed_at:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 persistent_browser_session.completed_at = naive_utc_now()
-                persistent_browser_session.status = "completed"
+                persistent_browser_session.status = resolve_terminal_status(
+                    "completed", persistent_browser_session.close_reason
+                )
                 persistent_browser_session.download_run_id = None
                 await session.commit()
                 await session.refresh(persistent_browser_session)

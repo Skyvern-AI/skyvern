@@ -22,10 +22,12 @@ import {
   TurnNarrativeState,
   formatElapsed,
   humanizeJudgeText,
+  hasObservedBlockEvidence,
   isBlockOk,
   isInterimOutcome,
   notConfirmedOutcome,
   parseUtcIsoMs,
+  terminalNarrativeText,
   toolActivityDisplayLabel,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
@@ -34,7 +36,12 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
+const MAX_DRAFTING_LABELS = 6;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const OUTCOME_NOT_CONFIRMED_REASON =
+  "the run finished without showing the goal was met";
+const QUESTION_PROSE_CLASSES =
+  "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]";
 const TERMINAL_PROSE_GRADIENT_CHARS = 32;
 const TERMINAL_PROSE_GRADIENT_SETTLE_MS = 420;
 
@@ -57,13 +64,39 @@ function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
   return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
 }
 
-function hasBlockOutcomeNotConfirmed(turn: TurnNarrativeState): boolean {
-  return turn.blocks.some(
-    (block) =>
+function isQuestionTurn(turn: TurnNarrativeState): boolean {
+  return (
+    !turn.cancelled &&
+    (turn.responseType === "ASK_QUESTION" || turn.responseKind === "clarify")
+  );
+}
+
+function blockIdentity(block: BlockState): string {
+  return block.workflowRunBlockId || block.label;
+}
+
+function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
+  if (notConfirmedOutcome(turn) === null) return null;
+
+  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
+    const block = turn.blocks[i]!;
+    if (
       block.state === "completed" &&
       block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole),
-  );
+      !isInterimOutcome(block.outcomeRole)
+    ) {
+      return blockIdentity(block);
+    }
+  }
+
+  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
+    const block = turn.blocks[i]!;
+    if (block.state === "failed" || block.state === "stopped") {
+      return blockIdentity(block);
+    }
+  }
+
+  return null;
 }
 
 interface BlockPalette {
@@ -476,6 +509,7 @@ interface FBlockRunProps {
   turnEnded: boolean;
   onSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
+  ownsOutcomeNotConfirmed?: boolean;
   // Narrator title for the row this card heads. The card's own status text
   // still names the block, so the title replaces only the label here.
   rowTitle?: string | null;
@@ -504,6 +538,7 @@ function FBlockRun({
   turnEnded,
   onSelect,
   outcomeReasonFallback,
+  ownsOutcomeNotConfirmed,
   rowTitle,
   flat,
   rowGlyph,
@@ -537,6 +572,12 @@ function FBlockRun({
   const prominentFailure = isFail && !quietFailure;
   const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
+  const collapsedOutcomeReason =
+    isOutcomeNotShown || ownsOutcomeNotConfirmed
+      ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
+      : null;
+  const ownsOutcomeReason =
+    ownsOutcomeNotConfirmed === true && collapsedOutcomeReason !== null;
 
   const accentBorder = isRunning
     ? "border-blue-400/60"
@@ -616,12 +657,14 @@ function FBlockRun({
         hasActions ||
         isFail ||
         isOutcomeNotShown ||
+        ownsOutcomeReason ||
         (detailAfterBlock !== null && detailAfterBlock !== undefined);
   const toggleable =
     hasExpandableDetail &&
     (expansion !== undefined ||
       isOk ||
       isOutcomeNotShown ||
+      ownsOutcomeReason ||
       isVerifying ||
       isRanNeutral ||
       isStopped);
@@ -677,9 +720,15 @@ function FBlockRun({
   ) : (
     palette.glyph
   );
-  const collapsedOutcomeReason = isOutcomeNotShown
-    ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
-    : null;
+  const failureActivity = block.activity.find(
+    (entry) => entry.kind === "tool_result",
+  )?.text;
+  const failureDetail =
+    failureActivity ?? collapsedOutcomeReason ?? "Halted — see run details.";
+  // Keep the amber evidence box only when it adds information beyond the
+  // failed row's rose failure box.
+  const showSeparateOutcomeReason =
+    ownsOutcomeReason && (!isFail || failureDetail !== collapsedOutcomeReason);
 
   const onHeaderClick = () => {
     onSelect?.(block.label);
@@ -699,11 +748,16 @@ function FBlockRun({
       ) : null}
       {!open && !expansion && isOutcomeNotShown ? (
         <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
-          Outcome not confirmed — the run finished without showing the goal was
-          met
+          {`Outcome not confirmed — ${OUTCOME_NOT_CONFIRMED_REASON}`}
           {collapsedOutcomeReason
             ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
             : "."}
+        </div>
+      ) : null}
+      {!open && ownsOutcomeReason && !isOutcomeNotShown ? (
+        <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
+          Outcome not confirmed —{" "}
+          {truncateOutcomeReason(collapsedOutcomeReason)}
         </div>
       ) : null}
     </>
@@ -750,18 +804,20 @@ function FBlockRun({
             ✕
           </span>
           <div className="text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200/90">
-            {block.activity.find((e) => e.kind === "tool_result")?.text ??
-              "Halted — see run details."}
+            {failureDetail}
           </div>
         </div>
       ) : null}
-      {isOutcomeNotShown ? (
+      {isOutcomeNotShown || showSeparateOutcomeReason ? (
         <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
-          <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
+          <span
+            aria-hidden="true"
+            className="text-[11px] font-bold text-amber-700 dark:text-amber-300"
+          >
             !
           </span>
           <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
-            {normalizeOutcomeReason(block.outcomeReason) ??
+            {collapsedOutcomeReason ??
               "The step ran, but the run did not demonstrate the goal was met."}
           </div>
         </div>
@@ -1121,6 +1177,7 @@ function FActivityLogRow({
   turnEnded,
   onBlockSelect,
   outcomeReasonFallback,
+  outcomeOwnerKey,
 }: {
   row: ActivityRowModel;
   open: boolean;
@@ -1131,6 +1188,7 @@ function FActivityLogRow({
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
+  outcomeOwnerKey?: string | null;
 }) {
   const last = row.entries[row.entries.length - 1];
   // A lone run card becomes the row itself, so the collapsed line keeps the
@@ -1208,6 +1266,29 @@ function FActivityLogRow({
 
   const lineContent =
     soloBlock || last === undefined ? null : entryLine(last, row.label);
+  // These arrive as the raw authored identifiers (`open_page`), so they get the
+  // same humanizing every other surface applies — otherwise a block reads
+  // `open_page` here and "Open Page" in its own card a second later. The
+  // backend caps its own list at 50; a chat pane this narrow reads about three
+  // labels to a line, so capping the head keeps already-read text still while
+  // only the tail counts up.
+  const draftingLine =
+    row.draftingLabels === undefined ? null : (
+      <>
+        <span>Writing the workflow code</span>
+        {row.draftingLabels.length === 0 ? null : (
+          <span className="text-muted-foreground dark:text-slate-500">
+            {` · ${row.draftingLabels
+              .slice(0, MAX_DRAFTING_LABELS)
+              .map(humanizeBlockLabel)
+              .join(", ")}`}
+            {row.draftingLabels.length > MAX_DRAFTING_LABELS
+              ? ` +${row.draftingLabels.length - MAX_DRAFTING_LABELS} more`
+              : ""}
+          </span>
+        )}
+      </>
+    );
   // A mark reports an outcome, so only a step that returned can carry one — a
   // call still in flight has no outcome yet. Beyond that, a browse or write
   // step that worked says so in its own sentence, so only a run's result and
@@ -1271,6 +1352,7 @@ function FActivityLogRow({
       turnEnded={turnEnded}
       onSelect={onBlockSelect}
       outcomeReasonFallback={outcomeReasonFallback}
+      ownsOutcomeNotConfirmed={blockIdentity(soloBlock) === outcomeOwnerKey}
       rowTitle={row.label}
       flat
       rowGlyph={kindGlyph}
@@ -1314,7 +1396,7 @@ function FActivityLogRow({
       onClick={hasDetail ? onToggle : undefined}
       expanded={hasDetail ? open : undefined}
     >
-      {lineContent?.content}
+      {draftingLine ?? lineContent?.content}
       {mark === null ? null : (
         <span
           className={
@@ -1361,6 +1443,7 @@ function FActivityLogRow({
               turnEnded={turnEnded}
               onSelect={onBlockSelect}
               outcomeReasonFallback={outcomeReasonFallback}
+              ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
               flat
               quietFailure
             />
@@ -1382,6 +1465,7 @@ function FActivityLog({
   interactionRef,
 }: FActivityLogProps) {
   const outcomeReasonFallback = notConfirmedDisplayReason(turn);
+  const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
   const { rows, focusIndex } = useMemo(() => deriveActivityLog(turn), [turn]);
   // Signed, not a bare id set: a click on the live row has to be able to mean
   // "closed", or folding the active row would silently pin it open instead.
@@ -1468,6 +1552,7 @@ function FActivityLog({
               turnEnded={turnEnded}
               onBlockSelect={onBlockSelect}
               outcomeReasonFallback={outcomeReasonFallback}
+              outcomeOwnerKey={outcomeOwnerKey}
             />
           </div>
         );
@@ -1490,8 +1575,9 @@ function DetailView({
   activityInteractionRef,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
-  const blockShowsOutcomeNotConfirmed = hasBlockOutcomeNotConfirmed(turn);
-  const hasBlocks = turn.blocks.length > 0;
+  const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
+  const observedBlocks = turn.blocks.filter(hasObservedBlockEvidence);
+  const hasBlocks = observedBlocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
   // Hide the "Designed the workflow" cluster on terminal turns that produced
@@ -1530,13 +1616,14 @@ function DetailView({
 
         {!showChecklist && hasBlocks ? (
           <div className="flex flex-col gap-1">
-            {turn.blocks.map((b) => (
+            {observedBlocks.map((b) => (
               <FBlockRun
                 key={b.workflowRunBlockId || b.label}
                 block={b}
                 turnEnded={turn.terminal !== null}
                 onSelect={onBlockSelect}
                 outcomeReasonFallback={collapsedOutcomeReason}
+                ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
               />
             ))}
           </div>
@@ -1548,22 +1635,44 @@ function DetailView({
           </div>
         ) : null}
 
-        {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
-          <div className="text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-            <CopilotMarkdown
-              text={humanizeJudgeText(
-                turn.narrativeSummary?.trim() ||
-                  turn.terminalMessage?.trim() ||
-                  "",
-              )}
-            />
+        {notConfirmedOutcome(turn) !== null && outcomeOwnerKey === null ? (
+          <div className="flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
+            <span
+              aria-hidden="true"
+              className="text-[11px] font-bold text-amber-700 dark:text-amber-300"
+            >
+              !
+            </span>
+            <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
+              <span className="font-semibold">Outcome not confirmed</span>
+              {` — ${
+                collapsedOutcomeReason !== null
+                  ? truncateOutcomeReason(collapsedOutcomeReason)
+                  : OUTCOME_NOT_CONFIRMED_REASON
+              }`}
+            </div>
           </div>
         ) : null}
 
-        {collapsedOutcomeReason && !blockShowsOutcomeNotConfirmed ? (
-          <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-300">
-            <span className="font-medium">Outcome not confirmed</span>
-            {` — ${truncateOutcomeReason(collapsedOutcomeReason)}`}
+        {/* terminalProseTone's question branch without its evidence gate: an
+            ask that followed a run keeps the rail here, beside the evidence,
+            rather than replacing the card with prose-only chrome. */}
+        {turn.terminal &&
+        (turn.narrativeSummary ||
+          turn.terminalMessage ||
+          turn.budgetExpiry?.reportProduced === false) ? (
+          <div
+            data-testid="copilot-detail-prose"
+            className={[
+              "text-[13px] leading-[1.55]",
+              isQuestionTurn(turn)
+                ? QUESTION_PROSE_CLASSES
+                : "text-foreground dark:text-slate-200",
+            ].join(" ")}
+          >
+            <CopilotMarkdown
+              text={humanizeJudgeText(terminalNarrativeText(turn))}
+            />
           </div>
         ) : null}
       </div>
@@ -1592,9 +1701,9 @@ function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
   // Agent language is freeform, so parsing it to decide whether the user needs
   // to respond would turn presentation into a brittle copy contract.
   if (turn.terminal !== "response" || turn.cancelled) return null;
-  // A run whose outcome was not demonstrated needs its existing warning and
-  // expandable evidence. Freeform clarification prose cannot replace that
-  // inspection path.
+  // A run whose outcome was not demonstrated needs its recorded outcome
+  // evidence. Freeform clarification prose cannot replace that inspection
+  // path.
   if (notConfirmedOutcome(turn) !== null) return null;
   if (
     turn.proposalDisposition === "review_untested" ||
@@ -1605,7 +1714,7 @@ function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
   // A terminal question can follow a partial build or test. Keep recorded work
   // on the expandable evidence path rather than losing it to prose-only chrome.
   if (hasRecordedTerminalEvidence(turn)) return null;
-  if (turn.responseKind === "clarify" || turn.responseType === "ASK_QUESTION") {
+  if (isQuestionTurn(turn)) {
     return "question";
   }
   if (
@@ -1682,7 +1791,7 @@ function TerminalProse({
       className={[
         "text-[13px] leading-[1.55]",
         tone === "question"
-          ? "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]"
+          ? QUESTION_PROSE_CLASSES
           : "text-foreground dark:text-slate-200",
       ].join(" ")}
     >
@@ -1709,9 +1818,7 @@ export function NarrativeView({
   workingRowActive,
 }: NarrativeViewProps) {
   const proseTone = terminalProseTone(turn);
-  const proseText = humanizeJudgeText(
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
-  );
+  const proseText = humanizeJudgeText(terminalNarrativeText(turn));
   const activityInteractionRef = useRef<string | null>(null);
 
   if (proseTone !== null && proseText) {

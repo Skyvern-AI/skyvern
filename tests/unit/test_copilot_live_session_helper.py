@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
@@ -10,10 +12,23 @@ from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 import skyvern.forge.sdk.copilot.agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 
 _UNSET_UPSTREAM = "<unset>"
+
+
+def _ctx() -> AgentContext:
+    return AgentContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wpid-1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(),
+    )
 
 
 class _FakeBrowser:
@@ -24,6 +39,11 @@ class _FakeBrowser:
 class _FakeBrowserContext:
     browser = _FakeBrowser()
     _impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+
+
+@asynccontextmanager
+async def _browser_operation(_session_id: str, state: object) -> AsyncIterator[BrowserOperation]:
+    yield BrowserOperation(state, BrowserRetirement())
 
 
 def _request(browser_session_id: str | None = None, wpid: str = "wpid-1") -> WorkflowCopilotChatRequest:
@@ -73,7 +93,9 @@ async def test_no_id_returns_none_and_does_not_call_db(monkeypatch: pytest.Monke
         SimpleNamespace(get_debug_session_by_browser_session_id=debug_mock),
     )
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id=None), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id=None), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result is None
     debug_mock.assert_not_awaited()
@@ -87,7 +109,9 @@ async def test_unknown_id_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
         SimpleNamespace(get_debug_session_by_browser_session_id=AsyncMock(return_value=None)),
     )
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_unknown"), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_unknown"), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result is None
 
@@ -107,6 +131,7 @@ async def test_wrong_workflow_falls_back(monkeypatch: pytest.MonkeyPatch) -> Non
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_foreign", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result is None
@@ -135,6 +160,7 @@ async def test_persistent_row_missing_falls_back(monkeypatch: pytest.MonkeyPatch
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_unknown_persistent", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result is None
@@ -165,6 +191,7 @@ async def test_status_in_final_state_falls_back(monkeypatch: pytest.MonkeyPatch)
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_done", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result is None
@@ -195,6 +222,7 @@ async def test_browser_address_unset_falls_back(monkeypatch: pytest.MonkeyPatch)
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_booting", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result is None
@@ -224,6 +252,7 @@ async def test_default_manager_registered_browser_state_allows_missing_browser_a
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_booted_local", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result == "pbs_booted_local"
@@ -254,6 +283,7 @@ async def test_default_manager_unattachable_registered_browser_state_falls_back(
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_not_ready", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result is None
@@ -283,6 +313,7 @@ async def test_owned_and_running_returns_id(monkeypatch: pytest.MonkeyPatch) -> 
     result = await _resolve_live_browser_session_id(
         _request(browser_session_id="pbs_live", wpid="wpid-1"),
         organization_id="org-1",
+        ctx=_ctx(),
     )
 
     assert result == "pbs_live"
@@ -300,7 +331,9 @@ async def test_db_exception_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_x"), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_x"), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result is None
 
@@ -329,6 +362,7 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
         SimpleNamespace(
             get_browser_state=get_browser_state_mock,
             create_session=create_session_mock,
+            browser_operation=_browser_operation,
         ),
     )
 
@@ -371,7 +405,9 @@ async def test_liveness_lookup_failure_keeps_the_session(monkeypatch: pytest.Mon
         AsyncMock(side_effect=SQLATimeoutError("QueuePool limit of size 20 overflow 20 reached")),
     )
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_live"), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result == "pbs_live"
 
@@ -414,7 +450,9 @@ async def test_unavailable_health_signal_keeps_the_session_at_the_first_gate(
     state = SimpleNamespace(browser_context=_RaisingContext())
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=state))
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_live"), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result == "pbs_live"
 
@@ -458,6 +496,8 @@ async def test_a_session_the_relay_declared_unreachable_is_not_reused(monkeypatc
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_session", AsyncMock(return_value=dead))
     monkeypatch.setattr(agent_module, "_manager_can_probe_registered_browser_state", lambda: False)
 
-    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_test"), organization_id="org-1")
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_test"), organization_id="org-1", ctx=_ctx()
+    )
 
     assert result is None

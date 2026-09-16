@@ -45,7 +45,7 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.utils.document import get_main_document_loader_id
-from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script, with_dom_utils
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -989,7 +989,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         return self.element_tree_trimmed
 
     async def start_listen_dom_increment(self, element: ElementHandle | None = None) -> None:
-        js_script = "async (element) => await startGlobalIncrementalObserver(element)"
+        js_script = with_dom_utils(
+            "async (element) => await startGlobalIncrementalObserver(element)", ("startGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script, arg=element)
 
     async def stop_listen_dom_increment(self) -> None:
@@ -997,7 +999,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         js_script = "() => window.globalObserverForDOMIncrement === undefined"
         if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
             return
-        js_script = "async () => await stopGlobalIncrementalObserver()"
+        js_script = with_dom_utils(
+            "async () => await stopGlobalIncrementalObserver()", ("stopGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(
             frame=self.skyvern_frame.get_frame(),
             expression=js_script,

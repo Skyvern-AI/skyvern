@@ -878,6 +878,18 @@ CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyver
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.closeBrowserSession("pbs_123");
 """
+EXTEND_BROWSER_SESSION_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+browser_session = await skyvern.extend_browser_session(browser_session_id="pbs_123", additional_minutes=30)
+print(browser_session.timeout)  # the session's new total budget in minutes
+"""
+# No TypeScript sample until the Fern regen ships extendBrowserSession in @skyvern/client.
+EXTEND_BROWSER_SESSION_CODE_SAMPLE_CURL = """curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_123/extend \\
+  -H "x-api-key: YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"additional_minutes": 30}'
+"""
 GET_BROWSER_SESSION_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")

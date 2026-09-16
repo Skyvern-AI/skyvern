@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from contextlib import suppress
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
+from itertools import count
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot import agent as copilot_agent
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
+from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
+from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -21,8 +32,24 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
 )
+from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
+from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import BlockType
+from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
@@ -109,6 +136,365 @@ def stub_artifact_app(
     )
     monkeypatch.setattr(run_execution_module, "app", fake_app)
     return retrieved_ids
+
+
+_RUN_SESSION_ID = "pbs_run"
+_CHAT_SESSION_ID = "pbs_chat"
+# The chat session answers with a different proxy than the run session, so a lookup that reads the
+# wrong session shows up as the wrong label instead of passing.
+_CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
+
+
+def _fake_workflow_run(status: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        status=WorkflowRunStatus(status),
+        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        browser_session_id=None,
+        failure_reason=None,
+    )
+
+
+def install_get_run_results_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    blocks: list[MagicMock],
+    run_status: str = "failed",
+    dispatch_to_worker: bool = True,
+    workflow_parameters: list[dict[str, str]] | None = None,
+    attach_action_traces: Callable[..., Awaitable[None]] | None = None,
+    recent_actions: list[MagicMock] | None = None,
+    attach_failed_block_screenshots: Callable[..., Awaitable[None]] | None = None,
+) -> SimpleNamespace:
+    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with."""
+    run = SimpleNamespace(
+        status=run_status,
+        workflow_permanent_id="wpid-1",
+        workflow_id="wf-1",
+        failure_reason=None,
+        browser_session_id="pbs-1",
+    )
+    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+
+    class _AppStub:
+        class DATABASE:
+            class workflow_runs:
+                get_workflow_run = AsyncMock(return_value=run)
+
+            class workflows:
+                get_workflow = AsyncMock(return_value=None)
+                get_workflow_for_workflow_run = AsyncMock(return_value=workflow)
+
+            class observer:
+                get_workflow_run_blocks = AsyncMock(return_value=blocks)
+
+            class tasks:
+                get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+
+        class AGENT_FUNCTION:
+            should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=dispatch_to_worker)
+
+    monkeypatch.setattr(run_execution_module, "app", _AppStub())
+    if attach_action_traces is not None:
+        monkeypatch.setattr(run_execution_module, "_attach_action_traces", attach_action_traces)
+    # Stubbed by default so most callers need no artifact store; pass the real function to assert
+    # that at-failure evidence actually reaches the packet rather than that the call was made.
+    monkeypatch.setattr(
+        run_execution_module,
+        "_attach_failed_block_screenshots",
+        attach_failed_block_screenshots or AsyncMock(),
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={}))
+    monkeypatch.setattr(run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
+    return SimpleNamespace(
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        copilot_total_timeout_exceeded=False,
+        last_run_blocks_workflow_run_id=None,
+        proposal_workflow_run_id=None,
+        dispatched_run_ids_this_turn=set(),
+    )
+
+
+def run_result_action_row(
+    task_id: str,
+    action_type: ActionType,
+    status: ActionStatus,
+    *,
+    code_line: int | None = None,
+) -> MagicMock:
+    action = MagicMock()
+    action.task_id = task_id
+    action.step_id = f"stp_{task_id}"
+    action.action_type = action_type
+    action.status = status
+    action.reasoning = None
+    action.element_id = None
+    action.response = None
+    action.output = {"code_line": code_line} if code_line is not None else None
+    return action
+
+
+def run_result_block_row(
+    label: str,
+    status: str,
+    final_url: str | None = None,
+    *,
+    failure_reason: str | None = None,
+    error_codes: list[str] | None = None,
+    task_id: str | None = None,
+) -> MagicMock:
+    row = MagicMock()
+    row.label = label
+    row.block_type = SimpleNamespace(name="code")
+    row.status = status
+    row.failure_reason = failure_reason
+    row.error_codes = error_codes or []
+    row.output = None
+    row.task_id = task_id
+    row.final_url = final_url
+    row.workflow_run_block_id = f"wrb_{label}"
+    return row
+
+
+async def install_run_blocks_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow_yaml: str,
+    polled_status: str,
+    dispatch_to_worker: bool = False,
+    terminal_blocks: list[WorkflowRunBlock] | None = None,
+    recent_actions: list[MagicMock] | None = None,
+    run_proxy_location: ProxyLocationInput = None,
+    run_session_proxy_location: ProxyLocationInput = None,
+) -> dict[str, Any]:
+    """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
+    polled run parked on ``polled_status`` so the watchdog decides the exit."""
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=workflow_yaml,
+    )
+    now = datetime.now(timezone.utc)
+    organization = Organization(
+        organization_id="org-1",
+        organization_name="Test Org",
+        created_at=now,
+        modified_at=now,
+    )
+    captured: dict[str, Any] = {"workflow": workflow, "executor_cancelled": False}
+
+    database = MagicMock()
+    database.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
+    database.workflows.get_workflow = AsyncMock(return_value=workflow)
+    database.organizations.get_organization = AsyncMock(return_value=organization)
+    persisted_output_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, OutputParameter)]
+    persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
+    database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
+    database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
+    database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
+    monkeypatch.setattr(forge_app, "DATABASE", database)
+
+    async def _execute_workflow(**_kwargs: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            captured["executor_cancelled"] = True
+            raise
+
+    workflow_service = MagicMock()
+    workflow_service.get_workflow_parameters = AsyncMock(return_value=persisted_workflow_params)
+    workflow_service.execute_workflow = AsyncMock(side_effect=_execute_workflow)
+    workflow_service.create_copilot_dispatch_draft_version = AsyncMock(return_value=workflow)
+    monkeypatch.setattr(forge_app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "should_dispatch_copilot_block_run_to_worker",
+        AsyncMock(return_value=dispatch_to_worker),
+    )
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "allow_copilot_inline_code_execution",
+        MagicMock(return_value=False),
+    )
+
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_paused",
+        workflow_id="w_source",
+        sequential_credential_id=None,
+        proxy_location=run_proxy_location,
+        runnable_id=None,
+    )
+    monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
+
+    async def _get_session(session_id: str, _organization_id: str | None = None) -> SimpleNamespace:
+        proxy_location = run_session_proxy_location if session_id == _RUN_SESSION_ID else _CHAT_SESSION_PROXY_LOCATION
+        return SimpleNamespace(proxy_location=proxy_location, runnable_id=None)
+
+    monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
+
+    polled_run = _fake_workflow_run(status=polled_status)
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any, Any]:
+        return polled_run, now, now
+
+    monkeypatch.setattr(run_execution_module, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution_module, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(run_execution_module, "_fallback_page_info", AsyncMock(return_value=("", "")))
+
+    association = ActiveRunSessionAssociation(
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        debug_browser_session_id=_CHAT_SESSION_ID,
+        run_browser_session_id=_RUN_SESSION_ID,
+        workflow_run_id="wr_paused",
+        turn_id="turn-1",
+        generation="gen-1",
+        expires_at=now + timedelta(minutes=5),
+    )
+    captured["publish"] = AsyncMock(return_value=association)
+    captured["clear"] = AsyncMock(return_value=True)
+    captured["cancel_run_task"] = AsyncMock(return_value=None)
+    captured["cooperative_cancel"] = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "publish_active_run_session", captured["publish"])
+    monkeypatch.setattr(run_execution_module, "clear_active_run_session", captured["clear"])
+    monkeypatch.setattr(run_execution_module, "_cancel_run_task_if_not_final", captured["cancel_run_task"])
+    monkeypatch.setattr(run_execution_module, "_cooperative_cancel_dispatched_run", captured["cooperative_cancel"])
+    if dispatch_to_worker:
+        captured["worker_execute"] = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            run_execution_module.AsyncExecutorFactory,
+            "get_executor",
+            MagicMock(return_value=SimpleNamespace(execute_workflow=captured["worker_execute"])),
+        )
+        monkeypatch.setattr(run_execution_module, "_delete_dispatch_draft_if_run_final", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            run_execution_module, "_capture_dispatched_terminal_page_evidence", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={})
+        )
+    return captured
+
+
+HANDBACK_WORKFLOW_YAML = """
+title: extraction example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+"""
+
+
+def terminal_extraction_block(
+    status: str,
+    *,
+    final_url: str | None = None,
+    label: str = "extract_heading",
+    failure_reason: str | None = None,
+    task_id: str | None = None,
+) -> WorkflowRunBlock:
+    return WorkflowRunBlock(
+        label=label,
+        block_type=BlockType.EXTRACTION,
+        status=status,
+        final_url=final_url,
+        task_id=task_id,
+        failure_reason=(
+            (failure_reason or 'Timeout exceeded: waiting for locator("#heading") to be visible')
+            if status == "failed"
+            else None
+        ),
+        workflow_run_block_id=f"wrb_{label}",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+        modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+    )
+
+
+SEARCH_THEN_SELECT_WORKFLOW_YAML = """
+title: search then select
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: run_search
+      url: https://fixture.test
+      data_extraction_goal: Extract the search results.
+    - block_type: extraction
+      label: select_first_result
+      data_extraction_goal: Extract the selected result.
+"""
+
+
+def page_only_failed_block() -> WorkflowRunBlock:
+    """A failed block with no failure_reason, so the post-run page is its only structural signal."""
+    return WorkflowRunBlock(
+        label="extract_heading",
+        block_type=BlockType.EXTRACTION,
+        status="failed",
+        failure_reason=None,
+        workflow_run_block_id="wrb_extract_heading",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+        modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+    )
+
+
+def same_run_page_evidence() -> dict[str, object]:
+    return {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_paused",
+        "source_browser_session_id": "pbs_run",
+        "current_url": "https://example.com/done",
+        "page_title": "Done",
+        "inspected_url": "https://example.com/done",
+    }
+
+
+def count_record_and_send(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    counts = {"record": 0, "send": 0}
+    real_record = run_execution_module.record_build_test_outcome
+    real_send = run_execution_module._send_run_outcome_update
+
+    def _record(ctx: object, outcome: object) -> None:
+        counts["record"] += 1
+        real_record(ctx, outcome)
+
+    async def _send(*args: object, **kwargs: object) -> None:
+        counts["send"] += 1
+        await real_send(*args, **kwargs)
+
+    monkeypatch.setattr(run_execution_module, "record_build_test_outcome", _record)
+    monkeypatch.setattr(run_execution_module, "_send_run_outcome_update", _send)
+    return counts
+
+
+async def handback_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    polled_status: str,
+    block_status: str,
+    terminal_blocks: list[WorkflowRunBlock] | None = None,
+) -> CopilotContext:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status=polled_status,
+        terminal_blocks=terminal_blocks or [terminal_extraction_block(block_status)],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    return ctx
 
 
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
@@ -297,3 +683,273 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+
+
+SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
+    "registry_missing",
+    "registry_incomplete",
+    "registry_other_run",
+    "run_still_active",
+    "run_id_unclaimed",
+    "second_browser_run_replaced_registry",
+    "same_session_earlier_run_unbound",
+]
+
+
+def taint_by_terminal_run(ctx: Any, *, workflow_run_id: str, session_id: str) -> None:
+    """Mark ``session_id`` as the page a finished credential run left, attributed to that run."""
+    record_sensitive_origin_run_taint(ctx, workflow_run_id=workflow_run_id, session_id=session_id)
+
+
+def remove_sensitive_disclosure_prerequisite(ctx: Any, arm: str) -> None:
+    """Drop exactly one prerequisite of the terminal-matching-registry disclosure route."""
+    registry = ctx.origin_run_redaction_registry
+    if arm == "registry_missing":
+        ctx.origin_run_redaction_registry = None
+    elif arm == "registry_incomplete":
+        ctx.origin_run_redaction_registry = replace(registry, contains_all_sensitive_values=False)
+    elif arm == "registry_other_run":
+        ctx.origin_run_redaction_registry = replace(registry, workflow_run_id="wr_unrelated")
+    elif arm == "run_still_active":
+        register_sensitive_origin_run_lease(
+            ctx, workflow_run_id=registry.workflow_run_id, session_id=ctx.browser_session_id
+        )
+    elif arm == "run_id_unclaimed":
+        ctx.last_run_blocks_workflow_run_id = None
+    elif arm == "second_browser_run_replaced_registry":
+        # A later run on another browser finished with a complete registry and is the run the
+        # model now claims; the page under inspection was tainted by the earlier run, whose
+        # values were never bound. The complete registry must not unlock that page.
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_second", session_id="pbs_second_browser")
+        ctx.last_run_blocks_workflow_run_id = "wr_second"
+        ctx.origin_run_redaction_registry = replace(
+            registry, workflow_run_id="wr_second", contains_all_sensitive_values=True
+        )
+    elif arm == "same_session_earlier_run_unbound":
+        # An earlier run on this same page ended without completing its registry, so a value
+        # it entered may be on the page while the claimed run's complete registry knows nothing of it.
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_earlier", session_id=ctx.browser_session_id)
+    else:
+        raise AssertionError(f"unknown arm {arm}")
+
+
+TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")
+
+
+async def run_turn_to_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    exit_path: str,
+    session_id: str | None = "pbs_turn",
+    browser_state: MagicMock | None = None,
+    resolve_session_id: str | None = None,
+    eval_mode: CopilotEvalMode | None = None,
+    turn_origin: TurnOrigin = TurnOrigin.interactive,
+    attach_through: str = "resolve",
+    on_attached: Callable[[CopilotContext], Awaitable[None]] | None = None,
+    get_browser_state: AsyncMock | None = None,
+) -> tuple[AgentResult | None, BaseException | None]:
+    """Drive one real ``run_copilot_agent`` turn to ``exit_path`` against ``manager``, attaching
+    through the real resolve funnel so the finalizer releases only what that funnel recorded."""
+    manager.get_browser_state = get_browser_state or AsyncMock(return_value=browser_state)
+    if turn_origin == TurnOrigin.runtime_self_heal and browser_state is not None:
+        browser_state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    async def _exit(ctx: CopilotContext) -> None:
+        if on_attached is not None:
+            await on_attached(ctx)
+        if exit_path == "model_error":
+            raise RuntimeError("model stream failed")
+        if exit_path == "deadline":
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=901.0, iteration=1)
+            raise CopilotTotalTimeoutError()
+        if exit_path == "cancel":
+            raise asyncio.CancelledError()
+
+    async def fake_turn(**kwargs: Any) -> SimpleNamespace:
+        ctx = kwargs["ctx"]
+        ctx.browser_session_id = session_id
+        ctx.turn_origin = turn_origin
+        ctx.injected_browser_state = browser_state
+        ctx.heal_workflow_run_id = "wr_heal"
+        if attach_through == "liveness_probe":
+            assert session_id is not None
+            await copilot_agent._registered_browser_state_liveness(session_id, ctx.organization_id, ctx)
+        elif attach_through == "resolve":
+            await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=resolve_session_id)
+        await _exit(ctx)
+        return SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[])
+
+    stub_copilot_agent_loop(monkeypatch, fake_turn)
+    workflow_run_id: str | None = None
+    if attach_through == "prior_run_hydration":
+        assert session_id is not None
+        workflow_run_id = "wr_origin"
+        origin = RepairOriginBinding(
+            workflow_run_id=workflow_run_id,
+            browser_session_id=session_id,
+            refusal=None,
+            status=WorkflowRunStatus.failed,
+        )
+        monkeypatch.setattr(copilot_agent, "seed_repair_origin_run", AsyncMock(return_value=origin))
+
+        async def hydrate_and_exit(ctx: CopilotContext, *, workflow_run_id: str | None) -> None:
+            await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=session_id)
+            await _exit(ctx)
+
+        monkeypatch.setattr(copilot_agent, "hydrate_prior_run_packet", hydrate_and_exit)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(copilot_runtime, "app", mock_app)
+    monkeypatch.setattr(copilot_agent, "_manager_can_probe_registered_browser_state", lambda: True)
+
+    try:
+        result = await run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                workflow_permanent_id="wfp-1",
+                workflow_id="wf-1",
+                workflow_copilot_chat_id="chat-1",
+                message="read the page title and tell me what it is",
+                workflow_yaml="",
+                workflow_run_id=workflow_run_id,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            eval_mode=eval_mode,
+        )
+    except BaseException as exc:
+        return None, exc
+    return result, None
+
+
+async def run_concurrent_turns_on_one_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_states: tuple[MagicMock, MagicMock],
+    exit_order: tuple[int, int] = (0, 1),
+    after_first_exit: Callable[[], None] = lambda: None,
+) -> None:
+    """Two turns attached to one session, each on its own generation, released in ``exit_order``;
+    ``after_first_exit`` is the point where only the earlier turn's release has run."""
+    attached = (asyncio.Event(), asyncio.Event())
+    may_exit = (asyncio.Event(), asyncio.Event())
+    arrivals = count()
+
+    async def _gate() -> None:
+        index = next(arrivals)
+        attached[index].set()
+        await may_exit[index].wait()
+
+    def _turn(index: int) -> asyncio.Task[tuple[AgentResult | None, BaseException | None]]:
+        return asyncio.ensure_future(
+            run_turn_to_exit(
+                monkeypatch,
+                manager=manager,
+                exit_path="normal",
+                browser_state=browser_states[index],
+                on_attached=lambda _ctx: _gate(),
+            )
+        )
+
+    first = _turn(0)
+    await asyncio.wait_for(attached[0].wait(), 5)
+    second = _turn(1)
+    await asyncio.wait_for(attached[1].wait(), 5)
+    turns = (first, second)
+
+    may_exit[exit_order[0]].set()
+    await turns[exit_order[0]]
+    after_first_exit()
+    may_exit[exit_order[1]].set()
+    await turns[exit_order[1]]
+
+
+async def run_turn_attaching_during_release(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_states: tuple[MagicMock, MagicMock],
+    lookup_already_in_flight: bool = False,
+) -> None:
+    """A second turn resolves the session while the first turn's exit evict is still in flight.
+    The manager hands out the first generation until that evict completes and the second after.
+    With ``lookup_already_in_flight`` the second turn's lookup was issued before the release began
+    and only answers once the evict is under way."""
+    first_attached, evicting, evicted, contested = (asyncio.Event() for _ in range(4))
+
+    async def _evict(*_args: object, **_kwargs: object) -> bool:
+        if evicted.is_set():
+            return True
+        evicting.set()
+        with suppress(TimeoutError):
+            await asyncio.wait_for(contested.wait(), 1.0)
+        evicted.set()
+        return True
+
+    async def _current_generation(**_kwargs: object) -> MagicMock:
+        first_attached.set()
+        if evicting.is_set() and not evicted.is_set():
+            contested.set()
+        return browser_states[1] if evicted.is_set() else browser_states[0]
+
+    async def _generation_answered_mid_release(**kwargs: object) -> MagicMock:
+        await asyncio.wait_for(evicting.wait(), 5)
+        return await _current_generation(**kwargs)
+
+    manager.evict_cached_browser_state = AsyncMock(side_effect=_evict)
+    first = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=browser_states[0],
+            get_browser_state=AsyncMock(side_effect=_current_generation),
+        )
+    )
+    second_lookup = _current_generation
+    if lookup_already_in_flight:
+        await asyncio.wait_for(first_attached.wait(), 5)
+        second_lookup = _generation_answered_mid_release
+    else:
+        await asyncio.wait_for(evicting.wait(), 5)
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        browser_state=browser_states[1],
+        get_browser_state=AsyncMock(side_effect=second_lookup),
+    )
+    await first
+
+
+async def run_turn_cancelled_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manager: MagicMock,
+    browser_state: MagicMock,
+    evicting: asyncio.Event,
+    on_attached: Callable[[CopilotContext], Awaitable[None]] | None = None,
+) -> tuple[AgentResult | None, BaseException | None]:
+    """Cancel the turn once its exit release has reached the manager, which is the only window in
+    which a cancel can land on the finalizer rather than on the turn's own work."""
+    turn = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=browser_state,
+            on_attached=on_attached,
+        )
+    )
+    await asyncio.wait_for(evicting.wait(), 5)
+    turn.cancel()
+    return await turn

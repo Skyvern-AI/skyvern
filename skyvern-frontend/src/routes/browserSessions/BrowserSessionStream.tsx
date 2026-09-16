@@ -202,10 +202,6 @@ function BrowserSessionStream({
       enabled: recordingChannelEnabled,
       exfiltrate: !!exfiltrate,
       workflowPermanentId: workflowPermanentId ?? null,
-      getFrameDataUrl: () =>
-        streamImgSrcRef.current
-          ? `data:image/${streamFormat};base64,${streamImgSrcRef.current}`
-          : null,
       clipboard: "message",
       reconnectTrigger: recordingReconnectTrigger,
       onConnectionChange: handleRecordingConnectionChange,

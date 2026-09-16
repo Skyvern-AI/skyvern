@@ -1,5 +1,7 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
+import { RunEngine } from "@/api/types";
+import { RunEngineSelector } from "@/components/EngineSelector";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import {
@@ -59,7 +61,14 @@ function ValidationEditorBody({
     continueOnFailure,
     nextLoopOnFailure,
     disableCache,
+    engine,
   } = data;
+  const availableEngines = [
+    RunEngine.SkyvernV1,
+    RunEngine.SkyvernV3,
+    RunEngine.OpenaiCua,
+    RunEngine.AnthropicCua,
+  ];
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -124,6 +133,19 @@ function ValidationEditorBody({
                   availableOutputParameters={outputParameterKeys}
                   parameters={parameterKeys}
                   onParametersChange={(next) => update({ parameterKeys: next })}
+                />
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
+                    Engine
+                  </Label>
+                </div>
+                <RunEngineSelector
+                  value={engine}
+                  onChange={(next) => update({ engine: next })}
+                  className="nopan w-52 text-xs"
+                  availableEngines={availableEngines}
                 />
               </div>
               <div className="space-y-2">

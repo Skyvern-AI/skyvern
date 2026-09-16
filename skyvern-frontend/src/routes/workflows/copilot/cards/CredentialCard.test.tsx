@@ -13,6 +13,7 @@ import {
   CREDENTIAL_REQUIRED_FRAME_BY_REASON,
   CREDENTIAL_REQUIRED_FRAME_MINIMAL,
   CREDENTIAL_REQUIRED_FRAME_NO_MESSAGE,
+  CREDENTIAL_REQUIRED_FRAME_REDACTED_ASK,
   RESOLVED_OUTCOME_CONNECTED,
   RESOLVED_OUTCOME_CONNECTED_UNNAMED,
   RESOLVED_OUTCOME_SKIPPED,
@@ -26,7 +27,7 @@ import {
   type CredentialRequiredReason,
 } from "./CredentialCard";
 
-const { getClientMock, credsData, credsFail } = vi.hoisted(() => {
+const { getClientMock, credsData, credsFail, clientGet } = vi.hoisted(() => {
   const data = {
     current: [] as Array<{
       credential_id: string;
@@ -36,17 +37,29 @@ const { getClientMock, credsData, credsFail } = vi.hoisted(() => {
     }>,
   };
   const fail = { current: false };
-  const get = vi.fn((path: string) =>
-    path === "/credentials"
-      ? fail.current
-        ? Promise.reject(new Error("network"))
-        : Promise.resolve({ data: data.current })
-      : Promise.resolve({ data: {} }),
+  // Stands in for the route's `search` param (case-insensitive across name and username) so a test
+  // can prove the picker's box reaches the server rather than filtering the fetched page.
+  const get = vi.fn(
+    (path: string, config?: { params?: { search?: string } }) => {
+      if (path !== "/credentials") return Promise.resolve({ data: {} });
+      if (fail.current) return Promise.reject(new Error("network"));
+      const term = config?.params?.search?.toLowerCase();
+      return Promise.resolve({
+        data: term
+          ? data.current.filter((credential) =>
+              `${credential.name} ${credential.credential?.username ?? ""}`
+                .toLowerCase()
+                .includes(term),
+            )
+          : data.current,
+      });
+    },
   );
   return {
     getClientMock: vi.fn(() => Promise.resolve({ get })),
     credsData: data,
     credsFail: fail,
+    clientGet: get,
   };
 });
 
@@ -58,7 +71,22 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 // Radix Popover + cmdk misbehave in jsdom (portals, pointer capture); stub them to plain wrappers so
 // the picker's items render inline and are directly clickable, mirroring the Select mock below.
 vi.mock("@/components/ui/popover", () => ({
-  Popover: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  // Exposes onOpenChange as a clickable close, since the real dismissal is a Radix pointer gesture
+  // jsdom cannot perform. Nothing else about the card reads it.
+  Popover: ({
+    children,
+    onOpenChange,
+  }: {
+    children?: ReactNode;
+    onOpenChange?: (open: boolean) => void;
+  }) => (
+    <div>
+      <button type="button" onClick={() => onOpenChange?.(false)}>
+        close-popover
+      </button>
+      {children}
+    </div>
+  ),
   PopoverTrigger: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
   ),
@@ -68,8 +96,20 @@ vi.mock("@/components/ui/popover", () => ({
 }));
 vi.mock("@/components/ui/command", () => ({
   Command: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
-  CommandInput: ({ placeholder }: { placeholder?: string }) => (
-    <input placeholder={placeholder} />
+  CommandInput: ({
+    placeholder,
+    value,
+    onValueChange,
+  }: {
+    placeholder?: string;
+    value?: string;
+    onValueChange?: (value: string) => void;
+  }) => (
+    <input
+      placeholder={placeholder}
+      value={value}
+      onChange={(event) => onValueChange?.(event.target.value)}
+    />
   ),
   CommandList: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
@@ -111,9 +151,13 @@ afterEach(() => {
 });
 
 describe("CredentialCard content", () => {
-  it("renders the site parsed from login_page_urls in the headline", () => {
+  it.each([
+    "https://news.ycombinator.com",
+    "http://news.ycombinator.com",
+    "https://news.ycombinator.com:8443",
+  ])("renders the full origin %s in the headline", (origin) => {
     const frame = buildCredentialRequiredFrame({
-      login_page_urls: ["https://news.ycombinator.com/login?goto=news"],
+      login_page_urls: [`${origin}/login?goto=news`],
     });
     render(
       <CredentialCard
@@ -124,7 +168,7 @@ describe("CredentialCard content", () => {
       />,
     );
     expect(
-      screen.getByText("Copilot needs to sign in to news.ycombinator.com"),
+      screen.getByText(`Copilot needs to sign in to ${origin}`),
     ).toBeTruthy();
   });
 
@@ -186,7 +230,9 @@ describe("CredentialCard content", () => {
     );
     expect(container.querySelector("p.text-sm")).toBeNull();
     expect(
-      screen.getByText("Copilot needs to sign in to news.ycombinator.com"),
+      screen.getByText(
+        "Copilot needs to sign in to https://news.ycombinator.com",
+      ),
     ).toBeTruthy();
   });
 
@@ -319,7 +365,8 @@ describe("CredentialCard terminal org-credential picker", () => {
     expect(onConnect).toHaveBeenCalledWith("cred_hn", "HN login");
   });
 
-  it("degrades to the Connect-credential CTA only when the org has no credentials", async () => {
+  it("says the list is loading while the fetch is in flight, CTA still usable", () => {
+    credsData.current = [{ credential_id: "cred_a", name: "Login A" }];
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -328,28 +375,169 @@ describe("CredentialCard terminal org-credential picker", () => {
         onSkip={vi.fn()}
       />,
     );
-    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    expect(screen.getByRole("status").textContent).toContain(
+      "Loading saved logins",
+    );
+    expect(screen.queryByRole("button", { name: "Login A" })).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Connect credential" })
+        .hasAttribute("disabled"),
+    ).toBe(false);
+  });
+
+  it("leaves the announcement to a surrounding live region instead of nesting one", () => {
+    credsData.current = [{ credential_id: "cred_a", name: "Login A" }];
+    render(
+      <div role="status" aria-live="polite" data-testid="chat-live-region">
+        <CredentialCard
+          frame={buildCredentialRequiredFrame()}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />
+      </div>,
+    );
+    expect(screen.getByText(/Loading saved logins/)).toBeTruthy();
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status").dataset.testid).toBe("chat-live-region");
+  });
+
+  it("keeps its own live region for an inline pause restored outside the chat's", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    credsFail.current = true;
+    // A pause restored after a reload renders beside, not inside, the chat's live region.
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    const liveRegion = screen.getByRole("status");
+    await waitFor(() =>
+      expect(liveRegion.textContent).toBe("Couldn't load your saved logins."),
+    );
+    expect(screen.getByRole("status")).toBe(liveRegion);
+    errSpy.mockRestore();
+  });
+
+  it("shows an empty org as empty — no error, no loading text, creation still offered", async () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe(""),
+    );
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
     expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByText(/Couldn't load your saved logins/)).toBeNull();
   });
 
-  it("degrades to the CTA when the fetch fails, without caching an empty list", async () => {
+  it("shows a failed fetch as failed, and Retry recovers to a usable picker", async () => {
+    const onConnect = vi.fn();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     credsFail.current = true;
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
         mode="terminal"
-        onConnect={vi.fn()}
+        onConnect={onConnect}
         onSkip={vi.fn()}
       />,
     );
-    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    // Captured before the fetch settles: a live region is only announced when it was already in the
+    // tree when its text changed, so the failure must land in this same element.
+    const liveRegion = screen.getByRole("status");
+    expect(
+      await screen.findByText(/Couldn't load your saved logins/, {
+        selector: ":not(.sr-only)",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("status")).toBe(liveRegion);
+    expect(liveRegion.textContent).toBe("Couldn't load your saved logins.");
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
     expect(screen.queryByRole("combobox")).toBeNull();
+    // The AxiosError-shaped rejection serializes credentials into console output otherwise.
+    const logged = errSpy.mock.calls.find((call) =>
+      String(call[0]).includes("Failed to load credentials"),
+    );
+    expect(typeof logged![1]).toBe("string");
+    errSpy.mockRestore();
+
+    credsFail.current = false;
+    credsData.current = [
+      { credential_id: "cred_recovered", name: "Recovered" },
+    ];
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recovered" }));
+    expect(onConnect).toHaveBeenCalledWith("cred_recovered", "Recovered");
+    expect(screen.queryByText(/Couldn't load your saved logins/)).toBeNull();
+  });
+
+  it("disables Retry once the inline pause has expired", async () => {
+    credsFail.current = true;
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          expires_at: new Date(Date.now() - 1000).toISOString(),
+        })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(retry.hasAttribute("disabled")).toBe(true);
+    expect(
+      screen
+        .getByRole("button", { name: "Connect credential" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("offers an explicitly listed credential even when the ask carries no candidate ids", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [
+      { credential_id: "cred_listed", name: "Listed login" },
+    ];
+    render(
+      <CredentialCard
+        frame={CREDENTIAL_REQUIRED_FRAME_REDACTED_ASK}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Listed login" }),
+    );
+    expect(onConnect).toHaveBeenCalledWith("cred_listed", "Listed login");
+  });
+
+  it("never picks a sole credential on the user's behalf", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [{ credential_id: "cred_only", name: "Only login" }];
+    render(
+      <CredentialCard
+        frame={CREDENTIAL_REQUIRED_FRAME_REDACTED_ASK}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    await screen.findByRole("button", { name: "Only login" });
+    expect(onConnect).not.toHaveBeenCalled();
   });
 
   it("does not fetch for a terminal receipt (resolved outcome)", () => {
@@ -419,6 +607,324 @@ describe("CredentialCard terminal org-credential picker", () => {
       />,
     );
     expect(await screen.findByText("New login")).toBeTruthy();
+  });
+
+  it("keeps a loaded picker when a re-fetch fails instead of falling back to create-only", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    credsData.current = [{ credential_id: "cred_kept", name: "Kept login" }];
+    const { rerender } = render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        reloadKey={0}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Kept login")).toBeTruthy();
+
+    credsFail.current = true;
+    rerender(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        reloadKey={1}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        errSpy.mock.calls.some((call) =>
+          String(call[0]).includes("Failed to load credentials"),
+        ),
+      ).toBe(true),
+    );
+    expect(screen.getByText("Kept login")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load your saved logins/)).toBeNull();
+    errSpy.mockRestore();
+  });
+
+  it("searches the server rather than the fetched page, so a login past the page cap is reachable", async () => {
+    credsData.current = [{ credential_id: "cred_page1", name: "On page one" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("On page one")).toBeTruthy();
+
+    // Stands for a credential the org owns beyond the 100 the unpaginated fetch returns: it is
+    // absent from the rendered page and only a server-side search can surface it.
+    credsData.current = [
+      { credential_id: "cred_beyond", name: "Beyond the cap" },
+    ];
+    fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
+      target: { value: "beyond" },
+    });
+    expect(await screen.findByText("Beyond the cap")).toBeTruthy();
+    expect(clientGet).toHaveBeenCalledWith(
+      "/credentials",
+      expect.objectContaining({
+        params: expect.objectContaining({ search: "beyond" }),
+      }),
+    );
+  });
+
+  it("caps the search box at the route's limit, so the rows never answer a hidden prefix", async () => {
+    credsData.current = [{ credential_id: "cred_a", name: "Acme login" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+
+    // The route caps search at 200 characters, so an unclamped paste 422s into a failure whose
+    // Retry re-sends the same rejected term and can never succeed. Clamping only the request would
+    // instead leave the box showing 250 characters while the rows answered the first 200 — with
+    // local filtering off, those rows read as matching the whole visible term.
+    const box = screen.getByPlaceholderText(
+      "Search credentials...",
+    ) as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "z".repeat(250) } });
+    expect(box.value).toHaveLength(200);
+    await waitFor(() =>
+      expect(
+        clientGet.mock.calls.some(
+          (call) =>
+            (call[1] as { params?: { search?: string } })?.params?.search
+              ?.length === 200,
+        ),
+      ).toBe(true),
+    );
+    expect(
+      clientGet.mock.calls.every(
+        (call) =>
+          ((call[1] as { params?: { search?: string } })?.params?.search ?? "")
+            .length <= 200,
+      ),
+    ).toBe(true);
+
+    // The route counts code points, and an emoji is two UTF-16 units. Clamping by units would keep
+    // half of it, which Axios cannot URL-encode, so the search would fail on every Retry.
+    const atLimit = "a".repeat(199) + "😀";
+    fireEvent.change(box, { target: { value: `${atLimit}b` } });
+    expect(box.value).toBe(atLimit);
+    expect(Array.from(box.value)).toHaveLength(200);
+  });
+
+  it("says when a full page of matches hides the rest instead of reading as the complete set", async () => {
+    credsData.current = Array.from({ length: 100 }, (_unused, index) => ({
+      credential_id: `cred_${index}`,
+      name: `Login ${index}`,
+    }));
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Login 0")).toBeTruthy();
+    expect(screen.getByText(/Showing the first 100/)).toBeTruthy();
+
+    credsData.current = credsData.current.slice(0, 99);
+    fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
+      target: { value: "Login" },
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(/Showing the first 100/)).toBeNull(),
+    );
+  });
+
+  it("drops a zero-match term when the popover closes, so the add-credential route comes back", async () => {
+    credsData.current = [
+      { credential_id: "cred_other", name: "Other login" },
+      { credential_id: "cred_work", name: "Work login" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      await screen.findByRole("button", { name: "Other login" }),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
+      target: { value: "nothing-matches-this" },
+    });
+    expect(await screen.findByText("No credentials found.")).toBeTruthy();
+
+    // A term left behind keeps the card in search mode over an empty result, which on this receipt
+    // hides both the remaining logins and the only route to the add-credential modal and Retry.
+    fireEvent.click(screen.getByRole("button", { name: "close-popover" }));
+    expect(
+      await screen.findByRole("button", { name: "Other login" }),
+    ).toBeTruthy();
+    expect(
+      (screen.getByPlaceholderText("Search credentials...") as HTMLInputElement)
+        .value,
+    ).toBe("");
+  });
+
+  it("keeps the picker in place while a cleared search reloads, and offers Retry if that reload fails", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    credsData.current = [
+      { credential_id: "cred_acme", name: "Acme login" },
+      { credential_id: "cred_other", name: "Other login" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    const box = await screen.findByPlaceholderText("Search credentials...");
+    fireEvent.change(box, { target: { value: "acme" } });
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+
+    // Erasing the term searches for the empty one. The picker must not vanish mid-edit while that
+    // reload is in flight, which would close the dropdown and drop focus.
+    credsFail.current = true;
+    fireEvent.change(box, { target: { value: "" } });
+    expect(screen.getByPlaceholderText("Search credentials...")).toBeTruthy();
+
+    // A failed reset leaves the rows answering "acme" while the box is empty, so it has to say so
+    // and stay recoverable — otherwise the picker never returns and creation is the only option.
+    expect(
+      await screen.findByText(/Couldn't run that search/, {
+        selector: ":not(.sr-only)",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByPlaceholderText("Search credentials...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Acme login" })).toBeNull();
+
+    credsFail.current = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Other login")).toBeTruthy();
+    expect(screen.getByText("Acme login")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't run that search/)).toBeNull();
+    errSpy.mockRestore();
+  });
+
+  it("trims the term before searching, so padding neither misses a match nor empties the list", async () => {
+    credsData.current = [{ credential_id: "cred_acme", name: "Acme login" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+
+    // The route builds its ILIKE pattern from the literal value, so an untrimmed " Acme " would
+    // match nothing despite the credential existing.
+    const box = screen.getByPlaceholderText("Search credentials...");
+    fireEvent.change(box, { target: { value: " Acme " } });
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+    expect(clientGet).toHaveBeenCalledWith(
+      "/credentials",
+      expect.objectContaining({
+        params: expect.objectContaining({ search: "Acme" }),
+      }),
+    );
+
+    // An all-space term is no term: it must not be sent as a pattern that matches almost nothing.
+    fireEvent.change(box, { target: { value: "   " } });
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+    expect(clientGet).not.toHaveBeenCalledWith(
+      "/credentials",
+      expect.objectContaining({
+        params: expect.objectContaining({ search: "   " }),
+      }),
+    );
+  });
+
+  it("offers nothing to pick while a typed search is still in flight", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [{ credential_id: "cred_other", name: "Other login" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Other login")).toBeTruthy();
+
+    // Typing leaves the previous rows on hand until the debounce and the request complete. While
+    // that is true they answer a different term, and cmdk highlights the first row, so Enter would
+    // resume the turn with a login the user never searched for.
+    fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
+      target: { value: "acme" },
+    });
+    expect(screen.getByText("Searching…")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Other login" })).toBeNull();
+    expect(onConnect).not.toHaveBeenCalled();
+
+    credsData.current = [{ credential_id: "cred_acme", name: "Acme login" }];
+    fireEvent.click(await screen.findByRole("button", { name: "Acme login" }));
+    expect(onConnect).toHaveBeenCalledWith("cred_acme", "Acme login");
+    expect(screen.queryByText("Searching…")).toBeNull();
+  });
+
+  it("withdraws the previous rows when a search fails, rather than offering them as its result", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    credsData.current = [{ credential_id: "cred_stale", name: "Earlier row" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Earlier row")).toBeTruthy();
+    const liveRegion = screen.getByRole("status");
+
+    credsFail.current = true;
+    fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
+      target: { value: "acme" },
+    });
+    expect(
+      await screen.findByText(/Couldn't run that search/, {
+        selector: ":not(.sr-only)",
+      }),
+    ).toBeTruthy();
+    // The visible notice renders in the portaled popover, outside any live region, so focus in the
+    // search box would otherwise hear nothing. The card's own region, mounted earlier, carries it.
+    expect(screen.getByRole("status")).toBe(liveRegion);
+    expect(liveRegion.textContent).toBe("Couldn't run that search.");
+    // The earlier row answered a different query, so it is no longer offered — nothing selectable
+    // can submit a login the user did not search for. The term stays put and retryable.
+    expect(screen.queryByText("Earlier row")).toBeNull();
+    expect(screen.queryByText("No credentials found.")).toBeNull();
+    expect(screen.getByPlaceholderText("Search credentials...")).toBeTruthy();
+
+    credsFail.current = false;
+    credsData.current = [{ credential_id: "cred_acme", name: "Acme login" }];
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Acme login")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't run that search/)).toBeNull();
+    errSpy.mockRestore();
   });
 
   it("pins the frame's credential_refs under a Suggested group, full list still complete", async () => {
@@ -989,8 +1495,6 @@ describe("CredentialCard auto-bound receipt", () => {
 
   it("keeps Change reachable when the credential list fails to load", async () => {
     const onConnect = vi.fn();
-    // A transient /credentials failure leaves the list null; Change must not vanish (alternates may
-    // exist) — it falls back to the add-credential path so the auto-bound pick stays correctable.
     credsFail.current = true;
     render(
       <CredentialCard
@@ -1005,5 +1509,68 @@ describe("CredentialCard auto-bound receipt", () => {
     await waitFor(() => expect(getClientMock).toHaveBeenCalled());
     fireEvent.click(await screen.findByRole("button", { name: "Change" }));
     expect(onConnect).toHaveBeenCalledWith(undefined);
+  });
+
+  it("says a failed load once when the receipt sits inside the chat's live region", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    credsFail.current = true;
+    // The chat renders this receipt inside each message's role="status" wrapper, which already
+    // announces the visible sentence; a hidden copy would make it heard twice.
+    render(
+      <div role="status" aria-live="polite">
+        <CredentialCard
+          frame={buildCredentialRequiredFrame()}
+          mode="auto-bound"
+          autoBound={{ credentialId: "cred_work", name: "Work login" }}
+          canChange
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />
+      </div>,
+    );
+    await screen.findByRole("button", { name: "Retry" });
+    expect(
+      screen.getAllByText("Couldn't load your other saved logins."),
+    ).toHaveLength(1);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    errSpy.mockRestore();
+  });
+
+  it("recovers the Change picker from a failed list fetch via Retry", async () => {
+    const onConnect = vi.fn();
+    credsFail.current = true;
+    credsData.current = [
+      { credential_id: "cred_other", name: "Other login" },
+      { credential_id: "cred_work", name: "Work login" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    // Captured before the fetch settles, so the announcement must change this element's text rather
+    // than arrive in a freshly mounted one that screen readers would not announce.
+    const liveRegion = screen.getByRole("status");
+    expect(liveRegion.textContent).toBe("");
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(
+      screen.getByText("Couldn't load your other saved logins.", {
+        selector: ":not(.sr-only)",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("status")).toBe(liveRegion);
+    expect(liveRegion.textContent).toBe(
+      "Couldn't load your other saved logins.",
+    );
+    credsFail.current = false;
+    fireEvent.click(retry);
+    fireEvent.click(await screen.findByRole("button", { name: "Change" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Other login" }));
+    expect(onConnect).toHaveBeenCalledWith("cred_other", "Other login");
   });
 });

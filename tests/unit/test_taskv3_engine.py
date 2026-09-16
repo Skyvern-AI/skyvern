@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
 import yarl
+from structlog.testing import capture_logs
 
+from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import engine as engine_mod
@@ -23,15 +28,30 @@ from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
+    OPAQUE_URL_GUIDANCE,
+    SYSTEM_PROMPT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
-from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
+from skyvern.forge.taskv3.loop import (
+    CODE_TOOL_NAME,
+    LoopOutcome,
+    SemanticCommitStats,
+    ToolResult,
+    ToolSpec,
+    _ProgressEvidence,
+)
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
+from tests.unit.test_taskv3_tools import (
+    _SURFACE_OFF_TOOL_NAMES,
+    _DownloadFakePage,
+    _FakePage,
+    _fixed_page_provider,
+)
 
 
 @pytest.mark.asyncio
@@ -442,6 +462,109 @@ async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_engine_requests_reasoning_summary_for_bridge_routed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only gpt-5.6 models are routed through litellm's chat->responses bridge, which is the only
+    # path that accepts the dict form of reasoning_effort -- so only those calls should carry it.
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMConfig(
+        model_name="gpt-5.6-luna",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    # The configured effort is preserved verbatim, never hardcoded.
+    assert captured["call_kwargs"] == {"reasoning_effort": {"effort": "high", "summary": "auto"}}
+
+
+@pytest.mark.asyncio
+async def test_engine_requests_reasoning_summary_for_gpt56_dispatched_router_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # litellm bridges from the DISPATCHED model string, so a router deployment qualifies only when
+    # its litellm model is gpt-5.6-named; an opaque alias must not (litellm would not bridge it).
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMRouterConfig(
+        model_name="azure-gpt-5-6-sol-flex-fallback-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="azure-gpt-5-6-sol-flex",
+                litellm_params={"model": "azure/gpt-5.6-sol-deployment"},
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+        ],
+        main_model_group="azure-gpt-5-6-sol-flex",
+        reasoning_effort="medium",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    assert captured["call_kwargs"] == {"reasoning_effort": {"effort": "medium", "summary": "auto"}}
+
+    captured.clear()
+    caller.llm_config.model_list[0].litellm_params["model"] = "azure/some-opaque-deployment-name"
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+    assert "reasoning_effort" not in (captured.get("call_kwargs") or {})
+
+
+@pytest.mark.asyncio
+async def test_engine_omits_reasoning_summary_for_non_bridge_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMConfig(
+        model_name="claude-fable-5",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    # A plain dict reasoning_effort on a non-bridge model 400s ("Unknown parameter: 'reasoning'"),
+    # so this model must never get it -- and no other call kwarg applies here either.
+    assert captured["call_kwargs"] is None
+
+
+@pytest.mark.asyncio
 async def test_engine_wires_failure_evidence_gate() -> None:
     # End-to-end wiring: the engine's own ActivityRecency reaches both the loop (which records the
     # solve_captcha attempt) and the finish tool (which holds the failure verdict for one evidence
@@ -518,9 +641,9 @@ async def test_engine_forwards_the_page_probe_and_withholds_it_from_page_free_ru
 async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_free_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The innerHTML fingerprint sampler also drives the loop's auto-observe change decision (not just
-    # make_finish_tool's settle gate) -- drop it anywhere on the way to run_agent_tool_loop and
-    # auto-observe silently falls back to the document-identity probe for every in-page mutation.
+    # The innerHTML fingerprint sampler also drives the loop's page-state stall detector (not just
+    # make_finish_tool's settle gate) -- drop it anywhere on the way to run_agent_tool_loop and the
+    # detector silently loses its rendered-content signal.
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
@@ -559,7 +682,7 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     # object, or arm them for a page-free run (which has no page to ask) and disarm them for an
     # ordinary one, and nothing else in the suite would notice.
     from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome, SubmitWatch
+    from skyvern.forge.taskv3.loop import SubmitWatch
 
     finish_args: list[tuple[Any, Any]] = []
     loop_watches: list[Any] = []
@@ -607,6 +730,67 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     assert watches[1] is None, watches
     assert loop_watches[0] is watches[0], (loop_watches, watches)
     assert loop_watches[1] is None, loop_watches
+
+
+@pytest.mark.asyncio
+async def test_engine_shares_one_semantic_commit_stats_between_the_browser_tools_and_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The counter needs BOTH halves on ONE record: the browser tools increment it, the loop's
+    # terminal record reads it. Wire either half to a different object and every production run
+    # reports 0 opportunities / 0 accepts forever, and nothing else in the suite would notice.
+    tool_stats: list[Any] = []
+    loop_stats: list[Any] = []
+    real_build = engine_mod.build_browser_tools
+    real_loop = engine_mod.run_agent_tool_loop
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tool_stats.append(kwargs.get("semantic_commit_stats"))
+        return real_build(*args, **kwargs)
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert isinstance(tool_stats[0], SemanticCommitStats), tool_stats
+    assert loop_stats[0] is tool_stats[0], (loop_stats, tool_stats)
+
+
+@pytest.mark.asyncio
+async def test_engine_omits_semantic_commit_stats_when_the_verify_kill_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tier only ever increments under TASK_V3_SEMANTIC_COMMIT_VERIFY, so with the kill switch
+    # off a live object makes every page-ful run emit 0 opportunities for a tier that is turned
+    # off — the denominator drag omission exists to prevent. The switch and the omission contract
+    # have to agree, or flipping the switch silently corrupts the accept rate instead of ending it.
+    monkeypatch.setattr(settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    loop_stats: list[Any] = []
+    real_loop = engine_mod.run_agent_tool_loop
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert loop_stats == [None], loop_stats
 
 
 @pytest.mark.asyncio
@@ -688,6 +872,79 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_a_resolvable_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A workflow template renders a file parameter into the goal, the system guidance and the block URL,
+    # with no payload carrying it. Each must get the same treatment as the payload: token in, real URL out.
+    signature = "f1e2d3c4b5a697887766554433221100aabbccddeeff00112233445566778899"
+    cover_signature = "99887766554433221100ffeeddccbbaa00112233445566778899aabbccddeeff"
+    query = "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260824T000000Z&X-Amz-Expires=2700&X-Amz-SignedHeaders=host"
+    signed_url = f"https://files.example.test/uploads/0123456789abcdef/resume.pdf{query}&X-Amz-Signature={signature}"
+    cover_url = (
+        f"https://files.example.test/uploads/0123456789abcdef/cover.pdf{query}&X-Amz-Signature={cover_signature}"
+    )
+    start_signature = "00112233445566778899aabbccddeeff99887766554433221100ffeeddccbbaa"
+    start_url = f"https://files.example.test/uploads/O'Brien/posting.pdf{query}&X-Amz-Signature={start_signature}"
+    plain_url = "https://portfolio.example.test/jo"
+    goal = f"Fill out the application.\n\nresume: {signed_url}\nportfolio: {plain_url}.\n"
+    # Distinct URLs, so each token can only resolve through the refs minted from its own text.
+    token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(signed_url)
+    cover_token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(cover_url)
+    # The apostrophe is a legal path character that ends a prose URL match.
+    start_token = OpaqueUrlRefs(masked=None, refs={}).derive(start_url)
+    assert len({token, cover_token, start_token}) == 3 and cover_token.startswith("opaque_url_")
+
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    captured_sources: list[str] = []
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        captured_sources.append(source)
+        request_info = aiohttp.RequestInfo(url=yarl.URL(source), method="GET", headers={}, real_url=yarl.URL(source))
+        raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
+
+    import skyvern.forge.sdk.api.files as files_module
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+
+    caller = _ScriptedCaller(
+        [
+            [("file_upload", {"selector": "#cv", "file": token})],
+            [("file_upload", {"selector": "#cover", "file": cover_token})],
+            [("navigate", {"url": start_token})],
+            [("finish", {"status": "failed", "reason": "upload rejected"})],
+        ]
+    )
+    page = _FakePage()
+    skyvern_context.set(SkyvernContext(task_id="tsk_goal"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal=goal,
+            parameters=None,
+            starting_url=start_url,
+            extra_system_guidance=f"Always attach the cover letter at {cover_url}",
+        )
+    finally:
+        skyvern_context.reset()
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert f"resume: {token}\n" in user_prompt
+    assert f"You start on: {start_token}" in user_prompt
+    assert f"portfolio: {plain_url}." in user_prompt  # nosemgrep: incomplete-url-substring-sanitization
+    system_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "system")
+    assert f"Always attach the cover letter at {cover_token}" in system_prompt
+    assert OPAQUE_URL_GUIDANCE in system_prompt
+    transcript = json.dumps(outcome.messages)
+    assert all(sig not in transcript for sig in (signature, cover_signature, start_signature))
+    assert captured_sources == [signed_url, cover_url]
+    assert page.url == start_url
+
+
+@pytest.mark.asyncio
 async def test_business_identifier_value_under_a_non_signing_key_stays_readable() -> None:
     # A token-shaped VALUE under an ordinary business KEY (order id, not a signing param) must never be
     # tokenized: neither in the payload nor in ordinary page content the model reads.
@@ -744,21 +1001,21 @@ async def test_hash_route_job_url_is_not_masked() -> None:
 
 @pytest.mark.asyncio
 async def test_page_free_mode_does_not_mask_signed_urls() -> None:
-    # Page-free mode has no tools to resolve an opaque_url_ token, so the payload stays verbatim.
+    # Page-free mode has no tools to resolve an opaque_url_ token, so every model-facing URL stays verbatim.
     signed_url = "https://files.example.test/uploads/x?token=eyJhbGciOiJIUzI1NiJ9c2lnbmVkQ29ycmVjdEhvcnNl"
     caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]])
     outcome = await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),  # never consulted: page_free has no tools
         llm_caller=caller,
-        goal="assess",
+        goal=f"assess {signed_url}",
+        starting_url=signed_url,
         page_free=True,
         parameters={"u": signed_url},
         max_turns=4,
     )
     user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
-    assert (
-        signed_url in user_message and "opaque_url_" not in user_message
-    )  # nosemgrep: incomplete-url-substring-sanitization
+    assert f"assess {signed_url}" in user_message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in user_message
 
 
 @pytest.mark.asyncio
@@ -891,7 +1148,7 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     async def blocker(_staged: frozenset[str]) -> str | None:
         return "no download yet"
 
-    async def verification_blocker() -> str | None:
+    async def verification_blocker(_status: str) -> str | None:
         return "no code arrived"
 
     await run_task_v3_agent_loop(
@@ -1003,66 +1260,639 @@ async def test_engine_drops_a_leftover_refresh_signal_when_the_loop_is_cancelled
     assert ctx.refresh_working_page is False
 
 
+def test_caller_level_bridge_check_denies_raw_client_dispatch() -> None:
+    # A custom/BYO model can be NAMED gpt-5.6-* yet dispatch through the raw OpenAI client branch,
+    # which never bridges — the dict form there is a schema violation on every call. The caller-level
+    # check must deny on dispatch path, whatever the name says.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LLMConfig
+
+    config = LLMConfig(
+        model_name="openrouter/gpt-5.6-custom",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    raw_client_self = SimpleNamespace(
+        openai_client=object(), _custom_openrouter=False, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(raw_client_self) is False
+    openrouter_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=True, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(openrouter_self) is False
+    litellm_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(litellm_self) is True
+
+
+def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
+    from skyvern.schemas.llm import LLMConfig
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: False
+    caller.llm_config = LLMConfig(
+        model_name="gpt-5.6-luna",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    assert reasoning_effort_with_summary(caller) is None
+
+
+def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
+    # litellm decides the bridge from the DISPATCHED model string alone. A model_info label saying
+    # gpt-5.6 must NOT flip the gate for an opaque deployment alias: litellm would not bridge that
+    # call, and the dict form would reach a chat-completions endpoint.
+    from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+    aliased = LLMConfig(
+        model_name="azure/opaque-deployment-alias",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(model_info={"model_name": "azure/gpt-5.6-sol"}),
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(aliased) is False
+    dispatched_named = LLMConfig(
+        model_name="azure/gpt-5.6-sol-deployment",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(dispatched_named) is True
+
+
+def test_bridge_check_denies_router_with_non_bridge_fallback_group() -> None:
+    # A mixed router could hand the dict reasoning_effort to a non-bridge fallback deployment,
+    # which rejects it — every serving deployment must qualify.
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    config = LLMRouterConfig(
+        model_name="mixed-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="primary-group",
+                litellm_params={"model": "gpt-5.6-luna"},
+                model_info={"model_name": "gpt-5.6-luna"},
+            ),
+            LLMRouterModelConfig(
+                model_name="fallback-group",
+                litellm_params={"model": "gpt-4.1"},
+                model_info={"model_name": "gpt-4.1"},
+            ),
+        ],
+        main_model_group="primary-group",
+        fallback_model_group="fallback-group",
+        reasoning_effort="high",
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(config) is False
+
+
+def test_caller_level_bridge_check_denies_custom_llm_keys() -> None:
+    # A custom/BYO key routes litellm at an arbitrary api_base that need not implement
+    # /v1/responses, whatever the user named the model — default-deny.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.forge.sdk.api.llm.custom_llm_registry import CUSTOM_LLM_KEY_PREFIX
+    from skyvern.schemas.llm import LLMConfig
+
+    config = LLMConfig(
+        model_name="openai/gpt-5.6-byo",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    custom_self = SimpleNamespace(
+        openai_client=None,
+        _custom_openrouter=False,
+        llm_config=config,
+        original_llm_key=f"{CUSTOM_LLM_KEY_PREFIX}abc123",
+    )
+    assert LLMCaller.uses_openai_responses_bridge(custom_self) is False
+
+
+def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base() -> None:
+    # The built-in OPENAI_COMPATIBLE registration (configurable key name) dispatches openai/<model>
+    # at an arbitrary api_base that need not implement /v1/responses — deny. Azure legitimately
+    # carries an api_base and does bridge.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+    compat = LLMConfig(
+        model_name="openai/gpt-5.6-selfhosted",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(api_base="https://byo.example.internal/v1"),
+    )
+    compat_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=compat, original_llm_key="OPENAI_COMPATIBLE"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(compat_self) is False
+
+    azure = LLMConfig(
+        model_name="azure/gpt-5.6-sol-deployment",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(api_base="https://example.openai.azure.com"),
+    )
+    azure_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=azure, original_llm_key="AZURE_OPENAI_GPT5_6_SOL"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(azure_self) is True
+
+
 @pytest.mark.asyncio
-async def test_system_prompt_carries_auto_observe_guidance_only_when_the_flag_is_on(
+async def test_terminal_log_carries_duration_and_block_type() -> None:
+    # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
+    # the block context to slice workflow-block runs (SKY-15499).
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type="navigation",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1
+    assert terminal[0]["block_type"] == "navigation"
+    assert isinstance(terminal[0]["duration_seconds"], float)
+    assert terminal[0]["duration_seconds"] >= 0.0
+
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["block_type"] is None  # bare task: no block context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_type", "refused_count"), [("extraction", 1), ("task", 0), ("navigation", 0), (None, 0)]
+)
+async def test_entry_is_refused_only_in_an_extraction_block(block_type: str | None, refused_count: int) -> None:
+    script = [
+        [("type", {"selector": "#q", "text": "Jane Doe"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type=block_type,
+        )
+    refused = [e for e in logs if e.get("event") == "taskv3 loop extraction entry refused"]
+    assert len(refused) == refused_count
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_carries_loop_telemetry_and_the_two_terminal_records_stay_dead() -> None:
+    # The only test that can catch the loop telemetry silently dropping off this line, or either
+    # per-run record it replaced coming back — everything else asserts the payload, not the join.
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+
+    assert not [e for e in logs if e.get("event") == "taskv3 loop progress ledger final"]
+    assert not [e for e in logs if e.get("event") == "taskv3 canonical progress final"]
+
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    assert record["form_ever_armed"] is False
+    for member in _ProgressEvidence:
+        assert f"clear_{member.value}" in record, record
+    assert record["status"] == "completed"
+    assert isinstance(record["turns"], int)
+    assert "outcome_status" not in record, record
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_merges_a_fully_populated_telemetry_without_colliding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # SYSTEM_PROMPT itself must stay byte-identical to the flag-off prompt: the two auto-observe
-    # sentences belong in an addendum appended at the call site, never baked into the base constant,
-    # or TASK_V3_AUTO_OBSERVE=off would no longer be a no-op against the base engine.
-    from skyvern.config import settings
-    from skyvern.forge.taskv3.engine import SYSTEM_PROMPT
-    from skyvern.forge.taskv3.loop import LoopOutcome
+    # The sibling test above drives a bare run, so it merges an almost-empty payload — it would stay
+    # green if a ledger or semantic-commit key ever collided with one of this line's fixed kwargs,
+    # and that collision is a TypeError inside LOG.info that would take the whole run's record with
+    # it. This one hands the engine the maximal payload every optional branch can produce.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LedgerTerminalFields, TerminalTelemetry
 
-    loop_kwargs: dict[str, Any] = {}
-
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-
-    when_auto_observe_present = "act from that snapshot instead of calling observe again"
-    when_batching_present = "put it in the same turn"
-
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", False)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
+    stats = SemanticCommitStats(opportunities=3, accepts=2)
+    telemetry = TerminalTelemetry(
+        form_ever_armed=True,
+        survival={
+            "peak_same_touches": 5,
+            "peak_same_errors": 2,
+            "looping_targets": 1,
+            **{f"clear_{member.value}": 1 for member in _ProgressEvidence},
+        },
+        ledger=LedgerTerminalFields(
+            peak_actions_since_progress=9,
+            actions_since_progress=4,
+            form_armed=False,
+            would_fire=True,
+        ),
+        peak_page_state_stall_rounds=6,
+        peak_probe_revisits=7,
+        semantic_commit=stats,
     )
-    system_prompt = loop_kwargs["system_prompt"]
-    assert system_prompt.startswith(SYSTEM_PROMPT)
-    assert when_auto_observe_present not in system_prompt
-    assert when_batching_present not in system_prompt
 
-    loop_kwargs.clear()
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
-    )
-    system_prompt = loop_kwargs["system_prompt"]
-    assert when_auto_observe_present in system_prompt
-    assert when_batching_present in system_prompt
+    async def _loaded(**kwargs: object) -> LoopOutcome:
+        outcome = LoopOutcome(status="completed", reason="ok")
+        outcome.telemetry = telemetry
+        return outcome
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loaded)
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
+        )
+
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    # Every key the payload can carry survives the merge, and the line's own kwargs are untouched.
+    for key, value in telemetry.log_fields().items():
+        assert record[key] == value, (key, record)
+    assert record["status"] == "completed"
+    assert record["block_type"] is None
+    # form_armed and form_ever_armed now ride the same record and mean different things.
+    assert record["form_armed"] is False
+    assert record["form_ever_armed"] is True
 
 
 @pytest.mark.asyncio
-async def test_page_free_run_never_gets_auto_observe_guidance_even_with_the_flag_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.config import settings
+async def test_engine_forwards_the_error_code_mapping_to_the_finish_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The engine hop is the one link no other test covers: the agent-side wiring test mocks the loop,
+    # the loop tests call make_finish_tool directly, and the agent tests hand-build a LoopOutcome. Drop
+    # this pass-through and the codes silently stop reaching the model in production.
+    from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
-    loop_kwargs: dict[str, Any] = {}
+    finish_kwargs: dict[str, Any] = {}
 
     async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
         return LoopOutcome(status="completed", reason="ok")
 
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(*args, **kwargs)
+
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
 
-    async def no_page() -> Any:
-        raise AssertionError("page provider must never be consulted in page-free mode")
+    mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="check coverage",
+        error_code_mapping=mapping,
+    )
+    assert finish_kwargs["error_code_mapping"] == mapping
 
-    await run_task_v3_agent_loop(page_provider=no_page, llm_caller=_ScriptedCaller([]), goal="decide", page_free=True)
-    assert loop_kwargs["auto_observe"] is False
-    assert "act from that snapshot instead of calling observe again" not in loop_kwargs["system_prompt"]
+
+def _advertised(caller: _ScriptedCaller) -> set[str]:
+    """The tool names the MODEL was actually offered, read off the request the caller built."""
+    return {t["function"]["name"] for t in (caller.sent_tools or [])}
+
+
+def _stub_code_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("{}")
+
+    return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
+
+
+async def _run_to_finish(caller: _ScriptedCaller, *, frame_perception: bool | None = None) -> None:
+    # A real run always carries a context with a run identity; the code tool is withheld without one,
+    # so a context-free call would exercise the identity gate rather than the surface under test.
+    context = SkyvernContext(task_id="tsk_surface")
+    if frame_perception is not None:
+        context.frame_perception_flag = frame_perception
+        context.frame_perception_resolved_run_id = context.task_id
+    skyvern_context.set(context)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(caller)
+
+    assert not asked
+    assert CODE_TOOL_NAME not in _advertised(caller)
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_add_and_replace_advertise_exact_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    add_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(add_caller)
+
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "replace")
+    replace_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(replace_caller)
+
+    # `add` keeps every action tool and gains the code tool; `replace` keeps only perception and
+    # waiting. `finish` is assembled after this filter and survives both, which is what makes a
+    # `replace` run able to end at all.
+    assert _advertised(add_caller) == _SURFACE_OFF_TOOL_NAMES | {CODE_TOOL_NAME, "finish"}
+    assert _advertised(replace_caller) == {"observe", "get_html", "look", "wait", CODE_TOOL_NAME, "finish"}
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3: the code tool and frame perception do not run together.
+
+    Code driving the page directly never reaches the wrapper that writes the realm-attributed
+    ledger, so in-frame fills and submits would be invisible to the data-loss guard and the
+    completion gate. Asserted at the advertised-tool set, not at the gate, because what matters is
+    that the model is never offered the tool -- a gate that runs and then leaks is still a leak.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_per_run_pin_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same guarantee as `test_frame_perception_withholds_the_code_tool`, but for the per-run arm.
+
+    The env override is the force-on term; a run pinned on by the per-run resolver instead (env
+    False) must be withheld identically, or the code tool ends up gated on how the run was turned
+    on rather than on whether it was.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller, frame_perception=True)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_no_runner_leaves_every_surface_with_todays_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Today's actual state: the deployment has no runner, so the hook returns None.
+
+    The engine-level branch, not the helper's -- this is the path every run takes right now, and
+    `replace` reaching it must still leave the model able to act.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return None
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_a_raising_code_tool_hook_costs_the_tool_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`add` is meant to be purely additive, so a sandbox hiccup must not fail an otherwise fine run.
+
+    Asserted on the run's outcome as well as the advertised set: a withheld tool that still let the
+    exception escape would fail the task, which is the failure mode worth naming.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        raise RuntimeError("sandbox provisioning blew up")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface_raise"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_identity_is_not_given_a_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment keys a sandbox session on the run identity, so no identity means no tool.
+
+    Two runs sharing an empty identity would share a session. Withholding is the only answer that
+    cannot produce a collision.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext())
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert not asked
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+# The combobox bullet, pinned verbatim. This bullet produced FIVE defects in one PR, every one of them
+# a claim that some `select_combobox` error class falsifies -- only 4 of its 18 classes are row-related,
+# so guidance quantifying over them is wrong for most. A phrase blacklist cannot fire on wording nobody
+# anticipated ("every refusal provides a recovery action" would pass and is false), so the enforcing
+# mechanism is a snapshot: it fires on ALL change, which is the point for this text and not a cost.
+_COMBOBOX_BULLET = (
+    "- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only "
+    "AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the "
+    "`select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects "
+    "the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own "
+    "initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. "
+    "Act on what that error tells you rather than substituting a value of your own: this field commits only the "
+    "suggestions the page itself offers, and those are often coarser than the value you hold."
+)
+
+
+def test_combobox_bullet_is_pinned_so_every_edit_is_re_derived_against_the_error_taxonomy() -> None:
+    """The property, which the snapshot enforces rather than expresses: the bullet may claim what the
+    MODEL should do, never what an ERROR CONTAINS, and any prohibition is scoped by PROVENANCE (a value
+    or keystroke the model originates) rather than by shape. Four wordings broke the first rule -- "try
+    a fuller value", "pass a listed row's text back" (identical_rows wants a click), "the error states a
+    step" (row-less commit failures state none), "do not retype a longer value" (ambiguous_rows' own
+    next_step IS longer) -- and the unconditional typing ban broke the second, contradicting
+    identical_rows' "type the value to reopen the list" (tools.py:666).
+
+    WHAT THIS IS: a change-detector, not a correctness test. It cannot tell a semantic defect from a
+    rewording -- editing this constant alongside a broken prompt restores green. All it does is force a
+    human to look, which is the most any test here can do.
+
+    WHY EXACT PROSE, given CLAUDE.md:129 ("do not assert exact prompt prose ... WHEN A BEHAVIOR/CONTRACT
+    ASSERTION EXISTS"): that precondition is not met, and the claim is checkable. Every browser e2e
+    substitutes `ScriptedLLMCaller` for the model -- test_taskv3_fixture_parity.py says so in its own
+    docstring -- so no test in this repo can assert prompt-driven behaviour. The structural fix (a
+    mechanical guidance-vs-next_step consistency check) is tracked as SKY-16299, not built here.
+
+    Updating this snapshot is not a formality: re-derive the new text against every error class in
+    tools.py first, and against the WHOLE bullet -- a new clause can falsify an older one, which is how
+    the pre-existing unconditional typing ban became a live contradiction."""
+    bullet = next(line for line in SYSTEM_PROMPT.splitlines() if "select_combobox` tool" in line)
+
+    assert bullet == _COMBOBOX_BULLET
+
+
+@pytest.mark.asyncio
+async def test_engine_restores_a_blank_working_page_before_the_block_hands_it_on(tmp_path: Path) -> None:
+    # `finish` is assembled outside `build_browser_tools` (engine: browser_tools + extras + finish)
+    # and is therefore never wrapped, so a block shaped `click(download) -> finish` reaches the end
+    # of the loop with the tab still on `about:blank`. The next url-less block inherits it and
+    # `resolve_inherited_workflow_task_page` raises InvalidWorkflowTaskURLState (SKY-16322). Only the
+    # post-loop backstop can repair this shape -- the per-call guard has no later call to run on.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    script = [
+        [("click", {"selector": "#dl"})],
+        [("finish", {"status": "completed", "reason": "downloaded the statement"})],
+    ]
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller(script),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+    )
+
+    assert outcome.status == "completed"
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+@pytest.mark.asyncio
+async def test_engine_repairs_a_blank_page_when_the_loop_ends_without_another_tool_call(
+    tmp_path: Path,
+) -> None:
+    # The per-call guard repairs BEFORE a tool runs, so it cannot help when the blanking click is the
+    # last thing that happens -- the turn budget runs out and the loop returns with the page still
+    # blank. Only the post-loop backstop covers that, and the next url-less block is what pays.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller([[("click", {"selector": "#dl"})]]),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+        max_turns=1,
+    )
+
+    assert outcome.status != "completed"  # ran out of turns rather than finishing
+    assert restored == [(page, before)]
+    assert page.url == before

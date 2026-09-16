@@ -9,7 +9,6 @@ import {
   type TurnNarrativeState,
 } from "../narrativeState";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { derivePhases } from "../copilotPhases";
 import { ReviewGateCard, getReviewGateVerdict } from "./ReviewGateCard";
 
 const failedBlock = {
@@ -149,15 +148,13 @@ describe("getReviewGateVerdict", () => {
     expect(getReviewGateVerdict(undefined, proposal)).toBe(null);
   });
 
-  it("never reports tested while the turn's own rail computes a failed test phase", () => {
+  it("never reports tested for a turn with a failed test block", () => {
     const failedTurn = turn({
       proposalDisposition: "review_tested",
+      turnFacts: coveredFacts,
       blocks: [failedBlock],
     });
 
-    expect(
-      derivePhases(failedTurn).find((row) => row.id === "test")?.status,
-    ).toBe("fail");
     expect(getReviewGateVerdict(failedTurn, null)).not.toBe("tested");
   });
 });
@@ -194,17 +191,16 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
       <ReviewGateCard
         turn={turn({
           proposalDisposition: "review_untested",
-          terminalEnvelope: {
-            runVerdict: null,
-            runDisplayReason: null,
-            connectFailure: {
-              state: "already_closed",
-              retryAction: "test_end_to_end",
-              workflowRunId: null,
-              workflowRunBlockId: null,
-              taskId: null,
-              browserSessionId: "pbs_1",
-            },
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: null,
+            runId: null,
+            runCompleted: null,
+            terminalCause: "already_closed",
+            blocksRunThisTurn: null,
+            ranCleanOnCurrentSource: false,
+            authoredBlockCount: 0,
+            matchingSourceBlockCount: 0,
           },
         })}
         pending
@@ -221,6 +217,53 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     expect(
       screen.getByRole("button", { name: "Retry in a fresh session" }),
     ).not.toBeNull();
+  });
+
+  it("offers Billing instead of a fresh-session retry after credit admission refusal", () => {
+    let testRuns = 0;
+    render(
+      <ReviewGateCard
+        turn={turn({
+          proposalDisposition: "review_untested",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: null,
+            runId: null,
+            runCompleted: null,
+            terminalCause: "billing_credit_admission_refusal",
+            blocksRunThisTurn: 0,
+            ranCleanOnCurrentSource: false,
+            authoredBlockCount: 1,
+            matchingSourceBlockCount: 0,
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={() => {
+          testRuns += 1;
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "No browser or run started because credits are exhausted.",
+        { exact: false },
+      ),
+    ).not.toBeNull();
+    expect(screen.queryByText(/browser credits/i)).toBeNull();
+    const billing = screen.getByRole("link", { name: "Go to Billing" });
+    expect(billing.getAttribute("href")).toBe("/billing");
+    expect(screen.queryByRole("button", { name: /fresh session/i })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Test end-to-end/i }),
+    ).toBeNull();
+    expect(testRuns).toBe(0);
   });
 
   it("keeps Accept working on an untested proposal that never ran end-to-end", () => {
@@ -295,12 +338,79 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     ).toContain("place orders");
   });
 
+  it("withholds the every-step claim when the proposal could not be projected", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({ blocks: [completedBlock], review: null })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={noop}
+      />,
+    );
+
+    expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+    expect(
+      screen.getByText(/performs real actions on the site/),
+    ).not.toBeNull();
+  });
+
+  it("withholds the every-step claim when the proposal still holds an untested step", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          blocks: [completedBlock],
+          review: {
+            blocks: [
+              { label: "open_page", blockType: "task", change: "changed" },
+              {
+                label: "untouched_step",
+                blockType: "task",
+                change: "unchanged",
+                neverTested: true,
+              },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={noop}
+      />,
+    );
+
+    expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+    expect(
+      screen.getByText(/performs real actions on the site/),
+    ).not.toBeNull();
+  });
+
   it("states that steps were tested alone, not together, and that the run acts on the site", () => {
     render(
       <ReviewGateCard
         turn={turn({
           proposalDisposition: "review_untested",
           blocks: [completedBlock],
+          review: {
+            blocks: [
+              {
+                label: "open_page",
+                blockType: "task",
+                change: "changed",
+                neverTested: false,
+              },
+            ],
+            duplicateWrites: [],
+          },
         })}
         pending
         verdict="untested"

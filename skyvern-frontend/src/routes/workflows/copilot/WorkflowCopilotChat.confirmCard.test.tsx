@@ -8,10 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -138,9 +135,7 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 async function renderChat() {
   const view = render(
     <FeatureFlagContext.Provider value={() => false}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());

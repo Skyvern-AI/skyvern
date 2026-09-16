@@ -1,3 +1,6 @@
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
+import { RetryPolicyEditor } from "./RetryPolicyEditor";
+import { collectKnownErrorCodes } from "./retryPolicyUtils";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -33,6 +36,10 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 
+import {
+  hasBrowserTypeOptions,
+  useBrowserTypeOptionsQuery,
+} from "@/routes/workflows/utils";
 import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
@@ -97,11 +104,14 @@ function WorkflowSettingsEditorBody({
 }) {
   const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
+  const readOnly = useWorkflowScopeReadOnly();
+  const knownErrorCodes = useMemo(() => collectKnownErrorCodes(nodes), [nodes]);
   const edges = useEdges();
   const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });
   const studioEnabled = useWorkflowStudioEnabled();
   const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const { data: browserTypeOptions } = useBrowserTypeOptionsQuery();
   // Self-healing is restricted to copilot-authored workflows; hide the toggle
   // elsewhere so it never reads as a switch that silently does nothing.
   // copilot_authored is lineage-derived server-side — the current version's
@@ -150,6 +160,12 @@ function WorkflowSettingsEditorBody({
 
   return (
     <div data-testid="workflow-settings-block-form" className="space-y-4">
+      <RetryPolicyEditor
+        value={data.retryPolicy ?? null}
+        onChange={(retryPolicy) => update({ retryPolicy })}
+        knownErrorCodes={knownErrorCodes}
+        readOnly={readOnly || !data.editable}
+      />
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label>Model</Label>
@@ -221,6 +237,32 @@ function WorkflowSettingsEditorBody({
           onChange={(value) => update({ proxyLocation: value })}
         />
       </div>
+      {hasBrowserTypeOptions(browserTypeOptions) ? (
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label>Browser Type</Label>
+            <HelpTooltip content="Browser engine used for this agent's runs. Leave as Default to let Skyvern choose. A workflow-run setting overrides this. Note: Google Chrome does not support the captcha-solver extension." />
+          </div>
+          <Select
+            value={data.browserType ?? "default"}
+            onValueChange={(value) =>
+              update({ browserType: value === "default" ? null : value })
+            }
+          >
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Browser Type" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default">Default</SelectItem>
+              {browserTypeOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
       <div className="flex flex-col gap-4 rounded-md bg-slate-elevation5 p-4 pl-4">
         <div className="flex flex-col gap-4">
           <div className="flex justify-between">

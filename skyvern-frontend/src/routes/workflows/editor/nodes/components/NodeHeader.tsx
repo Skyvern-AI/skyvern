@@ -1,3 +1,6 @@
+import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
 import { AxiosError } from "axios";
 import {
   ChevronDownIcon,
@@ -75,11 +78,7 @@ import {
 } from "@/store/WorkflowSettingsStore";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
-import {
-  statusIsAFailureType,
-  statusIsFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 
 import {
   Tooltip,
@@ -282,13 +281,21 @@ function NodeHeader({
   const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun, isError: statusUnavailable } = useWorkflowRunQuery(
-    {
-      workflowRunId: activeWorkflowRunId,
-    },
-  );
+  const {
+    data: workflowRun,
+    isError: statusUnavailable,
+    isPlaceholderData,
+  } = useWorkflowRunQuery({
+    workflowRunId: activeWorkflowRunId,
+  });
+  // The hook withholds another run's payload, but not one retained across an org
+  // switch — that changes the query key while the run id stays the same.
+  const runStateIsLive = !statusUnavailable && !isPlaceholderData;
   const workflowRunIsRunningOrQueued =
-    !statusUnavailable && workflowRun && statusIsRunningOrQueued(workflowRun);
+    runStateIsLive &&
+    workflowRun &&
+    (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
+  useRunCompletionToast(runStateIsLive ? workflowRun : undefined);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -370,44 +377,6 @@ function NodeHeader({
       });
     }
   });
-
-  useEffect(() => {
-    if (
-      !workflowRun ||
-      !workflowPermanentId ||
-      !activeWorkflowRunId ||
-      // Only block-scoped runs toast per block; full runs report via the run
-      // surfaces (?wr= without ?bl=).
-      targetBlockLabel === undefined
-    ) {
-      return;
-    }
-
-    if (
-      activeWorkflowRunId === workflowRun?.workflow_run_id &&
-      statusIsFinalized(workflowRun)
-    ) {
-      if (statusIsAFailureType(workflowRun)) {
-        toast({
-          variant: "destructive",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-          description: `Reason: ${workflowRun.failure_reason}`,
-        });
-      } else if (statusIsFinalized(workflowRun)) {
-        toast({
-          variant: "success",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-        });
-      }
-    }
-  }, [
-    queryClient,
-    targetBlockLabel,
-    navigate,
-    workflowPermanentId,
-    workflowRun,
-    activeWorkflowRunId,
-  ]);
 
   const runBlock = useMutation({
     mutationFn: async (opts?: {
@@ -659,11 +628,15 @@ function NodeHeader({
         debugSessionId: debugSession?.debug_session_id,
         browserSessionId: debugSession?.browser_session_id,
       });
-      toast({
-        variant: "success",
-        title: "Agent Canceled",
-        description: "The agent has been successfully canceled.",
-      });
+      if (activeWorkflowRunId) {
+        claimRunCompletionNotice(activeWorkflowRunId, () => {
+          toast({
+            variant: "success",
+            title: "Agent Canceled",
+            description: "The agent has been successfully canceled.",
+          });
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -851,7 +824,7 @@ function NodeHeader({
   };
 
   const isRunning =
-    !statusUnavailable &&
+    runStateIsLive &&
     (workflowRun ? statusIsRunningOrQueued(workflowRun) : false);
   const createdAt = toDate(workflowRun?.created_at ?? "", null);
   const finishedAt = toDate(workflowRun?.finished_at ?? "", null);

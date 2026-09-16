@@ -642,6 +642,17 @@ if settings.ENABLE_ANTHROPIC:
         ),
     )
     LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5.1_FABLE",
+        LLMConfig(
+            "anthropic/claude-fable-5-1",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE5_OPUS",
         LLMConfig(
             "anthropic/claude-opus-5",
@@ -764,6 +775,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-fable-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-fable-5-1",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,

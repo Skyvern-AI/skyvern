@@ -344,7 +344,8 @@
               "sdk-reference/browser-sessions/create-browser-session",
               "sdk-reference/browser-sessions/get-browser-session",
               "sdk-reference/browser-sessions/get-browser-sessions",
-              "sdk-reference/browser-sessions/close-browser-session"
+              "sdk-reference/browser-sessions/close-browser-session",
+              "sdk-reference/browser-sessions/extend-browser-session"
             ]
           },
           {
@@ -427,6 +428,18 @@
     }
   },
   "redirects": [
+    {
+      "source": "/api-reference/runs/extract-a-job-application-posting",
+      "destination": "/api-reference/recipes/extract-a-job-application-posting"
+    },
+    {
+      "source": "/api-reference/runs/apply-to-a-job",
+      "destination": "/api-reference/recipes/apply-to-a-job"
+    },
+    {
+      "source": "/api-reference/runs/list-job-recipe-runs",
+      "destination": "/api-reference/recipes/list-job-recipe-runs"
+    },
     {
       "source": "/going-to-production/captcha-bot-detection",
       "destination": "/developers/features/captcha-and-bot-bypass"

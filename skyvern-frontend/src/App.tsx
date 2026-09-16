@@ -8,6 +8,7 @@ import { PostHogProvider } from "posthog-js/react";
 import { LoggingContext, loggingStub } from "@/store/LoggingContext";
 import { UserContext } from "@/store/UserContext";
 import { dropNoiseExceptions } from "@/util/posthogNoiseFilter";
+import { RuntimeFeatureFlagProvider } from "@/providers/RuntimeFeatureFlagProvider";
 
 const postHogOptions = {
   api_host: "https://app.posthog.com",
@@ -31,9 +32,11 @@ function App() {
           options={postHogOptions}
         >
           <QueryClientProvider client={queryClient}>
-            <ThemeProvider defaultTheme="dark">
-              <RouterProvider router={router} />
-            </ThemeProvider>
+            <RuntimeFeatureFlagProvider>
+              <ThemeProvider defaultTheme="dark">
+                <RouterProvider router={router} />
+              </ThemeProvider>
+            </RuntimeFeatureFlagProvider>
           </QueryClientProvider>
         </PostHogProvider>
       </UserContext.Provider>

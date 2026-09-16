@@ -206,9 +206,11 @@ export class TabScope {
     return this.quarantinedTabIds.has(tabId);
   }
 
-  cancelTabOperations(tabId, error) {
+  cancelTabOperations(tabId, error, shouldCancel = null) {
     for (const lease of this.tabOperationLeases.get(tabId) ?? []) {
-      lease.cancel(error);
+      if (shouldCancel === null || shouldCancel(lease)) {
+        lease.cancel(error);
+      }
     }
   }
   trackTabOperationLease(tabId, lease) {
@@ -226,8 +228,20 @@ export class TabScope {
     }
   }
 
+  hasCreatedTabUrlChangeGrant(tabId) {
+    if (!this.createdTabIds.has(tabId)) {
+      return false;
+    }
+    return [...(this.tabOperationLeases.get(tabId) ?? [])].some((lease) =>
+      lease.hasUrlChangeGrant(),
+    );
+  }
+
   cancelForTabUpdate(tabId, changeInfo, expectedGroupTransition) {
-    if (!this.scopedTabIds.has(tabId)) {
+    if (
+      !this.scopedTabIds.has(tabId) &&
+      !this.hasCreatedTabUrlChangeGrant(tabId)
+    ) {
       return;
     }
     if (Object.hasOwn(changeInfo, "url")) {
@@ -240,8 +254,10 @@ export class TabScope {
             ? "Chrome does not allow controlling this URL."
             : "The page changed while the extension operation was running.",
         ),
+        restricted
+          ? null
+          : (lease) => !lease.consumeUrlChangeGrant(changeInfo.url),
       );
-      return;
     }
     if (
       Object.hasOwn(changeInfo, "groupId") &&
@@ -384,12 +400,25 @@ export class TabScope {
           "Chrome did not return a tab identifier.",
         );
       }
+      // Accept committed URL events while tabs.create is being published, then
+      // revoke this grant before the lease can outlive publication or failure.
+      lease.allowUrlChange();
       this.trackTabOperationLease(tab.id, lease);
-      lease.assertCurrent();
-      this.createdTabIds.add(tab.id);
-      await this.persistScope(lease);
       try {
-        const scopedTab = await this.addToScopeLocked(tab, lease);
+        lease.assertCurrent();
+        this.createdTabIds.add(tab.id);
+        await this.persistScope(lease);
+        const currentTab = await this.getTab(tab.id);
+        lease.assertCurrent();
+        const currentUrl = currentTab.pendingUrl ?? currentTab.url ?? "";
+        if (isRestrictedUrl(currentUrl)) {
+          throw new ProtocolError(
+            ERROR_CODES.RESTRICTED_URL,
+            "Chrome does not allow controlling this URL.",
+          );
+        }
+        lease.consumeUrlChangeGrant(currentUrl);
+        const scopedTab = await this.addToScopeLocked(currentTab, lease);
         lease.assertCurrent();
         this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
           ...this.publicTab(scopedTab, false),
@@ -403,6 +432,8 @@ export class TabScope {
           // Preserve the original setup error. The tab-removal event retries persistence.
         }
         throw error;
+      } finally {
+        lease.revokeUrlChange();
       }
     });
   }
@@ -548,9 +579,9 @@ export class TabScope {
       await this.runTabOperation(tab.id, async (lease) => {
         openerLease.assertCurrent();
         await this.assertControllableLocked(tab.openerTabId, openerLease);
-        this.createdTabIds.add(tab.id);
-        await this.persistScope(lease);
         try {
+          this.createdTabIds.add(tab.id);
+          await this.persistScope(lease);
           const scopedTab = await this.addToScopeLocked(tab, lease);
           openerLease.assertCurrent();
           await this.assertControllableLocked(tab.openerTabId, openerLease);
@@ -1062,6 +1093,7 @@ export class TabScope {
     try {
       return await current;
     } finally {
+      lease.revokeUrlChange();
       if (this.tabOperations.get(tabId) === current) {
         this.tabOperations.delete(tabId);
       }
@@ -1081,6 +1113,7 @@ export class TabScope {
     let rejectInvalidated;
     let cancelled = false;
     let cancellationError = null;
+    let pendingUrlChangeGrant = null;
     const invalidated = new Promise((_, reject) => {
       rejectInvalidated = reject;
     });
@@ -1089,6 +1122,25 @@ export class TabScope {
       invalidated,
       isCurrent: () => !cancelled && generation === this.operationGeneration,
       remainingMs: () => Math.max(0, deadlineMs - Date.now()),
+      // A commanded navigation accepts every non-restricted URL event while in flight.
+      // The grant is revoked when the operation ends.
+      allowUrlChange: () => {
+        pendingUrlChangeGrant = {
+          redirected: false,
+        };
+      },
+      hasUrlChangeGrant: () => pendingUrlChangeGrant !== null,
+      revokeUrlChange: () => {
+        pendingUrlChangeGrant = null;
+      },
+      consumeUrlChangeGrant: () => {
+        const grant = pendingUrlChangeGrant;
+        if (grant === null) {
+          return false;
+        }
+        grant.redirected = true;
+        return true;
+      },
       assertCurrent: () => {
         if (cancelled || generation !== this.operationGeneration) {
           throw (

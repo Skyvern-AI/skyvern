@@ -134,6 +134,33 @@ class TestRecordArtifactsAfterActionTargetClosed:
 
         assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
 
+    @pytest.mark.asyncio
+    async def test_capture_deadline_timeout_warns_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        assert any(
+            "Timed out taking the post-action screenshot" in str(call.args[0]) for call in log.warning.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_timeout_still_logs_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+        kwargs["browser_state"].take_post_action_screenshot = AsyncMock(return_value=b"png")
+        agent_mod.SkyvernFrame.create_instance.return_value.safe_scroll_to_x_y = AsyncMock()
+        monkeypatch.setattr(
+            agent_mod.app.ARTIFACT_MANAGER,
+            "accumulate_screenshot_to_step_archive",
+            MagicMock(side_effect=TimeoutError()),
+        )
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
+
 
 class TestScrapeWebsiteTargetClosed:
     @pytest.mark.asyncio
@@ -175,7 +202,7 @@ class TestScrapeWebsiteTargetClosed:
 
 
 class TestScrapeRetryLoopTargetClosed:
-    """The terminal scrape attempt re-raises, and its own ERROR is what Error Tracking would file."""
+    """The terminal scrape attempt re-raises and logs at warning; its callers own the error record."""
 
     def _rig(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[ForgeAgent, MagicMock, dict]:
         now = datetime.now(UTC)
@@ -208,13 +235,14 @@ class TestScrapeRetryLoopTargetClosed:
         assert any("browser target closed" in str(call.args[0]).lower() for call in log.warning.call_args_list)
 
     @pytest.mark.asyncio
-    async def test_final_attempt_still_errors_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_final_attempt_warns_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
         agent, log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
 
         with pytest.raises(FailedToTakeScreenshot):
             await agent.build_and_record_step_prompt(**kwargs)
 
-        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
+        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.warning.call_args_list)
+        assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
 
 
 def _browser_gone() -> MissingBrowserStatePage:
@@ -429,6 +457,30 @@ class TestCleanUpTaskTargetClosed:
     @pytest.mark.asyncio
     async def test_other_screenshot_failures_still_log_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        assert any(
+            "Failed to take screenshot before sending task response" in str(call.args[0])
+            for call in log.exception.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_capture_deadline_timeout_warns_without_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, TimeoutError())
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        log.exception.assert_not_called()
+        assert any("Timed out taking the final screenshot" in str(call.args[0]) for call in log.warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_timeout_still_logs_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, TimeoutError())
+        agent_mod.app.BROWSER_MANAGER.get_for_task.return_value.take_fullpage_screenshot = AsyncMock(
+            return_value=b"png"
+        )
+        agent_mod.app.ARTIFACT_MANAGER.create_artifact = AsyncMock(side_effect=TimeoutError())
 
         await ForgeAgent().clean_up_task(**kwargs)
 

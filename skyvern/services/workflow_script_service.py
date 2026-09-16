@@ -58,13 +58,35 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 }
 
 
+def is_block_type_cacheable(block: Any) -> bool:
+    """Whether a block instance is eligible for script caching.
+
+    Beyond block_type membership in BLOCK_TYPES_THAT_SHOULD_BE_CACHED, an extraction
+    block with export enabled is excluded: the generated script's cached replay
+    function only carries prompt/schema/url/model (see _build_extract_statement), so
+    a cached run would silently skip the Parquet export while still reporting
+    success (SKY-15396).
+
+    Accepts either a Block model instance or its dict/model_dump form, matching the
+    two shapes callers hold across script generation and workflow execution.
+    """
+    block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
+    if block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED:
+        return False
+    if block_type == BlockType.EXTRACTION:
+        export_enabled = (
+            block.get("export_enabled") if isinstance(block, dict) else getattr(block, "export_enabled", False)
+        )
+        if export_enabled:
+            return False
+    return True
+
+
 def cacheable_missing_labels(workflow_blocks: list[dict[str, Any]], cached_labels: set[str]) -> set[str]:
     return {
         block["label"]
         for block in workflow_blocks
-        if block.get("label")
-        and block.get("block_type") in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-        and block["label"] not in cached_labels
+        if block.get("label") and is_block_type_cacheable(block) and block["label"] not in cached_labels
     }
 
 

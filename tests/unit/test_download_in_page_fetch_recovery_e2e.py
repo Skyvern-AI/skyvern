@@ -169,6 +169,7 @@ async def cdp_https_site():
     cert_path, key_path = _self_signed_cert()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ssl_ctx.load_cert_chain(cert_path, key_path)
     server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
     port = server.server_address[1]

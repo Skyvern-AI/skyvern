@@ -1,22 +1,154 @@
+import os
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import BinaryIO, cast
+from urllib.parse import unquote
+
+import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.loop_download_filter import DownloadedFileSignature
+
+LOG = structlog.get_logger()
 
 # Hour-granularity equivalent of the sensitive cap for the GCS/Azure signing
 # clients, whose APIs take hours; max() keeps a future sub-hour cap from
 # truncating to zero.
 SENSITIVE_SHARE_URL_EXPIRY_HOURS = max(1, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS // 3600)
+
+
+async def resolve_current_attempt(
+    workflow_run_id: str | None,
+    attempt_number: int | None = None,
+) -> tuple[int, datetime | None]:
+    """Resolve the current attempt from durable rows and the process-local context.
+
+    A workflow context can be absent while cleanup is running, including when context
+    initialization failed. The attempt rows are therefore the durable fallback. Read them once
+    so callers can use the same attempt number and start time for the entire save operation. An
+    explicit attempt number takes precedence over the live context and the latest durable row.
+    """
+    if workflow_run_id is None:
+        return attempt_number if attempt_number is not None else 1, None
+
+    attempts = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if not attempts:
+        return attempt_number if attempt_number is not None else 1, None
+
+    resolved_attempt_number = attempt_number
+    if resolved_attempt_number is None:
+        context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+        resolved_attempt_number = (
+            context.attempt_number if context is not None else max(row.attempt_number for row in attempts)
+        )
+    attempt = next((row for row in attempts if row.attempt_number == resolved_attempt_number), None)
+    return resolved_attempt_number, attempt.started_at if attempt is not None else None
+
+
+async def resolve_download_attempt(
+    organization_id: str,
+    run_id: str | None,
+    attempt_number: int | None = None,
+) -> tuple[str | None, int, datetime | None]:
+    """Use the workflow owning the shared download directory, not the saving child."""
+    workflow_run_id = run_id
+    if run_id is not None and run_id.startswith("tsk_v2_"):
+        run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
+        if run is not None and run.parent_workflow_run_id:
+            workflow_run_id = run.parent_workflow_run_id
+        else:
+            task = await app.DATABASE.observer.get_task_v2(run_id, organization_id=organization_id)
+            workflow_run_id = task.workflow_run_id if task is not None else None
+    if workflow_run_id is None or not workflow_run_id.startswith("wr_"):
+        return None, 1, None
+
+    # Every reader treats attempt 1 as unscoped, so a run live in this process on its first attempt
+    # is resolved without the ancestry walk or the attempt rows. A child run resolves durably: its
+    # downloads belong to the root's attempt.
+    context = skyvern_context.current()
+    if (
+        attempt_number is None
+        and context is not None
+        and context.root_workflow_run_id == workflow_run_id
+        and app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id) <= 1
+        and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id)
+    ):
+        return workflow_run_id, 1, None
+
+    initial_workflow_run_id = workflow_run_id
+    visited: set[str] = set()
+    while workflow_run_id not in visited:
+        visited.add(workflow_run_id)
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id, organization_id=organization_id
+        )
+        if workflow_run is None or not workflow_run.parent_workflow_run_id:
+            break
+        workflow_run_id = workflow_run.parent_workflow_run_id
+    else:
+        raise ValueError("Cycle in download owner workflow ancestry")
+
+    context = skyvern_context.current()
+    saving_workflow_run_id = context.workflow_run_id if context and context.workflow_run_id else initial_workflow_run_id
+    if saving_workflow_run_id != workflow_run_id:
+        attempt_number = None
+    number, started_at = await resolve_current_attempt(workflow_run_id, attempt_number=attempt_number)
+    return workflow_run_id, number, started_at
+
+
+async def resolve_download_attempt_fail_open(
+    organization_id: str,
+    run_id: str | None,
+    attempt_number: int | None = None,
+) -> tuple[str | None, int, datetime | None]:
+    """Resolve the owner and attempt; a failed lookup treats every file as current instead of none."""
+    try:
+        return await resolve_download_attempt(organization_id, run_id, attempt_number=attempt_number)
+    except Exception:
+        LOG.warning(
+            "Failed to resolve download attempt; treating every downloaded file as current",
+            organization_id=organization_id,
+            run_id=run_id,
+            attempt_number=attempt_number,
+            exc_info=True,
+        )
+        return None, attempt_number or 1, None
+
+
+async def get_download_retry_started_at(organization_id: str | None, run_id: str | None) -> datetime | None:
+    _, attempt_number, started_at = await resolve_download_attempt_fail_open(organization_id or "", run_id)
+    if attempt_number <= 1 or started_at is None:
+        return None
+    return started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else started_at
+
+
+def is_file_from_retry_attempt(file_path: str, attempt_started_at: datetime | None) -> bool:
+    """Whether a local file was modified at or after the current attempt started.
+
+    An unknown start time keeps the file: re-saving a stale file under the current attempt is
+    recoverable, while skipping every file loses the download.
+    """
+    if attempt_started_at is None:
+        return True
+    if attempt_started_at.tzinfo is None:
+        attempt_started_at = attempt_started_at.replace(tzinfo=UTC)
+    else:
+        attempt_started_at = attempt_started_at.astimezone(UTC)
+    try:
+        file_modified_at = datetime.fromtimestamp(os.path.getmtime(file_path), tz=UTC)
+    except OSError:
+        return False
+    return file_modified_at >= attempt_started_at
 
 
 def key_is_org_scoped(key: str, allowed_prefixes: tuple[str, ...]) -> bool:
@@ -79,7 +211,7 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
     _ = artifact_type  # kept for call-site compatibility; URL hint now sourced from the artifact row.
     infos: list[FileInfo] = []
     for artifact in artifacts:
-        filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+        filename = artifact_filename_from_uri(artifact.uri)
         url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
         if url is None:
             continue
@@ -89,11 +221,22 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
                 checksum=artifact.checksum,
                 filename=filename,
                 file_size=artifact.file_size,
-                modified_at=artifact.created_at,
+                modified_at=artifact.modified_at or artifact.created_at,
                 artifact_id=artifact.artifact_id,
             )
         )
     return infos
+
+
+def artifact_filename_from_uri(uri: str | None) -> str:
+    """Basename of an artifact URI without urlparse: "?" and "#" are legal in object-store keys.
+
+    A local file URI percent-encodes its name (managed_file_uri), so only that scheme is decoded.
+    """
+    if not uri:
+        return ""
+    basename = uri.rsplit("/", 1)[-1]
+    return unquote(basename) if uri.startswith("file://") else basename
 
 
 def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
@@ -106,7 +249,19 @@ def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
     return {artifact.uri: artifact.checksum for artifact in artifacts if artifact.uri and artifact.checksum}
 
 
-def dedupe_run_scoped_download_artifacts(artifacts: list[Artifact]) -> list[Artifact]:
+def is_download_timestamp_current(timestamp: datetime | None, attempt_started_at: datetime | None) -> bool:
+    if attempt_started_at is None or timestamp is None:
+        return True
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    if attempt_started_at.tzinfo is None:
+        attempt_started_at = attempt_started_at.replace(tzinfo=UTC)
+    return timestamp >= attempt_started_at
+
+
+def dedupe_run_scoped_download_artifacts(
+    artifacts: list[Artifact], attempt_started_at: datetime | None = None
+) -> list[Artifact]:
     """Collapse the two representations of one persistent-session download in a run's DOWNLOAD set.
 
     A download can be registered both session-produced (``browser_session_id`` set — run-bound at
@@ -115,14 +270,26 @@ def dedupe_run_scoped_download_artifacts(artifacts: list[Artifact]) -> list[Arti
     the run-scoped one as canonical. Pairing is one-for-one: a checksum with N run-scoped rows drops at
     most N session rows, so two legitimate same-content session downloads backed by a single run-scoped
     row keep one. Order is preserved; distinct/absent checksums, twinless session rows, and multiple
-    run-scoped rows are all kept. Run-scoped only — never call on a session listing.
+    run-scoped rows are all kept. Rows before the attempt cutoff pass through without pairing.
+    Run-scoped only — never call on a session listing.
     """
-    run_scoped_checksums = Counter(a.checksum for a in artifacts if a.browser_session_id is None and a.checksum)
+    run_scoped_checksums = Counter(
+        a.checksum
+        for a in artifacts
+        if a.browser_session_id is None
+        and a.checksum
+        and is_download_timestamp_current(a.modified_at or a.created_at, attempt_started_at)
+    )
     if not run_scoped_checksums:
         return artifacts
     kept: list[Artifact] = []
     for a in artifacts:
-        if a.browser_session_id is not None and a.checksum and run_scoped_checksums[a.checksum] > 0:
+        if (
+            a.browser_session_id is not None
+            and a.checksum
+            and run_scoped_checksums[a.checksum] > 0
+            and is_download_timestamp_current(a.modified_at or a.created_at, attempt_started_at)
+        ):
             run_scoped_checksums[a.checksum] -= 1
             continue
         kept.append(a)
@@ -226,7 +393,18 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
+        # supersede_queued_prefixes marks a recording's finalize write and prefix_uri names the pre-finalize
+        # key its per-step prefixes queued to (when the finalize renames the object, e.g. .webm -> .mp4).
+        # Only the S3 backend serializes prefix vs finalize writes and acts on these; other backends ignore
+        # them and just overwrite, so the stale-prefix-cannot-overwrite-the-finalized-object ordering
+        # guarantee holds on S3 only (see store_artifact_prefix_from_path).
         pass
 
     @abstractmethod
@@ -252,6 +430,18 @@ class BaseStorage(ABC):
     @abstractmethod
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         pass
+
+    async def store_artifact_prefix_from_path(self, artifact: Artifact, path: str, length: int) -> None:
+        """Upload exactly the first ``length`` bytes of ``path`` (a snapshot of a still-growing file).
+
+        The default reads that bounded prefix and delegates to ``store_artifact``; backends that can
+        stream override this to avoid materializing the prefix in memory. The default buffers, so on
+        local/GCS/Azure a per-step prefix is not serialized against the finalize write — only S3 orders
+        them so a stale prefix cannot overwrite the finalized object.
+        """
+        with open(path, "rb") as f:
+            data = f.read(length)
+        await self.store_artifact(artifact, data)
 
     @abstractmethod
     async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
@@ -331,13 +521,27 @@ class BaseStorage(ABC):
         self,
         organization_id: str,
         run_id: str | None,
+        *,
+        attempt_number: int | None = None,
     ) -> None:
         """Raises DownloadSaveIncompleteError after the loop when any file could not be fully
         saved and registered; every other file already is when it raises, so the save is
         retryable-incomplete."""
 
+    def get_downloaded_file_signature_aliases(self, file_info: FileInfo) -> list[DownloadedFileSignature]:
+        return []
+
+    async def get_current_attempt_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        started_at = await get_download_retry_started_at(organization_id, run_id)
+        files = await self.get_downloaded_files(
+            organization_id=organization_id, run_id=run_id, attempt_started_at=started_at
+        )
+        return [file_info for file_info in files if is_download_timestamp_current(file_info.modified_at, started_at)]
+
     @abstractmethod
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         pass
 
     @abstractmethod
@@ -392,9 +596,21 @@ class BaseStorage(ABC):
     ) -> bool:
         pass
 
+    def manages_local_file_uri(self, uri: str, organization_id: str) -> bool:
+        """Whether this backend stores the file:// ``uri`` for ``organization_id``.
+
+        Only a backend that writes file:// URIs can answer yes, so the default is no.
+        """
+        return False
+
     @abstractmethod
     def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
-        pass
+        """Raise unless this backend owns ``uri`` for ``organization_id``.
+
+        Callers read a clean return as proof of ownership, so the default has to refuse: a backend
+        that forgets to override this would otherwise claim every URI in the system.
+        """
+        raise PermissionError(f"No permission to access storage URI: {uri}")
 
     @abstractmethod
     async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:

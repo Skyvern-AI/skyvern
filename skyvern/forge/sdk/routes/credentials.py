@@ -109,7 +109,9 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
     CustomCredentialServiceConfigResponse,
+    OnePasswordTokenStatusResponse,
     Organization,
+    OrganizationAuthTokenMetadata,
     TestConnectionResponse,
 )
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCodeAccepted, TOTPCode, TOTPCodeCreate
@@ -128,6 +130,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -697,6 +700,7 @@ async def create_credential(
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> CredentialResponse:
     if isinstance(data.credential, NonEmptyPasswordCredential):
         await _normalize_authenticator_totp_for_organization_or_raise(
@@ -756,6 +760,8 @@ async def create_credential(
         organization_id=current_org.organization_id,
         credential_id=credential.credential_id,
         credential_type=data.credential_type,
+        actor_user_id=current_user_id,
+        vault=credential.vault_type.value if credential.vault_type is not None else None,
     )
 
     return _convert_to_response(credential)
@@ -2666,7 +2672,7 @@ async def get_onepassword_token(
                 detail="No OnePassword service account token found for this organization",
             )
 
-        return CreateOnePasswordTokenResponse(token=auth_token)
+        return CreateOnePasswordTokenResponse(token=OrganizationAuthTokenMetadata.from_token(auth_token))
 
     except HTTPException:
         raise
@@ -2674,13 +2680,40 @@ async def get_onepassword_token(
         LOG.error(
             "Failed to get OnePassword service account token",
             organization_id=current_org.organization_id,
-            error=str(e),
-            exc_info=True,
+            error_type=type(e).__name__,
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to get OnePassword service account token: {str(e)}",
+            detail="Failed to get OnePassword service account token",
+        ) from e
+
+
+@base_router.get(
+    "/credentials/onepassword/status",
+    response_model=OnePasswordTokenStatusResponse,
+    summary="Get OnePassword service account token status",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/onepassword/status/",
+    response_model=OnePasswordTokenStatusResponse,
+    include_in_schema=False,
+)
+async def get_onepassword_token_status(
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+) -> OnePasswordTokenStatusResponse:
+    try:
+        return to_status(await resolve_onepassword_token(current_org.organization_id))
+    except Exception as e:
+        LOG.error(
+            "Failed to get OnePassword service account token status",
+            organization_id=current_org.organization_id,
+            error_type=type(e).__name__,
         )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to get OnePassword service account token",
+        ) from e
 
 
 @base_router.get(
@@ -2698,17 +2731,14 @@ async def get_onepassword_token(
 async def list_onepassword_items(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> OnePasswordItemsResponse:
-    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
-        current_org.organization_id,
-        OrganizationAuthTokenType.onepassword_service_account.value,
-    )
+    resolution = await resolve_onepassword_token(current_org.organization_id)
     # Org-scoped only: never fall back to the global OP_SERVICE_ACCOUNT_TOKEN here. In a shared
     # deployment that would let any org without its own token browse the instance/global account's
     # 1Password item metadata. (Runtime resolution may still use the global token for an item the
     # org explicitly configured by vault/item id; listing must not.)
-    if not org_auth_token:
-        return OnePasswordItemsResponse(configured=False, items=[])
-    token = org_auth_token.token
+    if resolution.source != "organization" or resolution.token is None:
+        return OnePasswordItemsResponse(configured=False, items=[], source=resolution.source)
+    token = resolution.token
 
     try:
         client = await OnePasswordClient.authenticate(
@@ -2749,7 +2779,7 @@ async def list_onepassword_items(
                     )
                 )
 
-        return OnePasswordItemsResponse(configured=True, items=items)
+        return OnePasswordItemsResponse(configured=True, items=items, source="organization")
     except asyncio.TimeoutError as e:
         LOG.warning(
             "Timed out while listing 1Password items",
@@ -2904,19 +2934,18 @@ async def update_onepassword_token(
             token_id=auth_token.id,
         )
 
-        return CreateOnePasswordTokenResponse(token=auth_token)
+        return CreateOnePasswordTokenResponse(token=OrganizationAuthTokenMetadata.from_token(auth_token))
 
     except Exception as e:
         LOG.error(
             "Failed to create or update OnePassword service account token",
             organization_id=current_org.organization_id,
-            error=str(e),
-            exc_info=True,
+            error_type=type(e).__name__,
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create or update OnePassword service account token: {str(e)}",
-        )
+            detail="Failed to create or update OnePassword service account token",
+        ) from e
 
 
 @base_router.delete(

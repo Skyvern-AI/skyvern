@@ -16,10 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import skyvern.webeye.actions.handler as handler_mod
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
-from skyvern.webeye.actions.handler import handle_input_text_action
+from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage
@@ -75,7 +76,7 @@ async def test_incremental_element_tree_propagates_when_both_attempts_time_out()
 
 
 async def _run_input_with_incremental_error(
-    error: BaseException, engine_selection: BrowserEngineSelection | None = None
+    error: BaseException, engine_selection: BrowserEngineSelection | None = None, via_dispatcher: bool = False
 ) -> list:
     skyvern_el = make_input_element_mock(element_id="AADC")
     dom_instance = MagicMock()
@@ -110,6 +111,10 @@ async def _run_input_with_incremental_error(
             return_value=engine_selection,
         ),
     ):
+        if via_dispatcher:
+            return await ActionHandler._handle_action(
+                scraped_page=scraped_page, task=_TASK, step=_STEP, page=MagicMock(), action=action
+            )
         return await handle_input_text_action(
             action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
         )
@@ -165,3 +170,28 @@ async def test_input_action_reraises_foreign_error_under_selected_engine(message
 
     with pytest.raises(PlaywrightError):
         await _run_input_with_incremental_error(PlaywrightError(message), engine_selection=_engine_selection())
+
+
+@pytest.mark.asyncio
+async def test_unexpected_input_failure_logs_one_error_through_the_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The input handler re-raises to the dispatcher, which owns the single error-level record of the failure."""
+    log = MagicMock()
+    monkeypatch.setattr(handler_mod, "LOG", log)
+    monkeypatch.setattr(handler_mod.app.AGENT_FUNCTION, "wait_for_challenge_solver", AsyncMock())
+
+    # Importing cloud registers an INPUT_TEXT setup hook on the global registry that would run first on the mock page.
+    with (
+        patch.dict(ActionHandler._setup_action_types, {}, clear=True),
+        patch.dict(ActionHandler._teardown_action_types, {}, clear=True),
+    ):
+        results = await _run_input_with_incremental_error(
+            _EngineError("something genuinely unexpected"), engine_selection=_engine_selection(), via_dispatcher=True
+        )
+
+    assert len(results) == 1 and results[0].success is False
+    assert results[0].exception_type == "_EngineError"
+    assert any(
+        call.args[0] == "Failed to input the value or finish the auto completion" for call in log.warning.call_args_list
+    )
+    assert [call.args[0] for call in log.exception.call_args_list] == ["Unhandled exception in action handler"]
+    log.error.assert_not_called()

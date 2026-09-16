@@ -1,3 +1,8 @@
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import {
+  runIsCancellable,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { type ReactNode, useMemo, useState } from "react";
 import { AxiosError } from "axios";
 import {
@@ -33,7 +38,7 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
@@ -51,7 +56,6 @@ import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
-import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { StudioPaneToggles } from "./StudioPaneToggles";
@@ -306,23 +310,23 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { data: workflowRun, isError: statusUnavailable } =
-    useWorkflowRunWithWorkflowQuery(
-      runId ? { workflowRunId: runId } : undefined,
-    );
+  const {
+    data: retainedRun,
+    isError: statusUnavailable,
+    isPlaceholderData,
+  } = useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
+  // The hook withholds another run's payload, but not one retained across an org
+  // switch — that changes the query key while the run id stays the same.
+  const workflowRun = isPlaceholderData ? undefined : retainedRun;
   const activeRunId = workflowRun?.workflow_run_id;
   const running =
-    !statusUnavailable &&
-    runOutcomeFromStatus(workflowRun?.status) === "running";
+    !statusUnavailable && Boolean(workflowRun && runIsCancellable(workflowRun));
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
   const rerunEligible = Boolean(
     workflowRun &&
-    // keepPreviousData can surface a prior run after the focused run clears/changes;
-    // only treat it as the focused run when its id matches the URL.
-    workflowRun.workflow_run_id === runId &&
-    statusIsFinalized(workflowRun) &&
+    runIsLogicallyFinal(workflowRun) &&
     workflowRun.task_v2 === null &&
     !isBlockRun &&
     !workflowRun.workflow?.deleted_at,
@@ -341,11 +345,15 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         queryKey: ["workflowRun", workflowPermanentId, activeRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
-      toast({
-        variant: "success",
-        title: "Run canceled",
-        description: "The agent run has been canceled.",
-      });
+      if (activeRunId) {
+        claimRunCompletionNotice(activeRunId, () => {
+          toast({
+            variant: "success",
+            title: "Run canceled",
+            description: "The agent run has been canceled.",
+          });
+        });
+      }
     },
     onError: (error: AxiosError) => {
       toast({

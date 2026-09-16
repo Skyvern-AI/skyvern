@@ -8,11 +8,13 @@ binding that decides which page it is read from.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -20,7 +22,12 @@ from playwright.async_api import Error as PlaywrightError
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    OriginRunRedactionRegistry,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
     register_secret_scrub_value,
 )
@@ -37,7 +44,12 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockType
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    make_copilot_ctx,
+    remove_sensitive_disclosure_prerequisite,
+    taint_by_terminal_run,
+)
 
 STAR_BUTTON = 'button.pill:has-text("Star")'
 STAR_VALUE = 'button.pill:has-text("Star") span.n'
@@ -320,6 +332,129 @@ async def test_locator_result_is_suppressed_when_session_becomes_tainted_in_flig
     assert "data" not in result
 
 
+OTP_SELECTOR = "#token"
+RUN_OTP = "424242"
+
+
+def _terminal_credential_run_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id="pbs_run")
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters={"totp": RUN_OTP},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    return ctx
+
+
+def _authenticator_page() -> _FakePage:
+    return _FakePage(
+        {
+            OTP_SELECTOR: [
+                {
+                    "tag": "input",
+                    "text_content": f"code {RUN_OTP}",
+                    "outer_html": f'<input id="token" value="{RUN_OTP}">',
+                    "descendants": [{"index": 0, "tag": "span", "text_content": RUN_OTP}],
+                }
+            ]
+        }
+    )
+
+
+def _bind_authenticator_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.resolve_browser_state_for_context",
+        AsyncMock(return_value=SimpleNamespace(get_working_page=AsyncMock(return_value=_authenticator_page()))),
+    )
+
+
+@pytest.mark.asyncio
+async def test_locator_reports_from_the_page_a_terminal_credential_run_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _terminal_credential_run_ctx()
+    _bind_authenticator_page(monkeypatch)
+
+    raw = await inspect_locator_matches_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+    )
+
+    result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["browser_target_workflow_run_id"] == "wr_credential"
+    entry = result["data"]["selectors"][0]
+    assert entry["selector"] == OTP_SELECTOR
+    assert entry["match_count"] == 1
+    assert RUN_OTP not in raw
+    assert REDACTED_SECRET_PLACEHOLDER in raw
+
+
+@pytest.mark.asyncio
+async def test_locator_scrubs_encoded_forms_of_the_run_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This read never crosses the MCP adapter: the URL carries the username URL-encoded and the
+    outer HTML the password HTML-escaped, and neither form may reach the model."""
+    username, password = "demo.user@pathfold.test", "Sp1r!t&Level<2026>"
+    ctx = _terminal_credential_run_ctx()
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters={"credential": {"username": username, "password": password}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    page = SimpleNamespace(url=f"http://pathfold.test/app?user={quote(username, safe='')}")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.resolve_browser_state_for_context",
+        AsyncMock(return_value=SimpleNamespace(get_working_page=AsyncMock(return_value=page))),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.inspect_locator_matches",
+        AsyncMock(
+            return_value={
+                "selectors": [
+                    {
+                        "selector": OTP_SELECTOR,
+                        "match_count": 1,
+                        "matches": [{"tag": "input", "outer_html": f'<input value="{html.escape(password)}">'}],
+                    }
+                ]
+            }
+        ),
+    )
+
+    raw = await inspect_locator_matches_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+    )
+
+    assert json.loads(raw)["ok"] is True
+    for form in (username, quote(username, safe=""), password, html.escape(password)):
+        assert form not in raw
+    assert REDACTED_SECRET_PLACEHOLDER in raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+async def test_locator_withholds_the_same_page_when_a_prerequisite_is_absent(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    ctx = _terminal_credential_run_ctx()
+    remove_sensitive_disclosure_prerequisite(ctx, arm)
+    _bind_authenticator_page(monkeypatch)
+
+    raw = await inspect_locator_matches_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+    )
+
+    result = json.loads(raw)
+    assert result["ok"] is False
+    assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
+    assert "data" not in result
+
+
 @pytest.mark.asyncio
 async def test_no_selectors_is_answered_without_touching_the_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     resolved: list[str] = []
@@ -472,7 +607,7 @@ async def test_a_closed_run_page_reports_nothing_rather_than_zero_matches(
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", _resolve)
 
     observed = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_gone",
         failed_block_code='page.locator("#rate").inner_text()',
     )
@@ -546,7 +681,7 @@ async def test_worker_owned_observation_types_every_selector_without_resolving_a
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", resolver)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_worker",
         failed_block_code='page.locator("#first")\npage.locator("#first")\npage.locator("text=Second")',
         worker_owned=True,
@@ -565,7 +700,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
 
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", AsyncMock(return_value=None))
     missing_browser = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_missing",
         failed_block_code='page.locator("#target")',
     )
@@ -575,7 +710,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
         AsyncMock(return_value=_observation_browser(None)),
     )
     missing_page = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_closed",
         failed_block_code='page.locator("#target")',
     )
@@ -602,7 +737,7 @@ async def test_resolution_and_identity_failures_never_become_zero_matches(monkey
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code=('page.locator("bad engine")\npage.locator("#identity")\npage.locator("#absent")'),
     )
@@ -638,7 +773,7 @@ async def test_ordinary_observation_exception_is_typed_without_losing_the_failur
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#failure")\npage.locator("#absent")',
     )
@@ -670,7 +805,7 @@ async def test_observation_cancellation_is_not_converted_to_typed_absence(
 
     with pytest.raises(asyncio.CancelledError):
         await run_execution._observe_authored_locators(
-            SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+            SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
             run_session_id="pbs_1",
             failed_block_code='page.locator("#cancelled")',
         )
@@ -697,7 +832,7 @@ async def test_observation_deadline_preserves_partial_rows_and_types_every_remai
     monkeypatch.setattr(run_execution, "_OBSERVED_LOCATOR_BUDGET_SECONDS", 0.01)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#done")\npage.locator("#wedged")\npage.locator("#later")',
     )
@@ -723,7 +858,7 @@ async def test_observer_packet_and_sanitizer_preserve_typed_rows_and_exact_omiss
         AsyncMock(return_value=_observation_browser(page)),
     )
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code="\n".join(f'page.locator("{selector}")' for selector in selectors),
     )
@@ -809,7 +944,12 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         AsyncMock(return_value=False),
     )
 
-    async def _attach_trace(_blocks: list[object], results: list[dict[str, object]], _organization_id: str) -> None:
+    async def _attach_trace(
+        _blocks: list[object],
+        results: list[dict[str, object]],
+        _organization_id: str,
+        include_completed: bool = False,
+    ) -> None:
         results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 4}]
 
     monkeypatch.setattr(run_execution, "_attach_action_traces", _attach_trace)

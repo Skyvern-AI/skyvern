@@ -7,7 +7,9 @@ from typing import Any
 import httpx
 import pytest
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import google_sheets_service
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 TransportInstaller = Callable[[Callable[[httpx.Request], httpx.Response]], None]
 
@@ -418,7 +420,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -447,7 +449,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -476,7 +478,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         frozen_now = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -518,7 +520,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -546,7 +548,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -570,7 +572,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused", request=request)
@@ -594,7 +596,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(503, json={"error": {"message": "upstream down"}})
@@ -646,6 +648,46 @@ class TestRuntime:
         assert payload["updates"]["updatedRows"] == 1
         assert captured["path"].endswith(":append")
         assert captured["params"]["valueInputOption"] == "USER_ENTERED"
+        assert captured["params"]["insertDataOption"] == "INSERT_ROWS"
+
+    @pytest.mark.asyncio
+    async def test_values_append_wrapper_forwards_the_insert_data_option(
+        self, mock_sheets_transport: TransportInstaller
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"updates": {"updatedRows": 1}})
+
+        mock_sheets_transport(handler)
+        await AgentFunction().google_sheets_values_append(
+            access_token="tok",
+            spreadsheet_id="1abc_xyz_1234567890ABCDEF",
+            range_="Sheet1!C63",
+            values=[["a"]],
+            insert_data_option="OVERWRITE",
+        )
+        assert captured["params"]["insertDataOption"] == "OVERWRITE"
+
+    @pytest.mark.asyncio
+    async def test_values_append_wrapper_defaults_to_inserting_rows(
+        self, mock_sheets_transport: TransportInstaller
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"updates": {"updatedRows": 1}})
+
+        mock_sheets_transport(handler)
+        await AgentFunction().google_sheets_values_append(
+            access_token="tok",
+            spreadsheet_id="1abc_xyz_1234567890ABCDEF",
+            range_="Sheet1",
+            values=[["a"]],
+        )
+        assert captured["params"]["insertDataOption"] == "INSERT_ROWS"
 
     @pytest.mark.asyncio
     async def test_batch_update_sends_requests(self, mock_sheets_transport: TransportInstaller) -> None:

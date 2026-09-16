@@ -47,6 +47,9 @@ class _DesignationServer:
 
 def _ctx(server: _DesignationServer) -> SimpleNamespace:
     return SimpleNamespace(
+        browser_session_id="pbs-debug",
+        last_run_blocks_browser_session_id=None,
+        last_run_blocks_workflow_run_id=None,
         discovery_mcp_server=server,
         completion_criteria_turn_state=None,
         request_policy=None,

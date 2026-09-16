@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from google.auth.exceptions import GoogleAuthError
 from oauthlib.oauth2 import InvalidGrantError, OAuth2Error
 
+from skyvern.forge import app
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
     CreateGoogleOAuthCallbackRequest,
@@ -228,6 +229,20 @@ async def google_oauth_callback(
         )
     scopes_granted = _require_scopes_from_token(token_data)
 
+    prior_state = None
+    prior_state_known = False
+    try:
+        prior_state = await app.DATABASE.google_oauth.get_credential_state(
+            current_org.organization_id, context.credential_id
+        )
+        prior_state_known = True
+    except Exception:
+        LOG.warning(
+            "Failed to read Google OAuth credential state before promotion",
+            organization_id=current_org.organization_id,
+            credential_id=context.credential_id,
+            exc_info=True,
+        )
     try:
         credential = await google_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
@@ -240,6 +255,30 @@ async def google_oauth_callback(
         raise HTTPException(status_code=400, detail=str(exc))
     except google_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+    if not prior_state_known:
+        LOG.warning(
+            "Skipping Google integration lifecycle analytics because prior credential state is unknown",
+            organization_id=current_org.organization_id,
+            credential_id=credential.id,
+        )
+    else:
+        try:
+            await app.AGENT_FUNCTION.on_integration_connected(
+                organization_id=current_org.organization_id,
+                provider="google",
+                credential_id=credential.id,
+                is_reconnect=prior_state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR},
+                actor_user_id=current_user_id,
+                connected_at=credential.modified_at,
+            )
+        except Exception:
+            LOG.warning(
+                "Google integration lifecycle analytics hook failed",
+                organization_id=current_org.organization_id,
+                credential_id=credential.id,
+                exc_info=True,
+            )
 
     try:
         if google_oauth_service.has_required_scopes(

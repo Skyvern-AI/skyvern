@@ -31,12 +31,9 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId: workflowRunBlock.workflow_run_id,
   });
-  // Actionable only when the resolved run IS this block's run (keepPreviousData can
-  // briefly return the prior run while switching), the run is paused, and this block
-  // is still running — else a stale/historical prompt would resolve the wrong pause
-  // (the continue/cancel mutations target the resolved run).
+  // Actionable only while this block's own run is paused and the block is still
+  // running — else a historical prompt would resolve the wrong pause.
   const isAwaitingInteraction =
-    workflowRun?.workflow_run_id === workflowRunBlock.workflow_run_id &&
     workflowRun?.status === WorkflowRunStatus.Paused &&
     workflowRunBlock.status === WorkflowRunStatus.Running;
 

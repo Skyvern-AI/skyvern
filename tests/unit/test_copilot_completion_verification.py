@@ -3119,7 +3119,10 @@ def _run_ctx() -> CopilotContext:
 
 def _ctx_with_blocks(*block_types: str) -> CopilotContext:
     ctx = _run_ctx()
-    blocks = [SimpleNamespace(block_type=bt, label=f"b{i}") for i, bt in enumerate(block_types)]
+    blocks = [
+        SimpleNamespace(block_type=bt, label="confirm" if index == 0 else f"b{index}")
+        for index, bt in enumerate(block_types)
+    ]
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks))
     ctx.verified_prefix_labels = [b.label for b in blocks]
     ctx.composition_verified_labels = [b.label for b in blocks]
@@ -4153,6 +4156,36 @@ async def test_non_fallback_offline_judge_does_not_fire_interactive_barrier(monk
     _record_run_blocks_result(ctx, result, completion_verification=verification)
     assert outcome_fully_verified(ctx) is False
     assert verified_goal_satisfied_context(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_work_plan_naming_the_requested_output_changes_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    judged_prompts: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict:
+        judged_prompts.append(prompt)
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+
+    async def verify(work_plan: list[str]) -> CompletionVerificationResult:
+        ctx = _ctx_with_blocks("extraction")
+        ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "the confirmation code is returned")])
+        ctx.work_plan = work_plan
+        verification = await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic())
+        assert verification is not None
+        return verification
+
+    without_plan = await verify([])
+    plan = ["the confirmation code is returned", "reach the payment step"]
+    with_plan = await verify(plan)
+
+    assert with_plan.is_fully_satisfied() is False
+    assert with_plan == without_plan
+    assert with_plan.to_trace_data() == without_plan.to_trace_data()
+    assert len(judged_prompts) == 2
+    assert judged_prompts[1] == judged_prompts[0]
+    assert "reach the payment step" not in judged_prompts[1]
 
 
 @pytest.mark.asyncio

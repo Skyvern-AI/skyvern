@@ -963,6 +963,7 @@ async def test_microsoft_oauth_callback_rejects_state_redeemed_by_another_caller
             microsoft_oauth=SimpleNamespace(
                 insert_pending_credential=insert_pending_credential,
                 load_pending_by_nonce=load_pending_by_nonce,
+                get_credential_state=AsyncMock(return_value=None),
             )
         ),
         raising=False,

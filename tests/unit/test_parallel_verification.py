@@ -23,6 +23,7 @@ from tests.unit.helpers import (
     make_task,
     setup_parallel_verification_mocks,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 @pytest.mark.asyncio
@@ -503,7 +504,6 @@ async def test_agent_step_skips_user_goal_check_when_feature_disabled(monkeypatc
     action_handler_mock = AsyncMock(return_value=[ActionSuccess()])
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", action_handler_mock)
     agent.record_artifacts_after_action = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
     agent.check_user_goal_complete = AsyncMock()
 
     llm_handler_mock = AsyncMock(return_value=json_response)
@@ -513,7 +513,7 @@ async def test_agent_step_skips_user_goal_check_when_feature_disabled(monkeypatc
     )
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
 
     async def fake_update_step(
@@ -632,13 +632,12 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     agent.create_extract_action = AsyncMock(return_value=extract_action)
     agent.record_artifacts_after_action = AsyncMock()
     agent._persist_scrape_artifacts = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
 
     action_handler_mock = AsyncMock(return_value=[ActionSuccess()])
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", action_handler_mock)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
     monkeypatch.setattr(
@@ -817,7 +816,7 @@ async def test_speculative_plan_null_response_does_not_unbind_without_page_infor
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", AsyncMock(return_value=[ActionSuccess()]))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=AsyncMock(return_value=None)))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
     monkeypatch.setattr(
@@ -826,7 +825,6 @@ async def test_speculative_plan_null_response_does_not_unbind_without_page_infor
     )
     agent.record_artifacts_after_action = AsyncMock()
     agent._persist_scrape_artifacts = AsyncMock()
-    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
     extract_action = ExtractAction(
         reasoning="collect",
         data_extraction_goal=task.data_extraction_goal,
@@ -923,7 +921,7 @@ async def test_discarded_speculative_plan_cost_write_survives_task_cleanup(
     )
 
     # Stands in for the speculative LLM call still being in flight when the completion path
-    # returns. call_later rather than sleep: the shared mocks replace asyncio.sleep.
+    # returns. call_later rather than sleep: the module-local sleep stand-in is scoped.
     speculative_call_finished = asyncio.Event()
     asyncio.get_running_loop().call_later(0.2, speculative_call_finished.set)
     persisted_steps: list[str] = []

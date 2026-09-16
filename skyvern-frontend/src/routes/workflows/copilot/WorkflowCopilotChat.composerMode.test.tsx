@@ -8,10 +8,9 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useRuntimeConfig } from "@/hooks/useRuntimeConfig";
+import { RuntimeFeatureFlagProvider } from "@/providers/RuntimeFeatureFlagProvider";
 
 type StreamBody = {
   message: string;
@@ -71,6 +70,12 @@ vi.mock("@/api/AxiosClient", () => ({
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
+
+vi.mock("@/hooks/useRuntimeConfig", () => ({
+  useRuntimeConfig: vi.fn(),
+}));
+
+const useRuntimeConfigMock = vi.mocked(useRuntimeConfig);
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
@@ -139,26 +144,34 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 type FlagConfig = {
-  copilotV2?: boolean;
   codeBlockMode?: boolean;
-  defaultMode?: string;
 };
 
 async function renderChat(flags: FlagConfig) {
   const booleanFlags: Record<string, boolean> = {
-    ENABLE_WORKFLOW_COPILOT_V2: flags.copilotV2 ?? false,
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: flags.codeBlockMode ?? false,
     CODE_BLOCK_ACCESS: flags.codeBlockMode ?? false,
   };
-  const valueFlags: Record<string, string | undefined> = {
-    WORKFLOW_COPILOT_DEFAULT_MODE: flags.defaultMode,
-  };
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={(name) => valueFlags[name]}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>,
+  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+  return view;
+}
+
+async function renderOssChat() {
+  useRuntimeConfigMock.mockReturnValue({
+    data: {
+      workflow_copilot_code_block_mode: true,
+      code_block_access: true,
+    },
+  } as ReturnType<typeof useRuntimeConfig>);
+  const view = render(
+    <RuntimeFeatureFlagProvider>
+      <WorkflowCopilotChat />
+    </RuntimeFeatureFlagProvider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
@@ -175,7 +188,7 @@ async function submit(value: string) {
   });
 }
 
-async function selectMode(label: "Ask" | "Build" | "Build with code") {
+async function selectMode(label: "Build" | "Build with code") {
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
       button: 0,
@@ -206,42 +219,31 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — unflagged composer default", () => {
+describe("WorkflowCopilotChat — Build composer", () => {
+  it("uses the OSS server fallback as the visible default", async () => {
+    await renderOssChat();
+
+    expect(
+      screen.getByRole("button", { name: "Switch mode" }).textContent,
+    ).toContain("Build with code");
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.code_block).toBe(true);
+  });
+
   it("defaults to Build with code when code-first is accessible", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("ignores the retired default-mode variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("sends code_block=null when Ask is selected", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await selectMode("Ask");
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
   it("lands on code ON when selecting Build with code", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await selectMode("Ask");
+    await renderChat({ codeBlockMode: true });
     await selectMode("Build with code");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -251,7 +253,7 @@ describe("WorkflowCopilotChat — unflagged composer default", () => {
   });
 
   it("turns code OFF when selecting plain Build", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await selectMode("Build");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -260,17 +262,14 @@ describe("WorkflowCopilotChat — unflagged composer default", () => {
     expect(streamCalls[0]?.body.code_block).toBe(false);
   });
 
-  it("sends code_block=null when code-first is inaccessible", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: false,
-      defaultMode: "build_no_code",
-    });
+  it("explicitly selects non-code Build when code-first is inaccessible", async () => {
+    await renderChat({ codeBlockMode: false });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
+    expect(streamCalls[0]?.body.code_block).toBe(false);
+    expect(screen.queryByRole("button", { name: "Switch mode" })).toBeNull();
   });
 });
 
@@ -281,7 +280,7 @@ describe("WorkflowCopilotChat — canvas selection context", () => {
 
   it("sends the canvas selection as selected_block_label", async () => {
     window.history.pushState(null, "", "/?selected-block=login");
-    await renderChat({ copilotV2: true });
+    await renderChat({});
     await submit("why is this block failing?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -289,7 +288,7 @@ describe("WorkflowCopilotChat — canvas selection context", () => {
   });
 
   it("sends null without a selection", async () => {
-    await renderChat({ copilotV2: true });
+    await renderChat({});
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 

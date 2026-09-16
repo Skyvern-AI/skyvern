@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     grade_fallback_floor_reached_end_state_criteria,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
@@ -39,9 +40,12 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.workflow import runtime_secret_bridge
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.block import _register_code_block_secret
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     make_completion_criterion,
+    make_copilot_ctx,
 )
 from tests.unit.copilot_test_helpers import make_stub_artifact as _artifact
 from tests.unit.copilot_test_helpers import make_stub_html_artifact as _html_artifact
@@ -523,9 +527,9 @@ _HTML_NO_VALUE = (
 _HTML_SCRAPE_PREACTION = "<html><body><main><p>SCRAPEONLYTOKEN loading form</p></main></body></html>"
 
 
-def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> SimpleNamespace:
+def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> CopilotContext:
     baseline = {"visible_text_excerpt": pre_run_prose} if pre_run_prose is not None else None
-    return SimpleNamespace(
+    return make_copilot_ctx(
         composition_page_evidence=baseline,
         pre_run_page_reference=None,
         workflow_verification_evidence=SimpleNamespace(),
@@ -534,10 +538,12 @@ def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> S
         origin_run_redaction_registry=None,
         scouted_credential_field_inventory_by_credential_id={},
         last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])),
+        last_run_blocks_workflow_run_id=None,
+        dispatched_run_ids_this_turn=set(),
     )
 
 
-def _snapshot_from_ctx(ctx: SimpleNamespace, run_id: str) -> RunEvidenceSnapshot:
+def _snapshot_from_ctx(ctx: CopilotContext, run_id: str) -> RunEvidenceSnapshot:
     block_outputs: dict[str, object] = {}
     block_output_sources: dict[str, EvidenceSourceKind] = {}
     completion_module._bind_independent_post_run_page_evidence(ctx, run_id, block_outputs, block_output_sources)
@@ -897,6 +903,44 @@ async def test_runtime_secret_bridge_round_trips_exact_values_through_local_cach
 
     assert published is True
     assert consumed == {"654321"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_secret_bridge_carries_a_code_block_minted_otp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A one-time code a code block mints or polls never passes through the OTP resolver, so the
+    bridge only carries it if the code block registers it as a runtime OTP rather than a bare secret."""
+    values: dict[str, str] = {}
+
+    class FakeLocalCache:
+        is_shared = False
+
+        def get_lock(self, *_args: object, **_kwargs: object) -> asyncio.Lock:
+            return asyncio.Lock()
+
+        async def set(self, key: str, value: str, ex: int) -> None:
+            values[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return values.get(key)
+
+    monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeLocalCache()))
+    workflow_run_context = WorkflowRunContext("title", "wid", "wpid", "wr_origin", None)
+    workflow_run_context.secrets["totp_identifier"] = "totp"
+    _register_code_block_secret(workflow_run_context, "654321")
+
+    published = await runtime_secret_bridge.publish_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+        workflow_run_context=workflow_run_context,
+    )
+    consumed = await runtime_secret_bridge.consume_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+    )
+
+    assert published is True
+    assert consumed == {"654321"}
+    assert "654321" in workflow_run_context.secrets.values()
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import subprocess
@@ -10,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,6 +22,7 @@ from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.broker_protocol import (
     BROKER_GENERATION,
     PREAUTH_FRAME_LIMIT,
+    encode_frame,
     event_frame,
     read_frame,
     response_frame,
@@ -33,6 +35,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 
 class EventRelay:
@@ -50,6 +53,7 @@ class EventRelay:
         self.on_disconnect = on_disconnect
         self.pending_request_count = 0
         self.extension_protocol_version: int | None = 2
+        self.extension_build_hash: str | None = None
         self.extension_connection_generation = 1
 
     async def start(self) -> None:
@@ -217,7 +221,7 @@ class CancelledLargeResponseRelay(EventRelay):
 
 @pytest.mark.asyncio
 async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     events: list[tuple[str, dict]] = []
 
     async def on_event(event: str, params: dict) -> None:
@@ -225,7 +229,7 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
 
     relay = EventRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, on_event, auto_spawn=False)
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -256,11 +260,459 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reader_continues_request_round_trip_while_event_callback_blocks() -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def on_event(_event: str, _params: dict) -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    reader, reader_task = await _start_test_transport(client)
+    request_task: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        reader.feed_data(
+            encode_frame(event_frame("extension.event", {"event": "debugger.event", "params": {"sequence": 1}}))
+        )
+        await asyncio.wait_for(callback_started.wait(), 1.0)
+
+        request_task = asyncio.create_task(client.request("tabs.list", {}))
+        await _eventually(lambda: "c-1" in client._pending)
+        reader.feed_data(encode_frame(response_frame("c-1", {"roundTrip": True})))
+
+        assert await asyncio.wait_for(request_task, 1.0) == {"roundTrip": True}
+        assert not reader_task.done()
+    finally:
+        release_callback.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_task
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_scope_mutation_is_applied_before_lease_response_while_callback_blocks() -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def on_event(_event: str, _params: dict) -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    reader, _reader_task = await _start_test_transport(client)
+    lease_list_task: asyncio.Task[list[dict[str, Any]]] | None = None
+    try:
+        tab = {"tabId": 11, "url": "https://example.test", "title": "Example"}
+        reader.feed_data(encode_frame(event_frame("extension.event", {"event": "scope.tabAdded", "params": tab})))
+        await asyncio.wait_for(callback_started.wait(), 1.0)
+
+        # The callback is still blocked, but the reader has already applied the
+        # scope mutation and can accept a lease-list request.
+        assert client.scoped_tabs == [tab]
+        lease_list_task = asyncio.create_task(client.list_scoped_tabs())
+        await _eventually(lambda: "c-1" in client._pending)
+        reader.feed_data(encode_frame(response_frame("c-1", {"tabs": list(client.scoped_tabs)})))
+        assert await asyncio.wait_for(lease_list_task, 1.0) == [tab]
+
+        reader.feed_data(
+            encode_frame(event_frame("extension.event", {"event": "scope.tabRemoved", "params": {"tabId": 11}}))
+        )
+        await _eventually(lambda: client.scoped_tabs == [])
+
+        lease_list_task = asyncio.create_task(client.list_scoped_tabs())
+        await _eventually(lambda: "c-2" in client._pending)
+        reader.feed_data(encode_frame(response_frame("c-2", {"tabs": list(client.scoped_tabs)})))
+        assert await asyncio.wait_for(lease_list_task, 1.0) == []
+    finally:
+        release_callback.set()
+        if lease_list_task is not None and not lease_list_task.done():
+            lease_list_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lease_list_task
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_event_forwarder_preserves_arrival_order_for_one_thousand_events() -> None:
+    received: list[int] = []
+
+    async def on_event(_event: str, params: dict) -> None:
+        received.append(params["sequence"])
+
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    reader, _reader_task = await _start_test_transport(client)
+    try:
+        for sequence in range(1000):
+            reader.feed_data(
+                encode_frame(
+                    event_frame("extension.event", {"event": "debugger.event", "params": {"sequence": sequence}})
+                )
+            )
+
+        await _eventually(lambda: len(received) == 1000)
+        assert received == list(range(1000))
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_event_queue_overflow_tears_down_once_and_fails_pending_request(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    disconnected = asyncio.Event()
+    disconnect_count = 0
+
+    async def on_event(_event: str, _params: dict) -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    async def on_disconnect() -> None:
+        nonlocal disconnect_count
+        disconnect_count += 1
+        disconnected.set()
+
+    client = BrokerClient(
+        19778,
+        on_event,
+        on_disconnect,
+        base_dir=_test_broker_base_dir(),
+        auto_spawn=False,
+    )
+    reader, _reader_task = await _start_test_transport(client)
+    pending_request: asyncio.Task[dict[str, Any]] | None = None
+    first_frame = encode_frame(
+        event_frame("extension.event", {"event": "debugger.event", "params": {"payload": "x" * 64}})
+    )
+    second_frame = encode_frame(
+        event_frame("extension.event", {"event": "debugger.event", "params": {"payload": "y" * 64}})
+    )
+    monkeypatch.setattr(
+        broker_client_module,
+        "MAX_CLIENT_EVENT_QUEUE_BYTES",
+        len(first_frame) + len(second_frame) - 2 * 4 - 1,
+    )
+
+    try:
+        pending_request = asyncio.create_task(client.request("tabs.list", {}))
+        await _eventually(lambda: "c-1" in client._pending)
+        reader.feed_data(first_frame)
+        await asyncio.wait_for(callback_started.wait(), 1.0)
+
+        with caplog.at_level(logging.WARNING):
+            reader.feed_data(second_frame)
+            await asyncio.wait_for(disconnected.wait(), 1.0)
+
+        with pytest.raises(BrowserExtensionNotConnectedError):
+            await asyncio.wait_for(pending_request, 1.0)
+        assert disconnect_count == 1
+        assert not client.broker_connected
+        assert client._event_queue_bytes == 0
+        assert "browser_extension_client_event_queue_overflow" in caplog.text
+    finally:
+        release_callback.set()
+        if pending_request is not None and not pending_request.done():
+            pending_request.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_request
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_event_callback_failure_logs_and_tears_down_without_deadlock(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    disconnected = asyncio.Event()
+
+    async def on_event(_event: str, _params: dict) -> None:
+        raise RuntimeError("callback failed")
+
+    async def on_disconnect() -> None:
+        disconnected.set()
+
+    client = BrokerClient(
+        19778,
+        on_event,
+        on_disconnect,
+        base_dir=_test_broker_base_dir(),
+        auto_spawn=False,
+    )
+    reader, reader_task = await _start_test_transport(client)
+    try:
+        with caplog.at_level(logging.ERROR):
+            reader.feed_data(
+                encode_frame(event_frame("extension.event", {"event": "debugger.event", "params": {"sequence": 1}}))
+            )
+            await asyncio.wait_for(disconnected.wait(), 1.0)
+            await asyncio.wait_for(asyncio.shield(reader_task), 1.0)
+
+        assert not client.broker_connected
+        assert "browser_extension_client_event_callback_failed" in caplog.text
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_eof_and_callback_failure_teardown_once_without_pending_tasks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    disconnected = asyncio.Event()
+    disconnect_count = 0
+
+    async def on_event(_event: str, _params: dict) -> None:
+        callback_started.set()
+        await release_callback.wait()
+        raise RuntimeError("callback failed")
+
+    async def on_disconnect() -> None:
+        nonlocal disconnect_count
+        disconnect_count += 1
+        disconnected.set()
+
+    client = BrokerClient(
+        19778,
+        on_event,
+        on_disconnect,
+        base_dir=_test_broker_base_dir(),
+        auto_spawn=False,
+    )
+    reader, reader_task = await _start_test_transport(client)
+    forwarder_task = client._event_forwarder_task
+    writer = client._writer
+    assert forwarder_task is not None
+    assert isinstance(writer, _TestWriter)
+    try:
+        with caplog.at_level(logging.ERROR):
+            reader.feed_data(encode_frame(event_frame("extension.event", {"event": "debugger.event", "params": {}})))
+            await asyncio.wait_for(callback_started.wait(), 1.0)
+
+            # Wake the callback and the reader's EOF path in the same turn.
+            reader.feed_eof()
+            release_callback.set()
+            await asyncio.wait_for(disconnected.wait(), 1.0)
+
+        for task in (reader_task, forwarder_task):
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), 1.0)
+        await _eventually(lambda: writer.closed and client._transport_teardown_task is None)
+
+        assert disconnect_count == 1
+        assert writer.closed
+        assert reader_task.done()
+        assert forwarder_task.done()
+        assert client._transport_teardown_task is None
+        assert "browser_extension_client_event_callback_failed" in caplog.text
+    finally:
+        release_callback.set()
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_replacement_fences_queued_events_and_stop_cancels_forwarder() -> None:
+    old_callback_started = asyncio.Event()
+    new_callback_started = asyncio.Event()
+    release_new_callback = asyncio.Event()
+    received: list[str] = []
+
+    async def on_event(event: str, _params: dict) -> None:
+        received.append(event)
+        if event == "old-active":
+            old_callback_started.set()
+            await asyncio.Event().wait()
+        elif event == "new-event":
+            new_callback_started.set()
+            await release_new_callback.wait()
+
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    old_reader, _old_reader_task = await _start_test_transport(client)
+    old_generation = client._transport_generation
+    old_writer = client._writer
+    assert old_writer is not None
+    try:
+        old_reader.feed_data(encode_frame(event_frame("extension.event", {"event": "old-active", "params": {}})))
+        await asyncio.wait_for(old_callback_started.wait(), 1.0)
+        old_reader.feed_data(encode_frame(event_frame("extension.event", {"event": "old-queued", "params": {}})))
+        await _eventually(lambda: client._event_queue_bytes > 0)
+
+        await asyncio.wait_for(client._teardown_transport(old_generation, old_writer), 1.0)
+        assert client._event_forwarder_task is None
+
+        new_reader, _new_reader_task = await _start_test_transport(client)
+        assert client._transport_generation == old_generation + 1
+        new_reader.feed_data(encode_frame(event_frame("extension.event", {"event": "new-event", "params": {}})))
+        await asyncio.wait_for(new_callback_started.wait(), 1.0)
+
+        release_new_callback.set()
+        await client.stop()
+        assert client._event_forwarder_task is None
+        assert received == ["old-active", "new-event"]
+    finally:
+        release_new_callback.set()
+        if not client._closed:
+            await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_waits_for_old_teardown_before_publishing_new_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disconnect_started = asyncio.Event()
+    release_disconnect = asyncio.Event()
+    disconnect_generations: list[int] = []
+    received: list[str] = []
+
+    async def on_event(event: str, _params: dict) -> None:
+        received.append(event)
+
+    client: BrokerClient
+
+    async def on_disconnect() -> None:
+        disconnect_started.set()
+        await release_disconnect.wait()
+        disconnect_generations.append(client._transport_generation)
+
+    client = BrokerClient(
+        19778,
+        on_event,
+        on_disconnect,
+        base_dir=_test_broker_base_dir(),
+        auto_spawn=False,
+    )
+    old_reader, _old_reader_task = await _start_test_transport(client)
+    old_generation = client._transport_generation
+    old_writer = client._writer
+    assert old_writer is not None
+
+    new_reader = asyncio.StreamReader()
+    new_writer = _TestWriter()
+    state = SimpleNamespace(
+        lifecycle="ready",
+        externalPort=19778,
+        protocolMin=1,
+        protocolMax=1,
+        brokerGeneration=BROKER_GENERATION,
+        pid=os.getpid(),
+        processStart="test",
+        controlEndpoint="test",
+    )
+
+    monkeypatch.setattr(broker_client_module, "read_broker_state", lambda _paths: state)
+    monkeypatch.setattr(broker_client_module, "process_identity_matches", lambda _pid, _start: True)
+    monkeypatch.setattr(broker_client_module, "resolve_control_endpoint", lambda _paths, _endpoint: _paths)
+
+    async def open_connection(_paths: object) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return new_reader, cast(Any, new_writer)
+
+    async def authenticate(_reader: asyncio.StreamReader, _writer: asyncio.StreamWriter) -> int:
+        return 2
+
+    monkeypatch.setattr(broker_client_module, "_open_control_connection", open_connection)
+    monkeypatch.setattr(client, "_authenticate", authenticate)
+
+    connect_task: asyncio.Task[None] | None = None
+    try:
+        await client._teardown_transport(old_generation, cast(Any, old_writer))
+        await asyncio.wait_for(disconnect_started.wait(), 1.0)
+
+        connect_task = asyncio.create_task(client._connect())
+        await asyncio.sleep(0)
+        assert not connect_task.done()
+        assert client._transport_generation == old_generation
+        assert client._writer is None
+
+        release_disconnect.set()
+        await asyncio.wait_for(connect_task, 1.0)
+        assert client._transport_generation == old_generation + 1
+        assert client._writer is new_writer
+        assert disconnect_generations == [old_generation]
+
+        # A delayed notification from generation 1 must not reset generation 2.
+        await client._notify_disconnect(transport_generation=old_generation, was_connected=True, force=True)
+        assert disconnect_generations == [old_generation]
+
+        new_reader.feed_data(encode_frame(event_frame("extension.event", {"event": "new-event", "params": {}})))
+        await _eventually(lambda: received == ["new-event"])
+        assert not new_writer.closed
+    finally:
+        release_disconnect.set()
+        if connect_task is not None and not connect_task.done():
+            connect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await connect_task
+        old_reader.feed_eof()
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_same_socket_reconnect_drops_stale_events_before_new_hello() -> None:
+    old_callback_started = asyncio.Event()
+    reconnected_hello_seen = asyncio.Event()
+    disconnected = asyncio.Event()
+    received: list[str] = []
+    disconnect_count = 0
+
+    async def on_event(event: str, _params: dict) -> None:
+        received.append(event)
+        if event == "old-active":
+            old_callback_started.set()
+            await asyncio.Event().wait()
+        elif event == "extension.hello":
+            reconnected_hello_seen.set()
+
+    async def on_disconnect() -> None:
+        nonlocal disconnect_count
+        disconnect_count += 1
+        disconnected.set()
+
+    client = BrokerClient(
+        19778,
+        on_event,
+        on_disconnect,
+        base_dir=_test_broker_base_dir(),
+        auto_spawn=False,
+    )
+    reader, _reader_task = await _start_test_transport(client)
+    transport_generation = client._transport_generation
+    try:
+        reader.feed_data(encode_frame(event_frame("extension.event", {"event": "old-active", "params": {}})))
+        await asyncio.wait_for(old_callback_started.wait(), 1.0)
+        reader.feed_data(encode_frame(event_frame("extension.event", {"event": "old-queued", "params": {}})))
+        await _eventually(lambda: client._event_queue_bytes > 0)
+
+        await client._handle_event(
+            event_frame("extension.disconnected", {}),
+            transport_generation,
+        )
+        await asyncio.wait_for(disconnected.wait(), 1.0)
+
+        reader.feed_data(encode_frame(event_frame("extension.event", {"event": "stale", "params": {}})))
+        reader.feed_data(
+            encode_frame(event_frame("extension.event", {"event": "extension.hello", "params": {"scopedTabs": []}}))
+        )
+        reader.feed_data(encode_frame(event_frame("extension.connected", {})))
+        await asyncio.wait_for(reconnected_hello_seen.wait(), 1.0)
+
+        assert client.connected
+        assert client.scoped_tabs == []
+        assert disconnect_count == 1
+        assert received == ["old-active", "extension.hello"]
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
 async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = TabListRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -291,7 +743,7 @@ async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
 
 @pytest.mark.asyncio
 async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     observed_tabs: list[list[dict[str, Any]]] = []
 
     async def on_event(event: str, _params: dict) -> None:
@@ -304,7 +756,7 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
     await relay.hello()
     await _eventually(lambda: not server._extension_reset_quarantined)
     relay.scoped_tabs = [{"tabId": 11, "url": "https://example.test", "title": "Example"}]
-    client = BrokerClient(19778, on_event, auto_spawn=False)
+    client = BrokerClient(19778, on_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
@@ -322,10 +774,10 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
 
 @pytest.mark.asyncio
 async def test_client_preserves_extension_request_error_type() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = ErrorRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -340,7 +792,7 @@ async def test_client_preserves_extension_request_error_type() -> None:
 
 @pytest.mark.asyncio
 async def test_client_accepts_large_response_only_for_extension_request() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = LargeResponseRelay(
         "extension-secret",
         19778,
@@ -348,7 +800,7 @@ async def test_client_accepts_large_response_only_for_extension_request() -> Non
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -362,7 +814,7 @@ async def test_client_accepts_large_response_only_for_extension_request() -> Non
 
 @pytest.mark.asyncio
 async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = TwentyMiBResponseRelay(
         "extension-secret",
         19778,
@@ -370,7 +822,7 @@ async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> No
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     try:
@@ -386,7 +838,7 @@ async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> No
 
 @pytest.mark.asyncio
 async def test_cancelled_large_response_is_discarded_without_closing_transport() -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = CancelledLargeResponseRelay(
         "extension-secret",
         19778,
@@ -394,7 +846,7 @@ async def test_cancelled_large_response_is_discarded_without_closing_transport()
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     large_request = asyncio.create_task(client.request("debugger.send", {"tabId": 11}))
@@ -435,7 +887,7 @@ async def test_cancelled_large_response_is_discarded_without_closing_transport()
 async def test_cancellation_during_drain_keeps_late_large_response_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = BrowserExtensionBrokerServer(19778)
+    server = BrowserExtensionBrokerServer(19778, base_dir=_test_broker_base_dir())
     relay = CancelledLargeResponseRelay(
         "extension-secret",
         19778,
@@ -443,7 +895,7 @@ async def test_cancellation_during_drain_keeps_late_large_response_authorized(
         server._handle_disconnect,
     )
     server._relay = relay
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     relay.scoped_tabs = [{"tabId": 11}]
     writer = client._writer
@@ -498,7 +950,7 @@ async def test_cancellation_during_drain_keeps_late_large_response_authorized(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("extra_field", ["recoverySecret", "unexpected"])
 async def test_reauthentication_rejects_excess_response_fields(extra_field: str) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -522,7 +974,7 @@ async def test_reauthentication_rejects_excess_response_fields(extra_field: str)
 
 @pytest.mark.asyncio
 async def test_reauthentication_rejects_attacker_substituted_client_id() -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -543,7 +995,7 @@ async def test_reauthentication_rejects_attacker_substituted_client_id() -> None
 
 @pytest.mark.asyncio
 async def test_failed_reauthentication_never_falls_back_to_enrollment(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client._client_id = "stored-client"
     client._recovery_secret = "stored-secret"
 
@@ -584,8 +1036,260 @@ async def test_failed_reauthentication_never_falls_back_to_enrollment(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_stop_suppresses_peer_reset_during_writer_close() -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.abort_calls = 0
+
+        def abort(self) -> None:
+            self.abort_calls += 1
+
+    class ResetWriter:
+        def __init__(self) -> None:
+            self.transport = Transport()
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def wait_closed(self) -> None:
+            raise ConnectionResetError
+
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    writer = ResetWriter()
+    client._writer = writer  # type: ignore[assignment]
+
+    await client.stop()
+
+    assert writer.close_calls == 1
+    assert writer.transport.abort_calls == 1
+    assert client._writer is None
+
+
+@pytest.mark.asyncio
+async def test_writer_close_is_bounded_and_reconnect_waits_for_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(broker_client_module, "CLIENT_CLOSE_GRACE_SECONDS", 0.01)
+
+    class Transport:
+        def __init__(self) -> None:
+            self.abort_calls = 0
+
+        def abort(self) -> None:
+            self.abort_calls += 1
+
+    class HangingWriter:
+        def __init__(self) -> None:
+            self.transport = Transport()
+            self.close_calls = 0
+            self.wait_closed_started = asyncio.Event()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def wait_closed(self) -> None:
+            self.wait_closed_started.set()
+            await asyncio.Future()
+
+    writer = HangingWriter()
+    started = asyncio.get_running_loop().time()
+    await broker_client_module._close_writer(writer)  # type: ignore[arg-type]
+    assert asyncio.get_running_loop().time() - started < 0.5
+    assert writer.close_calls == 1
+    assert writer.wait_closed_started.is_set()
+    assert writer.transport.abort_calls == 1
+
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    old_writer = HangingWriter()
+    client._reader = asyncio.StreamReader()
+    client._writer = old_writer  # type: ignore[assignment]
+    client._transport_generation = 1
+    new_reader = asyncio.StreamReader()
+
+    class ReadyWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.close_calls = 0
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+            self.close_calls += 1
+
+        async def wait_closed(self) -> None:
+            return None
+
+    new_writer = ReadyWriter()
+    monkeypatch.setattr(
+        broker_client_module,
+        "read_broker_state",
+        lambda _paths: SimpleNamespace(
+            lifecycle="ready",
+            externalPort=19778,
+            controlEndpoint=str(client.paths.control_socket),
+            protocolMin=1,
+            protocolMax=1,
+            brokerGeneration=BROKER_GENERATION,
+            pid=123,
+            processStart="marker",
+        ),
+    )
+    monkeypatch.setattr(broker_client_module, "process_identity_matches", lambda _pid, _marker: True)
+    monkeypatch.setattr(
+        broker_client_module,
+        "_open_control_connection",
+        AsyncMock(return_value=(new_reader, new_writer)),
+    )
+    monkeypatch.setattr(client, "_authenticate", AsyncMock(return_value=2))
+
+    try:
+        await asyncio.wait_for(client._connect(), 0.5)
+        assert client._writer is new_writer
+        assert client._transport_generation == 2
+        assert old_writer.transport.abort_calls == 1
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_control_request_tears_down_after_peer_reset_during_drain() -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.abort_calls = 0
+
+        def abort(self) -> None:
+            self.abort_calls += 1
+
+    class ResetWriter:
+        def __init__(self) -> None:
+            self.transport = Transport()
+
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            raise ConnectionResetError
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            raise ConnectionResetError
+
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    writer = ResetWriter()
+    client._writer = writer  # type: ignore[assignment]
+
+    with pytest.raises(BrowserExtensionNotConnectedError, match="not connected"):
+        await client._control_request("broker.status", {}, 5.0)
+    await _eventually(lambda: writer.transport.abort_calls == 1)
+
+    assert client._writer is None
+    assert not client._pending
+
+
+def _mock_pre_upgrade_daemon(monkeypatch: pytest.MonkeyPatch, client: BrokerClient) -> list[int]:
+    """Wire read_broker_state/process_identity_matches/psutil.Process so the client sees a
+    live daemon at BROKER_GENERATION - 1, pid 555_555, until FakeProcess.terminate() runs."""
+    terminated_pids: list[int] = []
+    alive = [True]
+
+    monkeypatch.setattr(
+        broker_client_module,
+        "read_broker_state",
+        lambda _paths: SimpleNamespace(
+            lifecycle="ready",
+            externalPort=19778,
+            controlEndpoint=str(client.paths.control_socket),
+            protocolMin=1,
+            protocolMax=1,
+            brokerGeneration=BROKER_GENERATION - 1,
+            pid=555_555,
+            processStart="stale-marker",
+        ),
+    )
+    monkeypatch.setattr(broker_client_module, "process_identity_matches", lambda _pid, _marker: alive[0])
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def terminate(self) -> None:
+            terminated_pids.append(self.pid)
+            alive[0] = False
+
+    monkeypatch.setattr(broker_client_module.psutil, "Process", FakeProcess)
+    return terminated_pids
+
+
+@pytest.mark.asyncio
+async def test_operator_client_never_terminates_a_pre_upgrade_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status/stop/grant/revoke construct auto_spawn=False clients that never bring a
+    replacement broker back up, so on a generation mismatch they must leave the still-
+    functioning daemon alone and report INCOMPATIBLE_BROKER rather than kill it out from
+    under whoever depends on it."""
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+
+    with pytest.raises(BrowserExtensionBrokerError) as exc_info:
+        await client._connect()
+
+    assert exc_info.value.code == "INCOMPATIBLE_BROKER"
+    assert terminated_pids == []
+
+
+@pytest.mark.asyncio
+async def test_start_terminates_incompatible_daemon_and_reaches_compatible_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-place upgrade leaves an old-generation daemon running when a new client
+    starts. start() must terminate it and reach the auto-spawn/reconnect path within
+    one call, not merely fail with INCOMPATIBLE_BROKER and leave the caller stuck."""
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=True)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+    monkeypatch.setattr(broker_client_module, "_ensure_broker_process", lambda _port, _paths: None)
+    connect_after_spawn = AsyncMock()
+    monkeypatch.setattr(client, "_connect_with_retry", connect_after_spawn)
+
+    await client.start()
+
+    assert terminated_pids == [555_555]
+    connect_after_spawn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_broker_terminates_a_pre_upgrade_daemon_despite_auto_spawn_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop is explicitly destructive, unlike status/grant/revoke: even with
+    auto_spawn=False, stop_broker() must terminate a mismatched-generation daemon
+    directly rather than surface INCOMPATIBLE_BROKER and leave it running forever."""
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+
+    result = await client.stop_broker()
+
+    assert result == {"stopping": True}
+    assert terminated_pids == [555_555]
+
+
+@pytest.mark.asyncio
 async def test_stale_ready_state_with_dead_process_is_spawnable(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     monkeypatch.setattr(
         broker_client_module,
         "read_broker_state",
@@ -620,7 +1324,7 @@ async def test_client_retains_and_reaps_spawned_broker_process(monkeypatch: pyte
             self.was_polled = True
             return self.returncode
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     process = SpawnedProcess()
     connect = AsyncMock(side_effect=[BrowserExtensionNotConnectedError("not running"), None])
     monkeypatch.setattr(client, "_connect", connect)
@@ -653,7 +1357,7 @@ async def test_client_stop_hands_live_spawned_process_to_daemon_waiter() -> None
             wait_finished.set()
             return 0
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     client._spawned_process = SpawnedProcess()  # type: ignore[assignment]
 
     try:
@@ -687,7 +1391,7 @@ async def test_cancelled_start_registers_late_spawn_for_reaping(monkeypatch: pyt
         release_spawn.wait()
         return process
 
-    client = BrokerClient(19778, _ignore_event)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     monkeypatch.setattr(client, "_connect", AsyncMock(side_effect=BrowserExtensionNotConnectedError("not running")))
     monkeypatch.setattr(broker_client_module, "_ensure_broker_process", blocked_spawn)
     start_task = asyncio.create_task(client.start())
@@ -841,7 +1545,7 @@ def test_client_module_contains_no_extension_credential_access() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_field", ["clientId", "recoverySecret", "brokerGeneration", "brokerProof"])
 async def test_enrollment_response_schema_is_exact(missing_field: str) -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
 
     def response(args: dict[str, Any], server_nonce: str) -> dict[str, Any]:
         client_nonce = args["clientNonce"]
@@ -863,7 +1567,7 @@ async def test_enrollment_response_schema_is_exact(missing_field: str) -> None:
 
 @pytest.mark.asyncio
 async def test_enrollment_response_rejects_excess_fields() -> None:
-    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
 
     def response(args: dict[str, Any], server_nonce: str) -> dict[str, Any]:
         client_nonce = args["clientNonce"]
@@ -976,6 +1680,44 @@ async def _eventually(predicate: Callable[[], bool]) -> None:
     raise AssertionError("condition did not become true")
 
 
+class _TestWriter:
+    def __init__(self) -> None:
+        self.closed = False
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def _start_test_transport(client: BrokerClient) -> tuple[asyncio.StreamReader, asyncio.Task[None]]:
+    reader = asyncio.StreamReader()
+    writer = _TestWriter()
+    client._reader = reader
+    client._writer = cast(Any, writer)
+    client._transport_generation += 1
+    transport_generation = client._transport_generation
+    client._disconnect_notified = False
+    client._accept_extension_events = True
+    client._extension_reconnect_pending = False
+    client._start_event_forwarder(transport_generation, cast(Any, writer))
+    reader_task = asyncio.create_task(client._read_loop(reader, cast(Any, writer), transport_generation))
+    client._reader_task = reader_task
+    client._extension_connected.set()
+    return reader, reader_task
+
+
 async def _ignore_event(_event: str, _params: dict) -> None:
     return None
 
@@ -1032,6 +1774,7 @@ async def _connect_over_socketpair(
     client._writer = client_writer
     client._connection_generation = connection_generation
     client._transport_generation += 1
+    client._start_event_forwarder(client._transport_generation, client_writer)
     client._reader_task = asyncio.create_task(
         client._read_loop(client_reader, client_writer, client._transport_generation)
     )

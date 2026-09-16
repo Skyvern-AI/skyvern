@@ -5,10 +5,10 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-_NESTED_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
-_BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
 
 
@@ -103,44 +103,7 @@ def workflow_blocks(parsed: dict[str, Any], selected_labels: set[str] | None = N
     """With `selected_labels`, collect only blocks whose label is in the set plus their
     descendants — a selected `for_loop` drags its `loop_blocks` in, since loop children are
     not themselves named in an executing label set."""
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return []
-
-    collected: list[dict[str, Any]] = []
-
-    def visit_branch(branch: dict[str, Any], inherited: bool) -> None:
-        for key in _NESTED_BLOCK_LIST_KEYS:
-            visit(branch.get(key), inherited)
-        for branch_key in _BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, dict):
-                    visit_branch(nested_branch, inherited)
-
-    def visit(blocks: Any, inherited: bool) -> None:
-        if not isinstance(blocks, list):
-            return
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            selected = inherited or selected_labels is None or block.get("label") in selected_labels
-            if selected:
-                collected.append(block)
-            for key in _NESTED_BLOCK_LIST_KEYS:
-                visit(block.get(key), selected)
-            for branch_key in _BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, dict):
-                        visit_branch(branch, selected)
-
-    visit(workflow_definition.get("blocks"), False)
-    return collected
+    return [location.block for location in workflow_block_locations(parsed, selected_labels)]
 
 
 def block_credential_ids(block: dict[str, Any], credential_params_by_key: Mapping[str, str | set[str]]) -> set[str]:
@@ -183,16 +146,18 @@ def workflow_credential_ids_from_parsed(parsed: dict[str, Any]) -> set[str]:
     return credential_ids
 
 
-def workflow_credential_origins(workflow_yaml: str) -> dict[str, set[str]]:
+def workflow_credential_origins(workflow_yaml: str, *, require_canonical_origin: bool = False) -> dict[str, set[str]]:
     if not workflow_yaml:
         return {}
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return {}
-    return workflow_credential_origins_from_parsed(parsed)
+    return workflow_credential_origins_from_parsed(parsed, require_canonical_origin=require_canonical_origin)
 
 
-def workflow_credential_origins_from_parsed(parsed: dict[str, Any]) -> dict[str, set[str]]:
+def workflow_credential_origins_from_parsed(
+    parsed: dict[str, Any], *, require_canonical_origin: bool = False
+) -> dict[str, set[str]]:
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return {}
@@ -206,8 +171,14 @@ def workflow_credential_origins_from_parsed(parsed: dict[str, Any]) -> dict[str,
         block_url = block.get("url")
         if not isinstance(block_url, str) or not block_url.strip():
             continue
-        origin = url_origin(block_url)
-        if not origin:
+        # Release authorization requires an unambiguous raw URL. Output scope comparison
+        # must retain other parseable origins: omitting them would hide a changed destination.
+        if require_canonical_origin:
+            canonical_origin = canonicalize_origin(block_url)
+            origin = canonical_origin.canonical if canonical_origin is not None else None
+        else:
+            origin = url_origin(block_url)
+        if origin is None:
             continue
         for credential_id in credential_ids:
             origins_by_id.setdefault(credential_id, set()).add(origin)

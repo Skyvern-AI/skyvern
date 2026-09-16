@@ -391,4 +391,30 @@ async function getClientWithRequestHeaders(
 
 export type CredentialGetter = () => Promise<string | null>;
 
+// A keepalive request is the one kind the browser finishes after the page is gone; an Axios call
+// started during page teardown is cancelled with it.
+export async function deleteUploadedFileOnPageExit(
+  fileId: string,
+): Promise<boolean> {
+  const headers: Record<string, string> = { "x-user-agent": "skyvern-ui" };
+  const authorization =
+    clientSansApiV1.defaults.headers.common["Authorization"];
+  if (typeof authorization === "string") {
+    headers.Authorization = authorization;
+  }
+  const apiKey = getRuntimeApiKey();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
+  try {
+    const response = await fetch(
+      `${apiSansApiV1BaseUrl}/files/${encodeURIComponent(fileId)}`,
+      { method: "DELETE", headers, keepalive: true },
+    );
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 export { artifactApiClient, getClient, getClientWithRequestHeaders };

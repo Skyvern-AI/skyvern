@@ -212,6 +212,18 @@ class OpaqueUrlRefs:
         self.refs[token] = url
         return token
 
+    def mint_in_text(self, text: str) -> str:
+        """Mint a ref for every signed URL inside free ``text`` and return the text with each replaced by
+        its token. Unlike mask(), this is by shape: it is how a URL first gains payload provenance."""
+
+        def _mint(match: re.Match[str]) -> str:
+            # Sentence punctuation after a URL is not part of it and would fail the signature charset.
+            url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
+            trailing = match.group(0)[len(url) :]
+            return (self.derive(url) if is_signed_url(url) else url) + trailing
+
+        return _URL_IN_TEXT_RE.sub(_mint, text)
+
     def mask(self, text: str) -> str:
         """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
         the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
@@ -256,33 +268,21 @@ def mask_opaque_urls(parameters: dict[str, Any] | None) -> OpaqueUrlRefs:
     """Replace every signed-URL string value in ``parameters`` with a deterministic opaque token.
 
     Never mutates ``parameters``; other values are copied unchanged."""
+    result = OpaqueUrlRefs(masked=None, refs={})
     if parameters is None:
-        return OpaqueUrlRefs(masked=None, refs={})
-
-    refs: dict[str, str] = {}
-
-    def _mask_url(url: str) -> str:
-        token = _token_for(url)
-        refs[token] = url
-        return token
-
-    def _mask_in_text(match: re.Match[str]) -> str:
-        # Sentence punctuation after a URL is not part of it and would fail the signature charset.
-        url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
-        trailing = match.group(0)[len(url) :]
-        return (_mask_url(url) if is_signed_url(url) else url) + trailing
+        return result
 
     def _mask(value: Any) -> Any:
         if isinstance(value, str):
             if is_signed_url(value):
-                return _mask_url(value)
+                return result.derive(value)
             # A free-form payload string (e.g. task_data prose) can carry the URL inline.
-            return _URL_IN_TEXT_RE.sub(_mask_in_text, value)
+            return result.mint_in_text(value)
         if isinstance(value, dict):
             return {key: _mask(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return type(value)(_mask(val) for val in value)
         return value
 
-    masked = _mask(parameters)
-    return OpaqueUrlRefs(masked=masked, refs=refs)
+    result.masked = _mask(parameters)
+    return result

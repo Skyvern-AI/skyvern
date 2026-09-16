@@ -29,6 +29,70 @@ if TYPE_CHECKING:
     # Deferred import: skyvern_context.py sits below the service layer and
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
+    from skyvern.webeye.actions.actions import Action
+
+
+@dataclass
+class MultiFieldTotpAttempt:
+    box_element_ids: list[str]
+    expected_digits: int
+    code_source: str
+    valid_from: float | None = None
+    valid_until: float | None = None
+    filled_code_hash: str | None = None
+    filled_at: float | None = None
+    fill_verified: bool = False
+    hint_code: str | None = field(default=None, repr=False)
+    credential_placeholders: frozenset[str] = field(default_factory=frozenset, repr=False)
+
+
+def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[str, Any]:
+    """Copy element metadata while removing non-empty values from it and its descendants."""
+    redacted = dict(element_data)
+    attributes = element_data.get("attributes")
+    if isinstance(attributes, dict):
+        redacted["attributes"] = dict(attributes)
+        if attributes.get("value") not in (None, ""):
+            redacted["attributes"]["value"] = "*"
+    children = element_data.get("children")
+    if isinstance(children, list):
+        redacted["children"] = [
+            redact_multi_field_totp_element_data(child) if isinstance(child, dict) else child for child in children
+        ]
+    return redacted
+
+
+def action_for_multi_field_totp_persistence(action: Action) -> Action:
+    """Return a safe copy of a multi-box OTP action for database persistence."""
+    timing_info = action.totp_timing_info
+    if not timing_info or not timing_info.get("is_totp_sequence"):
+        return action
+
+    updates: dict[str, Any] = {
+        "text": "*",
+        "reasoning": "Entered a one-time code digit.",
+        "totp_timing_info": {
+            key: timing_info[key]
+            for key in ("is_totp_sequence", "action_index", "box_element_ids", "code_source")
+            if key in timing_info
+        },
+    }
+    if action.intention is not None:
+        updates["intention"] = "*"
+    if action.response is not None:
+        updates["response"] = "*"
+    if action.skyvern_element_data is not None:
+        updates["skyvern_element_data"] = redact_multi_field_totp_element_data(action.skyvern_element_data)
+    if action.input_or_select_context is not None:
+        updates["input_or_select_context"] = action.input_or_select_context.model_copy(
+            update={
+                key: "Entered a one-time code digit."
+                for key, value in action.input_or_select_context.model_dump().items()
+                if isinstance(value, str)
+            }
+        )
+    return action.model_copy(update=updates)
+
 
 LOG = structlog.get_logger()
 
@@ -252,11 +316,17 @@ class SkyvernContext:
     # unbiased secure-vs-legacy comparison. Left None when no genuine assignment was made (no browser
     # session, provider unreachable) so a degraded provider never biases the legacy arm.
     codeblock_execution_path: str | None = None
+    # The driver's navigation error code for a task whose failure was handled rather than raised,
+    # keyed by task id. Keyed rather than last-one-wins because one browser state serves every block
+    # in a run: a later block that fails without navigating must not inherit an earlier block's code.
+    task_nav_error_codes: dict[str, str] = field(default_factory=dict)
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -330,6 +400,18 @@ class SkyvernContext:
     workflow_block_engine_resolved_run_id: str | None = None
     # Single-flight the first-use provider resolution when parallel branches share one context.
     workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # TASK_V3_FRAME_PERCEPTION arm, resolved once per run before the v3 loop starts; read through
+    # frame_perception_enabled(), never directly. The flag is written before the run-id sentinel, so
+    # a concurrent reader sees "unresolved" -- off, today's behaviour -- rather than a torn pair.
+    frame_perception_flag: bool = False
+    # The run the pin above was resolved for; a nested execution with a different id re-resolves.
+    # Last writer wins with no save/restore, so this prevents inheriting an unchecked arm but would
+    # not isolate two interleaved runs sharing one context, which nothing constructs today.
+    frame_perception_resolved_run_id: str | None = None
+    # Single-flight the first resolution when parallel branches share one context. Without it both
+    # branches pass the sentinel check, and the second -- which answers False on any provider
+    # failure -- overwrites the arm the first already baked into its observe description.
+    frame_perception_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
@@ -338,6 +420,11 @@ class SkyvernContext:
     slim_output_variant_assigned: str | None = None
     slim_output_variant_resolved: bool = False
     slim_output_variant_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    # Pin one screenshot strategy per execution identity, including provider failures that select control.
+    screenshot_cdp_first: bool = False
+    screenshot_arm_resolved_distinct_id: str | None = None
+    screenshot_arm_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
@@ -393,6 +480,19 @@ class SkyvernContext:
     # but it will only be considered as a magic link page in the login block scope
     # next blocks won't consider the page as a magic link page
     magic_link_pages: dict[str, Page] = field(default_factory=dict)
+
+    # Exact popup Page objects opened by a download click, keyed by the task that opened them. A
+    # download credited after the action seam returns (the CDP monitor / file-scan task lifecycle,
+    # which never fires a Playwright popup download event) can then close the never-committed marker
+    # popup it stranded. Task-keyed and dropped on task teardown so a claim never leaks into a later
+    # task/run/persistent-session scope.
+    download_popup_claims: dict[str, list[Page]] = field(default_factory=dict)
+
+    # Tasks whose terminal cleanup has already run its download half -- settle, save, and artifact
+    # outcome recording -- so a recovery path can tell "never recorded" from "recorded" without
+    # inferring it from the task row. Keyed per task rather than per stack frame because cleanup is
+    # also entered from callees (``_execute_task_v3``) whose progress a caller-local flag cannot see.
+    cleanup_downloads_recorded_task_ids: set[str] = field(default_factory=builtins.set)
 
     # parallel verification optimization
     # stores pre-scraped data for next step to avoid re-scraping
@@ -531,6 +631,33 @@ class SkyvernContext:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
+    def reset_attempt(self, task_id: str) -> None:
+        attempt = self.multi_field_totp.get(task_id)
+        if attempt is None:
+            return
+        attempt.valid_from = None
+        attempt.valid_until = None
+        attempt.filled_code_hash = None
+        attempt.filled_at = None
+        attempt.fill_verified = False
+        self.totp_codes.pop(f"{task_id}_totp_cache", None)
+
+    def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
+        attempt = self.multi_field_totp.pop(task_id, None)
+        self.seed_generated_totp_values.pop(task_id, None)
+        self.totp_codes.pop(task_id, None)
+        self.totp_codes.pop(f"{task_id}_secret", None)
+        cached_code = self.totp_codes.pop(f"{task_id}_totp_cache", None)
+        if (
+            restore_unverified_external
+            and attempt is not None
+            and attempt.code_source == "external"
+            and attempt.filled_code_hash is not None
+            and not attempt.fill_verified
+            and cached_code
+        ):
+            self.totp_codes[task_id] = cached_code
+
     def register_secret_value(self, value: str | None, *, hide_from_model: bool = False) -> None:
         """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed).
         When hide_from_model is True, also scrub it from the model's own view of tool output via hide_from_model()."""
@@ -590,6 +717,40 @@ class SkyvernContext:
             return False
         return True
 
+    def record_download_popup_claim(self, task_id: str, page: Page) -> None:
+        claims = self.download_popup_claims.setdefault(task_id, [])
+        if all(existing is not page for existing in claims):
+            claims.append(page)
+
+    def discard_download_popup_claim(self, task_id: str, page: Page) -> bool:
+        """Retire a stale claim once its exact Page is reused as a later action's initiating page.
+        Removes only entries where ``existing is page``, preserves sibling claims and other task
+        buckets, deletes the task key when its bucket becomes empty, and returns whether a claim was
+        removed."""
+        claims = self.download_popup_claims.get(task_id)
+        if not claims:
+            return False
+        remaining = [existing for existing in claims if existing is not page]
+        if len(remaining) == len(claims):
+            return False
+        if remaining:
+            self.download_popup_claims[task_id] = remaining
+        else:
+            del self.download_popup_claims[task_id]
+        return True
+
+    def take_download_popup_claims(self, task_id: str) -> list[Page]:
+        return self.download_popup_claims.pop(task_id, [])
+
+    def clear_download_popup_claims(self, task_id: str) -> None:
+        self.download_popup_claims.pop(task_id, None)
+
+    def mark_cleanup_downloads_recorded(self, task_id: str) -> None:
+        self.cleanup_downloads_recorded_task_ids.add(task_id)
+
+    def cleanup_downloads_recorded(self, task_id: str) -> bool:
+        return task_id in self.cleanup_downloads_recorded_task_ids
+
     def flush_feature_flags(self) -> None:
         if not self.feature_flag_entries:
             return
@@ -636,6 +797,23 @@ _context: ContextVar[SkyvernContext | None] = ContextVar(
     default=None,
 )
 
+_WORKFLOW_LOG_ATTEMPT: ContextVar[tuple[str, int] | None] = ContextVar("workflow_log_attempt", default=None)
+
+
+@contextmanager
+def workflow_log_attempt(workflow_run_id: str, attempt_number: int) -> Iterator[None]:
+    # Child flush tasks retain this identity even after the workflow context is replaced or removed.
+    token = _WORKFLOW_LOG_ATTEMPT.set((workflow_run_id, attempt_number))
+    try:
+        yield
+    finally:
+        _WORKFLOW_LOG_ATTEMPT.reset(token)
+
+
+def current_workflow_log_attempt(workflow_run_id: str) -> int | None:
+    origin = _WORKFLOW_LOG_ATTEMPT.get()
+    return origin[1] if origin is not None and origin[0] == workflow_run_id else None
+
 
 def current() -> SkyvernContext | None:
     """
@@ -675,6 +853,12 @@ def record_browser_success() -> None:
     context = current()
     if context is not None:
         context.browser_health.record_success()
+
+
+def record_browser_recovery(operation: BrowserOperation) -> None:
+    context = current()
+    if context is not None:
+        context.browser_health.record_recovery(operation)
 
 
 def set(context: SkyvernContext) -> None:

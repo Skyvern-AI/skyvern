@@ -171,7 +171,7 @@ async def get_script_blocks_response(
         )
 
         if not artifact:
-            LOG.error(
+            LOG.warning(
                 "No artifact found for script file",
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
@@ -185,7 +185,7 @@ async def get_script_blocks_response(
         data = await app.STORAGE.retrieve_artifact(artifact)
 
         if not data:
-            LOG.error(
+            LOG.warning(
                 "No data found for artifact",
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,

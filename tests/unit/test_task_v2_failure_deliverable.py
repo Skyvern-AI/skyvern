@@ -1,10 +1,14 @@
-"""task_v2 emits a best-effort deliverable from gathered data when it fails on budget exhaustion (SKY-11238)."""
+"""task_v2 emits a best-effort deliverable when it fails on budget exhaustion (SKY-11238), and the
+mark_task_v2_as_* terminal transitions refuse to overwrite a status that is already final."""
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.services import task_v2_service
 
 
@@ -18,6 +22,7 @@ class _FakeTaskV2:
     prompt = "do the thing"
     extracted_information_schema = None
     workflow_system_prompt = None
+    status = TaskV2Status.running
 
 
 @pytest.mark.asyncio
@@ -105,6 +110,7 @@ async def test_mark_task_v2_as_failed_threads_summary_and_output(monkeypatch: py
     async def _noop_webhook(task_v2: object) -> None:
         return None
 
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=_FakeTaskV2()))
     monkeypatch.setattr(task_v2_service, "_update_task_v2_status", _fake_update)
     monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", _noop_webhook)
     # No workflow_run_id => the workflow-run failure side effect is skipped; this exercises the
@@ -120,3 +126,94 @@ async def test_mark_task_v2_as_failed_threads_summary_and_output(monkeypatch: py
     assert captured["status"] == task_v2_service.TaskV2Status.failed
     assert captured["summary"] == "best-effort memo"
     assert captured["output"] == {"a": 1}
+
+
+@pytest.mark.asyncio
+async def test_mark_task_v2_as_canceled_keeps_prior_terminal_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    timed_out = _FakeTaskV2()
+    timed_out.status = TaskV2Status.timed_out
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=timed_out))
+    update_task_v2 = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "update_task_v2", update_task_v2)
+    webhook = AsyncMock()
+    monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", webhook)
+    cancel_run = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled", cancel_run)
+
+    result = await task_v2_service.mark_task_v2_as_canceled(
+        task_v2_id="tsk_v2_test", workflow_run_id="wr_test", organization_id="o_test"
+    )
+
+    assert result.status == TaskV2Status.timed_out
+    update_task_v2.assert_not_awaited()
+    webhook.assert_not_awaited()
+    cancel_run.assert_awaited_once_with("wr_test")
+
+
+@pytest.mark.asyncio
+async def test_mark_task_v2_as_failed_redrives_prior_terminal_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The generic failure handler must not turn a canceled task into a failed one, but the canceled writer it
+    reached may have died before its run write or webhook, so that writer is re-driven."""
+    canceled = _FakeTaskV2()
+    canceled.status = TaskV2Status.canceled
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=canceled))
+    update_status = AsyncMock(return_value=canceled)
+    monkeypatch.setattr(task_v2_service, "_update_task_v2_status", update_status)
+    webhook = AsyncMock()
+    monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", webhook)
+    fail_run = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed", fail_run)
+    cancel_run = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled", cancel_run)
+
+    result = await task_v2_service.mark_task_v2_as_failed(
+        task_v2_id="tsk_v2_test", workflow_run_id="wr_test", organization_id="o_test", failure_reason="late failure"
+    )
+
+    assert result.status == TaskV2Status.canceled
+    assert update_status.await_args.kwargs["status"] == TaskV2Status.canceled
+    fail_run.assert_not_awaited()
+    cancel_run.assert_awaited_once_with("wr_test")
+    webhook.assert_awaited_once_with(canceled)
+
+
+@pytest.mark.asyncio
+async def test_mark_task_v2_as_failed_redrives_side_effects_when_already_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run write or webhook that raised mid-way is retried by calling the writer again; that retry must still run."""
+    failed = _FakeTaskV2()
+    failed.status = TaskV2Status.failed
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=failed))
+    monkeypatch.setattr(task_v2_service, "_update_task_v2_status", AsyncMock(return_value=failed))
+    webhook = AsyncMock()
+    monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", webhook)
+    fail_run = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed", fail_run)
+
+    await task_v2_service.mark_task_v2_as_failed(
+        task_v2_id="tsk_v2_test", workflow_run_id="wr_test", organization_id="o_test", failure_reason="retry"
+    )
+
+    fail_run.assert_awaited_once()
+    webhook.assert_awaited_once_with(failed)
+
+
+@pytest.mark.asyncio
+async def test_mark_task_v2_as_failed_redrive_keeps_termination_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    terminated = _FakeTaskV2()
+    terminated.status = TaskV2Status.terminated
+    terminated.failure_category = [{"category": "unreachable_goal"}]
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=terminated))
+    monkeypatch.setattr(task_v2_service, "_update_task_v2_status", AsyncMock(return_value=terminated))
+    monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", AsyncMock())
+    terminate_run = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_terminated", terminate_run)
+
+    await task_v2_service.mark_task_v2_as_failed(
+        task_v2_id="tsk_v2_test", workflow_run_id="wr_test", organization_id="o_test", failure_reason="late failure"
+    )
+
+    terminate_run.assert_awaited_once_with(
+        "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}]
+    )

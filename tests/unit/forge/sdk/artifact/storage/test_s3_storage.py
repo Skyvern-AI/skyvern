@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import shutil
@@ -15,15 +16,19 @@ import pytest
 import zstandard as zstd
 from freezegun import freeze_time
 
+import skyvern.forge.sdk.artifact.storage.base as base_module
+import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 from skyvern.config import settings
 from skyvern.exceptions import DownloadSaveIncompleteError
-from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
+from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_for_ai_suggestion,
     create_fake_step,
@@ -803,6 +808,67 @@ class TestS3StorageContentType:
         assert obj_meta["ContentType"] == expected_content_type
 
 
+def _recording_artifact_with_ext(s3_storage: S3Storage, ext: str) -> Artifact:
+    """A RECORDING artifact whose URI ends in the given extension (the whole-display recorder registers .mp4)."""
+    artifact_id_val = generate_artifact_id()
+    step = create_fake_step(f"s_ct_{ext}")
+    base = s3_storage.build_uri(
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_id=artifact_id_val,
+        step=step,
+        artifact_type=ArtifactType.RECORDING,
+    )
+    uri = base.rsplit(".", 1)[0] + "." + ext
+    return Artifact(
+        artifact_id=artifact_id_val,
+        artifact_type=ArtifactType.RECORDING,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        step_id=step.step_id,
+        task_id=step.task_id,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestS3StorageRecordingContentType:
+    """SKY-15466: the whole-display recorder's S3 lifecycle must set ``ContentType=video/mp4`` for ``.mp4``
+    objects so a signed-S3 GET / Chrome <video> plays them. Real-S3 v7 proved every settled recording object
+    was served ``binary/octet-stream`` (FAIL_PRODUCT_CONTRACT); these end-to-end moto head_object checks would
+    fail on the current head."""
+
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
+    @pytest.mark.parametrize("supersede", [False, True], ids=["initial_store", "terminal_replacement"])
+    async def test_store_artifact_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, supersede: bool
+    ) -> None:
+        # Both write paths (initial store and the terminal supersede/replacement) must settle .mp4 as video/mp4.
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        await s3_storage.store_artifact(art, b"final-mp4-bytes", supersede_queued_prefixes=supersede)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_store_artifact_prefix_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        f = tmp_path / "rec.mp4"
+        f.write_bytes(b"m" * 4096)
+        await s3_storage.store_artifact_prefix_from_path(art, str(f), 4096)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_unknown_extension_no_invented_content_type(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "skyvernunknown15466")  # project-unique ext -> guess_type None
+        await s3_storage.store_artifact(art, b"opaque-bytes")
+        ct = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)["ContentType"]
+        assert ct != "video/mp4" and not ct.startswith("video/")  # unknown -> not invented (S3 default)
+
+
 @pytest.mark.asyncio
 class TestS3StorageHARCompression:
     """Test S3Storage HAR file compression with zstd."""
@@ -1358,8 +1424,6 @@ class TestS3SaveDownloadedFiles:
     async def test_partial_upload_failure_raises_after_saving_the_rest(
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
-
         self._seed_run_dir(tmp_path, monkeypatch)
         uploaded: list[str] = []
 
@@ -1373,9 +1437,17 @@ class TestS3SaveDownloadedFiles:
         monkeypatch.setattr(
             s3_module,
             "app",
-            SimpleNamespace(ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact)),
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
+            ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         with pytest.raises(DownloadSaveIncompleteError) as raised:
             await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
@@ -1387,8 +1459,6 @@ class TestS3SaveDownloadedFiles:
     async def test_artifact_row_failure_counts_as_skipped(
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
-
         self._seed_run_dir(tmp_path, monkeypatch)
         monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", AsyncMock())
 
@@ -1400,10 +1470,16 @@ class TestS3SaveDownloadedFiles:
             s3_module,
             "app",
             SimpleNamespace(
-                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row))
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
             ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         with pytest.raises(DownloadSaveIncompleteError) as raised:
             await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
@@ -1413,7 +1489,6 @@ class TestS3SaveDownloadedFiles:
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A run's second cleanup must cost only its new files, not the whole download dir (SKY-14752)."""
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 
         self._seed_run_dir(tmp_path, monkeypatch)
         run_dir = tmp_path / "downloads" / "wr_partial"
@@ -1439,10 +1514,16 @@ class TestS3SaveDownloadedFiles:
             "app",
             SimpleNamespace(
                 ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=_create_row),
-                DATABASE=SimpleNamespace(artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
             ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
         assert sorted(uploaded) == ["a.pdf", "b.pdf"]
 
@@ -1454,3 +1535,807 @@ class TestS3SaveDownloadedFiles:
 
         assert sorted(uploaded) == ["b.pdf", "c.pdf"]
         assert len(rows) == 3
+
+        uploaded.clear()
+        monkeypatch.setattr(base_module, "app", s3_module.app)
+        s3_module.app.DATABASE.workflow_run_attempts.attempts = [
+            SimpleNamespace(attempt_number=2, started_at=datetime.now(UTC) - timedelta(seconds=1))
+        ]
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert sorted(uploaded) == ["a.pdf", "b.pdf", "c.pdf"]
+        assert len(rows) == 6
+
+    async def test_retry_save_skips_stale_files_and_versions_fresh_redownloads(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_id = "wr_retry"
+        run_dir = tmp_path / "downloads" / run_id
+        run_dir.mkdir(parents=True)
+        stale_file = run_dir / "only-attempt-1.pdf"
+        fresh_file = run_dir / "report.pdf"
+        late_attempt_one_file = run_dir / "late-attempt-1.pdf"
+        stale_file.write_bytes(b"same bytes")
+        fresh_file.write_bytes(b"same bytes")
+        late_attempt_one_file.write_bytes(b"new attempt-one bytes")
+        monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+        attempt_started_at = datetime.now(UTC) - timedelta(seconds=1)
+        attempt_one_started_at = attempt_started_at - timedelta(minutes=2)
+        os.utime(stale_file, (attempt_started_at.timestamp() - 60, attempt_started_at.timestamp() - 60))
+        os.utime(fresh_file, (attempt_started_at.timestamp() + 1, attempt_started_at.timestamp() + 1))
+        os.utime(late_attempt_one_file, (attempt_started_at.timestamp() - 30, attempt_started_at.timestamp() - 30))
+        checksum = hashlib.sha256(b"same bytes").hexdigest()
+        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/{run_id}"
+        rows = [
+            _share_artifact(ArtifactType.DOWNLOAD, f"{base_uri}/{stale_file.name}").model_copy(
+                update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}
+            ),
+            _share_artifact(ArtifactType.DOWNLOAD, f"{base_uri}/{fresh_file.name}").model_copy(
+                update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}
+            ),
+        ]
+
+        async def _list_rows(**kwargs: object) -> list[Artifact]:
+            return rows
+
+        uploaded: list[str] = []
+
+        async def _upload(*, uri: str, **kwargs: object) -> None:
+            uploaded.append(uri.rsplit("/", 1)[-1])
+
+        async def _save_row(*, uri: str, checksum: str | None = None, **kwargs: object) -> str:
+            for row_index, row in enumerate(rows):
+                if row.uri == uri:
+                    rows[row_index] = row.model_copy(update={"modified_at": datetime.now(UTC)})
+                    return row.artifact_id
+            rows.append(
+                _share_artifact(ArtifactType.DOWNLOAD, uri).model_copy(
+                    update={"checksum": checksum, "modified_at": datetime.now(UTC)}
+                )
+            )
+            return rows[-1].artifact_id
+
+        attempts_repository = FakeWorkflowRunAttemptsRepository(
+            [
+                SimpleNamespace(attempt_number=1, started_at=attempt_one_started_at),
+                SimpleNamespace(attempt_number=2, started_at=attempt_started_at),
+            ]
+        )
+        upload_mock = AsyncMock(side_effect=_upload)
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", upload_mock)
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            fake_app := SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_save_row)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
+                    workflow_run_attempts=attempts_repository,
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
+            ),
+        )
+        monkeypatch.setattr(base_module, "app", fake_app)
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id=run_id)
+
+        assert attempts_repository.requested_workflow_run_ids == [run_id]
+        assert uploaded == [fresh_file.name]
+        assert upload_mock.await_args.kwargs["uri"] == f"{base_uri}/attempts/2/{fresh_file.name}"
+        assert len(rows) == 3
+        assert all(row.modified_at < attempt_started_at for row in rows[:2])
+        registered = [
+            call.kwargs["filename"] for call in s3_module.app.ARTIFACT_MANAGER.create_download_artifact.await_args_list
+        ]
+        assert registered == [fresh_file.name]
+        attempt_two_listing = [row.uri.rsplit("/", 1)[-1] for row in rows if row.modified_at >= attempt_started_at]
+        assert attempt_two_listing == [fresh_file.name]
+
+        uploaded.clear()
+        await s3_storage.save_downloaded_files(
+            organization_id=TEST_ORGANIZATION_ID,
+            run_id=run_id,
+            attempt_number=1,
+        )
+
+        assert attempts_repository.requested_workflow_run_ids == [run_id, run_id]
+        assert uploaded == [late_attempt_one_file.name]
+
+
+async def _settle(iterations: int = 100) -> None:
+    """Drain the event loop's ready queue deterministically so create_task'd writes reach their
+    chain-reservation/await points before the next reservation. Timing-independent (no wall-clock sleep
+    that can flake under load), and it needs no production test-only hook — every write reserves its chain
+    slot synchronously at task start, so a bounded set of no-op yields settles the intended interleaving.
+    A task parked on an unresolved predecessor future stays parked, preserving the queued-behind ordering.
+    """
+    for _ in range(iterations):
+        await asyncio.sleep(0)
+
+
+def _recording_artifact(uri: str) -> Artifact:
+    now = datetime.now(UTC)
+    return Artifact(
+        artifact_id="a_rec",
+        artifact_type=ArtifactType.RECORDING,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        task_id=TEST_TASK_ID,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_artifact_prefix_from_path_streams_bounded_reader(s3_storage: S3Storage, tmp_path: Path) -> None:
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"R" * 500)
+    artifact = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+
+    captured: dict = {}
+
+    async def _capture(
+        uri: str,
+        file_obj: object,
+        storage_class: object = None,
+        close_file_obj: bool = False,
+        serialize_key: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        captured["uri"] = uri
+        captured["close_file_obj"] = close_file_obj
+        captured["serialize_key"] = serialize_key
+        captured["data"] = file_obj.read()  # read inside the call; ownership/close is handed to the client
+        return uri
+
+    s3_storage.async_client = MagicMock()
+    s3_storage.async_client.upload_file_stream = AsyncMock(side_effect=_capture)
+
+    await s3_storage.store_artifact_prefix_from_path(artifact, str(src), 300)
+
+    assert captured["uri"] == artifact.uri
+    assert captured["data"] == b"R" * 300  # exactly the snapshot prefix, streamed
+    assert captured["close_file_obj"] is True  # reader lifetime handed to the client, not the with-block
+    assert captured["serialize_key"] == artifact.uri  # fenced against the terminal write to the same uri
+
+
+@pytest.mark.asyncio
+async def test_store_artifact_prefix_from_path_zst_falls_back_to_buffered(
+    s3_storage: S3Storage, tmp_path: Path
+) -> None:
+    src = tmp_path / "data.zst"
+    src.write_bytes(b"D" * 100)
+    artifact = _recording_artifact(f"s3://{TEST_BUCKET}/k/data.zst")
+
+    s3_storage.async_client = MagicMock()
+    s3_storage.async_client.upload_file = AsyncMock(return_value=artifact.uri)
+    s3_storage.async_client.upload_file_stream = AsyncMock()
+
+    await s3_storage.store_artifact_prefix_from_path(artifact, str(src), 50)
+
+    s3_storage.async_client.upload_file_stream.assert_not_awaited()
+    s3_storage.async_client.upload_file.assert_awaited_once()  # buffered store_artifact (compressed) path
+
+
+@pytest.mark.asyncio
+async def test_store_artifact_prefix_reader_survives_caller_cancel_until_transfer_done(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AsyncAWSClient shields/detaches the transfer, so a cancelled caller must NOT close the reader
+    out from under the still-running transfer. The reader must stay open until the real transfer
+    finishes, then close, and the detached transfer must still read the full snapshot."""
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"Z" * 400)
+    artifact = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    captured: dict = {}
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            captured["fileobj"] = fileobj
+            started.set()
+            await release.wait()  # model an in-flight transfer that outlives the caller's cancel
+            captured["read_after_cancel"] = fileobj.read()
+
+    class _FakeCtx:
+        async def __aenter__(self) -> _FakeClient:
+            return _FakeClient()
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(s3_storage.async_client, "_s3_client", lambda: _FakeCtx())
+
+    task = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(artifact, str(src), 400))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    assert captured["fileobj"].closed is False  # open while the transfer is active
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Caller has cancelled, but the shielded transfer is still active — the reader MUST remain open.
+    assert captured["fileobj"].closed is False
+
+    release.set()
+    for _ in range(1000):
+        if captured["fileobj"].closed:
+            break
+        await asyncio.sleep(0.005)
+
+    assert captured["read_after_cancel"] == b"Z" * 400  # detached transfer streamed the full snapshot
+    assert captured["fileobj"].closed is True  # closed only after the real transfer finished
+
+
+@pytest.mark.asyncio
+async def test_stale_prefix_cannot_overwrite_terminal_full_upload(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Data-integrity race: a per-step prefix transfer that is cancelled (30s barrier timeout) detaches
+    and keeps running. The terminal full-recording upload then writes the SAME uri. The stale detached
+    prefix must NOT land afterward and overwrite the finalized object with truncated bytes."""
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"P" * 200)  # truncated per-step prefix
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    full = b"F" * 5000  # finalized full recording
+
+    store: dict[str, bytes] = {}
+    prefix_started = asyncio.Event()
+    prefix_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            prefix_started.set()
+            await prefix_release.wait()  # in-flight; still reading after the caller cancelled/detached
+            store[key] = fileobj.read()
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            store[Key] = Body
+
+    class _FakeCtx:
+        async def __aenter__(self) -> _FakeClient:
+            return _FakeClient()
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(s3_storage.async_client, "_s3_client", lambda: _FakeCtx())
+    key = S3Uri(rec.uri).key
+
+    prefix_task = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(src), 200))
+    await asyncio.wait_for(prefix_started.wait(), timeout=5)
+    prefix_task.cancel()  # models wait_for_upload_aiotasks' 30s timeout cancelling the tracked task
+    with pytest.raises(asyncio.CancelledError):
+        await prefix_task
+
+    terminal_task = asyncio.create_task(s3_storage.store_artifact(rec, full))
+    await asyncio.sleep(0)  # give the terminal write a turn to attempt/queue
+    prefix_release.set()  # let the detached stale prefix finish
+    await asyncio.wait_for(terminal_task, timeout=5)
+    for _ in range(200):  # let any detached prefix transfer settle
+        await asyncio.sleep(0.005)
+        if store.get(key) == b"P" * 200:
+            break
+
+    assert store[key] == full, "finalized full upload must win; a stale prefix must not overwrite it"
+    # No unbounded chain/task registry: the per-key entry is dropped once the key goes idle.
+    assert s3_storage.async_client._object_write_chains == {}
+
+
+@pytest.mark.asyncio
+async def test_store_artifact_serializes_only_recording_writes(
+    s3_storage: S3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal write path fences recordings by uri (so any terminal call site is covered) and
+    leaves every other artifact type unserialized."""
+    seen: dict = {}
+
+    async def _capture(
+        uri: str,
+        data: bytes,
+        storage_class: object = None,
+        serialize_key: str | None = None,
+        supersede_queued: bool = False,
+        content_type: str | None = None,
+    ) -> str:
+        seen[uri] = (serialize_key, supersede_queued, content_type)
+        return uri
+
+    s3_storage.async_client = MagicMock()
+    s3_storage.async_client.upload_file = AsyncMock(side_effect=_capture)
+
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    other = rec.model_copy(update={"uri": f"s3://{TEST_BUCKET}/k/page.html", "artifact_type": ArtifactType.HTML})
+    await s3_storage.store_artifact(rec, b"data", supersede_queued_prefixes=True)
+    await s3_storage.store_artifact(other, b"data", supersede_queued_prefixes=True)
+
+    # RECORDING terminal write is fenced+sealed and opts into video MIME; a non-recording (HTML) write is neither.
+    assert seen[rec.uri] == (rec.uri, True, "video/webm")
+    assert seen[other.uri] == (None, True, None)
+
+
+@pytest.mark.asyncio
+async def test_terminal_recording_write_survives_barrier_cancel_and_lands_last(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 30s barrier cancels the QUEUED terminal task too, not just the prefix. The terminal recording
+    write must still complete after the older prefix drains — otherwise the persisted recording is left
+    truncated (the prefix) because the terminal put_object never ran."""
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"P" * 200)
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    full = b"F" * 5000
+
+    store: dict[str, bytes] = {}
+    prefix_started = asyncio.Event()
+    prefix_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            prefix_started.set()
+            await prefix_release.wait()
+            store[key] = fileobj.read()
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            store[Key] = Body
+
+    class _FakeCtx:
+        async def __aenter__(self) -> _FakeClient:
+            return _FakeClient()
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(s3_storage.async_client, "_s3_client", lambda: _FakeCtx())
+    key = S3Uri(rec.uri).key
+
+    prefix_task = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(src), 200))
+    await asyncio.wait_for(prefix_started.wait(), timeout=5)
+    prefix_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await prefix_task
+
+    terminal_task = asyncio.create_task(s3_storage.store_artifact(rec, full))
+    await asyncio.sleep(0)  # terminal reaches the chain await, blocked behind the detached prefix
+    terminal_task.cancel()  # the barrier cancels the queued terminal task as well
+    with pytest.raises(asyncio.CancelledError):
+        await terminal_task
+
+    prefix_release.set()
+    for _ in range(400):
+        await asyncio.sleep(0.005)
+        if store.get(key) == full:
+            break
+
+    assert store.get(key) == full, "terminal recording write must survive the barrier cancel and land last"
+    assert s3_storage.async_client._object_write_chains == {}
+
+
+@pytest.mark.asyncio
+async def test_live_run_prefixes_all_upload_in_issue_order(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No terminal write: every per-step prefix must upload, in issue order (no coalescing)."""
+    uploaded: list[bytes] = []
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            uploaded.append(fileobj.read())
+
+    class _FakeCtx:
+        async def __aenter__(self) -> _FakeClient:
+            return _FakeClient()
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(s3_storage.async_client, "_s3_client", lambda: _FakeCtx())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+
+    for content in (b"A" * 10, b"B" * 20, b"C" * 30):
+        p = tmp_path / f"{len(content)}.webm"
+        p.write_bytes(content)
+        await s3_storage.store_artifact_prefix_from_path(rec, str(p), len(content))
+
+    assert uploaded == [b"A" * 10, b"B" * 20, b"C" * 30]
+    assert _clean_write_state(s3_storage.async_client)
+
+
+def _recording_fake_ctx(monkeypatch, s3_storage, client):  # type: ignore[no-untyped-def]
+    class _FakeCtx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return client
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(s3_storage.async_client, "_s3_client", lambda: _FakeCtx())
+
+
+@pytest.mark.asyncio
+async def test_terminal_finalize_suppresses_queued_prefixes_and_waits_only_for_active(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prefix1 active, prefix2/prefix3 queued: the terminal finalize waits only for the active prefix1,
+    suppresses the queued prefix2/prefix3, then lands last."""
+    store: dict[str, bytes] = {}
+    calls = {"fileobj": 0, "put": 0}
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            calls["fileobj"] += 1
+            p1_started.set()
+            await p1_release.wait()
+            store[key] = fileobj.read()
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            calls["put"] += 1
+            store[Key] = Body
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    key = S3Uri(rec.uri).key
+    for i in (1, 2, 3):
+        (tmp_path / f"p{i}.webm").write_bytes(b"P" * (10 * i))
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p1.webm"), 10))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)  # prefix1 is the active transfer
+    p2 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p2.webm"), 20))
+    p3 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p3.webm"), 30))
+    await _settle()  # let prefix2/prefix3 queue behind prefix1
+    term = asyncio.create_task(s3_storage.store_artifact(rec, b"F" * 5000, supersede_queued_prefixes=True))
+    await _settle()  # terminal reserved + sealed
+    p1_release.set()
+    await asyncio.gather(p1, p2, p3, term)
+
+    assert calls["fileobj"] == 1  # only the active prefix uploaded; queued prefix2/prefix3 were suppressed
+    assert calls["put"] == 1
+    assert store[key] == b"F" * 5000  # terminal landed last
+    assert _clean_write_state(s3_storage.async_client)
+
+
+@pytest.mark.asyncio
+async def test_prefix_reserved_after_terminal_reserved_cannot_overwrite(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prefix reserved while the terminal finalize is still in flight is superseded and never writes."""
+    store: dict[str, bytes] = {}
+    calls = {"fileobj": 0, "put": 0}
+    term_started = asyncio.Event()
+    term_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            calls["fileobj"] += 1
+            store[key] = fileobj.read()
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            calls["put"] += 1
+            term_started.set()
+            await term_release.wait()
+            store[Key] = Body
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    key = S3Uri(rec.uri).key
+    (tmp_path / "late.webm").write_bytes(b"P" * 200)
+
+    term = asyncio.create_task(s3_storage.store_artifact(rec, b"F" * 5000, supersede_queued_prefixes=True))
+    await asyncio.wait_for(term_started.wait(), timeout=5)  # terminal in flight, key sealed
+    late = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "late.webm"), 200))
+    await _settle()
+    term_release.set()
+    await asyncio.gather(term, late)
+
+    assert calls["fileobj"] == 0  # the late prefix was superseded and never uploaded
+    assert store[key] == b"F" * 5000
+    assert _clean_write_state(s3_storage.async_client)
+
+
+@pytest.mark.asyncio
+async def test_active_prefix_failure_still_unblocks_terminal(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the active prefix transfer fails, it must still release the write chain so the terminal lands."""
+    store: dict[str, bytes] = {}
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            p1_started.set()
+            await p1_release.wait()
+            raise RuntimeError("prefix transfer boom")
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            store[Key] = Body
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    key = S3Uri(rec.uri).key
+    (tmp_path / "p.webm").write_bytes(b"P" * 200)
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p.webm"), 200))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)
+    term = asyncio.create_task(s3_storage.store_artifact(rec, b"F" * 5000, supersede_queued_prefixes=True))
+    await _settle()
+    p1_release.set()  # active prefix now fails
+    await asyncio.gather(p1, term)
+
+    assert store[key] == b"F" * 5000  # terminal unblocked and landed despite the prefix failure
+    assert _clean_write_state(s3_storage.async_client)
+
+
+def _clean_write_state(client: object) -> bool:
+    return (
+        client._object_write_chains == {}
+        and client._object_write_sealed == set()
+        and client._object_write_fallback == {}
+        and client._object_write_fallback_target == {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_uploads_newest_queued_prefix_as_fallback(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """active P1 + queued P2/P3 + terminal failure => the newest queued snapshot (P3) lands as a
+    fallback, P2 never uploads, and all per-key state drains."""
+    store: dict[str, bytes] = {}
+    uploaded: list[bytes] = []
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+    first = {"seen": False}
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            if not first["seen"]:  # the active prefix P1
+                first["seen"] = True
+                p1_started.set()
+                await p1_release.wait()
+            data = fileobj.read()
+            uploaded.append(data)
+            store[key] = data
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            raise RuntimeError("terminal put_object failed")  # non-token failure, not retried
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    key = S3Uri(rec.uri).key
+    (tmp_path / "p1.webm").write_bytes(b"1" * 10)
+    (tmp_path / "p2.webm").write_bytes(b"2" * 20)
+    (tmp_path / "p3.webm").write_bytes(b"3" * 30)
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p1.webm"), 10))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)
+    p2 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p2.webm"), 20))
+    p3 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p3.webm"), 30))
+    await _settle()  # P2 then P3 queue; P3 is the newest pre-terminal snapshot
+    term = asyncio.create_task(s3_storage.store_artifact(rec, b"F" * 5000, supersede_queued_prefixes=True))
+    await _settle()  # terminal reserved: seals, designates P3 the fallback
+    p1_release.set()
+    await asyncio.gather(p1, p2, p3, term)
+
+    assert store[key] == b"3" * 30  # newest queued snapshot preserved after the terminal write failed
+    assert uploaded == [b"1" * 10, b"3" * 30]  # active P1, then P3 fallback; P2 never uploaded
+    assert _clean_write_state(s3_storage.async_client)
+
+
+@pytest.mark.asyncio
+async def test_fallback_upload_failure_still_drains_and_closes(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If both the terminal write and the fallback upload fail, all per-key state still drains and the
+    retained reader is closed (no leak, no unhandled exception)."""
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+    first = {"seen": False}
+    readers: list[object] = []
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            readers.append(fileobj)
+            if not first["seen"]:
+                first["seen"] = True
+                p1_started.set()
+                await p1_release.wait()
+                fileobj.read()
+                return
+            raise RuntimeError("fallback upload failed")
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            raise RuntimeError("terminal put_object failed")
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    for name, n in (("p1", 10), ("p3", 30)):
+        (tmp_path / f"{name}.webm").write_bytes(b"x" * n)
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p1.webm"), 10))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)
+    p3 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(rec, str(tmp_path / "p3.webm"), 30))
+    await _settle()
+    term = asyncio.create_task(s3_storage.store_artifact(rec, b"F" * 5000, supersede_queued_prefixes=True))
+    await _settle()
+    p1_release.set()
+    await asyncio.gather(p1, p3, term)  # no exception escapes
+
+    assert _clean_write_state(s3_storage.async_client)
+    # the parked fallback reader (P3) was the second reader handed to the client and must be closed
+    assert readers[-1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_renamed_finalize_seals_prefix_key_and_supersedes_queued(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dominant finalize compresses the .webm prefixes into a renamed .mp4 object. The terminal write
+    must seal the OLD .webm key the prefixes queued to (so queued prefixes are superseded), while writing
+    the new .mp4 object — not seal the .mp4 key that nothing queued to (SKY-15288, thread r3917658240)."""
+    store: dict[str, bytes] = {}
+    calls = {"fileobj": 0, "put": 0}
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            calls["fileobj"] += 1
+            p1_started.set()
+            await p1_release.wait()
+            store[key] = fileobj.read()
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            calls["put"] += 1
+            store[Key] = Body
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    webm = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    mp4 = webm.model_copy(update={"uri": f"s3://{TEST_BUCKET}/k/rec.mp4"})
+    webm_key = S3Uri(webm.uri).key
+    mp4_key = S3Uri(mp4.uri).key
+    for i in (1, 2, 3):
+        (tmp_path / f"p{i}.webm").write_bytes(b"P" * (10 * i))
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(webm, str(tmp_path / "p1.webm"), 10))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)  # prefix1 active on the .webm key
+    p2 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(webm, str(tmp_path / "p2.webm"), 20))
+    p3 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(webm, str(tmp_path / "p3.webm"), 30))
+    await _settle()
+    # Terminal finalize: writes the renamed .mp4 object, seals the .webm prefix key.
+    term = asyncio.create_task(
+        s3_storage.store_artifact(mp4, b"F" * 5000, supersede_queued_prefixes=True, prefix_uri=webm.uri)
+    )
+    await _settle()
+    p1_release.set()
+    await asyncio.gather(p1, p2, p3, term)
+
+    assert calls["fileobj"] == 1  # only the active .webm prefix uploaded; queued p2/p3 superseded on the old key
+    assert store[mp4_key] == b"F" * 5000  # finalized recording landed under the renamed .mp4 key
+    assert store.get(webm_key) == b"P" * 10  # the one active prefix; no queued prefix drained afterward
+    assert _clean_write_state(s3_storage.async_client)
+
+
+@pytest.mark.asyncio
+async def test_renamed_finalize_failure_arms_no_fallback(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the finalize renames the object, a parked .webm prefix could never be served under the .mp4
+    row, so the terminal must NOT arm a fallback. On terminal failure the newest queued prefix is
+    superseded like the rest (contrast test_terminal_failure_uploads_newest_queued_prefix_as_fallback,
+    the same-key case where it IS the fallback)."""
+    store: dict[str, bytes] = {}
+    uploaded: list[bytes] = []
+    p1_started = asyncio.Event()
+    p1_release = asyncio.Event()
+    first = {"seen": False}
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            if not first["seen"]:
+                first["seen"] = True
+                p1_started.set()
+                await p1_release.wait()
+            data = fileobj.read()
+            uploaded.append(data)
+            store[key] = data
+
+        async def put_object(
+            self, Body: bytes = b"", Bucket: str = "", Key: str = "", StorageClass: str = "", **kw: object
+        ) -> None:
+            raise RuntimeError("terminal put_object failed")
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    webm = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+    mp4 = webm.model_copy(update={"uri": f"s3://{TEST_BUCKET}/k/rec.mp4"})
+    (tmp_path / "p1.webm").write_bytes(b"1" * 10)
+    (tmp_path / "p3.webm").write_bytes(b"3" * 30)
+
+    p1 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(webm, str(tmp_path / "p1.webm"), 10))
+    await asyncio.wait_for(p1_started.wait(), timeout=5)
+    p3 = asyncio.create_task(s3_storage.store_artifact_prefix_from_path(webm, str(tmp_path / "p3.webm"), 30))
+    await _settle()
+    term = asyncio.create_task(
+        s3_storage.store_artifact(mp4, b"F" * 5000, supersede_queued_prefixes=True, prefix_uri=webm.uri)
+    )
+    await _settle()
+    p1_release.set()
+    await asyncio.gather(p1, p3, term)
+
+    assert uploaded == [b"1" * 10]  # only the active prefix; no meaningless .webm fallback on rename
+    assert _clean_write_state(s3_storage.async_client)
+
+
+@pytest.mark.asyncio
+async def test_stream_upload_bounds_resident_memory_with_transfer_config(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """upload_fileobj must receive a TransferConfig that caps s3transfer's io queue, so a streamed
+    prefix's resident memory is a fixed queue-depth x chunk-size regardless of prefix size
+    (SKY-15288, thread r3918986929)."""
+    seen: list[object] = []
+
+    class _FakeClient:
+        async def upload_fileobj(
+            self, fileobj: object, bucket: str, key: str, ExtraArgs: dict | None = None, Config: object = None
+        ) -> None:
+            seen.append(Config)
+            fileobj.read()
+
+    _recording_fake_ctx(monkeypatch, s3_storage, _FakeClient())
+    rec = _recording_artifact(f"s3://{TEST_BUCKET}/k/rec.webm")
+
+    small = tmp_path / "small.webm"
+    small.write_bytes(b"s" * 100)
+    large = tmp_path / "large.webm"
+    large.write_bytes(b"l" * 100_000)
+    await s3_storage.store_artifact_prefix_from_path(rec, str(small), 100)
+    await s3_storage.store_artifact_prefix_from_path(rec, str(large), 100_000)
+
+    assert len(seen) == 2
+    assert all(cfg is not None for cfg in seen)
+    # size-independent: the same bounded queue depth for a 100B and a 100KB prefix
+    assert {cfg.max_io_queue_size for cfg in seen} == {_STREAM_UPLOAD_IO_QUEUE_DEPTH}

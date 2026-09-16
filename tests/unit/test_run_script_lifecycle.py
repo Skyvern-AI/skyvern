@@ -11,14 +11,17 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.workflows import BlockType
-from skyvern.services.script_service import _create_workflow_block_run_and_task, run_script
+from skyvern.services.script_service import _create_video_artifact, _create_workflow_block_run_and_task, run_script
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 
 SUCCESS_SCRIPT = "async def run_workflow(parameters=None):\n    return None\n"
@@ -208,3 +211,34 @@ async def test_run_script_ordinary_cleanup_error_preserves_outcome(
     else:
         await run_script(path, **kwargs)
     manager.cleanup_for_script.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension, expected_suffix",
+    [("mp4", ".mp4"), ("webm", ".webm"), (None, ".webm")],
+    ids=["mp4_video_creates_mp4_uri", "webm_video_keeps_webm_uri", "default_video_keeps_webm_uri"],
+)
+async def test_create_video_artifact_uri_matches_video_extension(
+    monkeypatch: pytest.MonkeyPatch, extension: str | None, expected_suffix: str
+) -> None:
+    # Entry-point (real ArtifactManager URI, not mock-arg): script_service must key the mp4 RECORDING row .mp4.
+    va = [VideoArtifact(video_path="/tmp/recording.mp4", video_data=b"partial", video_file_extension=extension)]
+    browser_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(video_artifacts=va))
+    task = SimpleNamespace(task_id="tsk", workflow_run_id="wr")
+    step = SimpleNamespace(organization_id="o", task_id="tsk", step_id="stp")
+    captured: dict[str, str] = {}
+
+    async def capture(*, uri: str, **_: object) -> str:
+        captured["uri"] = uri
+        return "a_recording"
+
+    real = ArtifactManager()
+    monkeypatch.setattr(real, "_create_artifact", AsyncMock(side_effect=capture))
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", real)
+    monkeypatch.setattr(app.STORAGE, "build_uri", MagicMock(return_value="s3://b/recording.webm"))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=browser_state))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_video_artifacts", AsyncMock(return_value=va))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "set_video_artifact_for_task", MagicMock())
+    await _create_video_artifact(task, step)
+    assert captured["uri"].endswith(expected_suffix)

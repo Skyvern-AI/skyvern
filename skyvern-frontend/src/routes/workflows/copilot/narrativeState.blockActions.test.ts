@@ -491,6 +491,47 @@ describe("applyNarrativeEvent — client_block_actions", () => {
 });
 
 describe("hydrateNarrativeFromPayload — client_block_actions fields", () => {
+  it("drops snapshot-only rows while retaining every supported evidence carrier", () => {
+    const base = {
+      blockType: "code",
+      state: "drafted",
+      lastSeenIteration: 0,
+      activity: [],
+      startedAt: null,
+      endedAt: null,
+    };
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-evidence",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [
+        { ...base, label: "snapshot_only" },
+        { ...base, label: "identity", workflowRunBlockId: "wrb_identity" },
+        {
+          ...base,
+          label: "activity",
+          activity: [
+            {
+              kind: "tool_result",
+              text: "Edited block",
+              iteration: 1,
+              id: "tr-edit",
+            },
+          ],
+        },
+        { ...base, label: "timestamp", startedAt: "2026-06-10T00:00:04Z" },
+        { ...base, label: "outcome", outcome: "not_demonstrated" },
+      ],
+    })!;
+
+    expect(hydrated.blocks.map((block) => block.label)).toEqual([
+      "identity",
+      "activity",
+      "timestamp",
+      "outcome",
+    ]);
+  });
+
   it("never sets recordedActions from a BE-built history payload", () => {
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-1",
@@ -532,5 +573,21 @@ describe("hydrateNarrativeFromPayload — client_block_actions fields", () => {
     expect(
       state.blocks.flatMap((b) => b.activity.map((e) => e.text)),
     ).not.toContain("Checking whether the invoices need a login");
+  });
+
+  it("keeps only the most recent 200 attempts when a loop mints one per iteration", () => {
+    const loop = Array.from({ length: 201 }, (_, i) =>
+      blockProgress({
+        block_label: "loop_body",
+        workflow_run_block_id: `wrb_iter_${i}`,
+        iteration: i,
+        status: "completed",
+      }),
+    );
+    const state = reduce([turnStart(), ...loop]);
+
+    expect(state.blocks).toHaveLength(200);
+    expect(state.blocks[0]!.workflowRunBlockId).toBe("wrb_iter_1");
+    expect(state.blocks[199]!.workflowRunBlockId).toBe("wrb_iter_200");
   });
 });

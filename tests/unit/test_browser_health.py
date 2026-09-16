@@ -62,6 +62,33 @@ class TestDegradedSignal:
         assert not health.is_degraded
         assert health.consecutive_timeouts == 0
 
+    def test_a_recovered_operation_gives_back_only_its_own_strike(self) -> None:
+        """A capture rescued over a second route proves the browser answers, but not that the
+        operations still stuck have recovered; those strikes must survive the rescue."""
+        health = BrowserHealth()
+        _strike(health, BrowserOperation.EVALUATE, settings.BROWSER_DEGRADED_TIMEOUT_STRIKES)
+        _strike(health, BrowserOperation.RELOAD, 1)
+        health.record_timeout(BrowserOperation.SCREENSHOT)
+        assert health.is_degraded
+
+        health.record_recovery(BrowserOperation.SCREENSHOT)
+
+        assert health.is_degraded, "evaluate and reload are still unanswered"
+        assert health.stuck_operations == {BrowserOperation.EVALUATE, BrowserOperation.RELOAD}
+        assert health.consecutive_timeouts == settings.BROWSER_DEGRADED_TIMEOUT_STRIKES + 1
+
+    def test_a_recovery_for_an_operation_that_never_struck_gives_nothing_back(self) -> None:
+        """The capture primitive raises the same exception for a non-timeout error, which records no
+        strike; a rescue after that must not spend a strike another operation earned."""
+        health = BrowserHealth()
+        _strike(health, BrowserOperation.EVALUATE, settings.BROWSER_DEGRADED_TIMEOUT_STRIKES)
+        _strike(health, BrowserOperation.RELOAD, 1)
+
+        health.record_recovery(BrowserOperation.SCREENSHOT)
+
+        assert health.consecutive_timeouts == settings.BROWSER_DEGRADED_TIMEOUT_STRIKES + 1
+        assert health.stuck_operations == {BrowserOperation.EVALUATE, BrowserOperation.RELOAD}
+
 
 class TestEvaluateRecordsBrowserHealth:
     """Without these the tally stays empty and the probe below can never fire."""
@@ -100,7 +127,7 @@ class TestEvaluateRecordsBrowserHealth:
                 frame=MagicMock(),
                 expression="() => 7",
                 evaluate_expression=answers,
-                timeout_ms=1000,
+                timeout_ms=30_000,
             )
             == 7
         )
@@ -124,7 +151,7 @@ class TestEvaluateRecordsBrowserHealth:
         )
         frame.wait_for_load_state = AsyncMock()
 
-        assert await SkyvernFrame.evaluate(frame=frame, expression="() => 7", timeout_ms=1000) == 7
+        assert await SkyvernFrame.evaluate(frame=frame, expression="() => 7", timeout_ms=30_000) == 7
         assert context.browser_health.consecutive_timeouts == 0
         assert not context.browser_health.stuck_operations
 

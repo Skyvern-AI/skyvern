@@ -40,6 +40,8 @@ const makeGetIncrementElements = new Function(
   "_jsConsoleError",
   "document",
   "buildElementObject",
+  "stampOtpInputBoxes",
+  "otpContainerCounts",
   `${extractFn("getIncrementElements")}\nreturn getIncrementElements;`,
 );
 
@@ -62,6 +64,8 @@ function bind(windowStub, sleep = immediateSleep) {
     () => {},
     throwingDocument,
     throwingBuild,
+    () => {},
+    new WeakMap(),
   );
 }
 

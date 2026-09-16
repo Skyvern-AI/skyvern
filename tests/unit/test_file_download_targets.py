@@ -178,6 +178,7 @@ async def _execute_file_download(
         mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=storage_save_side_effect)
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=downloaded_file_infos or [])
+        mock_app.STORAGE.get_current_attempt_downloaded_files = mock_app.STORAGE.get_downloaded_files
         result = await block.execute(
             workflow_run_id="workflow-run-id",
             workflow_run_block_id="workflow-run-block-id",
@@ -826,6 +827,55 @@ async def test_same_name_identical_content_frozen_mtime_is_not_delivered(tmp_pat
     )
 
     execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt_number", [1, 2])
+@pytest.mark.parametrize("change", ["content", "mtime"])
+async def test_retry_download_delivers_proven_rewrite_with_old_mtime(
+    tmp_path: Path, attempt_number: int, change: str
+) -> None:
+    download_dir = tmp_path / "downloads"
+    rewritten, unchanged = _write_downloads(download_dir, "report.pdf", "unchanged.pdf")
+    rewritten.write_bytes(b"before")
+    old_time = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
+    for file in (rewritten, unchanged):
+        os.utime(file, (old_time, old_time))
+    late_stale = download_dir / "late.pdf"
+    fresh = download_dir / "fresh.pdf"
+    cutoff = datetime(2026, 1, 2, tzinfo=UTC)
+
+    def produce_downloads() -> None:
+        rewritten.write_bytes(b"after!" if change == "content" else b"before")
+        rewritten_time = old_time if change == "content" else old_time + 1
+        os.utime(rewritten, (rewritten_time, rewritten_time))
+        late_stale.write_bytes(b"previous attempt")
+        os.utime(late_stale, (old_time, old_time))
+        fresh.write_bytes(b"new download")
+        os.utime(fresh, (cutoff.timestamp(), cutoff.timestamp()))
+
+    block = _file_download_block(
+        FileDownloadTarget.SFTP,
+        sftp_host="sftp.example.com",
+        sftp_username="skyvern",
+        sftp_password="password",
+    )
+    with patch(
+        "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+        AsyncMock(return_value=("wr_1", attempt_number, cutoff)),
+    ):
+        execution = await _execute_file_download(
+            block, _browser_result(block), download_dir, during_execute=produce_downloads
+        )
+
+    delivered = {call.kwargs["file_path"] for call in execution.upload.await_args_list}
+    expected = {str(rewritten), str(fresh)}
+    if attempt_number == 1:
+        expected.add(str(late_stale))
+    assert execution.result.success
+    assert delivered == expected
+    assert unchanged.read_bytes() == b"unchanged.pdf"
+    assert late_stale.read_bytes() == b"previous attempt"
 
 
 @pytest.mark.asyncio
@@ -1657,6 +1707,43 @@ async def test_sftp_unwraps_secrets_and_defaults_port_to_22(tmp_path: Path) -> N
     assert destination.sftp_password == "actual-password"
     assert destination.sftp_private_key == "actual-private-key"
     assert destination.sftp_private_key_passphrase == "actual-passphrase"
+
+
+@pytest.mark.asyncio
+async def test_sftp_identity_fields_bound_to_secret_parameters_reach_the_real_server(tmp_path: Path) -> None:
+    """A file_download block renders templates with secrets masked, so the host, remote directory
+    and host key arrive as placeholders and must be mapped back before connecting."""
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.SFTP,
+        sftp_host="{{sftp_host}}",
+        sftp_username="skyvern",
+        sftp_password="password",
+        sftp_remote_path="{{sftp_remote_path}}",
+        sftp_host_key="{{sftp_host_key}}",
+    )
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        secret_values={
+            "{{sftp_host}}": "sftp.example.com",
+            "{{sftp_remote_path}}": "/inbound/claims",
+            "{{sftp_host_key}}": "ssh-ed25519 AAAAC3Nz",
+        },
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.sftp_host == "sftp.example.com"
+    assert destination.sftp_remote_path == "/inbound/claims"
+    assert destination.sftp_host_key == "ssh-ed25519 AAAAC3Nz"
+    # The uri is recorded as the block output, so a secret-bound host and remote path
+    # stay masked there even though the connection above uses the real values.
+    assert destination.customer_uri == "sftp://{{sftp_host}}:22/{{sftp_remote_path}}/statement.pdf"
+    assert destination.sdk_uri == destination.customer_uri
 
 
 @pytest.mark.asyncio

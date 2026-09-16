@@ -70,12 +70,15 @@ async def verify_browser_session(
             (current_time - last_activity_at).total_seconds() if last_activity_at is not None else None
         )
 
+        # A session this server owns can always be given longer; on cloud, a vendor row's stream is
+        # gated by the session router's own connect rule before it reaches the browser.
         if not session_is_active(
             seconds_since_start=(current_time - started_at).total_seconds(),
             base_timeout_seconds=base_timeout_seconds,
             seconds_since_last_activity=seconds_since_last_activity,
             idle_timeout_seconds=base_timeout_seconds,
             max_lifetime_seconds=MAX_LIFETIME_SECONDS,
+            budget_may_lift_cap=True,
         ):
             LOG.info(
                 "Browser session invalid, as it has timed out, but is still in a non-final status. This is likely a bug!",

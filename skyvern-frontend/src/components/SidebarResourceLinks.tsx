@@ -10,6 +10,7 @@ import {
   starCountFormatter,
   useGithubStarCount,
 } from "@/hooks/useGithubStarCount";
+import { DISCORD_INVITE_URL, GITHUB_REPO_URL } from "@/util/externalLinks";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -24,13 +25,13 @@ const links = [
   },
   {
     label: "GitHub",
-    href: "https://github.com/skyvern-ai/skyvern",
+    href: GITHUB_REPO_URL,
     icon: <GitHubLogoIcon className="size-4" />,
     showStars: true,
   },
   {
     label: "Discord",
-    href: "https://discord.com/invite/fG2XXEuQX3",
+    href: DISCORD_INVITE_URL,
     icon: <DiscordLogoIcon className="size-4" />,
   },
   {

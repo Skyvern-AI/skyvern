@@ -11,10 +11,10 @@ import structlog
 from agents import FunctionTool, function_tool
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
-from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
-from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
+from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
+from skyvern.forge.sdk.copilot.browser_target import BrowserTarget, resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -24,6 +24,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_pause import (
+    await_pending_credential_pause,
+    release_credential_pause_gate,
+)
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -41,7 +45,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     bound_call_browser_session,
     resolve_browser_state_for_context,
-    sensitive_origin_page_is_tainted,
+    sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -56,6 +60,7 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     inspect_locator_matches,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.work_plan import WorkPlanArguments, set_work_plan
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
 )
@@ -72,6 +77,8 @@ from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
+from ._shared import AdmittedOutputRead as AdmittedOutputRead
+from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
 from ._shared import _fallback_page_info as _fallback_page_info
@@ -80,6 +87,7 @@ from ._shared import _proxy_location_trace_value as _proxy_location_trace_value
 from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
+from ._shared import admitted_requested_output_reads
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
@@ -111,6 +119,7 @@ from .credential_fill import _credential_fill_authority_error as _credential_fil
 from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
     _fill_credential_field_impl,
+    _request_credential,
 )
 from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
 from .credentials import _credential_id_misbinding_findings as _credential_id_misbinding_findings
@@ -131,6 +140,7 @@ from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
 from .discovery import _rank_discovery_entrypoint_candidates as _rank_discovery_entrypoint_candidates
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
+from .errors import copilot_tool_failure
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
 from .frontier import _JINJA_LITERAL_ROOTS as _JINJA_LITERAL_ROOTS
 from .frontier import _JINJA_RUNTIME_GLOBAL_ROOTS as _JINJA_RUNTIME_GLOBAL_ROOTS
@@ -206,6 +216,7 @@ from .run_execution import (
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .run_execution import (
     finalize_build_test_result,
+    run_workflow_end_to_end,
 )
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
@@ -224,6 +235,7 @@ from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
+from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
@@ -263,6 +275,7 @@ def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[st
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="update_workflow",
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
@@ -275,6 +288,10 @@ async def update_workflow_tool(
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
+
+    A successful write is staged as a proposal, which the returned `persistence` and
+    `persistence_message` report. The user accepts a staged proposal to save it, or
+    discards it to keep the current version.
 
     Top-level workflow parameter keys appear in the run-input UI. When you
     add runtime inputs in `workflow_definition.parameters`, name keys for the
@@ -375,7 +392,7 @@ def _stored_workflow_yaml(copilot_ctx: Any) -> str:
     return stored_workflow_yaml(copilot_ctx)
 
 
-@function_tool(name_override="edit_block", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="edit_block", strict_mode=False)
 async def edit_block_tool(
     ctx: RunContextWrapper,
     label: str,
@@ -433,6 +450,7 @@ async def edit_block_tool(
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="edit_block_and_run",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -463,6 +481,7 @@ async def edit_block_and_run_tool(
     credential and reply with the credential name; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     requested_labels = list(block_labels) if block_labels else [label]
@@ -551,7 +570,7 @@ async def edit_block_and_run_tool(
     )
 
 
-@function_tool(name_override="add_block", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="add_block", strict_mode=False)
 async def add_block_tool(
     ctx: RunContextWrapper,
     after_label: str,
@@ -620,7 +639,7 @@ async def add_block_tool(
     )
 
 
-@function_tool(name_override="delete_block")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="delete_block")
 async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     """Remove one block from the workflow by label.
 
@@ -656,39 +675,38 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     )
 
 
-class RequestedOutputRead(TypedDict):
-    """A requested output and the exact label/value the model sees on the current page."""
-
-    output_path: str
-    value_text: str
-    label: str
+SUPERSEDED_BY_VALUE_WITNESS = "superseded-by-value-witness"
 
 
-_MAX_REQUESTED_OUTPUT_READS = 8
+def _witnessed_output_paths(data: object) -> frozenset[str]:
+    """Output paths this call's capture already addressed by the value its screenshot read."""
+    if not isinstance(data, dict):
+        return frozenset()
+    witnesses = data.get("value_witnesses")
+    if not isinstance(witnesses, list):
+        return frozenset()
+    return frozenset(
+        str(witness["output_path"])
+        for witness in witnesses
+        if isinstance(witness, dict) and str(witness.get("output_path") or "")
+    )
 
 
 async def _verify_requested_output_reads(
     copilot_ctx: CopilotContext,
     reads: list[RequestedOutputRead],
+    witnessed_paths: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Verify model-designated rendered values and return page facts without retaining a plan."""
     verified: list[dict[str, Any]] = []
-    unverified: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
-    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
-        unverified.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
-    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
-        raw_path = str(read.get("output_path") or "").strip()
-        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
-        value_text = str(read.get("value_text") or "").strip()
-        label = str(read.get("label") or "").strip()
-        if not raw_path or not value_text:
-            unverified.append({"output_path": raw_path, "reason": "malformed"})
+    admitted, unverified = admitted_requested_output_reads(reads)
+    for read in admitted:
+        output_path = read.output_path
+        value_text = read.value_text
+        label = read.label
+        if output_path in witnessed_paths:
+            unverified.append({"output_path": output_path, "reason": SUPERSEDED_BY_VALUE_WITNESS})
             continue
-        if output_path in seen_paths:
-            unverified.append({"output_path": output_path, "reason": "duplicate-output-path"})
-            continue
-        seen_paths.add(output_path)
         server = copilot_ctx.discovery_mcp_server
         if server is None:
             unverified.append({"output_path": output_path, "reason": "no-browser"})
@@ -753,7 +771,7 @@ async def _verify_requested_output_reads(
     return verified, unverified
 
 
-@function_tool(name_override="list_credentials")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="list_credentials")
 async def list_credentials_tool(
     ctx: RunContextWrapper,
     page: int = 1,
@@ -764,7 +782,8 @@ async def list_credentials_tool(
     Use this to find credential IDs for login blocks.
 
     When the agent selects a saved name or credential ID that appears as a complete
-    credential reference in the latest literal user turn, pass it as `exact_reference`.
+    credential reference in the latest literal user turn, or is already selected in the saved
+    workflow or a credential-card reply, pass it as `exact_reference` without asking again.
     Exact mode verifies provenance and organization-wide cardinality, then atomically binds
     the single match into server-owned request authority. It does not classify the surrounding
     prose and never falls back to fuzzy search, discovery, or pagination. Zero or multiple exact
@@ -789,7 +808,75 @@ async def list_credentials_tool(
     return json.dumps(sanitized)
 
 
-@function_tool(name_override="list_integrations")
+@function_tool(failure_error_function=copilot_tool_failure, name_override="request_credential")
+async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, reason: str) -> str:
+    """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
+
+    Use this instead of a prose question when a login still needs selection or setup, including
+    a sign-in page discovered while navigating. Reuse the user's existing choice, the saved
+    workflow's binding, or an unambiguous website match without asking again when it can fill.
+    `login_page_url` is the absolute HTTP(S) sign-in URL shown on the card; selecting a credential
+    authorizes it for that site. `reason` is one sentence explaining why the login is needed.
+    The call waits for the user's answer and comes back `connected` with the credential
+    to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
+    carries. One ask per turn.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"login_page_url": login_page_url, "reason": reason}
+    result: dict[str, Any] = {}
+    try:
+        authority_error = _authority_tool_error(copilot_ctx, "request_credential")
+        if authority_error:
+            result = {"ok": False, "error": authority_error}
+        else:
+            result = await _request_credential(login_page_url, reason, copilot_ctx)
+    finally:
+        # A card on screen right now owns the gate; this call must not open it for one it never
+        # raised. Every other exit has to release, including a repeat ask in a later response.
+        if not copilot_ctx.credential_ask_in_flight:
+            release_credential_pause_gate(copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "request_credential", arguments, result)
+    return json.dumps(result)
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override="ask_user")
+async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionInput]) -> str:
+    """Ask the user questions in an inline card and receive their response before continuing.
+
+    Keep questions and choice labels concise. Aim for 200 characters or fewer per question or choice, and offer no more than eight choices.
+
+    Give each question a prompt and optional choices. The card always has a bottom free-text
+    field. Users can submit choices, free text, or both, answer some parts, or skip. The result
+    preserves the questions, chosen options, free text, and unanswered parts. Decide what to do
+    next from those facts, including explaining or asking again. Use request_credential for
+    credentials; an ordinary answer does not change existing action or credential permissions.
+    """
+    from skyvern.forge.sdk.copilot.ask_user import ask_user
+
+    return json.dumps(await ask_user(ctx.context, AskUserArguments(parts=parts), ctx.tool_call_id))
+
+
+# This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
+# Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
+@function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
+async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str]) -> str:
+    """Replace your own work plan for this chat with `items`, in the order you mean to do them.
+
+    This is your working memory, not a report to the user and not evidence of anything: nothing
+    you write here satisfies a requirement, proves an output, or changes what gets tested or run.
+    It survives across turns and comes back to you at the start of every later model call, so use
+    it to hold onto responsibilities you have not reached yet — the steps past the one you are
+    working on right now.
+
+    Every call replaces the whole list; there is no append and no per-item update, so send the
+    full plan as you now believe it, and send an empty list to clear it. Rewrite it whenever what
+    you learned changes what is left: after scouting, after authoring, after a test, after a
+    repair.
+    """
+    return json.dumps(await set_work_plan(ctx.context, WorkPlanArguments(items=items)))
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
     never tokens). Each entry has `connection_id`, `provider`, `name`, `state`,
@@ -818,6 +905,14 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
+
+    A `credential_id` may instead be the connection `name` or `email_address`
+    exactly as the user wrote it in this turn. The server resolves it and reports
+    the outcome under `google_connection_resolution` in the `update_workflow`
+    result: `resolved` rewrites the slot to the `connection_id`, while `ambiguous`,
+    `not_found`, `ineligible`, and `not_cited` leave it alone and return the
+    eligible rows to clarify against. A slot still holding an unresolved reference
+    cannot run.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -834,6 +929,7 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="run_blocks_and_collect_debug",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -876,6 +972,7 @@ async def run_blocks_tool(
     evidence instead of retrying guessed URL params or page structure.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
@@ -927,7 +1024,38 @@ async def run_blocks_tool(
     return json.dumps(sanitized)
 
 
-@function_tool(name_override="get_run_results")
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override="test_workflow_from_blank_browser",
+    timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
+    strict_mode=False,
+)
+async def test_workflow_from_blank_browser_tool(
+    ctx: RunContextWrapper, parameters: dict[str, Any] | None = None
+) -> str:
+    """Test every block of the staged candidate, or current canonical workflow, in order.
+
+    Uses a separate blank browser with no scouting state and no restored saved browser profile.
+    This tests code-established prerequisites, not configured authenticated-profile behavior;
+    the workflow's saved profile settings are retained. Choose this test when useful; ordinary
+    partial-run tools keep their current scope. Supply runtime workflow inputs in parameters.
+    For secrets, use saved credential references rather than raw passwords or one-time codes.
+    """
+    copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
+    result = await run_workflow_end_to_end(copilot_ctx, parameters=parameters)
+    record_tool_step_result_for_ctx(
+        copilot_ctx, "test_workflow_from_blank_browser", {"parameters": parameters or {}}, result
+    )
+    enqueue_screenshot_from_result(
+        copilot_ctx,
+        result,
+        provenance=_run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
+    )
+    return json.dumps(sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result))
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override="get_run_results")
 async def get_run_results_tool(
     ctx: RunContextWrapper,
     workflow_run_id: str | None = None,
@@ -954,6 +1082,7 @@ async def get_run_results_tool(
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override="update_and_run_blocks",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
@@ -1020,6 +1149,7 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
@@ -1104,7 +1234,7 @@ def _credential_deferred_combined_tool_result(
     arguments: dict[str, Any],
     update_result: dict[str, Any],
 ) -> str:
-    """Record a persisted draft when a combined edit/update cannot safely run yet."""
+    """Record the staged draft when a combined edit/update cannot safely run yet."""
     copilot_ctx.last_run_skipped_unbound_credentials = True
     skip_result = {
         "ok": True,
@@ -1116,7 +1246,7 @@ def _credential_deferred_combined_tool_result(
             "skip_reason": "workflow_credential_inputs_unbound",
         },
     }
-    carry_author_time_findings(update_result, skip_result)
+    skip_result = carry_author_time_findings(update_result, skip_result)
     record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
     finalize_build_test_result(
         copilot_ctx,
@@ -1175,7 +1305,7 @@ async def _run_updated_workflow_blocks(
                 frontier_start_label=frontier_start_label,
             )
         recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
-        carry_author_time_findings(update_result, run_result)
+        run_result = carry_author_time_findings(update_result, run_result)
         _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         finalize_build_test_result(
@@ -1220,7 +1350,9 @@ def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: st
     )
 
 
-@function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)
+@function_tool(
+    failure_error_function=copilot_tool_failure, name_override="discover_workflow_entrypoint", strict_mode=False
+)
 async def discover_workflow_entrypoint_tool(
     ctx: RunContextWrapper,
     site_or_url: str,
@@ -1254,11 +1386,45 @@ async def discover_workflow_entrypoint_tool(
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
-@function_tool(name_override="inspect_page_for_composition", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="search_web", strict_mode=False)
+async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int = 10) -> str:
+    """Search the web for pages matching a query, when you need candidate sites rather than one known page.
+
+    Use this while scouting -- to find companies, suppliers, listings, or
+    documentation pages the user described but did not name. ``results`` holds
+    up to ``max_results`` entries with ``title``, ``url`` and ``snippet``, each
+    ``url`` a direct absolute link to the result site.
+
+    The rest of the reply is what the search actually did, so you can tell the
+    cases apart yourself: ``extracted_count`` is how many results the page
+    carried, ``withheld_count`` how many of those were withheld because their
+    destination is not allowed, ``http_status`` how the page was served (null
+    here, since this tab does not report one), ``error_kind`` the failure if the
+    fetch itself failed, and ``page_title`` the title served. An empty
+    ``results`` with a non-zero ``withheld_count`` is a filtered page; with
+    ``extracted_count`` zero it is a page carrying no results, which is a
+    refusal page as often as a genuine miss -- ``page_title`` usually says
+    which. Do not report a failed fetch as "no matches".
+
+    This navigates the scouting tab away from whatever page it was on. The
+    same search is available inside a code block as
+    ``await search_web(query, max_results=10)``, returning the same shape.
+    """
+    authority_error = _authority_tool_error(ctx.context, "search_web")
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, "search_web", authority_error)
+    result = await _search_web_impl(ctx.context, query, max_results)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
+@function_tool(
+    failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
+)
 async def inspect_page_for_composition_tool(
     ctx: RunContextWrapper,
     target_url: str,
     requested_output_reads: list[RequestedOutputRead] | None = None,
+    target: BrowserTarget = BrowserTarget.DEBUG,
 ) -> str:
     """Inspect a known page before composing form/search workflow blocks.
 
@@ -1267,10 +1433,15 @@ async def inspect_page_for_composition_tool(
     Use this after the entrypoint URL is known and before authoring blocks that
     fill fields, submit searches, filter results, or expand result rows. It
     can also inspect the current browser page after a run by passing
-    target_url="current_page"; use that after partial/budgeted runs so you do
+    target_url="current_page". `target="debug"` (the default) keeps the read on
+    the browser this chat drives; `target="last_run"` reads the browser used by
+    the most recent test run. Use the latter after partial/budgeted runs so you do
     not replay a search that already advanced the page. Passing any other
-    `target_url` navigates the live browser there and reports the reached
-    `current_url`, so a further `navigate_browser` to that same URL is redundant. The packet
+    `target_url` navigates the targeted browser there and reports the reached
+    `current_url`, so a further `navigate_browser` to that same URL is redundant. Navigating
+    `target="last_run"` leaves the page that run stopped on, losing the state you are diagnosing,
+    and anything it submits there is real; pass `target_url="current_page"` to observe that browser
+    without moving it. The packet
     describes the page only as it is at that moment: a control that appears solely after an
     interaction -- a Delete control after an Add click, a cart after add-to-cart, the secure area
     after login -- is absent from it until that interaction has happened.
@@ -1298,34 +1469,90 @@ async def inspect_page_for_composition_tool(
     and returns every observed selector candidate with its cardinality as facts; you
     remain responsible for choosing a selector and authoring the workflow read.
     """
-    authority_error = _authority_tool_error(ctx.context, "inspect_page_for_composition")
-    if authority_error:
-        return _diagnosis_repair_tool_error(ctx.context, "inspect_page_for_composition", authority_error)
-    result = await _inspect_page_for_composition_impl(ctx.context, target_url)
-    if requested_output_reads and result.get("ok"):
-        verified, unverified = await _verify_requested_output_reads(ctx.context, requested_output_reads)
-        data = result.get("data")
-        if isinstance(data, dict):
-            data["requested_output_designations"] = verified
-            if unverified:
-                data["unverified_output_designations"] = unverified
-                retry_paths = [item["output_path"] for item in unverified if item.get("output_path")]
-                if retry_paths:
-                    data["requested_output_designation_capability"] = requested_output_designation_capability(
-                        retry_paths
-                    )
-    elif result.get("ok"):
-        requested_paths = requested_output_paths_for_derivation(ctx.context)
-        data = result.get("data")
-        if requested_paths and isinstance(data, dict):
-            data["requested_output_designation_capability"] = requested_output_designation_capability(
-                list(requested_paths)
+    copilot_ctx = ctx.context
+    target_value = target.value
+    arguments: dict[str, Any] = {"target_url": target_url, "target": target_value}
+    if requested_output_reads is not None:
+        arguments["requested_output_reads"] = requested_output_reads
+    binding = resolve_browser_session_binding(copilot_ctx, {"target": target_value})
+
+    def finish(result: dict[str, Any], source_browser_session_id: str | None) -> str:
+        result_data = result.get("data")
+        session_provenance = result_data.get("browser_session_provenance") if isinstance(result_data, dict) else None
+        mixed_session_provenance = isinstance(session_provenance, dict) and session_provenance.get("mixed") is True
+        source_matches_target = (
+            binding.source_matches_target
+            and not mixed_session_provenance
+            and source_browser_session_id is not None
+            and source_browser_session_id == binding.session_id_for(copilot_ctx)
+        )
+        stamped = {
+            **result,
+            **binding.provenance(),
+            "source_matches_target": source_matches_target,
+            "source_browser_session_id": source_browser_session_id,
+        }
+        scrubbed = scrub_secrets_from_structure(copilot_ctx, stamped)
+        model_result = _model_facing_inspect_result(scrubbed)
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, model_result)
+        return json.dumps(model_result)
+
+    if binding.unavailable_reason:
+        return finish(
+            {"ok": False, "data": None, "error": binding.unavailable_reason},
+            None,
+        )
+
+    with bound_call_browser_session(binding.session_id_override):
+        authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
+        if authority_error:
+            authority_result = json.loads(
+                _diagnosis_repair_tool_error(copilot_ctx, "inspect_page_for_composition", authority_error)
             )
-    scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
-    return json.dumps(_model_facing_inspect_result(scrubbed_result))
+            return finish(
+                authority_result,
+                None,
+            )
+        admitted, _ = admitted_requested_output_reads(requested_output_reads or [])
+        result = await _inspect_page_for_composition_impl(copilot_ctx, target_url, admitted)
+        if requested_output_reads and result.get("ok"):
+            data = result.get("data")
+            witnessed_paths = _witnessed_output_paths(data)
+            verified, unverified = await _verify_requested_output_reads(
+                copilot_ctx, requested_output_reads, witnessed_paths
+            )
+            if isinstance(data, dict):
+                data["requested_output_designations"] = verified
+                if unverified:
+                    data["unverified_output_designations"] = unverified
+                    retry_paths = [
+                        item["output_path"]
+                        for item in unverified
+                        if item.get("output_path") and item.get("reason") != SUPERSEDED_BY_VALUE_WITNESS
+                    ]
+                    if retry_paths:
+                        data["requested_output_designation_capability"] = requested_output_designation_capability(
+                            retry_paths
+                        )
+        elif result.get("ok"):
+            requested_paths = requested_output_paths_for_derivation(copilot_ctx)
+            data = result.get("data")
+            if requested_paths and isinstance(data, dict):
+                data["requested_output_designation_capability"] = requested_output_designation_capability(
+                    list(requested_paths)
+                )
+        data = result.get("data")
+        source_browser_session_id = (
+            data.get("source_browser_session_id")
+            if isinstance(data, dict) and "source_browser_session_id" in data
+            else None
+        )
+        if not isinstance(source_browser_session_id, str):
+            source_browser_session_id = None
+        return finish(result, source_browser_session_id)
 
 
-@function_tool(name_override="fill_credential_field", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override="fill_credential_field", strict_mode=False)
 async def fill_credential_field_tool(
     ctx: RunContextWrapper,
     selector: str,
@@ -1349,17 +1576,18 @@ async def fill_credential_field_tool(
     An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
     the page left the one the fill acted on, so the field was cleared by its own submit.
 
-    Do not use this tool to reproduce an existing saved login block. Run that
-    block unchanged with `run_blocks_and_collect_debug`, then inspect the page
-    it reaches; the block's bound credential resolves in the workflow run.
+    To test an existing saved login block, run that block unchanged with `run_blocks_and_collect_debug`.
+    When repairing its login in the live browser, reuse the saved block's credential here;
+    its saved login origin, tested site, or vault site can authorize the fill without another ask.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id`: when a page observation returns
     `resolved_login_credential_id`, the server has already authorized that
     credential for this login page — pass that id. When it returns
-    `candidate_login_credentials`, ask the user which one to use and pass the
-    `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
+    `candidate_login_credentials`, reuse an existing user or saved-workflow choice if present;
+    otherwise call `request_credential` for the sign-in URL and pass the selected `credential_id`.
+    `field` is one of `username`, `password`, `totp`.
 
     `submit_selector` is optional and submits in the SAME call: pass the CSS
     selector of the form's submit control and this tool clicks it once the fill
@@ -1405,8 +1633,10 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
     copilot_ctx = ctx.context
 
     def finish(result: dict[str, Any]) -> str:
-        # Scrub once, then record and return that same structure, so nothing downstream retains an
-        # unsanitized copy of page text.
+        # This tool reads Playwright directly and never crosses the MCP adapter; the exact-value
+        # scrubber carries each secret's encoded forms, so a credential echoed URL-encoded in the URL
+        # or HTML-escaped in outer HTML is caught here too. Scrub once, then record and return that
+        # same structure, so nothing downstream retains an unsanitized copy of page text.
         scrubbed = scrub_secrets_from_structure(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, LOCATOR_INSPECTION_TOOL_NAME, parsed, scrubbed)
         return json.dumps(scrubbed)
@@ -1435,7 +1665,8 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
         return finish({"ok": False, "error": "No selectors supplied.", **binding.provenance()})
 
     with bound_call_browser_session(binding.session_id_override):
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        run_id = copilot_ctx.last_run_blocks_workflow_run_id
+        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
         browser_state = await resolve_browser_state_for_context(copilot_ctx)
         if browser_state is None:
@@ -1458,7 +1689,7 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
                 }
             )
         facts = await inspect_locator_matches(page, selectors)
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
         return finish({"ok": True, "current_url": page.url, **binding.provenance(), "data": facts})
 
@@ -1473,6 +1704,8 @@ inspect_locator_matches_tool = FunctionTool(
 
 
 NATIVE_TOOLS = [
+    ask_user_tool,
+    set_work_plan_tool,
     update_workflow_tool,
     edit_block_tool,
     edit_block_and_run_tool,
@@ -1481,10 +1714,26 @@ NATIVE_TOOLS = [
     list_credentials_tool,
     list_integrations_tool,
     run_blocks_tool,
+    test_workflow_from_blank_browser_tool,
     get_run_results_tool,
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
+    search_web_tool,
     inspect_page_for_composition_tool,
     inspect_locator_matches_tool,
     fill_credential_field_tool,
+    request_credential_tool,
 ]
+
+# Native tools that cannot do their job without a browser: they dispatch a run, drive the
+# scouting tab, or read a live page. Membership is by hand because FunctionTool carries no
+# capability metadata; a new tool that touches a browser belongs here.
+BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
+    {
+        "discover_workflow_entrypoint",
+        "search_web",
+        "inspect_page_for_composition",
+        LOCATOR_INSPECTION_TOOL_NAME,
+        "fill_credential_field",
+    }
+)

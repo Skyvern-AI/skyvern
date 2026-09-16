@@ -8,15 +8,20 @@ from email_validator import EmailNotValidError, validate_email
 # The `token` keyword is guarded by negative lookbehinds so pagination cursors
 # (next_token, page_token, continuation_token, ...), which are not credentials,
 # aren't matched as secrets by either detection or redaction.
-SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
+_SECRET_KEYWORD = (
     r"(?:^|(?<=[^A-Za-z0-9]))(?:[A-Za-z0-9]+_){0,8}"
     r"(?:password|passcode|api[_ -]?key|secret|bearer|authorization"
     r"|(?<!next_)(?<!prev_)(?<!previous_)(?<!page_)(?<!continuation_)(?<!cursor_)token)"
+)
+SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
     # Consume an optional auth scheme word so `Authorization: Bearer <token>`
     # redacts the token, not just the scheme.
-    r"\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?\S+",
+    _SECRET_KEYWORD + r"\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?\S+",
     re.I,
 )
+# A structured label carrying the keyword anywhere ("Password (required)"), for callers that already
+# hold the label apart from its value and so cannot rely on the assignment shape above.
+SECRET_KEYWORD_LABEL_PATTERN = re.compile(_SECRET_KEYWORD + r"(?![A-Za-z0-9])", re.I)
 RAW_SECRET_PATTERNS = (
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     re.compile(
@@ -41,7 +46,7 @@ def _candidate_secret_segments(text: str) -> list[str]:
     return [segment for segment in segments if segment]
 
 
-def _is_valid_account_row_email(value: str) -> bool:
+def is_account_row_email(value: str) -> bool:
     if any(char.isspace() for char in value) or "/" in value or ":" in value:
         return False
     try:
@@ -69,7 +74,7 @@ def _email_password_pair_segments(text: str) -> list[str]:
         email, separator, secret_value = segment.partition(":")
         if not separator:
             continue
-        if _is_valid_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
+        if is_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
             pairs.append(segment)
     return pairs
 
@@ -81,12 +86,64 @@ def contains_email_password_pair(text: str) -> bool:
     return bool(_email_password_pair_segments(text))
 
 
+def raw_secret_spans_for_prompt(text: str) -> tuple[tuple[int, int], ...]:
+    """Return deterministic secret spans in the original prompt text."""
+    raw = text or ""
+    spans = {(match.start(), match.end()) for pattern in RAW_SECRET_PATTERNS for match in pattern.finditer(raw)}
+    for segment in _email_password_pair_segments(raw):
+        start = 0
+        while (index := raw.find(segment, start)) >= 0:
+            spans.add((index, index + len(segment)))
+            start = index + 1
+    return tuple(sorted(spans))
+
+
 def redact_raw_secrets_for_prompt(text: str) -> str:
     redacted = text or ""
     for pattern in RAW_SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED_SECRET]", redacted)
     for segment in _email_password_pair_segments(redacted):
         redacted = redacted.replace(segment, "[REDACTED_SECRET]")
+    return redacted
+
+
+# A 32+ hex run carrying a letter is signature-shaped, and a long separator-free run mixing case and
+# digits is token-shaped. Both mirror the same shape test taskv3 uses for opaque signing values.
+_HEX_BLOB_RE = re.compile(r"[0-9A-Fa-f]{32,}")
+# Includes the separators a token alphabet uses (``ghp_...``, base64url), since the word-run
+# check below is what keeps ordinary names like "Q3_Report_2026_Final" readable.
+_OPAQUE_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
+_LOWERCASE_RUN_RE = re.compile(r"[a-z]+")
+# A CamelCase export name ("CustomerOrdersExport20260911") carries several whole words; a random
+# token can hit one long lowercase run by chance, so one is not evidence and two are.
+_WORDLIKE_RUN_CHARS = 4
+_WORDLIKE_RUNS_REQUIRED = 2
+
+
+def _is_secret_shaped(token: str) -> bool:
+    if any(not run.isdigit() for run in _HEX_BLOB_RE.findall(token)):
+        return True
+    wordlike_runs = sum(1 for run in _LOWERCASE_RUN_RE.findall(token) if len(run) >= _WORDLIKE_RUN_CHARS)
+    return (
+        _OPAQUE_TOKEN_RE.fullmatch(token) is not None
+        and wordlike_runs < _WORDLIKE_RUNS_REQUIRED
+        and any(char.isupper() for char in token)
+        and any(char.islower() for char in token)
+        and any(char.isdigit() for char in token)
+    )
+
+
+def redact_secretlike_filename(name: str) -> str:
+    """Keep an ordinary display name, but never hand the model a filename whose stem is shaped like a
+    credential. The patterns above only catch secrets they can name, and a filename is user-chosen
+    text that no semantic screen sees.
+    """
+    redacted = redact_raw_secrets_for_prompt(name or "")
+    stem, dot, extension = redacted.rpartition(".")
+    if not dot:
+        stem, extension = redacted, ""
+    if _is_secret_shaped(stem.strip()):
+        return f"[REDACTED_SECRET]{dot}{extension}"
     return redacted
 
 

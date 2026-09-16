@@ -7,8 +7,8 @@ import {
   Navigate,
   Route,
   Routes,
+  useLocation,
   useParams,
-  useSearchParams,
 } from "react-router-dom";
 import { useMemo } from "react";
 
@@ -20,32 +20,16 @@ import { TaskActions } from "@/routes/tasks/detail/TaskActions";
 import { TaskDetails } from "@/routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "@/routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "@/routes/tasks/detail/TaskRecording";
-import { WorkflowRun } from "@/routes/workflows/WorkflowRun";
-import { WorkflowPostRunParameters } from "@/routes/workflows/workflowRun/WorkflowPostRunParameters";
-import { WorkflowRunOutput } from "@/routes/workflows/workflowRun/WorkflowRunOutput";
-import { WorkflowRunOverview } from "@/routes/workflows/workflowRun/WorkflowRunOverview";
-import { WorkflowRunRecording } from "@/routes/workflows/workflowRun/WorkflowRunRecording";
-import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
-import { WorkflowsPageLayout } from "@/routes/workflows/WorkflowsPageLayout";
 import { WorkflowEditor } from "@/routes/workflows/editor/WorkflowEditor";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
-import { useWorkflowStudioFlagState } from "@/hooks/useWorkflowStudioEnabled";
-import { useTaskV2Query } from "@/routes/runs/useTaskV2Query";
 import {
-  SYSTEM_RUN_FOCUS_PARAM,
+  parsePanesParam,
+  RUN_APPEND_PANES,
+  STUDIO_PANES_PARAM,
   toReadableSearch,
 } from "@/routes/workflows/studio/panes";
-
-// Sub-paths the ?wr= redirect below may forward; anything else (including the
-// self-redirecting blocks route and crafted splats) lands on overview.
-const REDIRECTABLE_RUN_SUBPATHS = new Set([
-  "overview",
-  "output",
-  "parameters",
-  "recording",
-  "code",
-]);
+import { useTaskV2Query } from "@/routes/runs/useTaskV2Query";
 
 const loadingIndicator = (
   <div
@@ -60,66 +44,36 @@ const loadingIndicator = (
 );
 
 function RunRouter() {
-  const { runId, "*": subPath } = useParams();
-  const studioFlagState = useWorkflowStudioFlagState();
-  const studioEnabled = studioFlagState ?? false;
+  const params = useParams();
+  const runId = params.runId;
+  const location = useLocation();
+  const isTaskV2Run = Boolean(runId?.startsWith("tsk_v2"));
+  const isWorkflowRun = Boolean(runId?.startsWith("wr_"));
 
   const { data: task_v2, isLoading } = useTaskV2Query({
-    id: runId?.startsWith("tsk_v2") ? runId : undefined,
+    id: isTaskV2Run ? runId : undefined,
   });
 
-  // With the studio on, a workflow-run short URL renders the studio run view in
-  // place (short URL stays in the address bar) rather than redirecting to the
-  // long /agents/{wpid}/studio?wr= form. The studio components read the workflow
-  // id, which the path lacks, so resolve it from the run first — this query is
-  // shared/cached with the shell that renders next. An embedded run (?embed=true)
-  // keeps the legacy chrome-free view instead of the full studio shell.
-  const [searchParams] = useSearchParams();
-  const isEmbedded = searchParams.get("embed") === "true";
-  const renderStudioRun =
-    studioEnabled && Boolean(runId?.startsWith("wr_")) && !isEmbedded;
+  // Workflow-run short URLs render the studio run view in place (short URL
+  // stays in the address bar) rather than redirecting to the long
+  // /agents/{wpid}/studio?wr= form. The studio components read the workflow id,
+  // which the path lacks, so resolve it from the run first — this query is
+  // shared/cached with the shell that renders next.
   const { data: studioRun, isError: studioRunFailed } =
     useWorkflowRunWithWorkflowQuery({
-      workflowRunId: renderStudioRun ? runId : undefined,
-      enabled: renderStudioRun,
+      workflowRunId: isWorkflowRun ? runId : undefined,
+      enabled: isWorkflowRun,
     });
 
-  const runType = runId?.startsWith("tsk_v2")
+  const runType = isTaskV2Run
     ? "redirect"
-    : runId?.startsWith("wr_")
+    : isWorkflowRun
       ? "workflow"
       : runId?.startsWith("tsk_")
         ? "task"
         : null;
 
   const routes = useMemo(() => {
-    if (runType === "workflow") {
-      return (
-        <Routes>
-          <Route element={<WorkflowsPageLayout />}>
-            <Route element={<WorkflowRun />}>
-              <Route index element={<Navigate to="overview" replace />} />
-              <Route
-                path="blocks"
-                element={<Navigate to={`/runs/${runId}/overview`} replace />}
-              />
-              <Route path="overview" element={<WorkflowRunOverview />} />
-              <Route path="output" element={<WorkflowRunOutput />} />
-              <Route
-                path="parameters"
-                element={<WorkflowPostRunParameters />}
-              />
-              <Route path="recording" element={<WorkflowRunRecording />} />
-              <Route
-                path="code"
-                element={<WorkflowRunCode showCacheKeyValueSelector={true} />}
-              />
-            </Route>
-          </Route>
-        </Routes>
-      );
-    }
-
     if (runType === "task") {
       return (
         <Routes>
@@ -137,7 +91,63 @@ function RunRouter() {
     }
 
     return <Status404 />;
-  }, [runType, runId]);
+  }, [runType]);
+
+  const legacySubview = params["*"]?.split("/")[0] || undefined;
+  const studioView = legacySubview
+    ? {
+        overview: "timeline",
+        blocks: "timeline",
+        output: "outputs",
+        parameters: "inputs",
+        recording: "recording",
+        code: "code",
+      }[legacySubview]
+    : undefined;
+  const searchParams = new URLSearchParams(location.search);
+  const routedStudioView =
+    searchParams.has("active") &&
+    (studioView === "outputs" || studioView === "inputs")
+      ? "timeline"
+      : studioView;
+  const embedded = searchParams.get("embed") === "true";
+  const requestedView = routedStudioView ?? searchParams.get("view");
+  const requiredPane = requestedView === "recording" ? "browser" : "overview";
+  const embeddedPanes = parsePanesParam(searchParams.get(STUDIO_PANES_PARAM));
+  const embeddedLayoutInvalid =
+    embeddedPanes === null ||
+    embeddedPanes.length === 0 ||
+    embeddedPanes.some((pane) => pane !== "overview" && pane !== "browser");
+  const normalizeEmbeddedLayout =
+    embedded && (legacySubview !== undefined || embeddedLayoutInvalid);
+  if (isWorkflowRun && (routedStudioView || normalizeEmbeddedLayout)) {
+    if (routedStudioView) {
+      searchParams.set("view", routedStudioView);
+    }
+    const panes = embedded
+      ? [requiredPane]
+      : (parsePanesParam(searchParams.get(STUDIO_PANES_PARAM)) ?? [
+          ...RUN_APPEND_PANES,
+        ]);
+    searchParams.set(
+      STUDIO_PANES_PARAM,
+      embedded
+        ? requiredPane
+        : [requiredPane, ...panes.filter((pane) => pane !== requiredPane)].join(
+            ",",
+          ),
+    );
+    return (
+      <Navigate
+        to={{
+          pathname: `/runs/${runId}`,
+          search: toReadableSearch(searchParams),
+          hash: location.hash,
+        }}
+        replace
+      />
+    );
+  }
 
   if (runId?.startsWith("tsk_v2")) {
     if (isLoading) {
@@ -159,23 +169,17 @@ function RunRouter() {
     return <Navigate to={`/runs/${workflowRunId}`} replace />;
   }
 
-  if (renderStudioRun) {
-    // keepPreviousData holds the prior run's response while navigating between
-    // short URLs; wait for the fetch that matches this runId before handing its
-    // workflow id to the studio, so the editor and run panes never mix two runs.
-    const resolvedRun =
-      studioRun?.workflow_run_id === runId ? studioRun : undefined;
-    if (!resolvedRun) {
-      // No matching run data yet. A permanently failed initial fetch (deleted,
-      // foreign-org, or garbage run id) lands on 404 like the legacy run view; a
-      // failed background poll of a live run retains its data, so resolvedRun
-      // stays set above and never flashes 404 over a working view.
+  if (isWorkflowRun) {
+    if (!studioRun) {
+      // A permanently failed initial fetch (foreign-org or garbage run id)
+      // lands on 404; a failed background poll of a live run retains its data,
+      // so it never flashes 404 over a working view.
       if (studioRunFailed) {
         return <Status404 />;
       }
       return loadingIndicator;
     }
-    const workflowPermanentId = resolvedRun.workflow?.workflow_permanent_id;
+    const workflowPermanentId = studioRun.workflow?.workflow_permanent_id;
     if (!workflowPermanentId) {
       console.error("Workflow permanent ID for run %s not found", runId);
       return <Status404 />;
@@ -184,34 +188,6 @@ function RunRouter() {
       <WorkflowPermanentIdContext.Provider value={workflowPermanentId}>
         <WorkflowEditor />
       </WorkflowPermanentIdContext.Provider>
-    );
-  }
-
-  // A studio URL carries the viewed run in ?wr= and a possibly stale one in the
-  // path, so honor ?wr= here — but only once the flag is known off (or under
-  // ?embed=true, which never renders the studio), since rewriting while flags
-  // resolve would strip a studio user's URL state. Land on the sub-path
-  // directly because the index and /blocks redirects drop the search (?active=
-  // must survive), and scrub ?wrs=/?bl=, studio-internal companions of ?wr=.
-  const sharedStudioRunId = searchParams.get("wr");
-  if (
-    runType === "workflow" &&
-    (studioFlagState === false || isEmbedded) &&
-    sharedStudioRunId !== null &&
-    /^wr_\w+$/.test(sharedStudioRunId) &&
-    sharedStudioRunId !== runId
-  ) {
-    const params = new URLSearchParams(searchParams);
-    params.delete("wr");
-    params.delete(SYSTEM_RUN_FOCUS_PARAM);
-    params.delete("bl");
-    const targetSubPath =
-      subPath && REDIRECTABLE_RUN_SUBPATHS.has(subPath) ? subPath : "overview";
-    return (
-      <Navigate
-        to={`/runs/${sharedStudioRunId}/${targetSubPath}${toReadableSearch(params)}`}
-        replace
-      />
     );
   }
 

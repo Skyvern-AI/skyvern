@@ -1,6 +1,7 @@
 """Tests for prompt-based conditional branch evaluation behavior."""
 
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +11,8 @@ import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.exceptions import BranchEvaluationContextTooLargeError, ConditionalBranchEvaluationError
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
@@ -24,6 +27,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     _neutralize_jinja_delimiters,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
@@ -1491,3 +1495,196 @@ async def test_failed_branch_does_not_reorder_later_matching_branches() -> None:
     assert metadata["branch_index"] == 1
     # The third branch is never reached, so it must not appear as evaluated or matched.
     assert [entry["next_block_label"] for entry in metadata["evaluations"]] == ["premium", "first_true"]
+
+
+# Engine A/B parity contracts (SKY-15494): the synthetic branch-eval ExtractionBlock follows the
+# run's resolved engine, so these pin that rendering/alignment never branch on engine, a failed
+# extraction raises rather than retrying on another engine, and jinja-only conditionals build no
+# ExtractionBlock at all. Whether the block honors the run override lives in
+# tests/unit/test_workflow_block_engine.py, which owns engine resolution/dispatch coverage.
+
+
+@pytest.fixture
+def scoped_context() -> Iterator[SkyvernContext]:
+    context = SkyvernContext()
+    skyvern_context.set(context)
+    try:
+        yield context
+    finally:
+        skyvern_context.reset()
+
+
+def _pin_engine_override(context: SkyvernContext, workflow_run_id: str, engine: RunEngine | None) -> None:
+    context.workflow_block_engine_resolved_run_id = workflow_run_id
+    context.workflow_block_engine_override = engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_override", [None, RunEngine.skyvern_v3], ids=["control", "v3_override"])
+async def test_multi_branch_batch_parity_regardless_of_resolved_engine(
+    scoped_context: SkyvernContext, engine_override: RunEngine | None
+) -> None:
+    """Contract A: for a multi-branch, all-prompt batch, the (results, rendered_expressions) the
+    batch function returns must not depend on which engine the synthetic ExtractionBlock
+    resolves to."""
+    _pin_engine_override(scoped_context, "wr_multi", engine_override)
+
+    branches = [
+        BranchCondition(
+            criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+        ),
+        BranchCondition(
+            criteria=PromptBranchCriteria(expression="user is a returning customer"), next_block_label="returning"
+        ),
+        BranchCondition(
+            criteria=PromptBranchCriteria(expression="cart total exceeds $100"), next_block_label="big_cart"
+        ),
+    ]
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"plan": "premium"})  # type: ignore[method-assign]
+
+    async def _execute(self: ExtractionBlock, *args: object, **kwargs: object) -> BlockResult:
+        return _extraction_result(
+            self.output_parameter,
+            [
+                {"condition_index": 1, "reasoning": "ok", "result": True},
+                {"condition_index": 2, "reasoning": "ok", "result": False},
+                {"condition_index": 3, "reasoning": "ok", "result": True},
+            ],
+        )
+
+    with patch.object(ExtractionBlock, "execute", _execute):
+        results, rendered_expressions, _, _ = await block_module._evaluate_prompt_branch_conditions_batch(
+            log_label="cond",
+            branches=branches,
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_multi",
+            workflow_run_block_id="wrb",
+            organization_id="org_1",
+            browser_session_id=None,
+            workflow_id="wf_1",
+        )
+
+    assert results == [True, False, True]
+    assert rendered_expressions == [
+        "user selected premium plan",
+        "user is a returning customer",
+        "cart total exceeds $100",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_override", [None, RunEngine.skyvern_v3], ids=["control", "v3_override"])
+async def test_jinja_prerendered_mix_batch_parity_regardless_of_resolved_engine(
+    scoped_context: SkyvernContext, engine_override: RunEngine | None
+) -> None:
+    """Contract A: a batch mixing a fully Jinja-rendered branch with a pure natural-language
+    branch returns the same rendered expressions and results regardless of the resolved engine."""
+    _pin_engine_override(scoped_context, "wr_mixed_parity", engine_override)
+
+    branches = [
+        BranchCondition(criteria=PromptBranchCriteria(expression='{{tier}} == "gold"'), next_block_label="gold"),
+        BranchCondition(
+            criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+        ),
+    ]
+    evaluation_context = BranchEvaluationContext(
+        workflow_run_context=None,
+        template_renderer=lambda expr: expr.replace("{{tier}}", "gold"),
+    )
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"plan": "premium"})  # type: ignore[method-assign]
+
+    async def _execute(self: ExtractionBlock, *args: object, **kwargs: object) -> BlockResult:
+        return _extraction_result(
+            self.output_parameter,
+            [
+                {"condition_index": 1, "reasoning": "ok", "result": True},
+                {"condition_index": 2, "reasoning": "ok", "result": False},
+            ],
+        )
+
+    with patch.object(ExtractionBlock, "execute", _execute):
+        results, rendered_expressions, _, _ = await block_module._evaluate_prompt_branch_conditions_batch(
+            log_label="cond",
+            branches=branches,
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_mixed_parity",
+            workflow_run_block_id="wrb",
+            organization_id="org_1",
+            browser_session_id=None,
+            workflow_id="wf_1",
+        )
+
+    assert results == [True, False]
+    assert rendered_expressions == ['gold == "gold"', "user selected premium plan"]
+
+
+@pytest.mark.asyncio
+async def test_failed_extraction_raises_without_a_different_engine_retry(scoped_context: SkyvernContext) -> None:
+    """Contract C: a failing extraction raises ConditionalBranchEvaluationError immediately, with
+    no second execute attempt on a different engine. Extraction-level failures already retry at
+    the step level inside the task (block.py:14703-14714), so the batch function must not
+    silently re-roll on a different engine as a fallback."""
+    _pin_engine_override(scoped_context, "wr_no_fallback", RunEngine.skyvern_v3)
+
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="x"
+    )
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    captured_engines: list[RunEngine] = []
+
+    async def _execute(self: ExtractionBlock, *args: object, **kwargs: object) -> BlockResult:
+        captured_engines.append(self.resolve_engine("wr_no_fallback"))
+        return _failed_extraction_result(self.output_parameter, "LLM rate limited")
+
+    with (
+        patch.object(ExtractionBlock, "execute", _execute),
+        pytest.raises(ConditionalBranchEvaluationError, match="LLM rate limited"),
+    ):
+        await block_module._evaluate_prompt_branch_conditions_batch(
+            log_label="cond",
+            branches=[branch],
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_no_fallback",
+            workflow_run_block_id="wrb",
+            organization_id="org_1",
+            browser_session_id=None,
+            workflow_id="wf_1",
+        )
+
+    assert len(captured_engines) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_override", [None, RunEngine.skyvern_v3], ids=["no_override", "v3_override"])
+async def test_jinja_only_conditional_never_constructs_extraction_block(
+    scoped_context: SkyvernContext, engine_override: RunEngine | None
+) -> None:
+    """Contract D: a conditional whose branches are all JinjaBranchCriteria never builds or
+    executes a synthetic ExtractionBlock, whether or not the run is pinned into the v3 A/B."""
+    _pin_engine_override(scoped_context, "wr_jinja_only", engine_override)
+
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ 1 == 2 }}"), next_block_label="a"),
+            BranchCondition(is_default=True, next_block_label="fallback_block"),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        await block.execute(workflow_run_id="wr_jinja_only", workflow_run_block_id="wrb", organization_id="org")
+
+    mock_extraction_cls.assert_not_called()
+    assert mock_build_result.await_args.kwargs["executed_branch_next_block"] == "fallback_block"

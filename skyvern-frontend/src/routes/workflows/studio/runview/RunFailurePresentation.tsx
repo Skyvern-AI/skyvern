@@ -5,6 +5,8 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 
+import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
+import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import { Button } from "@/components/ui/button";
 // Fix leads when it is offered; Retry is the primary only when it stands alone.
 export function FailureRecoveryActions({
@@ -57,6 +59,7 @@ export function FailureTips({ tips }: { tips: Array<string> }) {
 // The strip's second line. The block name is the jump; the full
 // reason rides the headline's title so nothing else is said at run level.
 export function RunFailureLine({
+  workflowRun,
   blockLabel,
   headline,
   detail,
@@ -64,6 +67,7 @@ export function RunFailureLine({
   tips,
   children,
 }: {
+  workflowRun?: WorkflowRunStatusApiResponseWithWorkflow;
   blockLabel: string | null;
   headline: string;
   detail: string | null;
@@ -71,6 +75,13 @@ export function RunFailureLine({
   tips: Array<string>;
   children: ReactNode;
 }) {
+  if (workflowRun && runIsRetryWaiting(workflowRun)) {
+    return (
+      <div className="shrink-0 text-xs text-muted-foreground">
+        Retry pending. Skyvern will run this workflow again.
+      </div>
+    );
+  }
   return (
     <div
       data-testid="run-failure-line"

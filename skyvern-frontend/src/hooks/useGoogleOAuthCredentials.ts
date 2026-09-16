@@ -10,7 +10,6 @@ import {
   GoogleOAuthCredentialResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
-export { GOOGLE_SHEETS_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:google-oauth-credentials";
 
@@ -90,16 +89,17 @@ export function hasGoogleOAuthCredentialScopes(
   return requiredScopes.every((scope) => granted.has(scope));
 }
 
-export function matchesGoogleOAuthIntegrationScopes(
+export function attemptedGoogleOAuthIntegrationScopes(
   credential: GoogleOAuthCredential,
   requiredScopes: readonly string[],
+  capabilityScopes: readonly string[] = requiredScopes,
 ): boolean {
   const requested = getGoogleOAuthCredentialScopesRequested(credential);
   if (requested.length > 0) {
     const requestedSet = new Set(requested);
     return requiredScopes.every((scope) => requestedSet.has(scope));
   }
-  return hasGoogleOAuthCredentialScopes(credential, requiredScopes);
+  return hasGoogleOAuthCredentialScopes(credential, capabilityScopes);
 }
 
 // Falls back to the first credential even when none are active, so a single

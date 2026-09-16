@@ -19,6 +19,8 @@ import {
   vi,
 } from "vitest";
 import { type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import type {
@@ -27,13 +29,23 @@ import type {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import type { WorkflowBlock } from "../types/workflowTypes";
-import type { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
+import {
+  WorkflowRunOverview,
+  type WorkflowRunOverviewActiveElement,
+} from "./WorkflowRunOverview";
 import { WorkflowRunTimeline } from "./WorkflowRunTimeline";
+import { DebuggerRunTimeline } from "../debugger/DebuggerRunTimeline";
+import { DebuggerRunTimelineMinimal } from "../debugger/DebuggerRunTimelineMinimal";
 
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
   statusUnavailable: false,
+  timelineQuery: vi.fn(),
+}));
+
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: mocks.workflowRun, isLoading: false }),
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -44,10 +56,20 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   }),
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
-  useWorkflowRunTimelineQuery: () => ({
-    data: mocks.timeline,
-    isLoading: false,
-  }),
+  useWorkflowRunTimelineQuery: (options?: { workflowRunId?: string }) => {
+    mocks.timelineQuery(options);
+    return { data: mocks.timeline, isLoading: false };
+  },
+}));
+vi.mock("@/hooks/useRuntimeConfig", () => ({
+  useStreamTransport: () => ({ streamTransport: "cdp" }),
+}));
+vi.mock("./RunHealChip", () => ({ RunHealChip: () => null }));
+vi.mock("./RunReliabilityUplink", () => ({ RunReliabilityUplink: () => null }));
+vi.mock("./WorkflowRunBlockScreenshot", () => ({
+  WorkflowRunBlockScreenshot: ({ running }: { running: boolean }) => (
+    <div data-testid="block-screenshot" data-polling={running} />
+  ),
 }));
 // Radix ScrollArea needs ResizeObserver, which jsdom doesn't provide.
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -153,6 +175,7 @@ function renderTimeline(
 ) {
   return render(
     <WorkflowRunTimeline
+      workflowRunId={undefined}
       activeItem={activeItem}
       hideBorder={options.hideBorder}
       hideHeader={options.hideHeader}
@@ -185,9 +208,181 @@ afterEach(() => {
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.statusUnavailable = false;
+  mocks.timelineQuery.mockClear();
 });
 
 describe("WorkflowRunTimeline", () => {
+  it("opens the selected attempt and preserves manual expansion across retries", () => {
+    const workflowRun = {
+      workflow_run_id: "wr_default",
+      status: Status.Running,
+      attempt: 2,
+      workflow: { workflow_definition: { blocks: [] } },
+    };
+    const historicalBlock = buildBlock({
+      workflow_run_block_id: "wrb_historical",
+      label: "historical_block",
+    });
+    mocks.workflowRun = workflowRun;
+    const timeline = [{ ...buildBlockItem(historicalBlock), attempt: 1 }];
+    mocks.timeline = timeline;
+    const view = (activeItem: WorkflowRunOverviewActiveElement) => (
+      <WorkflowRunTimeline
+        workflowRunId="wr_default"
+        activeItem={activeItem}
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />
+    );
+    const { rerender } = render(view(historicalBlock));
+    const historicalGroup = () =>
+      screen.getByRole("button", { name: /Attempt 1$/ });
+    expect(historicalGroup().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("historical_block").closest("[hidden]")).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: /Attempt 2/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+
+    mocks.workflowRun = { ...workflowRun, attempt: 3 };
+    mocks.timeline = [
+      ...timeline,
+      {
+        ...buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_current" })),
+        attempt: 3,
+      },
+    ];
+    rerender(view({ ...historicalBlock }));
+    expect(historicalGroup().getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(historicalGroup());
+    rerender(view({ ...historicalBlock }));
+    expect(historicalGroup().getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("historical_block")).toBeNull();
+
+    fireEvent.click(historicalGroup());
+    rerender(view(null));
+    mocks.workflowRun = { ...workflowRun, attempt: 4 };
+    rerender(view(null));
+    expect(historicalGroup().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("historical_block").closest("[hidden]")).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: /Attempt 3$/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(
+      screen
+        .getByRole("button", { name: /Attempt 4/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+  });
+
+  it("restarts block numbering in each attempt", () => {
+    mocks.workflowRun = {
+      workflow_run_id: "wr_default",
+      status: Status.Completed,
+      attempt: 2,
+      workflow: { workflow_definition: { blocks: [] } },
+    };
+    mocks.timeline = [1, 2].map((attempt) => ({
+      ...buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: `wrb_attempt_${attempt}`,
+          label: `attempt_${attempt}_block`,
+          created_at: `2026-01-01T00:0${attempt}:00Z`,
+        }),
+      ),
+      attempt,
+    }));
+
+    renderTimeline(null);
+    fireEvent.click(screen.getByRole("button", { name: /Attempt 1$/ }));
+
+    for (const attempt of [1, 2]) {
+      const row = screen
+        .getByText(`attempt_${attempt}_block`)
+        .closest("button")!;
+      expect(within(row).getByText("#1")).toBeDefined();
+    }
+  });
+
+  it("hides the Live control during a retry wait and restores it for the next attempt", () => {
+    const workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Failed,
+      attempt: 1,
+      retry_pending: true,
+      total_steps: 0,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.workflowRun = workflowRun;
+    mocks.timeline = [];
+    const view = () => (
+      <WorkflowRunTimeline
+        workflowRunId="wr_1"
+        activeItem={null}
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />
+    );
+    const { rerender } = render(view());
+    const liveControl = {
+      name: "Jump to the live stream of the running workflow",
+    };
+    expect(screen.queryByRole("button", liveControl)).toBeNull();
+
+    mocks.workflowRun = {
+      ...workflowRun,
+      status: Status.Running,
+      attempt: 2,
+      retry_pending: false,
+    };
+    rerender(view());
+    expect(screen.getByRole("button", liveControl)).toBeDefined();
+  });
+
+  it("stops overview artifact polling during a retry delay and resumes for the next attempt", () => {
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Failed,
+      retry_pending: true,
+    };
+    mocks.timeline = [buildBlockItem(buildBlock())];
+    const client = new QueryClient();
+    const view = () => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/?active=wrb_default"]}>
+          <WorkflowRunOverview />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(view());
+
+    expect(screen.getByTestId("block-screenshot").dataset.polling).toBe(
+      "false",
+    );
+
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+      attempt: 2,
+    };
+    rerender(view());
+    expect(screen.getByTestId("block-screenshot").dataset.polling).toBe("true");
+    client.clear();
+  });
+
   it("does not offer a live stream from an unavailable status payload", () => {
     mocks.workflowRun = {
       status: Status.Running,
@@ -643,6 +838,7 @@ describe("timeline selection reveal", () => {
 
     rerender(
       <WorkflowRunTimeline
+        workflowRunId={undefined}
         activeItem={child1}
         onLiveStreamSelected={noop}
         onActionItemSelected={noop}
@@ -674,6 +870,7 @@ describe("timeline selection reveal", () => {
     // A different nested selection outranks the old collapse.
     view.rerender(
       <WorkflowRunTimeline
+        workflowRunId={undefined}
         activeItem={child2}
         onLiveStreamSelected={noop}
         onActionItemSelected={noop}
@@ -685,4 +882,119 @@ describe("timeline selection reveal", () => {
 
     expect(screen.getByText("submit_form")).toBeTruthy();
   });
+});
+
+describe("timeline run resolution", () => {
+  it("states no run rather than deferring to the route when the prop is undefined", () => {
+    renderTimeline(null);
+
+    expect(mocks.timelineQuery).toHaveBeenCalledWith({
+      workflowRunId: undefined,
+    });
+  });
+
+  it("scopes the timeline to an explicit run id prop", () => {
+    render(
+      <WorkflowRunTimeline
+        activeItem={null}
+        workflowRunId="wr_explicit"
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />,
+    );
+
+    expect(mocks.timelineQuery).toHaveBeenCalledWith({
+      workflowRunId: "wr_explicit",
+    });
+  });
+});
+
+it("shows debugger execution indicators only between retry waits in both timeline variants", () => {
+  const run: { status: Status; retry_pending: boolean; attempt: number } = {
+    status: Status.Running,
+    retry_pending: false,
+    attempt: 1,
+  };
+  mocks.workflowRun = run;
+  mocks.timeline = [];
+  const view = () => (
+    <>
+      <DebuggerRunTimeline
+        activeItem={null}
+        onObserverThoughtCardSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+      />
+      <DebuggerRunTimelineMinimal />
+    </>
+  );
+  const { container, rerender } = render(view());
+  expect(screen.getAllByText(/formulating actions/i)).toHaveLength(2);
+  expect(container.querySelector(".animate-pulse")).not.toBeNull();
+
+  run.status = Status.Failed;
+  run.retry_pending = true;
+  rerender(view());
+  expect(screen.queryAllByText(/formulating actions/i)).toHaveLength(0);
+  expect(screen.getByText("Workflow timeline is empty")).toBeTruthy();
+  expect(screen.getByText("-")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+
+  mocks.timeline = [buildBlockItem(buildBlock({ label: "finished_attempt" }))];
+  rerender(view());
+  expect(screen.getByText("finished_attempt")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+
+  run.status = Status.Running;
+  run.retry_pending = false;
+  run.attempt = 2;
+  rerender(view());
+  expect(screen.getAllByText(/formulating actions/i)).toHaveLength(2);
+  expect(screen.queryByText("finished_attempt")).toBeNull();
+  mocks.timeline = [{ ...buildBlockItem(buildBlock()), attempt: 2 }];
+  rerender(view());
+  expect(screen.queryAllByText(/formulating actions/i)).toHaveLength(0);
+  expect(container.querySelectorAll(".animate-pulse")).toHaveLength(2);
+});
+
+it.each([1, 2])(
+  "does not formulate actions during attempt %s's retry wait",
+  (attempt) => {
+    mocks.workflowRun = {
+      workflow_run_id: "wr_empty",
+      status: Status.Failed,
+      retry_pending: true,
+      attempt,
+    };
+    mocks.timeline = [];
+    renderTimeline(null);
+    expect(screen.queryByText("Formulating actions...")).toBeNull();
+  },
+);
+
+it.each([
+  ["user_code_error", "The block's code raised an error"],
+  ["E_CUSTOM", "E_CUSTOM"],
+])("labels attempt errors for %s", (code, label) => {
+  mocks.workflowRun = {
+    workflow_run_id: "wr_errors",
+    status: Status.Failed,
+    attempt: 2,
+    attempts: [
+      { attempt_number: 1, status: Status.Failed, error_codes: [code] },
+    ],
+  };
+  mocks.timeline = [];
+  renderTimeline(null);
+  expect(
+    screen.getByRole("button", {
+      name: new RegExp(`Attempt 1.*failed.*${label}`),
+    }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: /Attempt 2.*failed/ }),
+  ).toBeTruthy();
 });

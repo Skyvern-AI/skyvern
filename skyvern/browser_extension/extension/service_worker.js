@@ -74,10 +74,27 @@ async function dispatchRequest(op, args) {
   return handler(args);
 }
 
+let cachedBuildHash;
+async function getBuildHash() {
+  if (cachedBuildHash !== undefined) {
+    return cachedBuildHash;
+  }
+  try {
+    const response = await fetch(chrome.runtime.getURL("build_hash.json"));
+    const data = await response.json();
+    cachedBuildHash = typeof data.sha256 === "string" ? data.sha256 : null;
+  } catch {
+    // Older unpacked copies predate build_hash.json; report unknown rather than failing hello.
+    cachedBuildHash = null;
+  }
+  return cachedBuildHash;
+}
+
 async function sendHello() {
   bridge.sendEvent(EVENTS.EXTENSION_HELLO, {
     protocolVersion: PROTOCOL_VERSION,
     extensionVersion: chrome.runtime.getManifest().version,
+    buildHash: await getBuildHash(),
     scopeEventOrigins: true,
     scopedTabs: await tabScope.helloTabs(),
   });

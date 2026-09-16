@@ -1,3 +1,4 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -11,7 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
@@ -74,9 +75,10 @@ function WorkflowRunCode(props?: Props) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const { toast } = useToast();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    props?.workflowRunId ? { workflowRunId: props.workflowRunId } : undefined,
-  );
+  const { data: workflowRun, isPlaceholderData: runIsWithheld } =
+    useWorkflowRunWithWorkflowQuery(
+      props?.workflowRunId ? { workflowRunId: props.workflowRunId } : undefined,
+    );
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
@@ -91,7 +93,7 @@ function WorkflowRunCode(props?: Props) {
     page: 1,
     workflowPermanentId,
   });
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : null;
   const parameters = workflowRun?.parameters;
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
@@ -321,6 +323,7 @@ function WorkflowRunCode(props?: Props) {
     // show a skeleton rather than a premature "no code" message.
     if (
       isGeneratingCode ||
+      runIsWithheld ||
       blockScriptsPendingLoading ||
       blockScriptsPublishedLoading
     ) {
@@ -334,6 +337,11 @@ function WorkflowRunCode(props?: Props) {
   }
 
   if (code.length === 0 && !isGeneratingCode) {
+    // A withheld run leaves workflowPermanentId undefined, which disables both
+    // block-scripts queries — absent code here means unknown, not none.
+    if (runIsWithheld) {
+      return <CodeLoadingSkeleton />;
+    }
     return (
       <div className="flex items-center justify-center bg-slate-elevation3 p-8">
         No code has been generated yet.

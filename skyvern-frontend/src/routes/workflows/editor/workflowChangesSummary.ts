@@ -212,6 +212,7 @@ const SETTINGS_LABELS: Array<{
     fields: ["browserProfileId", "browserProfileKey"],
     label: "Changed browser profile",
   },
+  { fields: ["browserType"], label: "Changed browser type" },
   { fields: ["model"], label: "Changed model" },
   { fields: ["maxScreenshotScrolls"], label: "Changed max screenshot scrolls" },
   { fields: ["maxElapsedTimeMinutes"], label: "Changed max run time" },
@@ -230,6 +231,7 @@ const SETTINGS_LABELS: Array<{
   { fields: ["finallyBlockLabel"], label: "Changed finally block" },
   { fields: ["workflowSystemPrompt"], label: "Changed workflow system prompt" },
   { fields: ["errorCodeMapping"], label: "Changed error handling" },
+  { fields: ["retryPolicy"], label: "Automatic retry" },
 ];
 
 function summarizeSettingsChanges(

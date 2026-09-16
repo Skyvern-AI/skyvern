@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeAlias, cast
 
 import structlog
 from playwright.async_api import Error as _PlaywrightError
@@ -42,8 +42,15 @@ from skyvern.webeye.browser_errors import (
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 
 if TYPE_CHECKING:
+    from playwright.async_api import Frame as _StockFrame
+
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.webeye.browser_manager import BrowserManager
+    from skyvern.webeye.skycdp.facade.page import Frame as _SkyCdpFrame
+
+    # Callers annotate against this rather than naming an engine's frame class, so engine identity
+    # stays behind the registry seam that test_experimental_engine_production_isolation pins.
+    EngineFrame: TypeAlias = "_StockFrame | _SkyCdpFrame"
 
 LOG = structlog.get_logger()
 
@@ -461,6 +468,25 @@ REGISTRY = BrowserEngineRegistry()
 REGISTRY.register(PLAYWRIGHT_SPEC)
 REGISTRY.register(RUSTWRIGHT_SPEC)
 REGISTRY.register(SKYCDP_SPEC)
+
+
+def is_any_engine_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the driver-error family of any engine this image could select.
+
+    For a caller that holds a page but not the run's ``BrowserEngineSelection`` and so cannot ask
+    ``is_engine_error``; going through the registry keeps the engine packages named here rather than
+    at the call site. Wider than the pinned check by construction, so it answers yes to a refusal the
+    selected engine would also own, and an engine whose package is absent contributes nothing.
+    """
+    for name in REGISTRY.names():
+        spec = REGISTRY.get(name)
+        try:
+            error_type, _ = spec._load_error_types()
+        except ImportError:
+            continue
+        if isinstance(exc, error_type):
+            return True
+    return False
 
 
 @dataclass(frozen=True)

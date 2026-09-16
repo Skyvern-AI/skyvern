@@ -675,7 +675,7 @@ def _install_db_fakes(
         state["execute_step_kwargs"] = kwargs
         return None, None, None
 
-    async def _get_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
+    async def _get_current_attempt_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
         return list(downloaded_files or [])
 
     async def _create_action(action: Action) -> Action:
@@ -711,7 +711,11 @@ def _install_db_fakes(
     monkeypatch.setattr(
         app.DATABASE.observer, "update_workflow_run_block", AsyncMock(side_effect=_update_workflow_run_block)
     )
-    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(side_effect=_get_downloaded_files))
+    monkeypatch.setattr(
+        app.STORAGE,
+        "get_current_attempt_downloaded_files",
+        AsyncMock(side_effect=_get_current_attempt_downloaded_files),
+    )
     monkeypatch.setattr(
         app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock(return_value=None)
     )
@@ -727,6 +731,7 @@ def _install_db_fakes(
 def _recording_page(exception: Exception | None, *, url: object = "http://example.test/home") -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception = MagicMock(return_value=exception)
+    page.failure_nav_error_code = MagicMock(return_value=None)
     page.url = url
     return page
 
@@ -749,6 +754,7 @@ class FakeRecorder:
     def __init__(self, **kwargs: Any) -> None:
         self.recording_page = MagicMock()
         self.recording_page.last_recorded_exception = MagicMock(return_value=self._next_last_exception)
+        self.recording_page.failure_nav_error_code = MagicMock(return_value=None)
         self._actions: list[Any] = []
         self.finalized_success: bool | None = None
         self.__class__.instances.append(self)
@@ -1100,6 +1106,16 @@ async def test_inline_declared_error_without_download_keeps_typed_output(monkeyp
         ],
         "failure_reason": "report generation failed",
         "status": "failed",
+        # SKY-15564: the run inherits the declared code instead of the classifier's UNKNOWN.
+        "failure_category": [
+            {
+                "category": "report_unavailable",
+                "confidence_float": 1.0,
+                "reasoning": "report generation failed",
+            }
+        ],
+        # Names the code as the author's own, so a reader can tell it from a driver's verdict.
+        "declared_error_code": "report_unavailable",
     }
     assert result.output_parameter_value == expected_output
     assert "downloaded_files" not in result.output_parameter_value

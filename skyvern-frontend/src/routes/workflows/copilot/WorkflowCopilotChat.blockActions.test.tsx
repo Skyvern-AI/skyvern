@@ -8,10 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = { message: string; workflow_run_id?: string | null };
 type StreamCall = {
@@ -160,7 +157,6 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
@@ -170,9 +166,7 @@ type ChatProps = { docked?: boolean; portalTarget?: HTMLElement | null };
 function chatUi(props: ChatProps = {}) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat {...props} />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat {...props} />
     </FeatureFlagContext.Provider>
   );
 }
@@ -186,13 +180,7 @@ function makeDockedProps(): ChatProps {
 
 async function renderChat(props: ChatProps = {}) {
   const view = render(chatUi(props));
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -611,16 +599,21 @@ describe("WorkflowCopilotChat — build follow", () => {
     expect(focusBlock).not.toHaveBeenCalled();
   });
 
-  it("never fights the recording overlay", async () => {
+  it("blocks Copilot submission while the recording overlay owns authoring", async () => {
     useRecordingStore.setState({ isRecording: true });
     try {
       await renderChat(makeDockedProps());
-      await submit("build it");
 
-      streamCalls[0]!.onMessage(
-        blockProgressFrame({ block_label: "login", status: "running" }),
-      );
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
+      ).toBe(true);
+      const sendButton = screen.getByRole("button", {
+        name: "Send disabled — finish the current authoring action",
+      }) as HTMLButtonElement;
+      expect(sendButton.disabled).toBe(true);
+      fireEvent.click(sendButton);
 
+      expect(postStreaming).not.toHaveBeenCalled();
       expect(focusBlock).not.toHaveBeenCalled();
     } finally {
       useRecordingStore.setState({ isRecording: false });

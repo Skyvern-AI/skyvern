@@ -12,10 +12,8 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import {
-  GOOGLE_SHEETS_REQUIRED_SCOPES,
-  useGoogleOAuthCredentials,
-} from "@/hooks/useGoogleOAuthCredentials";
+import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
+import { GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES } from "@/util/googleScopes";
 import { useGoogleSheetDimensions } from "@/hooks/useGoogleSheetDimensions";
 import { useGoogleSheetHeaders } from "@/hooks/useGoogleSheetHeaders";
 import { useGoogleSpreadsheet } from "@/hooks/useGoogleSpreadsheet";
@@ -178,7 +176,7 @@ function GoogleSheetsWriteEditorBody({
             nodeId={blockId}
             value={data.credentialId}
             onChange={(next) => update({ credentialId: next })}
-            requiredScopes={GOOGLE_SHEETS_REQUIRED_SCOPES}
+            requiredScopes={GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES}
           />
           {needsReconnect ? (
             <a

@@ -1,20 +1,20 @@
 import { useMutation } from "@tanstack/react-query";
 import { useRef } from "react";
-import { useFeatureFlagEnabled } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
-import {
-  type WorkflowBlock,
-  type WorkflowParameter,
-} from "@/routes/workflows/types/workflowTypes";
+import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
+import type { RecordedParameter } from "@/store/RecordedBlocksStore";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
+import type { RecordingEvidencePacket } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
   captureRecordBrowser,
   markRecordBrowserProcessed,
@@ -28,11 +28,13 @@ const useProcessRecordingMutation = ({
 }: {
   browserSessionId: string | null;
   onSuccess?: (args: {
+    recordingId: string | null;
     blocks: Array<WorkflowBlock>;
-    parameters: Array<WorkflowParameter>;
+    parameters: Array<RecordedParameter>;
   }) => void;
 }) => {
   const credentialGetter = useCredentialGetter();
+  const { openPane } = useStudioPanes();
   const recordingStore = useRecordingStore();
   const workflowPermanentId = useWorkflowPermanentId();
   const mutationStartedAtRef = useRef<number | null>(null);
@@ -42,10 +44,6 @@ const useProcessRecordingMutation = ({
     eventCount: number;
     optimisticStepCount: number;
   } | null>(null);
-  // Per-user opt-in preview; not enrolled reads as false (agent blocks).
-  const codeFirst =
-    useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
-
   const processRecordingMutation = useMutation({
     mutationFn: async (
       variables: {
@@ -71,10 +69,18 @@ const useProcessRecordingMutation = ({
         );
       }
 
+      if (useWorkflowHasChangesStore.getState().pendingRecordingId !== null) {
+        throw new Error(
+          "Save or discard the current workflow changes before processing another recording.",
+        );
+      }
+
       mutationStartedAtRef.current = Date.now();
 
       const currentRecording = useRecordingStore.getState();
       const eventCount = currentRecording.getEventCount();
+      const recordingAttemptId = currentRecording.recordingAttemptId;
+      const interpretationSessionId = currentRecording.interpretationSessionId;
       recordingStatsRef.current = {
         transport: currentRecording.recordingTransport,
         durationMs: Math.round(currentRecording.getSecondsRecording() * 1000),
@@ -105,25 +111,42 @@ const useProcessRecordingMutation = ({
             compressed_chunks: string[];
             draft_steps?: Array<RecordingDraftStep>;
             code_first: boolean;
+            supports_credential_tokens: boolean;
+            recording_attempt_id?: string;
+            interpretation_session_id?: string;
           },
           {
             data: {
+              recording_id: string | null;
               blocks: Array<WorkflowBlock>;
-              parameters: Array<WorkflowParameter>;
+              parameters: Array<RecordedParameter>;
+              evidence?: RecordingEvidencePacket | null;
             };
           }
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
-          code_first: codeFirst,
+          // Keep opting in explicitly while older backends still honor this field.
+          code_first: true,
+          // This build substitutes credential tokens in a code block's code; a build that
+          // does not must not be handed blocks whose code reads a token it cannot rename.
+          supports_credential_tokens: true,
+          ...(recordingAttemptId !== null
+            ? { recording_attempt_id: recordingAttemptId }
+            : {}),
+          ...(interpretationSessionId !== null
+            ? { interpretation_session_id: interpretationSessionId }
+            : {}),
           ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({
+          recordingId: response.data.recording_id ?? null,
           blocks: response.data.blocks,
           parameters: response.data.parameters,
+          evidence: response.data.evidence ?? null,
         }));
     },
-    onSuccess: ({ blocks, parameters }) => {
+    onSuccess: ({ recordingId, blocks, parameters, evidence }) => {
       const latencyMs =
         mutationStartedAtRef.current !== null
           ? Date.now() - mutationStartedAtRef.current
@@ -157,13 +180,32 @@ const useProcessRecordingMutation = ({
       recordingStore.clear();
 
       if (blocks && blocks.length > 0) {
+        if (recordingId && workflowPermanentId) {
+          useWorkflowHasChangesStore
+            .getState()
+            .setPendingRecording(recordingId, workflowPermanentId);
+        }
         toast({
           variant: "success",
-          title: "Recording Processed",
-          description: "The recording has been successfully processed.",
+          title: evidence ? "Workflow steps captured" : "Workflow steps added",
+          description: evidence
+            ? "Copilot is refining the workflow now. Follow its progress in the Copilot pane."
+            : "Skyvern turned your browser demonstration into workflow steps.",
         });
 
-        onSuccess?.({ blocks, parameters: parameters });
+        onSuccess?.({ recordingId, blocks, parameters: parameters });
+
+        if (evidence) {
+          // One replace-navigation stores the packet and arms the copilot turn that
+          // reads it, the same handoff RunTab makes for diagnose_run.
+          const nonce = crypto.randomUUID();
+          useRecordingRefinementEvidenceStore
+            .getState()
+            .set({ nonce, evidence });
+          openPane("copilot", {
+            state: { copilotAction: { kind: "refine_recording", nonce } },
+          });
+        }
 
         return;
       }
@@ -175,8 +217,9 @@ const useProcessRecordingMutation = ({
 
       toast({
         variant: "warning",
-        title: "Recording Processed (No Blocks)",
-        description: "No blocks could be created from the recording.",
+        title: "No workflow steps created",
+        description:
+          "Skyvern couldn't turn this task recording into workflow steps.",
       });
     },
     onError: (error) => {
@@ -191,9 +234,9 @@ const useProcessRecordingMutation = ({
         recordingStore.reset();
         toast({
           variant: "warning",
-          title: "Nothing was recorded",
+          title: "No task captured",
           description:
-            "Interact with the live browser (clicks, typing, navigation), then stop recording again to generate blocks.",
+            "Complete the task in the browser. Skyvern captures your clicks, typing, and navigation, then turns them into workflow steps.",
         });
         return;
       }
@@ -203,11 +246,9 @@ const useProcessRecordingMutation = ({
         latency_ms: latencyMs,
       });
 
-      useRecordingStore.setState({ finishRequested: false });
-
       toast({
         variant: "destructive",
-        title: "Error Processing Recording",
+        title: "Couldn't create workflow steps",
         description: error instanceof Error ? error.message : String(error),
       });
     },

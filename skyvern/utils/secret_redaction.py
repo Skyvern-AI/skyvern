@@ -59,12 +59,22 @@ _PLACEHOLDER_TOKEN_RE = re.compile(r"placeholder_\w+")
 _TOTP_SENTINEL_VALUES = frozenset({"BW_TOTP", "OP_TOTP", "AZ_TOTP"})
 
 
+def clears_numeric_secret_floor(value: str) -> bool:
+    """Whether an all-digit value is long enough to scrub without colliding with ordinary content.
+
+    `_is_redactable_otp_value` deliberately omits this floor, so short runtime codes still redact in
+    diagnostics. Callers scrubbing data the customer asked for apply it, so a 4-digit code cannot
+    rewrite the year out of a date.
+    """
+    return not (value.isdigit() and len(value) < MIN_NUMERIC_SECRET_LENGTH)
+
+
 def is_redactable_secret_value(value: Any, secrets: Mapping[str, Any]) -> bool:
     if not isinstance(value, str):
         return False
     if len(value) < MIN_SECRET_LENGTH:
         return False
-    if value.isdigit() and len(value) < MIN_NUMERIC_SECRET_LENGTH:
+    if not clears_numeric_secret_floor(value):
         return False
     if value in secrets:
         return False

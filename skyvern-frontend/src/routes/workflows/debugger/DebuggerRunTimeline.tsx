@@ -2,7 +2,11 @@ import { useMemo } from "react";
 
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import {
+  getRunAttempt,
+  runIsExecuting,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { filterTimelineToAttempt } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { cn } from "@/util/utils";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -36,8 +40,11 @@ function DebuggerRunTimeline({
   onActionItemSelected,
   onBlockItemSelected,
 }: Props) {
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
@@ -51,7 +58,7 @@ function DebuggerRunTimeline({
     [workflowRunWithWorkflow],
   );
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return <Skeleton className="h-full w-full" />;
   }
 
@@ -59,12 +66,17 @@ function DebuggerRunTimeline({
     return null;
   }
 
-  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
+  const attemptIsExecuting = runIsExecuting(workflowRun);
+  const currentAttemptTimeline = filterTimelineToAttempt(
+    workflowRunTimeline,
+    workflowRun.attempts ?? [],
+    getRunAttempt(workflowRun),
+  );
 
-  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
+  const numberOfActions = countActionsInTimeline(currentAttemptTimeline);
 
   const firstActionOrThoughtIsPending =
-    !workflowRunIsFinalized && workflowRunTimeline.length === 0;
+    attemptIsExecuting && currentAttemptTimeline.length === 0;
 
   return (
     <div
@@ -93,20 +105,20 @@ function DebuggerRunTimeline({
       <ScrollArea>
         <ScrollAreaViewport className="h-full w-full">
           <div className="w-full space-y-4">
-            {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
+            {!attemptIsExecuting && currentAttemptTimeline.length === 0 && (
               <div>Workflow timeline is empty</div>
             )}
-            {!workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
+            {attemptIsExecuting && currentAttemptTimeline.length === 0 && (
               <div className="flex h-full w-full items-center justify-center">
                 Formulating actions...
               </div>
             )}
-            {workflowRunTimeline?.map((timelineItem, i) => {
+            {currentAttemptTimeline.map((timelineItem, i) => {
               if (isBlockItem(timelineItem)) {
                 return (
                   <div
                     className={cn({
-                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                      "animate-pulse": attemptIsExecuting && i === 0,
                     })}
                     key={timelineItem.block.workflow_run_block_id}
                   >
@@ -127,7 +139,7 @@ function DebuggerRunTimeline({
                 return (
                   <div
                     className={cn({
-                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                      "animate-pulse": attemptIsExecuting && i === 0,
                     })}
                     key={timelineItem.thought.thought_id}
                   >

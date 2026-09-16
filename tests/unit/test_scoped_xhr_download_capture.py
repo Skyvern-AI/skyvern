@@ -7,7 +7,24 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.webeye.actions.handler import ScopedXhrDownloadCapture
+from skyvern.webeye.actions.handler import (
+    _MAX_STATUS_OBSERVATION_REQUESTS,
+    _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS,
+    ScopedXhrDownloadCapture,
+)
+
+
+class _FakeClock:
+    """Deterministic monotonic clock driven by the test, avoiding real sleeps."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self._now = now
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _make_response(
@@ -326,7 +343,7 @@ class TestScopedXhrDownloadCapture:
 
         assert capture._child_pages_with_bootstrap_allowance == set()
 
-    def test_cdp_interceptor_skips_response_capture_but_tracks_request_lifecycle(self) -> None:
+    def test_cdp_interceptor_attaches_response_listener_for_passive_observation(self) -> None:
         page = _make_page(cdp_active=True)
         capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
         capture.enable()
@@ -334,8 +351,29 @@ class TestScopedXhrDownloadCapture:
         page.on.assert_any_call("request", capture._on_request)
         page.on.assert_any_call("requestfinished", capture._on_request_finished)
         page.on.assert_any_call("requestfailed", capture._on_request_finished)
-        assert not any(call.args[0] == "response" for call in page.on.call_args_list)
+        # Passive status observation is always on, so the response listener attaches even on the CDP
+        # lane; body capture stays gated off there.
+        page.on.assert_any_call("response", capture._on_response_event)
+        assert capture._capture_responses is False
         assert capture._active
+
+    def test_cdp_interceptor_detaches_response_listener_symmetrically(self) -> None:
+        page = _make_page(cdp_active=True)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        capture.enable()
+        capture.disable()
+
+        page.remove_listener.assert_any_call("response", capture._on_response_event)
+
+    def test_cdp_interceptor_response_event_schedules_no_body_capture_task(self) -> None:
+        page = _make_page(cdp_active=True)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response()
+        _admit_response(capture, response)
+
+        capture._on_response_event(response)
+
+        assert capture._response_tasks == set()
 
     def test_enable_uses_current_cdp_interceptor_state(self) -> None:
         page = _make_page(cdp_active=False)
@@ -344,9 +382,11 @@ class TestScopedXhrDownloadCapture:
 
         capture.enable()
 
-        assert not any(call.args[0] == "response" for call in page.on.call_args_list)
+        assert capture._capture_responses is False
+        # Response listener still attaches on the CDP lane for passive status observation.
+        page.on.assert_any_call("response", capture._on_response_event)
         capture.disable()
-        assert not any(call.args[0] == "response" for call in page.remove_listener.call_args_list)
+        page.remove_listener.assert_any_call("response", capture._on_response_event)
 
     def test_disable_noop_when_not_enabled(self) -> None:
         page = _make_page(cdp_active=True)
@@ -758,3 +798,473 @@ class TestScopedXhrDownloadCapture:
         assert body_cancelled.is_set()
         assert capture._response_tasks == set()
         assert capture._drained.is_set()
+
+
+_ADMITTED_URL = "https://synthetic.test/authorized/statement"
+_ADMITTED_HOST_CANARY = "synthetic.test"
+
+
+class TestScopedXhrDownloadFailureStatusObserver:
+    def _admitted_capture(
+        self, *, cdp_active: bool = False, url: str = _ADMITTED_URL, status: int = 500
+    ) -> tuple[ScopedXhrDownloadCapture, MagicMock]:
+        page = _make_page(cdp_active=cdp_active)
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(url=url, status=status, content_type="application/json", content_disposition="")
+        _admit_response(capture, response)
+        return capture, response
+
+    def test_observes_5xx_for_admitted_request(self) -> None:
+        capture, response = self._admitted_capture(status=500)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 500
+
+    def test_observes_5xx_for_any_admitted_url(self) -> None:
+        # Genericity: no site/URL filter — any admitted 5xx is recorded regardless of its URL.
+        capture, response = self._admitted_capture(url="https://unrelated.example/api/export", status=503)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 503
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_observes_safe_5xx_variants(self, status: int) -> None:
+        capture, response = self._admitted_capture(status=status)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == status
+
+    @pytest.mark.parametrize("status", [501, 505, 507])
+    def test_does_not_observe_out_of_contract_5xx(self, status: int) -> None:
+        capture, response = self._admitted_capture(status=status)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_observes_5xx_on_cdp_active_interceptor_lane(self) -> None:
+        capture, response = self._admitted_capture(cdp_active=True, status=503)
+        # Drive the real response event: on the interceptor lane it schedules no body-capture task,
+        # so observation is proven to run through the same seam that production CDP lanes hit.
+        capture._on_response_event(response)
+        assert capture.observed_download_failure_status == 503
+        assert capture._response_tasks == set()
+
+    def test_does_not_observe_unadmitted_5xx(self) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        capture.enable()
+        # Response arrives without the request ever being admitted (e.g. before the click window).
+        response = _make_response(
+            url=_ADMITTED_URL, status=500, content_type="application/json", content_disposition=""
+        )
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_does_not_observe_4xx(self) -> None:
+        capture, response = self._admitted_capture(status=404)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_does_not_observe_2xx(self) -> None:
+        capture, response = self._admitted_capture(status=200)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status is None
+
+    def test_only_integer_status_retained_no_url_or_host(self) -> None:
+        capture, response = self._admitted_capture(status=500)
+        capture._observe_download_failure_status(response)
+        assert capture.observed_download_failure_status == 500
+        # Privacy canary: the observed URL/host must never be persisted on the capture.
+        serialized = repr(vars(capture))
+        assert _ADMITTED_URL not in serialized
+        assert _ADMITTED_HOST_CANARY not in serialized
+
+
+class TestScopedXhrStatusObservationBounds:
+    """Boundary/cleanup for the passive status-observation set (SKY-9971 _MAX_STATUS_OBSERVATION_REQUESTS)."""
+
+    @staticmethod
+    def _response_for(request: MagicMock, status: int) -> MagicMock:
+        resp = MagicMock()
+        resp.request = request
+        resp.status = status
+        return resp
+
+    def test_observation_set_caps_at_max_and_excludes_overflow(self) -> None:
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        capture.enable()
+        reqs = [_make_request() for _ in range(_MAX_STATUS_OBSERVATION_REQUESTS + 1)]
+        for req in reqs:
+            capture._on_request(req)
+
+        assert len(capture._status_observation_requests) == _MAX_STATUS_OBSERVATION_REQUESTS
+        assert capture._status_observation_capped is True
+        # Last request at the cap retained, the one past it excluded.
+        assert reqs[_MAX_STATUS_OBSERVATION_REQUESTS - 1] in capture._status_observation_requests
+        assert reqs[_MAX_STATUS_OBSERVATION_REQUESTS] not in capture._status_observation_requests
+
+        capture._observe_download_failure_status(self._response_for(reqs[_MAX_STATUS_OBSERVATION_REQUESTS], 500))
+        assert capture.observed_download_failure_status is None
+
+        capture._observe_download_failure_status(self._response_for(reqs[0], 503))
+        assert capture.observed_download_failure_status == 503
+
+    def test_cap_is_64_and_excludes_65th_eligible_request(self) -> None:
+        # Concrete-value guard on the defensive bound: filling 65 in-window-eligible requests must retain
+        # exactly 64 and drop the 65th, so a later request cannot stamp status while an earlier retained
+        # one still can. Fails at the prior cap of 512 (all 65 retained, never capped).
+        assert _MAX_STATUS_OBSERVATION_REQUESTS == 64
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        capture.enable()
+        reqs = [_make_request() for _ in range(65)]
+        for req in reqs:
+            capture._on_request(req)
+
+        assert len(capture._status_observation_requests) == 64
+        assert capture._status_observation_capped is True
+        assert reqs[63] in capture._status_observation_requests
+        assert reqs[64] not in capture._status_observation_requests
+
+        capture._observe_download_failure_status(self._response_for(reqs[64], 500))
+        assert capture.observed_download_failure_status is None
+
+        capture._observe_download_failure_status(self._response_for(reqs[0], 503))
+        assert capture.observed_download_failure_status == 503
+
+    def test_over_cap_late_request_neither_extends_wait_nor_is_observed(self) -> None:
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        capture.enable()
+        # Fill to the cap and finish each so none linger in the wait-extension set.
+        for _ in range(_MAX_STATUS_OBSERVATION_REQUESTS):
+            req = _make_request()
+            capture._on_request(req)
+            capture._on_request_finished(req)
+        assert capture.has_in_flight_requests is False
+
+        capture.seal_in_flight_requests()
+        late = _make_request()
+        capture._on_request(late)
+
+        assert late not in capture._status_observation_requests  # over cap -> excluded from observation
+        assert late not in capture._admitted_requests  # post-seal -> never admitted
+        assert capture.has_in_flight_requests is False  # never enters wait-extension state
+
+        capture._observe_download_failure_status(self._response_for(late, 500))
+        assert capture.observed_download_failure_status is None
+
+    def test_post_seal_in_window_request_is_observed_but_not_wait_extending(self) -> None:
+        # Load-bearing: a request initiated after seal (the delayed second hop) is still observed for
+        # status yet never joins the wait-extension admission set.
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        late = _make_request()
+        capture._on_request(late)
+        assert late in capture._status_observation_requests
+        assert late not in capture._admitted_requests
+        assert capture.has_in_flight_requests is False
+
+        capture._observe_download_failure_status(self._response_for(late, 502))
+        assert capture.observed_download_failure_status == 502
+
+    def test_disable_clears_retained_status_observation_references(self) -> None:
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        capture.enable()
+        for _ in range(10):
+            capture._on_request(_make_request())
+        assert capture._status_observation_requests
+        assert capture.has_in_flight_requests is True
+
+        capture.disable()
+        assert capture._status_observation_requests == set()
+        assert capture._in_flight_requests == set()
+        assert capture._active is False
+
+
+class TestScopedXhrStatusObservationPostSealGrace:
+    """The post-seal grace window bounds when a NEW request may enter status observation (SKY-9971).
+
+    Without it, ``_active`` stays true across the whole 240-600s download wait, so an unrelated 5xx
+    heartbeat fired minutes after the action could stamp ``download_failure_status``.
+    """
+
+    @staticmethod
+    def _response_for(request: MagicMock, status: int) -> MagicMock:
+        resp = MagicMock()
+        resp.request = request
+        resp.status = status
+        return resp
+
+    def test_request_within_grace_is_observed_even_if_response_lands_after_deadline(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()  # deadline = 0 + grace
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS / 2)  # still inside the grace
+        second_hop = _make_request()
+        capture._on_request(second_hop)
+        assert second_hop in capture._status_observation_requests
+
+        # Deadline bounds initiation, not completion: the response arrives well after the deadline.
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 100)
+        capture._observe_download_failure_status(self._response_for(second_hop, 503))
+        assert capture.observed_download_failure_status == 503
+
+    def test_request_after_grace_is_not_observed_and_5xx_does_not_stamp(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS + 0.01)  # just past the deadline
+        heartbeat = _make_request()
+        capture._on_request(heartbeat)
+        assert heartbeat not in capture._status_observation_requests
+
+        capture._observe_download_failure_status(self._response_for(heartbeat, 503))
+        assert capture.observed_download_failure_status is None
+
+    def test_request_at_deadline_is_not_observed(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS)  # monotonic() == deadline -> excluded
+        at_deadline = _make_request()
+        capture._on_request(at_deadline)
+        assert at_deadline not in capture._status_observation_requests
+
+    def test_pre_seal_requests_observed_regardless_of_clock(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+
+        clock.advance(9999)  # no deadline before seal: the whole action window is open
+        during_action = _make_request()
+        capture._on_request(during_action)
+        assert during_action in capture._status_observation_requests
+
+    def test_disable_resets_post_seal_deadline(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()
+        assert capture._status_observation_deadline is not None
+
+        capture.disable()
+        assert capture._status_observation_deadline is None
+
+
+class TestScopedXhrStatusObservationChainProvenance:
+    """Chain provenance for passive status observation (SKY-9971 review r3982881754 / r3983407333).
+
+    The post-seal deadline bounds where a NEW ROOT may enter observation, but a request already proven
+    action-owned inside the window -- a redirect off an admitted/observed request, or a bootstrap hop on a
+    child page opened in-window -- must stay eligible when its next hop begins after the deadline. A
+    redirect off a pre-action/stale root, whose predecessor was never admitted or observed, stays excluded
+    even inside the grace.
+    """
+
+    @staticmethod
+    def _response_for(request: MagicMock, status: int) -> MagicMock:
+        resp = MagicMock()
+        resp.request = request
+        resp.status = status
+        return resp
+
+    def test_in_window_admitted_root_redirect_after_deadline_stays_observed(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        root = _make_request()
+        capture._on_request(root)  # admitted + observed while the action is live
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)  # well past the deadline
+        redirect = _make_request(redirected_from=root)
+        capture._on_request(redirect)
+
+        assert redirect in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(redirect, 503))
+        assert capture.observed_download_failure_status == 503
+
+    def test_pre_capture_root_redirect_during_grace_is_excluded(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS / 2)  # inside the grace
+        pre_capture_root = _make_request()  # deliberately NOT fed to _on_request: it began before capture
+        redirect = _make_request(redirected_from=pre_capture_root)
+        capture._on_request(redirect)
+
+        assert redirect not in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(redirect, 500))
+        assert capture.observed_download_failure_status is None
+
+    def test_new_root_after_deadline_excluded_even_with_proven_sibling_chain(self) -> None:
+        # Guard: an entirely new JS-triggered root after the fixed deadline is excluded even though an
+        # unrelated admitted chain exists. Proven-owned eligibility never leaks to unrelated new roots.
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture._on_request(_make_request())  # an admitted chain the new root is not part of
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)
+        new_root = _make_request()
+        capture._on_request(new_root)
+
+        assert new_root not in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(new_root, 502))
+        assert capture.observed_download_failure_status is None
+
+    def test_redirect_off_post_seal_observed_root_stays_eligible(self) -> None:
+        # A JS second hop root started in-grace is observed but not admitted; its own redirect after the
+        # deadline must stay eligible via the OBSERVATION chain, not merely the admitted chain.
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS / 2)
+        second_hop_root = _make_request()
+        capture._on_request(second_hop_root)
+        assert second_hop_root in capture._status_observation_requests
+        assert second_hop_root not in capture._admitted_requests
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)
+        redirect = _make_request(redirected_from=second_hop_root)
+        capture._on_request(redirect)
+
+        assert redirect in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(redirect, 504))
+        assert capture.observed_download_failure_status == 504
+
+    def test_child_bootstrap_after_deadline_observed_when_page_opened_in_window(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        child_page = _make_page()
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS / 2)  # child page opens in-window
+        capture._on_new_page(child_page)
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)  # bootstrap hop fires after deadline
+        child_request = _make_request(page=child_page)
+        capture._on_request(child_request)
+
+        assert child_request in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(child_request, 500))
+        assert capture.observed_download_failure_status == 500
+
+    def test_child_bootstrap_excluded_when_page_opened_after_deadline(self) -> None:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        child_page = _make_page()
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)  # child page opens AFTER the deadline
+        capture._on_new_page(child_page)
+        child_request = _make_request(page=child_page)
+        capture._on_request(child_request)
+
+        # Still admitted for wait extension (unchanged), but never observed: its provenance is out-of-window.
+        assert child_request in capture._admitted_requests
+        assert child_request not in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(child_request, 500))
+        assert capture.observed_download_failure_status is None
+
+    def test_redirect_off_out_of_window_child_bootstrap_is_excluded(self) -> None:
+        # A child page opened AFTER the deadline yields a bootstrap request that is admitted for wait
+        # extension but correctly excluded from observation. A redirect off that admitted-but-unobserved
+        # request must NOT re-enter observation through the broader wait-admission set: redirect eligibility
+        # requires the predecessor's OWN observation provenance, not mere admission.
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        child_page = _make_page()
+        capture.enable()
+        capture.seal_in_flight_requests()
+
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)  # child page opens AFTER the deadline
+        capture._on_new_page(child_page)
+        child_request = _make_request(page=child_page)
+        capture._on_request(child_request)
+        assert child_request in capture._admitted_requests
+        assert child_request not in capture._status_observation_requests
+
+        redirect = _make_request(redirected_from=child_request)
+        capture._on_request(redirect)
+
+        # Predecessor was admitted-but-not-observed -> the redirect stays out of observation and cannot stamp.
+        assert redirect not in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(redirect, 500))
+        assert capture.observed_download_failure_status is None
+        # Normal wait extension is preserved: a redirect off an admitted request is still tracked.
+        assert redirect in capture._admitted_requests
+
+    def test_child_first_in_window_request_consumes_status_provenance(self) -> None:
+        # A child page opened in-window whose FIRST xhr/fetch fires while the action is still live
+        # (pre-seal) is observed via the general in-window path; its one-shot status-observation provenance
+        # must be spent then. Otherwise a later unrelated root from the same child after the 2s grace (e.g.
+        # a heartbeat during the long download wait) re-consumes the stale token and is wrongly stamped.
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        child_page = _make_page()
+        capture.enable()
+        capture._on_new_page(child_page)  # child opens in-window (pre-seal)
+
+        first = _make_request(page=child_page)
+        capture._on_request(first)  # first hop fires BEFORE seal -> observed via the in-window path
+        assert first in capture._status_observation_requests
+        assert child_page not in capture._status_observation_child_pages  # provenance consumed
+
+        capture.seal_in_flight_requests()
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5)  # past the deadline
+
+        later = _make_request(page=child_page)
+        capture._on_request(later)  # unrelated later root from the same child, after the grace
+        assert later not in capture._status_observation_requests
+        capture._observe_download_failure_status(self._response_for(later, 500))
+        assert capture.observed_download_failure_status is None
+        # Wait-extension allowance is separate and unchanged: the later child root is still admitted.
+        assert later in capture._admitted_requests
+
+    def _observe_child_root(self, *, pre_seal_root: bool, advance: float) -> bool:
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"), monotonic=clock)
+        child_page = _make_page()
+        capture.enable()
+        capture._on_new_page(child_page)  # child opened in-window
+        if pre_seal_root:
+            capture._on_request(_make_request(page=child_page))  # first root pre-seal spends the status token
+        capture.seal_in_flight_requests()
+        clock.advance(advance)
+        req = _make_request(page=child_page)
+        capture._on_request(req)
+        return req in capture._status_observation_requests
+
+    def test_in_grace_child_root_eligibility_matrix(self) -> None:
+        # Bootstrap provenance is ADDITIVE to ordinary in-grace eligibility, not an override. An in-grace
+        # (+0.5s) child root is observed whether or not the child made an earlier root; an after-grace
+        # (+10s) root is observed only via an UNSPENT bootstrap token, and a spent token blocks the later
+        # heartbeat.
+        in_grace = _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS / 2
+        after_grace = _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS * 5
+
+        assert self._observe_child_root(pre_seal_root=False, advance=in_grace) is True
+        assert self._observe_child_root(pre_seal_root=True, advance=in_grace) is True  # regression case
+        assert self._observe_child_root(pre_seal_root=False, advance=after_grace) is True
+        assert self._observe_child_root(pre_seal_root=True, advance=after_grace) is False
+
+    def test_disable_clears_status_observation_child_page_provenance(self) -> None:
+        capture = ScopedXhrDownloadCapture(_make_page(), Path("/tmp/downloads"))
+        child_page = _make_page()
+        capture.enable()
+        capture._on_new_page(child_page)
+        assert capture._status_observation_child_pages
+
+        capture.disable()
+        assert capture._status_observation_child_pages == set()

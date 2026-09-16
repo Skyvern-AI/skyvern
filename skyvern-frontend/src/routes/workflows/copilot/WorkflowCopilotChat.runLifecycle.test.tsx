@@ -8,10 +8,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -161,7 +158,6 @@ vi.mock("./WorkflowCopilotHistory", () => ({
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
@@ -175,9 +171,7 @@ type ChatProps = {
 function chatUi(props: ChatProps) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat {...props} />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat {...props} />
     </FeatureFlagContext.Provider>
   );
 }
@@ -192,13 +186,7 @@ function makeDockedProps(props: ChatProps = {}): ChatProps {
 
 async function renderChat(props: ChatProps = {}) {
   const view = render(chatUi(props));
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -318,11 +306,11 @@ describe("WorkflowCopilotChat — run lifecycle lines", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(screen.queryByText(/watching it now/)).toBeNull();
 
-    // REGRESSION: a plain omitted workflowRunId used to still let
+    // REGRESSION: an options object that omits workflowRunId lets
     // useWorkflowRunQuery fall back to the route's own :workflowRunId and poll it.
     expect(workflowRunQueryMock.mock.calls.length).toBeGreaterThan(0);
     for (const call of workflowRunQueryMock.mock.calls) {
-      expect(call[0]).toEqual({ workflowRunId: undefined, enabled: false });
+      expect(call[0]).toEqual({ workflowRunId: undefined });
     }
   });
 

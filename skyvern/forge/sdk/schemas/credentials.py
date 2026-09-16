@@ -6,6 +6,7 @@ from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
 from skyvern.utils.url_validators import validate_url
@@ -346,6 +347,7 @@ class OnePasswordItemsResponse(BaseModel):
 
     configured: bool = Field(..., description="Whether a 1Password service account token is configured")
     items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
+    source: OnePasswordTokenSource | None = None
 
 
 class BitwardenItemOverview(BaseModel):

@@ -180,6 +180,30 @@ describe("hydrateNarrativeFromPayload — credential signals", () => {
 });
 
 describe("Google connection notice hydration", () => {
+  it("rehydrates an unbound notice with its account choices", () => {
+    const unbound = {
+      provider: "google",
+      connectionId: null,
+      displayName: null,
+      condition: "unbound",
+      choices: [
+        {
+          connection_id: "goac_active",
+          name: "Sheets",
+          state: "active",
+          email_address: null,
+        },
+      ],
+    };
+    expect(
+      hydrateNarrativeFromPayload(
+        basePayload({ googleConnectionNotices: [unbound] }),
+      )?.googleConnectionNotices,
+    ).toEqual([unbound]);
+    expect(
+      parseGoogleConnectionNotices([{ ...unbound, condition: "missing" }]),
+    ).toEqual([]);
+  });
   it("keeps valid notices, deduplicates ids, and survives reload hydration", () => {
     const raw = [
       {

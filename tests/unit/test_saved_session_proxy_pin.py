@@ -45,7 +45,7 @@ def _workflow(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=SimpleNamespace(parameters=parameters or [], blocks=[]),
+        workflow_definition=SimpleNamespace(parameters=parameters or [], blocks=[], retry_policy=None),
     )
 
 
@@ -141,7 +141,14 @@ async def _create_forced_workflow_run(
     get_or_create_profile = get_or_create_profile or AsyncMock(return_value=(_profile(), False))
     update_profile = update_profile or AsyncMock(return_value=_profile())
     create_events: list[str] = []
-    created_workflow_run = SimpleNamespace(workflow_run_id="wr_forced")
+    created_workflow_run = SimpleNamespace(
+        workflow_run_id="wr_forced",
+        workflow_id="wf_test",
+        organization_id="org_test",
+        parent_workflow_run_id=None,
+        debug_session_id=None,
+        copilot_session_id=None,
+    )
 
     async def _create_workflow_run(**_: object) -> SimpleNamespace:
         create_events.append("create_workflow_run")
@@ -753,7 +760,16 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         browser_session_id="pbs_requested",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
     )
-    create_workflow_run = AsyncMock(return_value=SimpleNamespace(workflow_run_id="wr_non_force"))
+    create_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(
+            workflow_run_id="wr_non_force",
+            workflow_id="wf_test",
+            organization_id="org_test",
+            parent_workflow_run_id=None,
+            debug_session_id=None,
+            copilot_session_id=None,
+        )
+    )
     update_workflow_run = AsyncMock()
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,

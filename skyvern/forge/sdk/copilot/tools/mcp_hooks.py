@@ -12,6 +12,7 @@ from typing import Any
 import structlog
 from pydantic import JsonValue
 
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -29,7 +30,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
     SchemaOverlay,
-    _scrub_tool_result,
+    scrub_model_facing_tool_result,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     clear_sensitive_origin_page_taint,
+    sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
@@ -64,12 +66,16 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.models.block import CLEAR_BROWSER_DATA_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
+from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
     _composition_get_structured_evidence,
     _fallback_page_info,
+    attribute_navigation_failure,
 )
 from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -120,6 +126,7 @@ from .scouting import (
     _scout_act_observe_page_evidence,
     _scout_session_download_names,
     _shed_scout_page_summary_section,
+    record_signed_out_page_observation,
 )
 
 LOG = structlog.get_logger()
@@ -131,11 +138,25 @@ def _sensitive_origin_page_refusal(ctx: AgentContext) -> dict[str, Any] | None:
     return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
 
 
+def _sensitive_origin_page_action_refusal(ctx: AgentContext) -> dict[str, Any] | None:
+    """Refuse an action only while the page's facts cannot be scrubbed on the terminal-run route."""
+    if not sensitive_origin_page_facts_withheld(ctx, getattr(ctx, "last_run_blocks_workflow_run_id", None)):
+        return None
+    return _sensitive_origin_page_refusal(ctx)
+
+
 async def _sensitive_origin_page_pre_hook(
     _params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     return _sensitive_origin_page_refusal(ctx)
+
+
+async def _sensitive_origin_page_action_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _sensitive_origin_page_action_refusal(ctx)
 
 
 async def _sensitive_origin_page_post_hook(
@@ -239,7 +260,7 @@ _FAILED_CLICK_TRUNCATION_SUFFIX = "... [truncated]"
 def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> None:
     """Bound the complete model-visible failure while retaining typed control/error facts."""
 
-    scrubbed = _scrub_tool_result(ctx, result)
+    scrubbed = scrub_model_facing_tool_result(ctx, result)
     if isinstance(scrubbed, dict) and scrubbed is not result:
         result.clear()
         result.update(scrubbed)
@@ -475,9 +496,18 @@ async def _get_block_schema_post_hook(
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
+            data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
+            data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
+            data["dialog_policy_helper_contract"] = DIALOG_POLICY_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
                 data["page_operation_contracts"] = page_operation_contracts
+            execution_limits = await app.AGENT_FUNCTION.codeblock_execution_limits(
+                organization_id=ctx.organization_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+            )
+            if execution_limits is not None:
+                data["code_execution_limits"] = execution_limits
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
@@ -651,12 +681,7 @@ async def _evaluate_pre_hook(
     # call's post-hook to consume.
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
-    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
-    sensitive_page_refusal = None
-    if sensitive_origin_page_has_active_run(ctx) or (
-        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
-    ):
-        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     raw_expression = params.get("expression")
@@ -678,7 +703,7 @@ async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[st
     intent = params.get("intent")
     if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
         return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
-    return _sensitive_origin_page_refusal(ctx)
+    return _sensitive_origin_page_action_refusal(ctx)
 
 
 def _code_only_has_target_page_evidence(data: object) -> bool:
@@ -706,7 +731,7 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -728,7 +753,7 @@ async def _type_text_pre_hook(
 ) -> dict[str, Any] | None:
     _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -757,7 +782,7 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -769,7 +794,7 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -819,6 +844,7 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         return
 
     if record.verdict == "resolved" and record.candidates:
+        await record_signed_out_page_observation(ctx, url)
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name
@@ -869,7 +895,7 @@ async def _navigate_post_hook(
             source_tool="navigate_browser",
             captured_url=source_url,
         )
-    return result
+    return await attribute_navigation_failure(ctx, result)
 
 
 async def _navigate_pre_hook(
@@ -891,7 +917,7 @@ async def _wait_for_either_state_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     data = result.get("data")
@@ -947,7 +973,7 @@ async def _click_post_hook(
     captured_url: str | None = None
     observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1265,7 +1291,7 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         ctx.pending_scout_input_value = None
         return sensitive_page_refusal
@@ -1514,12 +1540,8 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     ctx.scout_observation_contract = None
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
-    sensitive_page_refusal = None
-    if sensitive_origin_page_has_active_run(ctx) or (
-        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
-    ):
-        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
     if sensitive_page_refusal is not None:
         ctx.pending_scout_read_expression = None
         ctx.pending_scout_read_output_path = None
@@ -1624,7 +1646,7 @@ async def _scroll_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
@@ -1644,7 +1666,7 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1727,7 +1749,7 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1839,7 +1861,8 @@ _WORKFLOW_KNOWLEDGE_DESCRIPTION = (
     "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
     "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
     "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
-    "choosing_a_block, common_patterns, and best_practices; omit topics to list every available ID. "
+    "choosing_a_block, common_patterns, best_practices, and code_block_runtime (the builtins, module "
+    "shims, and helpers a code block's Python may use); omit topics to list every available ID. "
     "Request only the relevant sections. For exact fields of a specific block type, use "
     "get_block_schema instead."
 )
@@ -1854,6 +1877,12 @@ _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     "exposes the download control and capture a stable selector, then author the terminal download "
     "step from the code-block schema contract."
 )
+
+
+# The evaluate tool bounds its own dispatch at the engine's action deadline and reports a factual
+# TIMEOUT; an equal ceiling here would cancel first and return the generic unknown-effect error
+# instead. Same headroom the navigate path uses.
+_EVALUATE_OVERLAY_TIMEOUT_SECONDS = DEFAULT_ACTION_TIMEOUT_MS // 1000 + 5
 
 
 def _evaluate_overlay_description(
@@ -1940,7 +1969,7 @@ def _build_skyvern_mcp_overlays(
             },
             requires_browser=True,
             redacts_sensitive_origin_structured_result=True,
-            timeout=30,
+            timeout=_EVALUATE_OVERLAY_TIMEOUT_SECONDS,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
         ),
@@ -1962,7 +1991,7 @@ def _build_skyvern_mcp_overlays(
             forced_args={"selector_mode": "direct"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_click_pre_hook,
             post_hook=_click_post_hook,
         ),
@@ -1984,7 +2013,7 @@ def _build_skyvern_mcp_overlays(
             arg_transforms={"clear_first": "clear"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
         ),
@@ -1997,6 +2026,7 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
         ),
@@ -2023,7 +2053,7 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["value"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,
         ),
@@ -2037,6 +2067,7 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["key"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
         ),
@@ -2044,7 +2075,8 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
+            redacts_sensitive_origin_structured_result=True,
+            pre_hook=_sensitive_origin_page_action_pre_hook,
             post_hook=_wait_for_either_state_post_hook,
         ),
         "skyvern_frame_list": SchemaOverlay(

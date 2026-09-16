@@ -6,23 +6,41 @@
 - SKY-14062: optional custom SMTP settings (custom_smtp_*) route the block through the
   user's SMTP server; when absent the default platform sender path is unchanged, and the
   custom password is never echoed in error messages.
+- SKY-15585: one Recipients entry may hold several comma- or semicolon-separated addresses
+  (a workflow parameter substituted into the editor's comma-separated field); both mail
+  blocks deliver to every address, and an invalid one fails the block without being echoed.
+- SKY-15919: `body_format: html` on either block sends a multipart/alternative message (generated
+  plain-text part + sanitized HTML part); the default `text` path is byte-identical to before.
+- SKY-16062: the subject is exactly what the user wrote — no run id is appended. Users who
+  want it place {{workflow_run_id}} themselves.
 """
 
 from __future__ import annotations
 
+import os
+import pickle
 import re
 import smtplib
 import ssl
+import traceback
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from email.message import EmailMessage
-from unittest.mock import MagicMock, patch
+from functools import partial
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import libcst as cst
 import pytest
+from email_validator import EmailUndeliverableError, validate_email
 
+from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_send_email_statement
 from skyvern.exceptions import BlockedHost, UnresolvableHost
-from skyvern.forge.sdk.api.email import send, validate_recipients
+from skyvern.forge import app
+from skyvern.forge.sdk.api import email as email_api
+from skyvern.forge.sdk.api.email import InvalidEmailRecipient, send, validate_recipients
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomSMTPAuthenticationFailed,
     CustomSMTPConnectionFailed,
@@ -30,7 +48,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     NoValidEmailRecipient,
 )
-from skyvern.forge.sdk.workflow.models.block import SendEmailBlock, _send_via_custom_smtp
+from skyvern.forge.sdk.workflow.models.block import HumanInteractionBlock, SendEmailBlock, _send_via_custom_smtp
 from skyvern.forge.sdk.workflow.models.parameter import (
     PLATFORM_SMTP_AWS_KEYS,
     UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
@@ -38,7 +56,9 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     ParameterType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
+from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.workflows import (
     HumanInteractionBlockYAML,
     SendEmailBlockYAML,
@@ -101,6 +121,16 @@ def _send_email_block(**overrides: object) -> SendEmailBlock:
     block = block_yaml_to_block(_send_email_block_yaml(**overrides), _default_parameters())
     assert isinstance(block, SendEmailBlock)
     return block
+
+
+def _human_interaction_block(**overrides: object) -> HumanInteractionBlock:
+    fields: dict = {
+        "label": "approve",
+        "output_parameter": _output_parameter("approve"),
+        "recipients": ["approver@example.com"],
+    }
+    fields.update(overrides)
+    return HumanInteractionBlock(**fields)
 
 
 def _run_context(secret_values: dict[str, str] | None = None, values: dict[str, str] | None = None) -> MagicMock:
@@ -308,7 +338,7 @@ def test_format_templates_renders_full_reference_password() -> None:
     with patch.object(
         SendEmailBlock,
         "format_block_parameter_template_from_workflow_run_context",
-        side_effect=lambda value, _context: f"formatted:{value}",
+        side_effect=lambda value, _context, **_kwargs: f"formatted:{value}",
     ):
         block.format_potential_template_parameters(MagicMock())
     assert block.custom_smtp_password == "formatted:{{ smtp_password_param }}"
@@ -718,10 +748,93 @@ def test_validate_recipients_rejects_an_empty_list() -> None:
         validate_recipients([])
 
 
-def test_send_email_block_still_raises_its_own_error_for_no_valid_recipients() -> None:
-    block = _send_email_block(recipients=[])
+@pytest.mark.parametrize("recipients", [[], ["", " , ; "]])
+def test_send_email_block_still_raises_its_own_error_for_no_valid_recipients(recipients: list[str]) -> None:
+    block = _send_email_block(recipients=recipients)
     with pytest.raises(NoValidEmailRecipient):
         block.get_real_email_recipients(_run_context())
+
+
+@pytest.fixture
+def offline_address_validation() -> Iterator[None]:
+    # email_validator resolves MX records by default; unit tests must not touch DNS.
+    with patch("skyvern.forge.sdk.api.email.validate_email", partial(validate_email, check_deliverability=False)):
+        yield
+
+
+def _workflow_run_context(values: dict[str, str]) -> WorkflowRunContext:
+    context = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        workflow_run_id="wr_1",
+        aws_client=MagicMock(),
+    )
+    context.values.update(values)
+    return context
+
+
+@pytest.mark.asyncio
+async def test_send_delivers_to_every_address_in_a_joined_recipients_entry(offline_address_validation: None) -> None:
+    transport = AsyncMock(return_value=True)
+    with patch("skyvern.forge.sdk.api.email._send", transport):
+        await send(
+            sender="sender@example.com",
+            subject="subject",
+            recipients=["first@example.com, second@example.com; third@example.com ", " "],
+            body="body",
+        )
+    assert transport.call_args.kwargs["message"]["To"] == "first@example.com, second@example.com, third@example.com"
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_block_notifies_every_address_in_a_comma_joined_parameter(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(recipients=["{{ notify_to }}"])
+    context = _workflow_run_context({"notify_to": "first@example.com, second@example.com, third@example.com"})
+    monkeypatch.setattr(HumanInteractionBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
+    database = _paused_run_database()
+    monkeypatch.setattr(app, "DATABASE", database)
+    transport = AsyncMock(return_value=True)
+
+    with patch("skyvern.forge.sdk.api.email._send", transport):
+        result = await block.execute("wr_1", "wrb_1", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    assert transport.call_args.kwargs["message"]["To"] == "first@example.com, second@example.com, third@example.com"
+    persisted = database.observer.update_workflow_run_block.call_args_list[0].kwargs
+    assert persisted["recipients"] == ["first@example.com", "second@example.com", "third@example.com"]
+
+
+def test_send_email_block_resolves_a_joined_entry_to_every_address(offline_address_validation: None) -> None:
+    block = _send_email_block(recipients=["lead@example.com", "notify_to"])
+    context = _run_context(values={"notify_to": "first@example.com; second@example.com"})
+    context.has_parameter.side_effect = lambda key: key == "notify_to"
+
+    assert block.get_real_email_recipients(context) == ["lead@example.com", "first@example.com", "second@example.com"]
+
+
+def test_send_email_block_fails_instead_of_dropping_an_invalid_recipient(offline_address_validation: None) -> None:
+    block = _send_email_block(recipients=["lead@example.com, second.approver@example"])
+    with pytest.raises(InvalidEmailRecipient) as excinfo:
+        block.get_real_email_recipients(_run_context())
+
+    assert (excinfo.value.position, excinfo.value.total) == (2, 2)
+    assert "second.approver" not in str(excinfo.value)
+
+
+def test_undeliverable_recipient_error_never_carries_the_domain_into_a_logged_traceback() -> None:
+    domain = "secret-person.example"
+    undeliverable = EmailUndeliverableError(f"The domain name {domain} does not exist.")
+    recipients = [f"approver@{domain}"]
+    with patch("skyvern.forge.sdk.api.email.validate_email", side_effect=undeliverable):
+        with pytest.raises(InvalidEmailRecipient) as excinfo:
+            validate_recipients(recipients)
+
+    assert str(excinfo.value) == "recipient 1 of 1 has a domain that does not accept email"
+    assert domain not in "".join(traceback.format_exception(excinfo.value))
+    assert str(pickle.loads(pickle.dumps(excinfo.value))) == str(excinfo.value)
 
 
 def test_converted_definition_carries_the_provisioned_parameters() -> None:
@@ -763,3 +876,293 @@ def test_unresolvable_platform_smtp_secrets_report_configuration_problems() -> N
         block._decrypt_smtp_parameters(_run_context(values={}))
     assert "Missing SMTP server" in str(excinfo.value)
     assert "Missing SMTP password" in str(excinfo.value)
+
+
+def _paused_run_database() -> MagicMock:
+    database = MagicMock()
+    database.observer.update_workflow_run_block = AsyncMock()
+    database.workflow_runs.update_workflow_run = AsyncMock()
+    database.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+    # Any status other than paused ends the block's wait loop on its first check.
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(status=WorkflowRunStatus.completed))
+    return database
+
+
+async def _human_interaction_message(
+    monkeypatch: pytest.MonkeyPatch, block: HumanInteractionBlock, browser_session_id: str | None = None
+) -> EmailMessage:
+    monkeypatch.setattr(
+        HumanInteractionBlock, "get_workflow_run_context", staticmethod(lambda _run_id: _workflow_run_context({}))
+    )
+    monkeypatch.setattr(app, "DATABASE", _paused_run_database())
+    transport = AsyncMock(return_value=True)
+    with patch("skyvern.forge.sdk.api.email._send", transport):
+        result = await block.execute("wr_1", "wrb_1", organization_id="o_1", browser_session_id=browser_session_id)
+    assert result.success is True, result.failure_reason
+    return transport.call_args.kwargs["message"]
+
+
+def test_body_format_round_trips_from_yaml_for_both_blocks() -> None:
+    assert _send_email_block(body_format="html").body_format == EmailBodyFormat.HTML
+    human_yaml = HumanInteractionBlockYAML(label="approve", recipients=["approver@example.com"], body_format="html")
+    human_block = block_yaml_to_block(human_yaml, {"approve_output": _output_parameter("approve")})
+    assert isinstance(human_block, HumanInteractionBlock)
+    assert human_block.body_format == EmailBodyFormat.HTML
+
+
+@pytest.mark.asyncio
+async def test_text_body_format_still_sends_a_single_plain_text_part(offline_address_validation: None) -> None:
+    block = _send_email_block(body="<b>not html</b>\nline 2")
+    message = await block._build_email_message(_run_context(), "wr_1", organization_id="o_1")
+    assert message.get_content_type() == "text/plain"
+    assert message.get_content() == "<b>not html</b>\nline 2\n"
+
+
+@pytest.mark.asyncio
+async def test_html_body_format_sends_sanitized_html_with_a_generated_text_part(
+    offline_address_validation: None,
+) -> None:
+    block = _send_email_block(
+        body_format="html",
+        body=(
+            "<!DOCTYPE html><html><head><style>h1 {color: red}</style>"
+            '<meta charset="utf-8"/><meta http-equiv="Refresh" content="0;url=https://evil.example"/></head><body>'
+            '<h1>Weekly report</h1><p>12 invoices for <b>Acme</b>. <a href="https://example.com/run">Open</a></p>'
+            '<script>alert(1)</script><a href="javascript:void(0)" onclick="steal()">x</a>'
+            '<a href="java\tscript:steal()">tab</a><a href=" JAVASCRIPT:steal()">upper</a>'
+            '<a href="java\u200bscript:steal()">zero-width</a><a href="data:text/html,evil">data</a>'
+            '<a href="vbscript:steal()">vb</a><a href="mailto:a@example.com">mail</a><a href="/relative">rel</a>'
+            '<img src="data:image/png;base64,AAAA"/><img src="data:image/svg+xml,%3Csvg%3E"/>'
+            '<a href="data:image/png;base64,AAAA">img-link</a>'
+            '<iframe src="https://evil.example"></iframe></body></html>'
+        ),
+    )
+    message = await block._build_email_message(_run_context(), "wr_1", organization_id="o_1")
+
+    assert message.get_content_type() == "multipart/alternative"
+    text_part, html_part = message.iter_parts()
+    assert (text_part.get_content_type(), html_part.get_content_type()) == ("text/plain", "text/html")
+    html_body = html_part.get_content()
+    assert html_body.startswith("<!DOCTYPE html>")
+    assert "<style>h1 {color: red}</style>" in html_body and "<b>Acme</b>" in html_body
+    for forbidden in (
+        "<script",
+        "<iframe",
+        "javascript:",
+        "onclick",
+        "script:steal",
+        "data:text/html",
+        "svg+xml",
+        "refresh",
+    ):
+        assert forbidden.lower() not in html_body.lower()
+    assert '<meta charset="utf-8"/>' in html_body
+    assert html_body.count("data:image/png") == 1
+    for kept in (
+        'href="https://example.com/run"',
+        'href="mailto:a@example.com"',
+        'href="/relative"',
+        'src="data:image/png;base64,AAAA"',
+    ):
+        assert kept in html_body
+    text_body = text_part.get_content()
+    assert text_body.splitlines()[0] == "Weekly report"
+    assert "12 invoices for Acme. Open (https://example.com/run)" in text_body
+    assert "alert(1)" not in text_body and "color: red" not in text_body
+
+
+@pytest.mark.asyncio
+async def test_html_body_with_an_attachment_nests_the_alternative_inside_mixed(
+    tmp_path: Path, offline_address_validation: None
+) -> None:
+    attachment = tmp_path / "report.bin"
+    attachment.write_bytes(b"\x00binary")
+    block = _send_email_block(body_format="html", body="<p>See the attached report.</p>")
+    with patch.object(SendEmailBlock, "_get_file_paths", return_value=[str(attachment)]):
+        message = await block._build_email_message(_run_context(), "wr_1", organization_id="o_1")
+
+    assert message.get_content_type() == "multipart/mixed"
+    alternative, attached = message.iter_parts()
+    assert alternative.get_content_type() == "multipart/alternative"
+    assert attached.get_filename() == "report.bin"
+    assert "<p>See the attached report.</p>" in message.get_body(preferencelist=("html",)).get_content()
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_text_footer_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(
+        body="Please approve",
+        instructions="Check the totals",
+    )
+    message = await _human_interaction_message(monkeypatch, block, browser_session_id="pbs_1")
+    assert message.get_content_type() == "text/plain"
+    assert message.get_content() == (
+        f"Please approve\n\nKindly visit {settings.SKYVERN_APP_URL}/runs/wr_1/overview\n\nCheck the totals\n\n"
+        f"To interact with the browser session directly, visit {settings.SKYVERN_APP_URL}/browser-session/pbs_1\n\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_html_footer_lands_inside_the_document(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(
+        body_format="html",
+        body="<html><body><h1>Review needed</h1></body></html>",
+        instructions="Check <the> totals\nthen decide",
+    )
+    message = await _human_interaction_message(monkeypatch, block, browser_session_id="pbs_1")
+    assert message.get_content_type() == "multipart/alternative"
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    run_url = f"{settings.SKYVERN_APP_URL}/runs/wr_1/overview"
+    assert html_body.index("<h1>Review needed</h1>") < html_body.index("Kindly visit") < html_body.index("</body>")
+    assert f'<a href="{run_url}">{run_url}</a>' in html_body
+    assert "/browser-session/pbs_1" in html_body
+    assert "Check &lt;the&gt; totals<br/>then decide" in html_body
+    text_body = message.get_body(preferencelist=("plain",)).get_content()
+    assert "Review needed" in text_body and run_url in text_body
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_html_footer_appends_to_a_fragment(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(
+        body_format="html",
+        body="<p>Review needed</p>",
+    )
+    message = await _human_interaction_message(monkeypatch, block)
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    assert html_body.startswith("<p>Review needed</p>")
+    assert "Kindly visit" in html_body and "browser session" not in html_body
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_html_footer_ignores_a_decoy_body_close_tag(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(
+        body_format="html",
+        body="<html><body><!-- </body> --><h1>Review needed</h1><style>p:after { content: '</body>' }</style></body></html>",
+    )
+    message = await _human_interaction_message(monkeypatch, block)
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    assert html_body.count("Kindly visit") == 1
+    assert html_body.index("<style>") < html_body.index("Kindly visit") < html_body.rindex("</body>")
+
+
+def test_html_body_without_beautifulsoup_fails_with_an_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(email_api, "BeautifulSoup", None)
+    message = EmailMessage()
+    with pytest.raises(RuntimeError, match="beautifulsoup4"):
+        email_api.set_body(message, "<p>x</p>", EmailBodyFormat.HTML)
+    email_api.set_body(message, "plain", EmailBodyFormat.TEXT)
+    assert message.get_content() == "plain\n"
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_html_footer_stays_inside_a_document_without_a_body_tag(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = _human_interaction_block(body_format="html", body="<html><p>Review needed</p></html>")
+    message = await _human_interaction_message(monkeypatch, block)
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    assert html_body.index("Kindly visit") < html_body.rindex("</html>")
+
+
+@pytest.mark.asyncio
+async def test_html_body_drops_foreign_content_that_would_re_parse_into_live_markup(
+    offline_address_validation: None,
+) -> None:
+    """html.parser keeps a <style> payload nested in <svg>/<math> as raw text, so the attribute walk
+    never sees it and an HTML5 client re-parses it back into a live <img onerror>."""
+    block = _send_email_block(
+        body_format="html",
+        body=(
+            "<h1>Report</h1>"
+            "<svg><style><img src=x onerror=alert(1)></style></svg>"
+            "<math><style><img src=x onerror=alert(2)></style></math>"
+            "<table><tr><td><SVG><STYLE><img src=x onerror=alert(3)></STYLE></SVG></td></tr></table>"
+        ),
+    )
+    message = await block._build_email_message(_run_context(), "wr_1", organization_id="o_1")
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+
+    for forbidden in ("<svg", "<math", "onerror", "alert("):
+        assert forbidden.lower() not in html_body.lower()
+    assert "<h1>Report</h1>" in html_body
+    assert "<table>" in html_body
+
+
+def test_generated_script_emits_body_format_only_when_html() -> None:
+    # The generator receives model_dump() output, where body_format is the enum member, not a str.
+    def compact(block: dict) -> str:
+        return cst.Module(body=[_build_send_email_statement(block)]).code.replace(" ", "").replace("\n", "")
+
+    assert "body_format='html'" in compact(_send_email_block(body_format="html").model_dump())
+    assert "body_format" not in compact(_send_email_block().model_dump())
+    legacy_block = {"label": "notify", "sender": "me@example.com", "recipients": [], "subject": "s", "body": "b"}
+    assert "body_format" not in compact(legacy_block)
+
+
+@pytest.mark.asyncio
+async def test_subject_carries_only_what_the_user_wrote(offline_address_validation: None) -> None:
+    context = _workflow_run_context({})
+
+    block = _send_email_block(subject="  Your order shipped  ")
+    block.format_potential_template_parameters(context)
+
+    assert (await block._build_email_message(context, "wr_1"))["Subject"] == "Your order shipped"
+
+
+@pytest.mark.asyncio
+async def test_subject_renders_the_run_id_where_the_user_placed_it(offline_address_validation: None) -> None:
+    context = _workflow_run_context({})
+
+    block = _send_email_block(subject="Your Run is Finished {{workflow_run_id}}")
+    block.format_potential_template_parameters(context)
+
+    assert (await block._build_email_message(context, "wr_1"))["Subject"] == "Your Run is Finished wr_1"
+
+
+@pytest.mark.asyncio
+async def test_a_substituted_newline_is_flattened_rather_than_failing_the_send(
+    offline_address_validation: None,
+) -> None:
+    context = _workflow_run_context({"injected": "ok\r\nBcc: attacker@example.com"})
+
+    block = _send_email_block(subject="Report {{injected}}")
+    block.format_potential_template_parameters(context)
+    message = await block._build_email_message(context, "wr_1")
+
+    assert message["Subject"] == "Report okBcc: attacker@example.com"
+    assert message["BCC"] == "sender@example.com"
+
+
+@pytest.mark.asyncio
+async def test_email_download_directory_ignores_previous_attempt_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    download_dir = tmp_path / "wr_email"
+    download_dir.mkdir()
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    for name, offset in (("old.txt", -1), ("fresh.txt", 0)):
+        path = download_dir / name
+        path.write_text(name)
+        os.utime(path, (started_at.timestamp() + offset,) * 2)
+    block = _send_email_block(file_attachments=[settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY])
+    context = _run_context()
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+            AsyncMock(return_value=("wr_email", 2, started_at)),
+        ),
+    ):
+        message = await block._build_email_message(context, "wr_email", "o_1")
+
+    assert [part.get_filename() for part in message.iter_attachments()] == ["fresh.txt"]
+    assert (download_dir / "old.txt").read_text() == "old.txt"

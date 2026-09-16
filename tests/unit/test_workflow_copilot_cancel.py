@@ -10,12 +10,12 @@ Covers:
   ``CopilotContext.workflow_persisted`` (so the route's rollback decision has
   the same source of truth on cancel as it does on success).
 - The route's success-path branch on ``agent_result.cancelled`` runs the
-  cancel-specific persistence (rollback + user msg + ``Cancelled by user.``
+  cancel-specific persistence (rollback + user msg + stop-report
   AI msg + RESPONSE frame) and skips proposal persistence when there is no WIP.
 - ``/workflow/copilot/cancel`` returns 503 when the Redis cache is absent and
   204 + the expected key/TTL when it is present.
 - A cancel nobody asked for (``task.cancel()`` without ``user_cancel_observed[0]``
-  set) is recorded as an interrupted turn, never as a ``Cancelled by user.`` chat row.
+  set) is recorded as an interrupted turn, never as a stop-report chat row.
 """
 
 from __future__ import annotations
@@ -29,25 +29,37 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException, status
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _build_exit_result
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
-from skyvern.forge.sdk.copilot.terminal_envelope import INTERRUPTED_TERMINAL_REASON
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
+from skyvern.forge.sdk.copilot.interruption import (
+    CANCEL_STOP_AT_USER_REQUEST,
+    CANONICAL_ROLLED_BACK,
+    INTERRUPTED_TERMINAL_REASON,
+    MINIMAL_CANCEL_STOP,
+    cancel_notice,
+)
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     USER_CANCELLED_TERMINAL_REASON,
     _assistant_row_exists_for_turn,
+    _build_recoverable_route_agent_result,
+    _coerce_cancel_source,
     _copilot_cancel_key,
+    _make_error_narrative_payload,
     _persist_cancel_turn,
     _persist_proposed_workflow_state,
+    _prior_global_llm_context,
     _watch_for_cancel,
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCancelRequest,
+    WorkflowCopilotChat,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
@@ -147,12 +159,12 @@ def test_build_exit_result_cancelled_round_trips_workflow_persisted() -> None:
     )
     ctx.workflow_persisted = True
 
-    result = _build_exit_result(ctx, "Cancelled by user.", None, cancelled=True)
+    result = _build_exit_result(ctx, MINIMAL_CANCEL_STOP, None, cancelled=True)
 
     assert isinstance(result, AgentResult)
     assert result.cancelled is True
     assert result.workflow_was_persisted is True
-    assert result.user_response == "Cancelled by user."
+    assert result.user_response == MINIMAL_CANCEL_STOP
 
 
 def test_build_exit_result_default_cancelled_false() -> None:
@@ -241,7 +253,6 @@ async def _drive_cancel_route(
     user_cancel: bool = True,
 ) -> tuple[AsyncMock, SimpleNamespace, list[Any]]:
     """Run a single chat-post + handler turn and return (restore_mock, workflow_params, sent_payloads)."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     if user_cancel:
@@ -253,8 +264,11 @@ async def _drive_cancel_route(
             cancel_token: str,
             handler_task: Any,
             observed: list[bool],
+            observed_source: list[str | None] | None = None,
         ) -> Any:
             observed[0] = True
+            if observed_source is not None:
+                observed_source[0] = "stop_button"
             return asyncio.sleep(0)
 
         monkeypatch.setattr(app._inst, "CACHE", _FakeCache(), raising=False)
@@ -299,8 +313,8 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
     """``agent_result.cancelled=True`` with no WIP -> rollback + cancellation RESPONSE."""
     chat = _make_chat(auto_accept=False)
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -327,7 +341,7 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
         "[Message unavailable because safety screening did not complete]"
     )
 
-    assert "Cancelled by user." in contents
+    assert f"{CANCEL_STOP_AT_USER_REQUEST} {CANONICAL_ROLLED_BACK}" in contents
 
     # No proposed_workflow update when the cancelled result has no WIP.
     workflow_params.update_workflow_copilot_chat.assert_not_awaited()
@@ -335,7 +349,7 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
         p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
     ]
     assert len(response_frames) == 1
-    assert response_frames[0].message == "Cancelled by user."
+    assert response_frames[0].message == f"{CANCEL_STOP_AT_USER_REQUEST} {CANONICAL_ROLLED_BACK}"
     assert response_frames[0].updated_workflow is None
     assert response_frames[0].cancelled is True
 
@@ -350,8 +364,8 @@ async def test_route_cancel_branch_records_an_unrequested_cancel_as_interrupted(
     """The agent absorbed a cancellation nobody asked for; the row must not claim user intent."""
     chat = _make_chat(auto_accept=False)
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -369,22 +383,114 @@ async def test_route_cancel_branch_records_an_unrequested_cancel_as_interrupted(
     )
 
     written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
-    assert "Cancelled by user." not in written["content"]
+    assert MINIMAL_CANCEL_STOP not in written["content"]
     assert "interrupted" in written["content"].lower()
     assert "iteration 2" in written["content"]
     assert "were not saved to the workflow" in written["content"]
     assert written["turn_outcome"].terminal_reason == INTERRUPTED_TERMINAL_REASON
-    interruption = written["narrative_payload"]["terminalEnvelope"]["interruption"]
-    assert interruption["iteration"] == 2
-    assert interruption["workflow_permanent_id"] == "wpid-1"
-    assert interruption["workflow_version"] == 3
-    assert interruption["authored_edits_saved"] is False
+    assert "wpid-1" in written["content"] and "version 3" in written["content"]
+    assert written["narrative_payload"]["terminalMessage"] == written["content"]
 
     response_frames = [
         p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
     ]
     assert len(response_frames) == 1
     assert "interrupted" in response_frames[0].message.lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_reply_names_the_rollback_it_performed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(
+        user_response="",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        resolved_model=None,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        turn_outcome=None,
+        narrative_summary=MINIMAL_CANCEL_STOP,
+        narrative_payload=_make_error_narrative_payload(None, 0, MINIMAL_CANCEL_STOP),
+    )
+    _, workflow_params, sent_payloads = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
+
+    written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert written["content"] == f"{CANCEL_STOP_AT_USER_REQUEST} {CANONICAL_ROLLED_BACK}"
+    assert written["narrative_payload"]["terminalMessage"] == written["content"]
+    frame = next(p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE)
+    assert frame.message == written["content"]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_turn_holding_a_draft_says_the_draft_is_there(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Draft"}
+    agent_result = AgentResult(
+        user_response="",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: Draft",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        resolved_model=None,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        proposal_disposition="review_untested",
+        turn_outcome=None,
+    )
+    _, _, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result, user_cancel=False
+    )
+
+    frame = next(p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE)
+    assert "The untested draft is available for review." in frame.message
+
+
+@pytest.mark.asyncio
+async def test_interrupted_record_replaces_the_cancel_rendered_narrative_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(
+        user_response="",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        resolved_model=None,
+        cancelled=True,
+        cancellation_iteration=2,
+        total_tokens=None,
+        response_type="REPLY",
+        turn_outcome=None,
+        narrative_summary=MINIMAL_CANCEL_STOP,
+        narrative_payload=_make_error_narrative_payload(None, 0, MINIMAL_CANCEL_STOP),
+    )
+    _, workflow_params, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result, user_cancel=False
+    )
+
+    frame = next(p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE)
+    assert "interrupted" in frame.message.lower()
+    assert frame.narrative_summary == frame.message
+    assert frame.narrative_payload["narrativeSummary"] == frame.message
+    assert "0 blocks ran" not in frame.narrative_summary
+    written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert written["narrative_payload"]["narrativeSummary"] == written["content"]
 
 
 @pytest.mark.asyncio
@@ -431,7 +537,7 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
     updated_workflow = MagicMock()
     updated_workflow.model_dump.return_value = {"workflow_id": "wf-canonical", "title": title}
     workflow_yaml = f"title: {title}"
-    agent_result = SimpleNamespace(
+    agent_result = AgentResult(
         user_response=user_response,
         updated_workflow=updated_workflow,
         global_llm_context=None,
@@ -468,14 +574,21 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
     assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
         "[Message unavailable because safety screening did not complete]"
     )
-    assert user_response in contents
+    expected_notice = cancel_notice(
+        base=user_response,
+        stop_button=True,
+        preserved_draft=disposition,
+        canonical_rolled_back=True,
+    )
+    assert expected_notice.startswith(user_response)
+    assert expected_notice in contents
 
     response_frames = [
         p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
     ]
     assert len(response_frames) == 1
     frame = response_frames[0]
-    assert frame.message == user_response
+    assert frame.message == expected_notice
     assert frame.updated_workflow == {"workflow_id": "wf-canonical", "title": title}
     assert frame.proposal_disposition == disposition
     assert frame.cancelled is True
@@ -503,8 +616,8 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
         auto_accept=False,
     )
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -537,8 +650,8 @@ async def test_route_cancel_keeps_stale_proposed_workflow_when_no_wip_and_keep_p
         auto_accept=False,
     )
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -569,8 +682,8 @@ async def test_route_cancel_explicit_clear_overrides_keep_pending(
         auto_accept=False,
     )
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -597,15 +710,14 @@ async def test_route_cancel_clears_stale_proposal_when_rollback_itself_fails(
 ) -> None:
     """A failed rollback leaves canonical's state unverified — keep_pending_proposal
     must not be honored against an assumption ("nothing changed") that didn't hold."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     chat = _make_chat(
         proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
         auto_accept=False,
     )
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
+    agent_result = AgentResult(
+        user_response="",
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
@@ -643,7 +755,7 @@ async def test_route_cancel_clears_stale_proposal_when_rollback_itself_fails(
 async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
     """Pre-agent cancel (agent_result=None) must clear any stale proposal.
 
-    Without this, reload reattaches the old card to the new "Cancelled by user." message.
+    Without this, reload reattaches the old card to the new stop-report message.
     """
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -669,10 +781,79 @@ async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
         original_workflow=None,
         user_message="please update",
         agent_result=None,
+        effective_mode="build",
+        code_available=True,
     )
 
     workflow_params.update_workflow_copilot_chat.assert_awaited_once()
     assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+    outcome = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["turn_outcome"]
+    assert outcome.copilot_effective_mode == "build"
+    assert outcome.copilot_code_available is True
+
+
+def _context_holding_a_credential_proposal() -> str:
+    return StructuredContext(
+        user_goal="log in and download the bill",
+        proposed_credential=ProposedCredential(
+            credential_id="cred_saved_login",
+            admitted_url="https://portal.example.test/login",
+        ),
+    ).to_json_str()
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_drops_the_one_turn_credential_proposal() -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="stop",
+        agent_result=None,
+        prior_global_llm_context=_context_holding_a_credential_proposal(),
+    )
+
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["global_llm_context"]
+    assert StructuredContext.from_json_str(persisted).proposed_credential is None
+    assert StructuredContext.from_json_str(persisted).user_goal == "log in and download the bill"
+
+
+def test_a_turn_carries_the_prior_credential_proposal_into_its_policy() -> None:
+    messages = [SimpleNamespace(global_llm_context=_context_holding_a_credential_proposal(), turn_outcome=object())]
+
+    carried = _prior_global_llm_context(messages)
+
+    proposal = StructuredContext.from_json_str(carried).proposed_credential
+    assert proposal is not None
+    assert proposal.credential_id == "cred_saved_login"
+
+
+def test_a_recoverable_failure_drops_the_one_turn_credential_proposal() -> None:
+    agent_result, _ = _build_recoverable_route_agent_result(
+        RuntimeError("boom"),
+        workflow_modified=False,
+        clear_proposed_workflow=False,
+        global_llm_context=_context_holding_a_credential_proposal(),
+    )
+
+    assert StructuredContext.from_json_str(agent_result.global_llm_context).proposed_credential is None
 
 
 @pytest.mark.asyncio
@@ -748,11 +929,46 @@ async def test_pre_agent_cancel_keeps_stale_proposed_workflow_when_keep_pending(
 
 
 @pytest.mark.asyncio
+async def test_pre_agent_cancel_reports_only_the_stop_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-agent cancel has no reply of its own, so the stop report is the whole message."""
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="please update",
+        agent_result=None,
+    )
+
+    written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert written["content"] == MINIMAL_CANCEL_STOP
+    assert written["narrative_payload"]["narrativeSummary"] == written["content"]
+
+
+@pytest.mark.asyncio
 async def test_timeout_wip_result_streams_normal_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Timeout WIP rescue must use normal finalisation, not the cancel ERROR path."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -771,7 +987,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     )
     updated_workflow = MagicMock()
     updated_workflow.model_dump.side_effect = lambda mode="json": {"workflow_id": "wf-draft", "title": "Draft"}
-    agent_result = SimpleNamespace(
+    agent_result = AgentResult(
         user_response="I ran out of time before I could finish testing. I have a draft workflow you can keep.",
         updated_workflow=updated_workflow,
         global_llm_context=None,
@@ -824,7 +1040,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
     assert error_frames == []
     contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
-    assert "Cancelled by user." not in contents
+    assert MINIMAL_CANCEL_STOP not in contents
 
 
 @pytest.mark.asyncio
@@ -883,7 +1099,6 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-cancel WIP rescue propagates ``review_tested`` so the frontend skips auto-apply."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -902,7 +1117,7 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
     )
     updated_workflow = MagicMock()
     updated_workflow.model_dump.side_effect = lambda mode="json": {"workflow_id": "wf-good", "title": "Last Good"}
-    agent_result = SimpleNamespace(
+    agent_result = AgentResult(
         user_response="I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
         updated_workflow=updated_workflow,
         global_llm_context=None,
@@ -983,18 +1198,73 @@ async def test_cancel_endpoint_204_writes_redis_flag(monkeypatch: pytest.MonkeyP
     organization = SimpleNamespace(organization_id="org-1")
 
     result = await workflow_copilot_cancel(
-        WorkflowCopilotCancelRequest(cancel_token="tok_abc"),
+        WorkflowCopilotCancelRequest(cancel_token="tok_abc", source="escape_key"),
         organization=organization,
     )
     assert result is None  # 204 No Content
 
+    # The flag value is the gesture, so the watcher can attribute the cancel.
     expected_key = _copilot_cancel_key("org-1", "tok_abc")
-    assert cache.store[expected_key] == "1"
+    assert cache.store[expected_key] == "escape_key"
     assert len(cache.set_calls) == 1
     key, value, ex = cache.set_calls[0]
-    assert (key, value) == (expected_key, "1")
+    assert (key, value) == (expected_key, "escape_key")
     assert isinstance(ex, timedelta)
     assert ex == COPILOT_CANCEL_TTL
+
+
+@pytest.mark.parametrize(
+    "flag, expected",
+    [
+        ("escape_key", "escape_key"),
+        ("stop_button", "stop_button"),
+        ("api", "api"),
+        (b"escape_key", "escape_key"),
+        # Written before the source existed: truthy, but names no gesture.
+        ("1", None),
+        ("something_else", None),
+    ],
+)
+def test_cancel_source_is_read_only_from_a_recognised_gesture(flag: str | bytes, expected: str | None) -> None:
+    assert _coerce_cancel_source(flag) == expected
+
+
+def test_the_gesture_is_recorded_beside_the_terminal_reason_on_the_turn() -> None:
+    """AC1: attributing cancels must not need a second column or a JSON blob.
+
+    ``turn_outcome`` is what the 120h RCA grouped by, so the source lives there
+    next to ``terminal_reason`` rather than only inside the narrative payload.
+    """
+    outcome = TurnOutcome(
+        response_kind=ResponseKind.RECOVER,
+        terminal_reason=USER_CANCELLED_TERMINAL_REASON,
+        cancel_source="escape_key",
+    )
+
+    persisted = outcome.model_dump(mode="json")
+    assert persisted["terminal_reason"] == USER_CANCELLED_TERMINAL_REASON
+    assert persisted["cancel_source"] == "escape_key"
+    # A turn whose request named no gesture reads as unattributed, never as a guess.
+    assert TurnOutcome(response_kind=ResponseKind.RECOVER).cancel_source is None
+
+
+@pytest.mark.asyncio
+async def test_watcher_reports_the_gesture_the_cancel_named() -> None:
+    cache = _FakeCache()
+    key = _copilot_cancel_key("org-1", "tok_abc")
+    cache.store[key] = "escape_key"
+    observed: list[bool] = [False]
+    observed_source: list[str | None] = [None]
+
+    async def never_finishes() -> None:
+        await asyncio.sleep(30)
+
+    handler_task = asyncio.create_task(never_finishes())
+    await _watch_for_cancel(cache, "org-1", "tok_abc", handler_task, observed, observed_source)
+
+    assert observed[0] is True
+    assert observed_source[0] == "escape_key"
+    assert handler_task.cancelled() or handler_task.cancelling()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +1277,6 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """task.cancel() without user_cancel_observed[0] -> an interrupted row, never a user-cancel row."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -1035,7 +1304,6 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
 
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        return None
 
     monkeypatch.setattr(
         "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
@@ -1089,23 +1357,26 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
 
     insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
     contents = [c.kwargs.get("content") for c in insert_calls]
-    assert "Cancelled by user." not in contents
+    assert MINIMAL_CANCEL_STOP not in contents
     interrupted = [content for content in contents if content and "interrupted" in content.lower()]
     assert len(interrupted) == 1
     assert "wpid-1" in interrupted[0]
     written = insert_calls[-1].kwargs
     assert written["turn_outcome"].terminal_reason == INTERRUPTED_TERMINAL_REASON
-    assert written["narrative_payload"]["terminalEnvelope"]["halt_kind"] == INTERRUPTED_TERMINAL_REASON
+    assert written["narrative_payload"]["terminalMessage"] == written["content"]
 
 
 @pytest.mark.asyncio
 async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -> None:
     """Without a turn-stamped outcome, reconcile would append an interrupted row beside the cancel."""
-    chat = SimpleNamespace(
+    chat = WorkflowCopilotChat(
         organization_id="org-1",
+        workflow_permanent_id="wpid-1",
         workflow_copilot_chat_id="chat-1",
         proposed_workflow=None,
         auto_accept=False,
+        created_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        modified_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
     )
     persisted: list[SimpleNamespace] = []
 
@@ -1120,6 +1391,7 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
         return row
 
     workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
         update_workflow_copilot_chat=AsyncMock(),
         create_workflow_copilot_chat_message=capture_message,
         clear_pending_copilot_turn=AsyncMock(),
@@ -1145,6 +1417,7 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
     assert len(assistant_rows) == 1
     outcome = assistant_rows[0].turn_outcome
     assert outcome is not None
+    assert outcome.copilot_runtime == "agent"
     assert outcome.copilot_turn_id == "turn-a"
     assert outcome.terminal_reason == USER_CANCELLED_TERMINAL_REASON
     assert outcome.terminal_reason != "interrupted"
@@ -1162,11 +1435,10 @@ async def test_cancel_during_shielded_finalisation_does_not_write_a_second_row(
     The finalise keeps running when the cancel raises at its await, so both writers would
     otherwise reach the read-then-create idempotency check, see no existing row, and insert.
     """
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     chat = _make_chat(auto_accept=False)
     original_workflow = _make_original_workflow()
-    agent_result = SimpleNamespace(
+    agent_result = AgentResult(
         user_response="Here is your workflow.",
         updated_workflow=None,
         global_llm_context=None,
@@ -1208,3 +1480,140 @@ async def test_cancel_during_shielded_finalisation_does_not_write_a_second_row(
     contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
     interrupted = [content for content in contents if content and "interrupted" in content.lower()]
     assert interrupted == [], f"finalisation owns this turn's row; got a competing write: {interrupted}"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_before_the_agent_starts_still_reports_a_cause_when_its_row_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This branch sits inside ``except CancelledError``, so the route's own ``except Exception``
+    is its sibling, not its backstop — a dead history read here would otherwise escape untold."""
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(user_response="", updated_workflow=None, global_llm_context=None)
+    captured = install_fake_create(monkeypatch)
+    _restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    def observe_user_cancel(
+        cache: Any,
+        organization_id: str,
+        cancel_token: str,
+        handler_task: Any,
+        observed: list[bool],
+        observed_source: list[str | None] | None = None,
+    ) -> Any:
+        observed[0] = True
+        if observed_source is not None:
+            observed_source[0] = "stop_button"
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(app._inst, "CACHE", _FakeCache(), raising=False)
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._watch_for_cancel", observe_user_cancel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        # Only the read inside the stop-report writer fails; initial loading must succeed, or the
+        # turn dies in the generic handler and never reaches the branch under test.
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    workflow_params.get_workflow_copilot_chat_messages = history
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+
+    sent: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+    await captured["handler"](stream)
+
+    assert reads > 1, "the stop-report writer must have reached its history read"
+    errors = [getattr(payload, "error", None) for payload in sent]
+    assert any(error and "dependency stopped responding" in error for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_that_rolled_back_before_its_write_failed_does_not_claim_the_workflow_survived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancel path rolls canonical back in its own finalizer, which never sets
+    ``finalise_started`` — so the reply must not read the agent's pre-rollback flag."""
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = AgentResult(
+        user_response="stopped",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_was_persisted=True,
+        cancelled=True,
+        turn_outcome=None,
+    )
+    captured = install_fake_create(monkeypatch)
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    async def landed_rollback(*args: Any, **kwargs: Any) -> None:
+        marker = workflow_copilot_route._CANONICAL_ROLLED_BACK.get()
+        assert marker is not None
+        marker[0] = True
+
+    restore.side_effect = landed_rollback
+
+    def observe_user_cancel(
+        cache: Any,
+        organization_id: str,
+        cancel_token: str,
+        handler_task: Any,
+        observed: list[bool],
+        observed_source: list[str | None] | None = None,
+    ) -> Any:
+        observed[0] = True
+        if observed_source is not None:
+            observed_source[0] = "stop_button"
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(app._inst, "CACHE", _FakeCache(), raising=False)
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._watch_for_cancel", observe_user_cancel)
+    reads = 0
+
+    async def history(workflow_copilot_chat_id: str) -> list[Any]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        raise DatabaseConnectionUnavailableError("get_workflow_copilot_chat_messages", 3)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+    workflow_params.get_workflow_copilot_chat_messages = history
+
+    sent: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+    await captured["handler"](stream)
+
+    restore.assert_awaited()
+    errors = [error for error in (getattr(payload, "error", None) for payload in sent) if error]
+    assert errors, "the turn must still terminate"
+    assert "was not modified" in errors[-1]
+    assert "preserved" not in errors[-1]

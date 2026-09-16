@@ -211,6 +211,7 @@ export type WorkflowBlock =
   | FileURLParserBlock
   | ValidationBlock
   | HumanInteractionBlock
+  | DataExportBlock
   | ActionBlock
   | NavigationBlock
   | ExtractionBlock
@@ -243,6 +244,7 @@ export const WorkflowBlockTypes = {
   FileURLParser: "file_url_parser",
   Validation: "validation",
   HumanInteraction: "human_interaction",
+  DataExport: "data_export",
   Action: "action",
   Navigation: "navigation",
   Extraction: "extraction",
@@ -451,6 +453,8 @@ export type FileUploadBlock = WorkflowBlockBase & {
   sftp_host_key: string | null;
 };
 
+export type EmailBodyFormat = "text" | "html";
+
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
   smtp_host?: AWSSecretParameter;
@@ -465,6 +469,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments: Array<string>;
 };
 
@@ -482,6 +487,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
+  engine: RunEngine | null;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
@@ -496,6 +502,15 @@ export type HumanInteractionBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
+};
+
+export type DataExportBlock = WorkflowBlockBase & {
+  block_type: "data_export";
+  data: string;
+  data_schema: Record<string, unknown>;
+  file_name: string | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type ActionBlock = WorkflowBlockBase & {
@@ -546,6 +561,10 @@ export type ExtractionBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  export_enabled?: boolean;
+  export_data_schema?: Record<string, unknown> | null;
+  export_file_name?: string | null;
+  export_records?: string | null;
 };
 
 export type LoginBlock = WorkflowBlockBase & {
@@ -710,7 +729,26 @@ export type SplitPdfBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type WorkflowRetryStatus =
+  | "completed"
+  | "failed"
+  | "terminated"
+  | "canceled"
+  | "timed_out";
+export type WorkflowRetryRule = {
+  status: WorkflowRetryStatus;
+  error_codes?: Array<string> | null;
+};
+export type WorkflowRetryWebhookMode = "final_only" | "every_attempt";
+export type WorkflowRetryPolicy = {
+  max_retries: number;
+  delay_seconds: number;
+  webhook_on_retry: WorkflowRetryWebhookMode;
+  retry_on: Array<WorkflowRetryRule>;
+};
+
 export type WorkflowDefinition = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
@@ -748,6 +786,7 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
   run_with: string; // 'agent' or 'code'
+  browser_type?: string | null; // BrowserType value; null = system default
   cache_key: string | null;
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
@@ -764,6 +803,7 @@ export type WorkflowApiResponse = {
 };
 
 export type WorkflowSettings = {
+  retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
@@ -777,6 +817,7 @@ export type WorkflowSettings = {
   extraHttpHeaders: string | null;
   cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'
+  browserType?: string | null; // BrowserType value; null = system default
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;

@@ -55,6 +55,7 @@ BROWSER_ABLATION_NATIVE_TOOLS = (
     "inspect_page_for_composition",
     "inspect_locator_matches",
     "fill_credential_field",
+    "request_credential",
 )
 # Browser ablation keeps the production Copilot browser aliases, then projects the missing
 # multi-page capabilities from the app registry. This avoids both a second handwritten browser
@@ -243,7 +244,29 @@ def resolve_copilot_tool_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
     registered_mcp_tools: Sequence[Any] | None = None,
+    browser_tools_available: bool = True,
 ) -> CopilotToolSurface:
+    if not browser_tools_available:
+        # Local import: tools/__init__ reaches this leaf back through CopilotContext.
+        from skyvern.forge.sdk.copilot.tools import BROWSER_BOUND_TOOL_NAMES
+
+        # A turn without browser authority advertises no tool that would need one, rather than
+        # advertising them and refusing at dispatch.
+        selected = [tool for tool in native_tools if tool.name not in BROWSER_BOUND_TOOL_NAMES]
+        selected_aliases = {
+            name: transport_name
+            for name, transport_name in alias_map.items()
+            if not getattr(overlays[name], "requires_browser", False)
+        }
+        selected_overlays = {name: overlays[name] for name in selected_aliases}
+        return CopilotToolSurface(
+            native_tools=tuple(selected),
+            alias_map=selected_aliases,
+            overlays=selected_overlays,
+            ordered_native_names=tuple(tool.name for tool in selected),
+            ordered_mcp_names=tuple(selected_aliases),
+        )
+
     if mode is None or mode in REPAIR_PROBE_MODES:
         selected = [
             tool

@@ -1,3 +1,9 @@
+import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+import type { Status, WorkflowRunRetryFields } from "@/api/types";
+import {
+  getRunAttemptKey,
+  runIsRetryWaiting,
+} from "../../workflowRun/runRetryState";
 import { useEffect, useState } from "react";
 
 import { BrowserStream } from "@/components/BrowserStream";
@@ -8,6 +14,7 @@ import { WorkflowRunStream } from "../../workflowRun/WorkflowRunStream";
 
 type RunLiveStreamProps = {
   workflowRunId: string;
+  run?: { workflow_run_id: string; status: Status } & WorkflowRunRetryFields;
   browserSessionId: string | null;
   interactive: boolean;
   // Live page URL from the CDP frames; the VNC path doesn't surface one yet.
@@ -18,7 +25,27 @@ type RunLiveStreamProps = {
  * Live browser for a workflow run, mirroring WorkflowRunOverview: VNC keyed by the
  * browser session, with the session's CDP screencast when VNC is wrong or closes early.
  */
-export function RunLiveStream({
+export function RunLiveStream(props: RunLiveStreamProps) {
+  if (props.run && runIsRetryWaiting(props.run)) {
+    return (
+      <StreamStatusPanel
+        diagnostic={{
+          title: "Retry pending",
+          detail: "The browser reconnects when the next attempt starts.",
+          pending: true,
+        }}
+      />
+    );
+  }
+  return (
+    <RunLiveStreamTransport
+      key={props.run ? getRunAttemptKey(props.run) : props.workflowRunId}
+      {...props}
+    />
+  );
+}
+
+function RunLiveStreamTransport({
   workflowRunId,
   browserSessionId,
   interactive,

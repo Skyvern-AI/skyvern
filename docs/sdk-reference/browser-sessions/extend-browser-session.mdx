@@ -1,0 +1,89 @@
+---
+title: "extend_browser_session"
+slug: sdk-reference/browser-sessions/extend-browser-session
+---
+
+Extend a live browser session's timeout. Sessions are created with a timeout of at most 240 minutes (4 hours) and can be extended, one call at a time, up to a total lifetime of 360 minutes (6 hours) counted from when the session started.
+
+<CodeGroup>
+```python Python
+session = await client.extend_browser_session("pbs_abc123", additional_minutes=30)
+print(session.timeout)  # the session's new total budget in minutes
+```
+
+```bash cURL
+curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_abc123/extend \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"additional_minutes": 30}'
+```
+</CodeGroup>
+
+<Note>
+The TypeScript SDK gains `extendBrowserSession` in its next release. Until then, call the REST endpoint directly from TypeScript.
+</Note>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browser_session_id` | `str` | Yes | The session ID to extend. |
+| `additional_minutes` | `int` | Yes | Minutes to add to the session's current deadline. Must be at least 1. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns
+
+The updated [`BrowserSessionResponse`](/sdk-reference/browser-sessions/get-browser-session). `timeout` is the session's new total budget in minutes, counted from `started_at`. If you asked for more than the remaining headroom, the session is extended by what remained and `warning` explains the difference.
+
+<Note>
+Extension is additive. Each call adds to the session's budget, so a retried request adds again; read `timeout` from the response rather than assuming your arithmetic. A session whose budget is already 360 minutes returns a `409` rather than a no-op.
+</Note>
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404` | No session with that ID belongs to your organization. |
+| `409` | The session has already ended, is under two minutes from its deadline, is already at the 360-minute maximum, or runs on infrastructure whose lifetime is fixed at creation. |
+| `202` | The extension was requested but its effect could not be confirmed yet. Do not retry, since each retry adds again; read `timeout` back with `get_browser_session`. The body carries a `warning`. |
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

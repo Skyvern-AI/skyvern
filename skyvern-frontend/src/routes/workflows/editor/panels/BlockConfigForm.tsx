@@ -8,6 +8,7 @@ import { ActionBlockForm } from "./BlockConfigForm/ActionBlockForm";
 import { CodeBlockBlockForm } from "./BlockConfigForm/CodeBlockBlockForm";
 import { ConditionalBlockForm } from "./BlockConfigForm/ConditionalBlockForm";
 import { DownloadBlockForm } from "./BlockConfigForm/DownloadBlockForm";
+import { DataExportBlockForm } from "./BlockConfigForm/DataExportBlockForm";
 import { EmailInboxBlockForm } from "./BlockConfigForm/EmailInboxBlockForm";
 import { ExtractionBlockForm } from "./BlockConfigForm/ExtractionBlockForm";
 import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
@@ -69,6 +70,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   googleSheetsRead: GoogleSheetsReadBlockForm,
   googleSheetsWrite: GoogleSheetsWriteBlockForm,
   splitPdf: SplitPdfBlockForm,
+  dataExport: DataExportBlockForm,
 };
 
 function BlockConfigForm({ blockId }: Readonly<{ blockId: string }>) {

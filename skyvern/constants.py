@@ -12,9 +12,17 @@ SKYVERN_MCP_USER_AGENT: str = "skyvern-mcp"
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
 
+# Bounds the reasoning that user-defined errors carry to the customer webhook, and the
+# descriptions in an error_code_mapping. Lives here so the leaf error models and the workflow
+# schema can share one number without the models depending on the schema package.
+ERROR_CODE_REASONING_MAX_LENGTH = 2000
+
 INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
+# Bounded attempts to close a crashed tab. Anything that waits on that close derives its budget from
+# this and BROWSER_PAGE_CLOSE_TIMEOUT rather than restating the count.
+CRASHED_PAGE_CLOSE_ATTEMPTS = 2
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 # Independent budget for disabling the download interceptor during close(). Kept well below
 # BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
@@ -43,6 +51,20 @@ PROXY_SENSITIVE_NAV_ERRORS = (
 # The outer context-recreation retry in get_or_create_page may still attempt
 # recovery for proxy-sensitive errors by picking a different proxy node.
 SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
+# The subset of PROXY_SENSITIVE_NAV_ERRORS that attributes a navigation failure to our own
+# egress rather than to the site. PROXY_SENSITIVE_NAV_ERRORS is deliberately wider because it
+# answers a different question -- whether retrying on a different proxy node is worth it -- and
+# it includes cert failures a plain expired certificate on the target site also produces.
+# ERR_CERT_AUTHORITY_INVALID is the one cert code that means an untrusted issuer, i.e. something
+# terminating TLS in front of us.
+EGRESS_ATTRIBUTABLE_NAV_ERRORS = (
+    "net::ERR_TUNNEL_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
+    "net::ERR_CERT_AUTHORITY_INVALID",
+)
 
 AUTO_COMPLETION_POTENTIAL_VALUES_COUNT = 3
 DROPDOWN_MENU_MAX_DISTANCE = 100
@@ -97,7 +119,7 @@ DEFAULT_LOGIN_COMPLETE_CRITERION = (
 )
 
 # Template for wrapping a block-level mini-goal with the user's original prompt as context.
-# Used by both TaskV2 planning and the workflow-copilot-v2 tool handler so that every block's
+# Used by both TaskV2 planning and the Workflow Copilot tool handler so that every block's
 # navigation_goal carries the user's overarching intent — the verifier (complete_verify) can
 # then reason about completion against the user's goal rather than the block's narrow action
 # decomposition.

@@ -4,6 +4,8 @@ import asyncio
 import functools
 import json
 import weakref
+from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from playwright.async_api import BrowserContext, Dialog, Page
@@ -42,6 +44,105 @@ _registered_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
 _registered_pages: weakref.WeakSet[Page] = weakref.WeakSet()
 
 
+@dataclass(frozen=True)
+class DialogPolicy:
+    action: str
+    prompt_text: str | None = None
+
+
+DIALOG_POLICY_ACTIONS: frozenset[str] = frozenset({"accept", "dismiss"})
+
+# Cap on records a block accumulates between reads, keeping the most recent. Deliberately not
+# skyvern_context.MAX_RECENT_DIALOG_MESSAGES: that one is tuned against the LLM prompt budget, and
+# retuning it there must not resize a CodeBlock return value.
+MAX_DIALOG_POLICY_RECORDS = 5
+
+DIALOG_POLICY_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await set_dialog_policy(page, 'accept'|'dismiss', prompt_text=None)",
+    "when_to_use": (
+        "The supported way for a code block to answer a native JS dialog: declare the answer as data "
+        "rather than registering a listener. On the secure CodeBlock runner a page.on('dialog', ...) "
+        "handler whose whole body is one dialog.accept('literal') or dialog.dismiss() call is read -- "
+        "never run -- and becomes this same policy; a handler that does anything else, "
+        "page.once('dialog', ...) because the answer covers the whole block, "
+        "page.remove_listener('dialog', ...), and every other event name are refused."
+    ),
+    "parameters": {
+        "page": {"accepted_type": "the block's own page object"},
+        "action": {"accepted_type": "str", "one_of": ["accept", "dismiss"]},
+        "prompt_text": {"accepted_type": "str", "note": "typed into a prompt(); only valid with 'accept'"},
+    },
+    "returns": (
+        f"list of {{type, message}} for the dialogs OBSERVED since this block's previous call, "
+        f"capped at the {MAX_DIALOG_POLICY_RECORDS} most recent (older ones are dropped)"
+    ),
+    "reading_the_result": (
+        "The declaring call runs before any dialog fires, so records come back on the NEXT call: "
+        "declare, drive the page, then call again to read what fired. An alert is recorded but "
+        "answered by its own branch rather than by the policy. On the secure CodeBlock runner a "
+        "page.on('dialog', ...) registration is the same call and also consumes the pending "
+        "records when it is sent, ahead of the block's next page call."
+    ),
+    "lifetime": (
+        "The policy covers the whole browser context for the rest of the block -- sibling and popup "
+        "pages included -- and is revoked at block end, restoring default dialog handling. It answers "
+        "confirm and prompt only: beforeunload is always accepted so that a declared 'dismiss' cannot "
+        "cancel the block's own navigation, and is recorded like any other dialog. Revocation wins a "
+        "tie: a dialog the page schedules as the block ends may be answered by default handling and "
+        "go unrecorded, so do not rely on the policy for a dialog that races block end."
+    ),
+}
+
+# Keyed on the RAW BrowserContext: a recording proxy builds a fresh context wrapper on every
+# attribute access, so a weak key taken from one would be dead before the next dialog fired.
+_dialog_policies: weakref.WeakKeyDictionary[BrowserContext, DialogPolicy] = weakref.WeakKeyDictionary()
+_dialog_records: weakref.WeakKeyDictionary[BrowserContext, list[dict[str, str]]] = weakref.WeakKeyDictionary()
+
+
+def _policy_key(browser_context: BrowserContext) -> BrowserContext | None:
+    """None for an object that cannot be weakly referenced, and so can hold no policy."""
+    try:
+        weakref.ref(browser_context)
+    except TypeError:
+        return None
+    return browser_context
+
+
+def set_dialog_policy(browser_context: BrowserContext, action: str, prompt_text: str | None = None) -> None:
+    """Declare how dialogs on this context are answered until the policy is cleared; strict about
+    the key, so a context that cannot hold one raises rather than arming what teardown cannot find."""
+    if action not in DIALOG_POLICY_ACTIONS:
+        raise ValueError(f"unsupported dialog policy action: {action!r}")
+    _dialog_policies[browser_context] = DialogPolicy(action=action, prompt_text=prompt_text)
+    if browser_context not in _dialog_records:
+        _dialog_records[browser_context] = []
+
+
+def clear_dialog_policy(browser_context: BrowserContext) -> None:
+    """Revert this context to default dialog handling and drop any undelivered records. In-flight
+    listeners are deliberately not drained -- they run as their own tasks, so waiting would make
+    teardown depend on a page-driven callback; revocation wins a tie and the policy never outlives
+    its block."""
+    key = _policy_key(browser_context)
+    if key is None:
+        return
+    _dialog_policies.pop(key, None)
+    _dialog_records.pop(key, None)
+
+
+def take_dialog_records(browser_context: BrowserContext) -> list[dict[str, str]]:
+    """Dialogs OBSERVED since the previous take, as plain data — never a live Dialog. An alert is
+    observed but not answered by the policy: it has one possible response and takes its own branch."""
+    key = _policy_key(browser_context)
+    if key is None:
+        return []
+    records = _dialog_records.get(key)
+    if not records:
+        return []
+    _dialog_records[key] = []
+    return records
+
+
 async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     """Handle a JavaScript dialog (alert/confirm/prompt/beforeunload) using LLM-based decision making.
 
@@ -63,6 +164,18 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     dialog_type = dialog.type
     dialog_message = dialog.message
     default_value = dialog.default_value
+
+    policy: DialogPolicy | None = None
+    policy_context = _policy_key(page.context) if page is not None else None
+    if policy_context is not None:
+        policy = _dialog_policies.get(policy_context)
+        if policy is not None:
+            recorded_message = dialog_message
+            if len(recorded_message) > skyvern_context.MAX_DIALOG_MESSAGE_CHARS:
+                recorded_message = recorded_message[: skyvern_context.MAX_DIALOG_MESSAGE_CHARS] + "…"
+            records = _dialog_records.setdefault(policy_context, [])
+            records.append({"type": dialog_type, "message": recorded_message})
+            del records[:-MAX_DIALOG_POLICY_RECORDS]
 
     ctx = skyvern_context.current()
     organization_id = ctx.organization_id if ctx else None
@@ -112,9 +225,15 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
             log.info("Dialog auto-accepted", dialog_type=dialog_type)
             await dialog.accept()
             return
+        # Ahead of the policy branch: a declared `dismiss` would otherwise cancel the navigation a
+        # block starts right after handling a confirm, stalling it until the block's own timeout.
         if dialog_type == "beforeunload":
             log.info("Dialog auto-accepted", dialog_type=dialog_type)
             await _respond("accept")
+            return
+        if policy is not None:
+            log.info("Dialog answered by declared policy", policy_action=policy.action)
+            await _respond(policy.action, policy.prompt_text)
             return
 
         if not navigation_goal and not navigation_payload:

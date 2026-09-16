@@ -6,18 +6,24 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type {
-  ButtonHTMLAttributes,
-  InputHTMLAttributes,
-  ReactNode,
-  SVGProps,
-  TextareaHTMLAttributes,
+import {
+  act,
+  createRef,
+  isValidElement,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type Ref,
+  type ReactNode,
+  type SVGProps,
+  type TextareaHTMLAttributes,
 } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
+import { Link } from "react-router-dom";
 
-import { PromptBox } from "./PromptBox";
+import { PromptBox, type PromptBoxHandle } from "./PromptBox";
 
 const { mockNavigate, mockPost, mockSetAutoplay } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
@@ -60,11 +66,15 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-vi.mock("@/components/AutoResizingTextarea/AutoResizingTextarea", () => ({
-  AutoResizingTextarea: (
-    props: TextareaHTMLAttributes<HTMLTextAreaElement>,
-  ) => <textarea {...props} />,
-}));
+vi.mock("@/components/AutoResizingTextarea/AutoResizingTextarea", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    AutoResizingTextarea: React.forwardRef<
+      HTMLTextAreaElement,
+      TextareaHTMLAttributes<HTMLTextAreaElement>
+    >((props, ref) => <textarea ref={ref} {...props} />),
+  };
+});
 
 vi.mock("@/components/ui/button", () => ({
   Button: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
@@ -132,14 +142,17 @@ vi.mock("@/components/icons/InboxIcon", () => ({ InboxIcon: () => null }));
 vi.mock("@/components/icons/MessageIcon", () => ({ MessageIcon: () => null }));
 vi.mock("@/components/icons/TrophyIcon", () => ({ TrophyIcon: () => null }));
 
-function renderPromptBox(enableCopilotHandoff = false) {
+function renderPromptBox(
+  enableCopilotHandoff = false,
+  ref?: Ref<PromptBoxHandle>,
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
 
   return render(
     <QueryClientProvider client={queryClient}>
-      <PromptBox enableCopilotHandoff={enableCopilotHandoff} />
+      <PromptBox ref={ref} enableCopilotHandoff={enableCopilotHandoff} />
     </QueryClientProvider>,
   );
 }
@@ -147,7 +160,7 @@ function renderPromptBox(enableCopilotHandoff = false) {
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
-  studioState.enabled = false;
+  studioState.enabled = true;
   mockNavigate.mockReset();
   mockPost.mockReset();
   mockSetAutoplay.mockReset();
@@ -164,6 +177,51 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
+  test("focuses and prefills an empty prompt without submitting or overwriting typed text", () => {
+    const ref = createRef<PromptBoxHandle>();
+    renderPromptBox(false, ref);
+    const textarea = screen.getByPlaceholderText("Enter your prompt...");
+    textarea.scrollIntoView = vi.fn();
+
+    act(() => ref.current?.focusAndPrefillExample("hackernews"));
+    expect((textarea as HTMLTextAreaElement).value).toBe(
+      "Navigate to the Hacker News homepage and get the top 3 posts.",
+    );
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    expect(textarea.getAttribute("id")).toBe("discover-prompt-input");
+    expect(mockPost).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
+    act(() => ref.current?.focusAndPrefillExample("contact_us_forms"));
+    expect((textarea as HTMLTextAreaElement).value).toBe(
+      "Keep my agent prompt",
+    );
+    expect(document.activeElement).toBe(textarea);
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  test("reuses the shipped sample prompts for onboarding intent keys", () => {
+    const ref = createRef<PromptBoxHandle>();
+    renderPromptBox(false, ref);
+    const textarea = screen.getByPlaceholderText(
+      "Enter your prompt...",
+    ) as HTMLTextAreaElement;
+    const cases = [
+      ["finditparts", "finditparts.com"],
+      ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
+      ["hackernews", "Hacker News homepage"],
+      ["AAPLStockPrice", "google finance"],
+    ] as const;
+
+    for (const [key, expected] of cases) {
+      fireEvent.change(textarea, { target: { value: "" } });
+      act(() => ref.current?.focusAndPrefillExample(key));
+      expect(textarea.value).toContain(expected);
+    }
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
   test("creates prompt-generated workflows as V1 agent runs", async () => {
     mockPost.mockResolvedValue({
       data: {
@@ -244,44 +302,8 @@ describe("PromptBox", () => {
     await submitPrompt("Visit the docs");
 
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledTimes(1));
-    expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_empty/build");
+    expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_empty/studio");
     expect(mockSetAutoplay).not.toHaveBeenCalled();
-  });
-
-  test("hands Discover prompts to the legacy build path via route state only", async () => {
-    mockPost.mockResolvedValue({
-      data: {
-        workflow_permanent_id: "wpid_copilot",
-        workflow_definition: { blocks: [] },
-      },
-    });
-
-    renderPromptBox(true);
-
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
-      target: { value: "Build this workflow" },
-    });
-    fireEvent.click(screen.getByLabelText("submit-prompt"));
-
-    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
-    const call = mockPost.mock.calls[0];
-    expect(call).toBeDefined();
-    const [path, yaml] = call!;
-
-    expect(path).toBe("/workflows");
-    expect(yaml).toContain("run_with: agent");
-    expect(yaml).not.toContain("run_with: code");
-    expect(mockNavigate).toHaveBeenCalledWith(
-      "/agents/wpid_copilot/build?via=discover",
-      {
-        state: { copilotMessage: "Build this workflow" },
-      },
-    );
-    // The legacy /build (Debugger) surface never mounts the recovery hook, so
-    // no session-scoped copy is written — writing one would strand a dead entry.
-    expect(
-      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_copilot"),
-    ).toBeNull();
   });
 
   test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {
@@ -312,4 +334,71 @@ describe("PromptBox", () => {
       sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_studio"),
     ).toBe("Build this in studio");
   });
+
+  // SKY-15589: the axios message ("Request failed with status code 402") hid
+  // the server's billing guidance behind a generic toast.
+  test.each([
+    { handoff: false, status: 402 },
+    { handoff: true, status: 402 },
+    { handoff: false, status: 422 },
+    { handoff: true, status: 422 },
+  ])(
+    "surfaces the server detail on a $status (handoff=$handoff)",
+    async ({ handoff, status }) => {
+      const detail =
+        status === 402
+          ? "Credits exhausted. Upgrade your plan in Billing."
+          : "Prompt must be at least 10 characters.";
+      mockPost.mockRejectedValue({
+        isAxiosError: true,
+        message: `Request failed with status code ${status}`,
+        response: { status, data: { detail } },
+      });
+
+      renderPromptBox(handoff);
+      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+        target: { value: "Visit the docs" },
+      });
+      fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+      await waitFor(() =>
+        expect(vi.mocked(toast)).toHaveBeenCalledWith(
+          expect.objectContaining({
+            variant: "destructive",
+            description: detail,
+          }),
+        ),
+      );
+      const args = vi.mocked(toast).mock.calls[0]![0];
+      if (status === 402) {
+        expect(args.title).toBe("Not enough credits");
+        const action = args.action;
+        if (
+          !isValidElement<{
+            altText: string;
+            asChild?: boolean;
+            children: unknown;
+          }>(action)
+        ) {
+          throw new Error("402 toast has no action element");
+        }
+        expect(action.type).toBe(ToastAction);
+        expect(action.props.altText).toBe("Go to Billing");
+        expect(action.props.asChild).toBe(true);
+        const link = action.props.children;
+        if (!isValidElement<{ to: string; children: unknown }>(link)) {
+          throw new Error("402 toast action has no link child");
+        }
+        expect(link.type).toBe(Link);
+        expect(link.props.to).toBe("/billing");
+        expect(link.props.children).toBe("Go to Billing");
+      } else {
+        expect(args.title).toBe(
+          handoff ? "Error creating agent" : "Error creating agent from prompt",
+        );
+        expect(args.action).toBeUndefined();
+      }
+      expect(mockNavigate).not.toHaveBeenCalled();
+    },
+  );
 });

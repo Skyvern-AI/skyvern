@@ -46,6 +46,7 @@ class _SelectedTargetClosed(_SelectedError):
 def _selection(*, native_target_closed: bool = False) -> BrowserEngineSelection:
     engine_error_types = (_SelectedError, TargetClosedError) if native_target_closed else (_SelectedError,)
     selection = MagicMock(spec=BrowserEngineSelection)
+    selection.name = "selected-engine"
     selection.is_engine_error.side_effect = lambda exc: isinstance(exc, engine_error_types)
     selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedTimeout)
     selection.classify_error.side_effect = lambda exc: (
@@ -58,6 +59,7 @@ def _stock_selection() -> BrowserEngineSelection:
     """A bound selection modeling stock Playwright: the base Error family classifies to
     BrowserAutomationError, and only the native TargetClosedError maps to the rich target-closed type."""
     selection = MagicMock(spec=BrowserEngineSelection)
+    selection.name = "stock-playwright"
     selection.is_engine_error.side_effect = lambda exc: isinstance(exc, PlaywrightError)
     selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, PlaywrightTimeoutError)
     selection.classify_error.side_effect = lambda exc: (
@@ -154,13 +156,19 @@ class TestScreenshotLoadStateNonFatal:
         page.screenshot.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_detailed_mode_waits_for_domcontentloaded(self) -> None:
+    async def test_detailed_mode_waits_for_load(self) -> None:
         page = _make_page(b"image-bytes")
 
-        await _current_viewpoint_screenshot_helper(page, mode=ScreenshotMode.DETAILED)
+        result = await _current_viewpoint_screenshot_helper(page, mode=ScreenshotMode.DETAILED)
 
+        assert result == b"image-bytes"
         page.wait_for_load_state.assert_awaited_once()
-        assert page.wait_for_load_state.await_args.args[0] == "domcontentloaded"
+        assert page.wait_for_load_state.await_args.args[0] == "load"
+        # The configured (default 5s) budget is preserved — the event changed, not the timeout policy.
+        assert (
+            page.wait_for_load_state.await_args.kwargs["timeout"]
+            == SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+        )
 
     @pytest.mark.asyncio
     async def test_lite_mode_skips_load_state_wait(self) -> None:

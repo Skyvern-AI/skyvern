@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import hashlib
 import json
@@ -41,6 +40,8 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
+    WRAPPER_SCOPE_GLOBAL_REASON_CODE,
+    CodeBlockPreflightDiagnostic,
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
 )
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
+    ProposalDisposition,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
 from skyvern.forge.sdk.copilot.google_connection_notice import (
@@ -66,6 +68,7 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 )
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
+    code_block_available_contracts_by_label,
     declared_string_workflow_parameter_keys,
     declared_workflow_parameter_keys,
 )
@@ -107,18 +110,30 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _normalize_copilot_yaml,
     _process_workflow_yaml,
+    dump_workflow_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
+    with_workflow_yaml_title,
 )
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.schemas.workflow_copilot import copilot_proposal_metadata
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
 from skyvern.schemas.proxy_location import runtime_proxy_location
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import (
+    BLOCK_YAML_SUBCLASSES,
+    BlockType,
+    CodeBlockYAML,
+    ForLoopBlockYAML,
+    WhileLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import validate_webhook_url
 
@@ -136,11 +151,14 @@ from .banned_blocks import (
     _task_v3_pure_policy_violations,
     _task_v3_pure_reject_message,
 )
-from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
+from .credentials import (
+    _credential_id_misbinding_findings,
+    _credential_reference_validation_error,
+    canonicalize_named_google_sheet_bindings,
+)
 from .frontier import (
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
-    _workflow_requires_canonical_persist,
 )
 from .guardrails import _authority_tool_error
 
@@ -743,16 +761,21 @@ def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_y
     return changed
 
 
-def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[str, list[str]]:
-    """Labels per advisory message, computed from every changed block rather than the
+def _advisory_labels_by_diagnostic(
+    changed_code_blocks: Mapping[str, str], accepted_yaml: str
+) -> dict[CodeBlockPreflightDiagnostic, list[str]]:
+    """Labels per advisory diagnostic, computed from every changed block rather than the
     budget-truncated ``stored_code`` so an oversized block still gets its note."""
-    labels_by_message: dict[str, list[str]] = {}
+    contracts = code_block_available_contracts_by_label(accepted_yaml)
+    labels_by_diagnostic: dict[CodeBlockPreflightDiagnostic, list[str]] = {}
     for label, code in sorted(changed_code_blocks.items()):
-        for diagnostic in advisory_code_block_diagnostics(code):
-            labels = labels_by_message.setdefault(diagnostic.message, [])
+        contract = contracts.get(label)
+        parameter_keys = contract.parameter_keys if contract is not None else ()
+        for diagnostic in advisory_code_block_diagnostics(code, parameter_keys=parameter_keys):
+            labels = labels_by_diagnostic.setdefault(diagnostic, [])
             if label not in labels:
                 labels.append(label)
-    return labels_by_message
+    return labels_by_diagnostic
 
 
 async def _scanner_advisory_labels_by_message(
@@ -3753,14 +3776,44 @@ def _missing_scouted_rung_violation_text(artifact: str) -> str:
     return "The persisted draft is missing scouted rung(s). " + artifact
 
 
+PersistenceDisposition = Literal["staged", "staged_auto_apply"]
+
+# Both values are staged: a write is never persisted at tool time, and the turn can still decline to
+# apply it. ``staged_auto_apply`` reports only that the chat opted into auto-apply; an unknown setting
+# is ``staged``.
+_PERSISTENCE_MESSAGES: dict[PersistenceDisposition, str] = {
+    "staged": (
+        "Staged as a proposal for review. Accepting it makes this version the saved workflow; "
+        "discarding it keeps the current one."
+    ),
+    "staged_auto_apply": (
+        "Staged as a proposal. This chat accepts proposals automatically, so this one becomes the saved "
+        "workflow at the end of the turn if the turn finishes cleanly and the change is fully verified. "
+        "Otherwise it stays staged for review."
+    ),
+}
+
+
+READINESS_WAIT_ADVISORY_REASON_CODE = "code_block_readiness_wait_advisory"
+# A nested `global` fails every run, but the run reports NameError at the use site and cannot
+# report that the block body is compiled inside a wrapper function the author never sees.
+WRAPPER_SCOPE_ADVISORY_REASON_CODE = "code_block_wrapper_scope_advisory"
+
+
+def persistence_disposition(ctx: AgentContext) -> PersistenceDisposition:
+    return "staged_auto_apply" if ctx.auto_accept is True else "staged"
+
+
 def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     """The combined update-and-run tool returns the run's result, not the update's, so what the
-    update said about the persisted draft reaches the model only if it is carried across."""
+    update said about the staged draft reaches the model only if it is carried across."""
     update_data = update_result.get("data")
     if not isinstance(update_data, dict):
         return result
     carried = {
-        key: update_data[key] for key in ("findings", "stored_code", "stored_code_withheld") if update_data.get(key)
+        key: update_data[key]
+        for key in ("findings", "stored_code", "stored_code_withheld", "persistence", "persistence_message")
+        if update_data.get(key)
     }
     if not carried:
         return result
@@ -3777,7 +3830,7 @@ def _author_time_findings(
     *,
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
-    code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    code_block_diagnostics: Mapping[CodeBlockPreflightDiagnostic, list[str]] | None = None,
     scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
@@ -3802,18 +3855,20 @@ def _author_time_findings(
                 "summary": "\n".join(str(violation) for violation in metadata_violations),
             }
         )
-    # A contentless readiness wait is intermittent by construction: it passes on every run where the
-    # page happens to settle, so a green test-run cannot tell the author the wait encodes nothing.
-    if code_block_diagnostics:
-        findings.append(
-            {
-                "reason_code": "code_block_readiness_wait_advisory",
-                "summary": "\n".join(
-                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
-                    for message, labels in code_block_diagnostics.items()
-                ),
-            }
+    # Neither defect is visible to a green test-run: a contentless readiness wait passes whenever the
+    # page happens to settle, and a write-only wrapper-scope `global` silently drops the update.
+    summaries_by_reason_code: dict[str, list[str]] = {}
+    for diagnostic, labels in (code_block_diagnostics or {}).items():
+        reason_code = (
+            WRAPPER_SCOPE_ADVISORY_REASON_CODE
+            if diagnostic.code == WRAPPER_SCOPE_GLOBAL_REASON_CODE
+            else READINESS_WAIT_ADVISORY_REASON_CODE
         )
+        summaries_by_reason_code.setdefault(reason_code, []).append(
+            f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {diagnostic.message}"
+        )
+    for reason_code, summaries in summaries_by_reason_code.items():
+        findings.append({"reason_code": reason_code, "summary": "\n".join(summaries)})
     # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
     # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
     if scanner_diagnostics:
@@ -3829,29 +3884,208 @@ def _author_time_findings(
     return findings
 
 
-async def _record_canonical_write_ownership(ctx: CopilotContext, workflow: Workflow) -> None:
-    """Stamp the turn's marker with what it just left canonical as.
+def _normalized_canvas_for_proposal_restore(
+    workflow_yaml: str,
+    *,
+    inherited_code_version: int | None = None,
+) -> WorkflowCreateYAMLRequest:
+    """Normalize editor-only empty code outlines before comparing canvas custody.
 
-    Best-effort: a missed stamp only costs this turn its rollback claim, while raising here
-    would fail a write that already succeeded. Canonical is re-read rather than fingerprinted
-    from the in-memory object so the value matches what reconcile computes.
+    The editor submits ``steps: []`` while a persisted code block round-trips that
+    same absence as ``steps: null``. Both execute identically, so this representational
+    difference must not make an unchanged canonical canvas suppress proposal recovery.
     """
-    with contextlib.suppress(Exception):
-        workflow_permanent_id = workflow.workflow_permanent_id
-        if not (ctx.workflow_copilot_chat_id and ctx.turn_id and workflow_permanent_id and ctx.organization_id):
-            return
-        persisted = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
+    normalized = _normalize_copilot_yaml(workflow_yaml)
+    normalized.webhook_callback_url = normalized.webhook_callback_url or None
+    normalized.extra_http_headers = normalized.extra_http_headers or None
+    normalized.mask_secrets = bool(normalized.mask_secrets)
+    if normalized.code_version is None:
+        normalized.code_version = inherited_code_version
+
+    def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
+        for block in blocks:
+            if isinstance(block, CodeBlockYAML):
+                block.steps = block.steps or None
+                block.parameter_keys = block.parameter_keys or None
+            elif isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
+                normalize_blocks(block.loop_blocks)
+
+    normalize_blocks(normalized.workflow_definition.blocks)
+    return normalized
+
+
+async def restore_pending_workflow_proposal(
+    ctx: CopilotContext,
+    *,
+    required_workflow_run_id: str | None = None,
+) -> None:
+    """Restore only the server's pending proposal, optionally constrained to its exact run."""
+    if ctx.staged_workflow is not None or not ctx.workflow_copilot_chat_id:
+        return
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+    )
+    if chat is None or chat.workflow_permanent_id != ctx.workflow_permanent_id:
+        return
+    proposal = chat.proposed_workflow
+    if not isinstance(proposal, dict):
+        return
+    metadata = copilot_proposal_metadata(proposal)
+    if metadata is not None:
+        # The token records the revision this turn observed, not the one it adopted. A turn that
+        # declines the candidate's content still has to supersede it when the model authors an edit,
+        # so every early return below this point keeps the token.
+        ctx.proposal_owner_turn_id = metadata.owner_turn_id
+        ctx.proposal_revision = metadata.revision
+        ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    if required_workflow_run_id is not None and (
+        metadata is None or metadata.workflow_run_id != required_workflow_run_id
+    ):
+        LOG.info(
+            "copilot_pending_proposal_restore_rejected",
+            reason="associated_run_mismatch",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            required_workflow_run_id=required_workflow_run_id,
+            proposal_workflow_run_id=metadata.workflow_run_id if metadata is not None else None,
+        )
+        return
+    if metadata is not None:
+        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
         )
-        if persisted is None:
-            return
-        await app.DATABASE.workflow_params.record_pending_copilot_turn_canonical_write(
-            organization_id=ctx.organization_id,
-            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
-            turn_id=ctx.turn_id,
-            fingerprint=workflow_content_fingerprint(persisted.model_dump(mode="json")),
+        observed_fingerprint = (
+            workflow_content_fingerprint(canonical.model_dump(mode="json")) if canonical is not None else None
         )
+        if canonical is None or observed_fingerprint != metadata.canonical_fingerprint:
+            LOG.info(
+                "copilot_pending_proposal_restore_rejected",
+                reason="canonical_fingerprint_mismatch",
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                expected_canonical_fingerprint=metadata.canonical_fingerprint,
+                observed_canonical_fingerprint=observed_fingerprint,
+            )
+            return
+    workflow_yaml = proposal.get("_copilot_yaml")
+    if not isinstance(workflow_yaml, str) or not workflow_yaml:
+        return
+    if ctx.workflow_yaml:
+        # An explicit canvas edit remains the model's input to the normal update tool.
+        # Only restore over the persisted canvas or the same pending proposal.
+        try:
+            known_sources = [workflow_yaml]
+            if ctx.persisted_workflow_yaml:
+                known_sources.append(ctx.persisted_workflow_yaml)
+            source_canvases = [_normalized_canvas_for_proposal_restore(source) for source in known_sources]
+            if all(
+                _normalized_canvas_for_proposal_restore(
+                    ctx.workflow_yaml,
+                    inherited_code_version=source.code_version,
+                )
+                != source
+                for source in source_canvases
+            ):
+                LOG.info(
+                    "copilot_pending_proposal_restore_rejected",
+                    reason="canvas_custody_mismatch",
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                )
+                return
+        except (yaml.YAMLError, ValidationError):
+            return
+    if "workflow_definition" in proposal:
+        workflow = Workflow.model_validate(proposal)
+        authored = _normalize_copilot_yaml(workflow_yaml)
+        if "cdp_connect_headers" in authored.model_fields_set:
+            # Workflow JSON masks these values for API disclosure; authored YAML retains
+            # the submitted header binding, including an explicit clear.
+            workflow.cdp_connect_headers = authored.cdp_connect_headers or {}
+        if "max_elapsed_time_minutes" in authored.model_fields_set:
+            workflow.max_elapsed_time_minutes = authored.max_elapsed_time_minutes
+        inherits_headers = (
+            "cdp_connect_headers" not in authored.model_fields_set and workflow.cdp_connect_headers is None
+        )
+        inherits_limit = (
+            "max_elapsed_time_minutes" not in authored.model_fields_set and workflow.max_elapsed_time_minutes is None
+        )
+        if inherits_headers or inherits_limit:
+            # Older proposal writers stored defaults rather than resolved omitted settings.
+            saved = await app.DATABASE.workflows.get_workflow(
+                workflow_id=ctx.workflow_id, organization_id=ctx.organization_id
+            )
+            if saved is not None:
+                if inherits_headers:
+                    workflow.cdp_connect_headers = saved.cdp_connect_headers
+                if inherits_limit:
+                    workflow.max_elapsed_time_minutes = saved.max_elapsed_time_minutes
+    else:
+        # Older proposals persisted only YAML.
+        workflow = await _process_workflow_yaml(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            workflow_yaml=workflow_yaml,
+            settings_fallback_yaml=ctx.persisted_workflow_yaml,
+        )
+    ctx.staged_workflow = workflow
+    ctx.staged_workflow_yaml = workflow_yaml
+    ctx.workflow_yaml = workflow_yaml
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = workflow_yaml
+    if metadata is not None:
+        ctx.proposal_workflow_run_id = metadata.workflow_run_id
+
+
+def _candidate_proposal_data(workflow: Workflow, workflow_yaml: str, ctx: CopilotContext) -> dict[str, Any]:
+    proposal = dict(workflow.model_dump(mode="json"))
+    proposal["_copilot_yaml"] = workflow_yaml
+    proposal["_copilot_unvalidated"] = True
+    if ctx.code_artifact_metadata:
+        proposal["_copilot_code_artifact_metadata"] = ctx.code_artifact_metadata
+    return proposal
+
+
+async def publish_workflow_candidate(
+    ctx: CopilotContext,
+    *,
+    workflow: Workflow,
+    workflow_yaml: str,
+    disposition: ProposalDisposition = "review_untested",
+) -> str:
+    """Durably publish admitted bytes before they become staged or visible.
+
+    Returns the bytes that were stored. Accept reparses them without going back through
+    ``_process_workflow_yaml``, so the title is resolved here — once, before the first durable
+    write — and callers stage what was stored so every later equality check compares like with like.
+    """
+    if not ctx.workflow_copilot_chat_id:
+        return workflow_yaml
+    workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if canonical is None:
+        raise RuntimeError("Canonical workflow disappeared before candidate publication")
+    updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+        proposal=_candidate_proposal_data(workflow, workflow_yaml, ctx),
+        owner_turn_id=ctx.turn_id,
+        canonical_fingerprint=workflow_content_fingerprint(canonical.model_dump(mode="json")),
+        disposition=disposition,
+        expected_owner_turn_id=ctx.proposal_owner_turn_id,
+        expected_revision=ctx.proposal_revision,
+    )
+    metadata = copilot_proposal_metadata(updated_chat.proposed_workflow)
+    if metadata is None:
+        raise RuntimeError("Candidate publication returned no ownership token")
+    ctx.proposal_owner_turn_id = metadata.owner_turn_id
+    ctx.proposal_revision = metadata.revision
+    ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    ctx.proposal_workflow_run_id = metadata.workflow_run_id
+    return workflow_yaml
 
 
 async def _update_workflow(
@@ -4049,6 +4283,9 @@ async def _update_workflow(
         )
 
     try:
+        # Before redaction: a connection name equal to a registered scrub value would otherwise
+        # reach the resolver already replaced by the placeholder.
+        workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4069,6 +4306,20 @@ async def _update_workflow(
             if isinstance(ctx, CopilotContext):
                 ctx.clear_persisted_completion_contract = clear_persisted_completion_contract
             params["workflow_yaml"] = workflow_yaml
+        # Retain settings whose omission means inheritance in the durable YAML. Header
+        # values cannot be reconstructed from the masked Workflow JSON after reload.
+        submitted_definition = parse_workflow_yaml(workflow_yaml)
+        prior_definition = parse_workflow_yaml(prior_yaml) if prior_yaml else None
+        if isinstance(submitted_definition, dict) and isinstance(prior_definition, dict):
+            inherited_settings = {
+                key: prior_definition[key]
+                for key in ("cdp_connect_headers", "max_elapsed_time_minutes")
+                if key not in submitted_definition and key in prior_definition
+            }
+            if inherited_settings:
+                submitted_definition.update(inherited_settings)
+                workflow_yaml = dump_workflow_yaml(submitted_definition)
+                params["workflow_yaml"] = workflow_yaml
         prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
@@ -4085,51 +4336,40 @@ async def _update_workflow(
             workflow.webhook_callback_url = validate_webhook_url(webhook_callback_url)
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
-        # Param / top-level setting changes go through canonical because
-        # prepare_workflow and the runtime parameter-row read consume canonical
-        # values; terminal handlers roll back on non-auto-accept.
-        requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
-        if requires_canonical_persist:
-            await app.WORKFLOW_SERVICE.update_workflow_definition(
-                workflow_id=ctx.workflow_id,
-                organization_id=ctx.organization_id,
-                title=workflow.title,
-                description=workflow.description,
-                workflow_definition=workflow.workflow_definition,
-                proxy_location=workflow.proxy_location,
-                webhook_callback_url=workflow.webhook_callback_url,
-                totp_verification_url=workflow.totp_verification_url,
-                totp_identifier=workflow.totp_identifier,
-                persist_browser_session=workflow.persist_browser_session,
-                reuse_browser_session=workflow.reuse_browser_session,
-                mask_secrets=getattr(workflow, "mask_secrets", False),
-                pin_saved_session_ip=workflow.pin_saved_session_ip,
-                browser_profile_id=workflow.browser_profile_id,
-                browser_profile_key=workflow.browser_profile_key,
-                model=workflow.model,
-                max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
-                extra_http_headers=workflow.extra_http_headers,
-                cdp_connect_headers=workflow.cdp_connect_headers,
-                run_with=workflow.run_with,
-                ai_fallback=workflow.ai_fallback,
-                cache_key=workflow.cache_key,
-                adaptive_caching=workflow.adaptive_caching,
-                enable_self_healing=workflow.enable_self_healing,
-                code_version=workflow.code_version,
-                run_sequentially=workflow.run_sequentially,
-                sequential_key=workflow.sequential_key,
-                edited_by="copilot",
-                preserve_completion_contract=not getattr(ctx, "clear_persisted_completion_contract", False),
-            )
-            ctx.canonical_was_persisted_due_to_param_change = True
-            # isinstance narrows the declared ``AgentContext`` to the marker-aware
-            # ``CopilotContext`` for mypy, matching the narrative-emit seam below.
-            if isinstance(ctx, CopilotContext):
-                await _record_canonical_write_ownership(ctx, workflow)
-        ctx.staged_workflow_yaml = workflow_yaml
-        ctx.staged_workflow = workflow
-        ctx.has_staged_proposal = True
-        ctx.workflow_yaml = workflow_yaml
+        # Runs materialize this proposal as their own version. The saved workflow
+        # remains unchanged until Accept, including parameter and setting edits.
+        if isinstance(ctx, CopilotContext):
+            # The durable write and the staged fields it backs move together, so a parallel tool
+            # call cannot read a staged draft the store has not accepted.
+            async with ctx.proposal_mutation_lock:
+                try:
+                    workflow_yaml = await publish_workflow_candidate(
+                        ctx, workflow=workflow, workflow_yaml=workflow_yaml
+                    )
+                except CopilotProposalConflictError as conflict:
+                    LOG.info(
+                        "copilot_candidate_publication_conflict",
+                        workflow_permanent_id=ctx.workflow_permanent_id,
+                        proposal_owner_turn_id=ctx.proposal_owner_turn_id,
+                        proposal_revision=ctx.proposal_revision,
+                        error=str(conflict),
+                    )
+                    return {
+                        "ok": False,
+                        "error": (
+                            "The pending proposal changed while this edit was being saved, so nothing was written. "
+                            "Read the current workflow again before re-submitting this edit."
+                        ),
+                    }
+                ctx.staged_workflow_yaml = workflow_yaml
+                ctx.staged_workflow = workflow
+                ctx.has_staged_proposal = True
+                ctx.workflow_yaml = workflow_yaml
+        else:
+            ctx.staged_workflow_yaml = workflow_yaml
+            ctx.staged_workflow = workflow
+            ctx.has_staged_proposal = True
+            ctx.workflow_yaml = workflow_yaml
         if isinstance(ctx, CopilotContext):
             ctx.runner_code_block_associations_by_label = runner_code_block_associations(
                 workflow_yaml,
@@ -4234,8 +4474,12 @@ async def _update_workflow(
                 )
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
+        disposition = persistence_disposition(ctx)
+        disposition_message = _PERSISTENCE_MESSAGES[disposition]
         data: dict[str, Any] = {
-            "message": "Workflow updated successfully.",
+            "persistence": disposition,
+            "persistence_message": disposition_message,
+            "message": disposition_message,
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
         stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
@@ -4252,7 +4496,7 @@ async def _update_workflow(
         # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
         # crafted block code must never turn a successful update into a failed turn.
         try:
-            advisory_labels = _advisory_labels_by_message(changed_code_blocks)
+            advisory_labels = _advisory_labels_by_diagnostic(changed_code_blocks, workflow_yaml)
         except Exception as advisory_err:
             LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
             advisory_labels = {}
@@ -4269,6 +4513,10 @@ async def _update_workflow(
         )
         if findings:
             data["findings"] = findings
+        if google_connection_resolution:
+            data["google_connection_resolution"] = google_connection_resolution
+        if isinstance(ctx, CopilotContext) and ctx.google_connection_notices:
+            data["google_connection_notices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
         return {
             "ok": True,
             "data": data,

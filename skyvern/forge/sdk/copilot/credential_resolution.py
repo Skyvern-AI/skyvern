@@ -7,7 +7,7 @@ the evidence at hand, not a set computed once at turn start.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
@@ -71,6 +71,26 @@ def url_parts(url: str) -> tuple[str, str, str] | None:
     # actually matches; the host tier alone would let any page on the host claim the credential.
     without_query = f"{origin}{path}"
     return (f"{without_query}?{query}" if query else without_query), without_query, origin
+
+
+def safe_admitted_url(url: str) -> str:
+    """The part of an admitted login URL that the origin check reads, with nothing else.
+
+    A live sign-in URL carries `?state=`/`?code=`/reset tokens and can carry `user:pass@`. This value
+    is persisted into the chat context and enters the next model prompt, so it keeps only the scheme,
+    host, port and path the exact and path tiers match on.
+    """
+    parsed = _parse_url(url if "://" in url else f"https://{url}")
+    if parsed is None or not parsed.hostname:
+        return ""
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ""
+    # urlparse strips the brackets an IPv6 literal needs; without them the port reads as part of
+    # the address and the next turn's origin check cannot canonicalize it.
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme.lower()}://{host}{port}{parsed.path.rstrip('/')}"
 
 
 def loggable_origin(url: str) -> str:
@@ -150,12 +170,12 @@ def credential_reference_spans(message: str, reference: str) -> list[tuple[int, 
         start = index + 1
 
 
-def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
-    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
-    candidates = {value for credential in credentials for value in (credential.name, credential.credential_id) if value}
+def grounded_references(message: str, candidates: Iterable[str]) -> set[str]:
+    """Find complete candidate literals in a turn, preferring the longest overlap: a shorter
+    candidate that only occurs inside a longer one is not cited on its own."""
     occurrences = [
         (reference, start, end)
-        for reference in candidates
+        for reference in {candidate for candidate in candidates if candidate}
         for start, end in credential_reference_spans(message, reference)
     ]
     return {
@@ -166,6 +186,13 @@ def grounded_credential_references(message: str, credentials: list[Credential]) 
             for _other, other_start, other_end in occurrences
         )
     }
+
+
+def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
+    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
+    return grounded_references(
+        message, (value for credential in credentials for value in (credential.name, credential.credential_id))
+    )
 
 
 def _match_by_url_tiered(

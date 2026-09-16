@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.interruption import MINIMAL_CANCEL_STOP
 from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
     OutputPolicyReason,
@@ -33,6 +34,10 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _credential_run_approval_blocker_signal,
+    _retire_stale_google_connection_denial,
+)
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
@@ -230,6 +235,24 @@ def test_shim_overrides_proposal_even_when_pre_override_result_carries_workflow(
     assert overridden.workflow_yaml is None
 
 
+@pytest.mark.parametrize(("authoring_barred", "expected_clear"), [(False, True), (True, False)])
+def test_shim_carries_authoring_barred_forward(authoring_barred: bool, expected_clear: bool) -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal()
+    result = AgentResult(
+        user_response="clarification from a turn that never authored",
+        updated_workflow=None,
+        global_llm_context=None,
+        clear_proposed_workflow=False,
+        authoring_barred=authoring_barred,
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.authoring_barred is authoring_barred
+    assert overridden.clear_proposed_workflow is expected_clear
+
+
 def test_blocker_signal_wins_over_demonstrated_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal(user_facing="I need one more detail before I can continue.")
@@ -295,7 +318,7 @@ def test_output_policy_generic_block_uses_only_safety_and_draft_evidence() -> No
     _seed_terminal_evidence(ctx)
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
 
-    result = _blocked_result(ctx, OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
+    result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
     assert result.response_type == "ASK_QUESTION"
     assert result.updated_workflow is fake_workflow
@@ -323,7 +346,7 @@ def test_output_policy_recorded_evidence_does_not_create_a_policy_recheck(monkey
 
     result = _blocked_result(
         ctx,
-        OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
+        OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         output_kind=CopilotOutputKind.REFUSAL,
     )
 
@@ -337,7 +360,7 @@ def test_output_policy_generic_block_requires_clean_terminal_evidence() -> None:
     adversarial.last_run_blocks_workflow_run_id = "wr_hidden"
 
     for ctx in (no_recorded, adversarial):
-        result = _blocked_result(ctx, OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
+        result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
         assert (
             result.user_response
             == "I could not safely return that chat reply. Please adjust the request and try again."
@@ -467,6 +490,28 @@ def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> 
     assert result.user_response == terminal.user_facing_reason
 
 
+def test_turn_halt_exit_never_makes_an_interactive_tested_draft_auto_applicable() -> None:
+    ctx = _ctx()
+    workflow = object()
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = "title: tested\nworkflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    terminal = _signal(
+        kind="tool_error",
+        user_facing="The browser session was lost after the test.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="tool_error_browser_session_lost",
+        blocked_tool="update_and_run_blocks",
+    )
+    halt = TurnHalt(kind=TurnHaltKind.BROWSER_SESSION_LOST, blocker_signal=terminal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.updated_workflow is workflow
+    assert result.proposal_disposition == "review_untested"
+
+
 def _seed_verified_outcome(ctx: CopilotContext) -> None:
     ctx.last_run_blocks_workflow_run_id = "wr_test"
     ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
@@ -478,7 +523,6 @@ def _seed_verified_outcome(ctx: CopilotContext) -> None:
 def test_runtime_self_heal_reply_never_echoes_run_output() -> None:
     ctx = _ctx()
     ctx.turn_origin = TurnOrigin.runtime_self_heal
-    ctx.verified_terminal_block_outputs = {"result": {"access_token": "secret-value"}}
 
     response = _runtime_self_heal_success_reply(ctx)
 
@@ -612,6 +656,49 @@ def test_unapproved_google_connection_preserves_verified_clickable_choices() -> 
     assert result.turn_outcome.connected_account_choices == choices
 
 
+def test_retired_google_denial_lets_the_completed_run_reply_stand() -> None:
+    completed_reply = "I ran both blocks and wrote the value into the sheet."
+    definition = {
+        "parameters": [],
+        "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_admitted"}],
+    }
+
+    def denied_ctx() -> CopilotContext:
+        ctx = _ctx()
+        ctx.request_policy = RequestPolicy()
+        signal = _credential_run_approval_blocker_signal(["goac_admitted"], ctx.request_policy)
+        assert signal is not None
+        ctx.blocker_signal = signal
+        ctx.latest_tool_blocker_signal = signal
+        ctx.tool_blocker_signals = [signal]
+        ctx.connected_account_recovery_choices = [
+            ConnectedAccountChoice(connection_id="goac_admitted", name="Sheets", state="active")
+        ]
+        return ctx
+
+    standing = denied_ctx()
+    blocked = _finalize_result_with_blocker_override(standing, _agent_result(completed_reply))
+
+    assert blocked.user_response != completed_reply
+    assert blocked.turn_outcome is not None
+    assert blocked.turn_outcome.connected_account_choices == standing.connected_account_recovery_choices
+
+    retired = denied_ctx()
+    _retire_stale_google_connection_denial(
+        retired,
+        workflow_definition=definition,
+        additional_approved_ids={"goac_admitted"},
+    )
+    preserved = _finalize_result_with_blocker_override(retired, _agent_result(completed_reply))
+
+    assert retired.blocker_signal is None
+    assert retired.latest_tool_blocker_signal is None
+    assert retired.tool_blocker_signals == []
+    assert retired.connected_account_recovery_choices == []
+    assert preserved.user_response == completed_reply
+    assert preserved.turn_outcome is None
+
+
 def test_password_blocker_does_not_reuse_prior_google_choices() -> None:
     choices = [ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active")]
     ctx = _ctx()
@@ -636,7 +723,7 @@ def test_shim_over_a_cancelled_turn_keeps_the_stop_label() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal()
     result = AgentResult(
-        user_response="Cancelled by user.",
+        user_response=MINIMAL_CANCEL_STOP,
         updated_workflow=None,
         global_llm_context=None,
         cancelled=True,

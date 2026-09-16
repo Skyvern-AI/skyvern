@@ -10,14 +10,25 @@ and wait() (accepts both seconds= and timeout_ms= parameter styles).
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import time
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.api_app as api_app_module
+import skyvern.forge.sdk.artifact.manager as artifact_manager_module
+import skyvern.forge.sdk.artifact.storage.base as storage_base_module
+import skyvern.forge.sdk.artifact.storage.local as local_storage_module
+import skyvern.forge.sdk.workflow.service as workflow_service_module
+import skyvern.library.embedded_server_factory as embedded_server_module
 from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -28,12 +39,24 @@ from skyvern.exceptions import (
     ScriptTerminationException,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    StaleFrameSelectionError,
 )
+from skyvern.forge.sdk.api import files as files_module
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.library.skyvern import Skyvern
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
+from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
 
 
 class _KeyboardStub:
@@ -581,6 +604,29 @@ async def test_terminate_raises_script_termination_exception_without_context(moc
         ):
             with pytest.raises(ScriptTerminationException, match="Terminate called: page not found"):
                 await script_page.terminate(errors=["page not found"])
+
+
+@pytest.mark.asyncio
+async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scraped_page, mock_ai, monkeypatch):
+    """The context-free solve_captcha fallback (no org/task/step) must arm the vendor solver lifecycle
+    around auto_solve_captchas — enter, solve, exit — or a factory-created (solver-off) session never arms."""
+    from skyvern.forge import app
+    from tests.unit.conftest import ScopeRecordingAgentFunction
+
+    agent_function = ScopeRecordingAgentFunction(auto_solve=True)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+
+    with (
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+            return_value=None,
+        ),
+        patch.object(script_page, "_wait_for_page_ready_before_action", new=AsyncMock()),
+    ):
+        await script_page.solve_captcha()
+
+    assert agent_function.events == ["enter", "solve", "exit"]
 
 
 @pytest.mark.asyncio
@@ -2514,24 +2560,28 @@ class _RecordingLocator:
 
 
 class _RecordingLocatorScope:
-    def __init__(self, locator: _RecordingLocator) -> None:
+    def __init__(self, locator: _RecordingLocator, page: object) -> None:
         self._locator = locator
+        self.page = page
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
 
     def locator(self, _selector: str, **_kwargs: object) -> _RecordingLocator:
         return self._locator
 
 
 def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) -> ScriptSkyvernPage:
+    raw_page = create_mock_page()
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
-            page=create_mock_page(),
+            page=raw_page,
             ai=mock_ai,
         )
-    script_page._working_frame = _RecordingLocatorScope(locator)
+    script_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return script_page
 
 
@@ -2550,7 +2600,7 @@ def _skyvern_page_with_locator(
             ai=mock_ai,
             engine_selection=engine_selection,
         )
-    skyvern_page._working_frame = _RecordingLocatorScope(locator)
+    skyvern_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return skyvern_page
 
 
@@ -3366,8 +3416,9 @@ class TestAiClickRunsRegisteredClickSetup:
         delete_spy.assert_not_awaited()
         assert page_ai._record_element_fallback_episode.await_args.kwargs["v3_parent_episode_id"] == "ep_1"
 
+    @pytest.mark.parametrize("handle_result", [[ActionAbort()], [ActionAbort(desired_state_reached=True)]])
     @pytest.mark.asyncio
-    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self):
+    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self, handle_result):
         # SKY-14052: handle_click_action's own ClickContext.desired_state guard can suppress the
         # click with an ActionAbort the same way a registered per-site setup does, but it arrives
         # via `handle_result`, not `setup_result` (no per-site setup is registered here). It must
@@ -3375,7 +3426,7 @@ class TestAiClickRunsRegisteredClickSetup:
         page_ai, _locator = self._build_page_ai()
         page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
         delete_spy = AsyncMock()
-        with self._patched(setup_result=None, handle_result=[ActionAbort()]) as spies:
+        with self._patched(setup_result=None, handle_result=handle_result) as spies:
             with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
                 result = await page_ai.ai_click(selector="#btn", intention="toggle owner")
 
@@ -3706,3 +3757,347 @@ class TestCachedClickDesiredState:
         assert self._clicks(locator) == [("click", None)]
         assert ("evaluate", None) not in locator.calls
         assert locator.click_kwargs == [{"timeout": settings.BROWSER_ACTION_TIMEOUT_MS}]
+
+
+def test_locator_scope_refuses_a_skycdp_frame_owned_by_another_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = CdpFrame(MagicMock(), "frame-1", url="https://pay.example.com/checkout")
+
+    with pytest.raises(StaleFrameSelectionError):
+        skyvern_page.locator_scope.locator("#card")
+
+
+def test_locator_scope_accepts_a_skycdp_frame_owned_by_this_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    frame = CdpFrame(skyvern_page.page, "frame-1", url="https://pay.example.com/checkout")
+    skyvern_page._working_frame = frame
+
+    assert skyvern_page.locator_scope is frame
+
+
+class _UnownedFrame:
+    def __init__(self) -> None:
+        self.page = MagicMock()
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
+
+
+def _page_with_unowned_frame(mock_ai) -> SkyvernPage:
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = _UnownedFrame()
+    return skyvern_page
+
+
+_TEXT_FIELD = {"selector": "#name", "type": "text", "tag": "input", "label": "Name"}
+_RADIO_GROUP_FIELD = {
+    "selector": "#q",
+    "type": "radio_group",
+    "tag": "input",
+    "label": "Q",
+    "options": [{"label": "Yes", "selector": "#yes"}],
+}
+_FILE_FIELD = {"selector": "#cv", "type": "file", "tag": "input", "name": "resume"}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda page: page.fill_autocomplete(selector="#city", value="Paris"),
+        lambda page: page.fill(selector="#name", value="Ada"),
+        lambda page: page.upload_file(selector="#cv", files="https://example.com/cv.pdf"),
+        lambda page: page.select_option(selector="#country", value="FR"),
+        lambda page: page.fill_from_mapping([_TEXT_FIELD], {0: "Ada"}),
+        lambda page: page._fill_with_planned_value(_TEXT_FIELD, "Ada", None),
+        lambda page: page.fill_from_mapping([_RADIO_GROUP_FIELD], {0: "Maybe"}),
+        lambda page: page.fill_from_mapping([_FILE_FIELD], {}, {"resume": "https://example.com/cv.pdf"}),
+        lambda page: page._fill_matched_field(_TEXT_FIELD, {"action": "fill"}, None),
+        lambda page: page._fill_unknown_field(_TEXT_FIELD, "Fill out the form"),
+        lambda page: page._find_autocomplete_options(),
+    ],
+    ids=[
+        "fill_autocomplete",
+        "fill",
+        "upload_file",
+        "select_option",
+        "fill_from_mapping_text",
+        "fill_with_planned_value",
+        "fill_from_mapping_group_ai_fallback",
+        "fill_from_mapping_file_pass",
+        "fill_matched_field",
+        "fill_unknown_field",
+        "find_autocomplete_options",
+    ],
+)
+@pytest.mark.asyncio
+async def test_frame_scoped_write_propagates_the_stale_frame_refusal(mock_ai, action):
+    page = _page_with_unowned_frame(mock_ai)
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+        AsyncMock(return_value="/tmp/cv.pdf"),
+    ):
+        with pytest.raises(StaleFrameSelectionError):
+            await action(page)
+
+
+@pytest.mark.asyncio
+async def test_structural_validate_propagates_the_stale_frame_refusal(mock_ai):
+    page = _page_with_unowned_frame(mock_ai)
+    page.page.evaluate = AsyncMock(return_value=[])
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.structural_validate()
+
+
+class _StealFocusOnSelectLocator(_RecordingLocator):
+    def __init__(self, scope: _RecordingLocatorScope) -> None:
+        super().__init__()
+        self._scope = scope
+
+    async def select_option(self, *_args: object, **_kwargs: object) -> None:
+        self._scope.page = MagicMock()
+        raise RuntimeError("no option matched")
+
+
+@pytest.mark.asyncio
+async def test_post_fill_validation_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    field = {
+        "selector": "#name",
+        "type": "text",
+        "tag": "input",
+        "label": "Name",
+        "_format_hint": "short text",
+    }
+
+    async def _steal_focus_after_filling(*_args: object, **_kwargs: object) -> None:
+        page.working_frame.page = MagicMock()
+
+    with patch.object(SkyvernPage, "fill", AsyncMock(side_effect=_steal_focus_after_filling)):
+        with pytest.raises(StaleFrameSelectionError):
+            await page._fill_with_planned_value(field, "Ada", None)
+
+
+@pytest.mark.asyncio
+async def test_select_ai_fallback_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    scope = page.working_frame
+    scope._locator = _StealFocusOnSelectLocator(scope)
+    field = {"selector": "#country", "type": "select-one", "tag": "select", "label": "Country"}
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.fill_from_mapping([field], {0: "France"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("organization_source", ["api_key", "embedded", "none"])
+async def test_library_page_reads_response_snapshot_with_trusted_organization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, organization_source: str
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(skyvern_context, "_context", ContextVar("test_context", default=None))
+    download_dir = tmp_path / "live_downloads"
+    download_dir.mkdir()
+    live_file = download_dir / "report.pdf"
+    live_file.write_bytes(b"attempt one")
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    rows: list[Artifact] = []
+
+    async def find_artifact(*, uri: str, **kwargs):
+        return next((row for row in rows if row.uri == uri), None)
+
+    async def create_artifact(**kwargs):
+        row = Artifact(**kwargs, created_at=datetime.now(UTC), modified_at=datetime.now(UTC))
+        rows.append(row)
+        return row
+
+    fake_app = SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=ArtifactManager(),
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+            artifacts=SimpleNamespace(
+                list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)),
+                find_download_artifact=find_artifact,
+                create_artifact=create_artifact,
+            ),
+        ),
+    )
+    for module in (artifact_manager_module, storage_base_module, local_storage_module, workflow_service_module):
+        monkeypatch.setattr(module, "app", fake_app)
+    monkeypatch.setattr(local_storage_module, "get_download_dir", lambda **kwargs: str(download_dir))
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1", attempt_number=1)
+    _, urls = await WorkflowService()._fetch_downloaded_files(
+        SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1"), task_v2=None
+    )
+    assert urls == [rows[0].uri]
+    snapshot_url = urls[0]
+    live_file.write_bytes(b"attempt two")
+
+    def authenticate(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/organizations/me"
+        if request.headers.get("x-api-key") != "test-api-key":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"organization_id": "o_1"})
+
+    transport: httpx.AsyncBaseTransport = httpx.MockTransport(authenticate)
+    if organization_source == "embedded":
+        monkeypatch.setattr(settings, "OTEL_ENABLED", False)
+        monkeypatch.delenv("LMNR_PROJECT_API_KEY", raising=False)
+        monkeypatch.setattr(api_app_module, "start_forge_app", lambda: SimpleNamespace(setup_api_app=None))
+        api = api_app_module.create_api_app()
+
+        async def authenticated_org() -> Organization:
+            organization = Organization(
+                organization_id="o_1",
+                organization_name="Test organization",
+                created_at=datetime.now(UTC),
+                modified_at=datetime.now(UTC),
+            )
+            org_auth_service.apply_request_org_context(organization)
+            return organization
+
+        api.dependency_overrides[org_auth_service.get_current_org] = authenticated_org
+        transport = httpx.ASGITransport(app=api)
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        if organization_source == "embedded":
+            http_client.headers["x-api-key"] = "test-api-key"
+            monkeypatch.setattr(embedded_server_module, "create_embedded_server", lambda **kwargs: http_client)
+            sdk = Skyvern.local(use_in_memory_db=True)
+        else:
+            sdk = Skyvern(
+                api_key="test-api-key" if organization_source == "api_key" else "",
+                base_url="https://api.example.test",
+                httpx_client=http_client,
+            )
+        uploaded_bytes: list[bytes] = []
+
+        async def set_input_files(path: str, **kwargs) -> None:
+            uploaded_bytes.append(Path(path).read_bytes())
+
+        raw_page = create_mock_page()
+        raw_page.locator = MagicMock(return_value=SimpleNamespace(set_input_files=set_input_files))
+        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+            page = SkyvernBrowserPage(SimpleNamespace(skyvern=sdk), raw_page)
+
+        if organization_source == "none":
+            with pytest.raises(PermissionError):
+                await page.download_file(download_url=snapshot_url)
+            with pytest.raises(PermissionError):
+                await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+            assert uploaded_bytes == []
+            return
+
+        context = SkyvernContext()
+        skyvern_context.set(context)
+        downloaded_path = await page.download_file(download_url=snapshot_url)
+        assert Path(downloaded_path).read_bytes() == b"attempt one"
+        await page.upload_file(selector="#file", files=snapshot_url)
+        await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert uploaded_bytes == [b"attempt one", b"attempt one"]
+        assert skyvern_context.current() is context
+        assert context.organization_id is None
+        assert context.request_id is None
+
+        context = SkyvernContext()
+        skyvern_context.set(context)
+        downloaded_path = await page.download_file(download_url=snapshot_url)
+        assert Path(downloaded_path).read_bytes() == b"attempt one"
+        await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert uploaded_bytes[-1] == b"attempt one"
+        assert skyvern_context.current() is context
+
+        context = SkyvernContext(organization_id="o_other")
+        skyvern_context.set(context)
+        with pytest.raises(PermissionError):
+            await page.download_file(download_url=snapshot_url)
+        with pytest.raises(PermissionError):
+            await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert skyvern_context.current() is context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_failure", ["offline", "unauthorized"])
+async def test_library_page_unscoped_files_skip_organization_lookup(
+    monkeypatch: pytest.MonkeyPatch, legacy_download_uris: dict[str, str], lookup_failure: str
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(skyvern_context, "_context", ContextVar("test_context", default=None))
+    requests: list[httpx.Request] = []
+
+    def unavailable_api(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if lookup_failure == "offline":
+            raise httpx.ConnectError("API unavailable", request=request)
+        return httpx.Response(401)
+
+    uploaded_bytes: list[bytes] = []
+
+    async def set_input_files(path: str, **kwargs) -> None:
+        uploaded_bytes.append(Path(path).read_bytes())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable_api)) as http_client:
+        sdk = Skyvern(api_key="test-api-key", base_url="https://api.example.test", httpx_client=http_client)
+        raw_page = create_mock_page()
+        raw_page.locator = MagicMock(return_value=SimpleNamespace(set_input_files=set_input_files))
+        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+            page = SkyvernBrowserPage(SimpleNamespace(skyvern=sdk), raw_page)
+        url = legacy_download_uris["canonical"]
+        local_path = await page.download_file(download_url=url)
+        assert Path(local_path).read_text() == "STORMBREAKER-safe-body"
+        for ai in ("fallback", None):
+            await page.upload_file(selector="#file", files=url, ai=ai)
+        assert uploaded_bytes == [b"STORMBREAKER-safe-body"] * 2
+        assert await page._get_file_organization_id(files_module.parse_uri_to_path(url)) is None
+
+        with patch(
+            "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+            AsyncMock(return_value=local_path),
+        ):
+            for scheme in ("http", "https"):
+                public_url = f"{scheme}://example.test/report.pdf"
+                assert await page.download_file(download_url=public_url) == local_path
+                for ai in ("fallback", None):
+                    await page.upload_file(selector="#file", files=public_url, ai=ai)
+        assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [2, 1, None, "lookup_error"])
+async def test_click_progress_ignores_retained_partial_rename(tmp_path, mock_scraped_page, mock_ai, attempt) -> None:
+    page = _make_script_page(mock_scraped_page, mock_ai)
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old bytes")
+    os.utime(stale, (100, 100))
+    context = SkyvernContext(organization_id="o_test", workflow_run_id="wr_retry")
+
+    async def click(_page):
+        stale.rename(tmp_path / "previous.pdf")
+
+    with (
+        patch.object(
+            storage_base_module,
+            "resolve_download_attempt",
+            new=AsyncMock(
+                return_value=("wr_retry", attempt or 1, cutoff if attempt else None),
+                side_effect=RuntimeError("lookup unavailable") if attempt == "lookup_error" else None,
+            ),
+        ),
+        patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context.current", return_value=context),
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.get_path_for_workflow_download_directory",
+            return_value=tmp_path,
+        ),
+        patch.object(settings, "CACHED_ACTION_DELAY_SECONDS", 0),
+        patch.object(page, "_wait_for_page_ready_before_action", new=AsyncMock()),
+        patch.object(page, "_create_action_and_result_after_execution", new=AsyncMock()) as record,
+        patch.object(page, "_create_screenshot_after_execution", new=AsyncMock()),
+        patch.object(page, "_create_html_action_after_execution", new=AsyncMock()),
+    ):
+        await page._decorate_call(click, ActionType.CLICK)
+    assert record.await_args.kwargs["download_triggered"] is (attempt != 2)
+    assert record.await_args.kwargs["downloaded_files"] == (None if attempt == 2 else ["previous.pdf"])
+    assert (tmp_path / "previous.pdf").stat().st_mtime == 100

@@ -16,7 +16,9 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
 )
 from skyvern.webeye.actions.responses import ActionFailure
+from skyvern.webeye.utils import dom
 from skyvern.webeye.utils.dom import SkyvernElement
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _skyvern_element(tag_name: str = "button") -> SkyvernElement:
@@ -72,7 +74,7 @@ async def test_skyvern_element_click_waits_before_dispatch() -> None:
     dispatch = AsyncMock()
 
     with (
-        patch("skyvern.webeye.utils.dom.asyncio.sleep", new=AsyncMock()),
+        patch.object(dom, "asyncio", ScopedAsyncio(sleep=AsyncMock())),
         patch("skyvern.webeye.utils.dom.EventStrategyFactory.click_element", new=dispatch),
     ):
         await element.click(MagicMock())

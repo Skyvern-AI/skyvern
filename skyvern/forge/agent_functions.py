@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -70,7 +71,8 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
-from skyvern.forge.taskv3.auto_observe import AutoObserveDecision, auto_observe_from_setting
+from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
+from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -89,11 +91,15 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+    from skyvern.forge.sdk.workflow.code_block_authorized_files import AuthorizedFileMaterialization
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.forge.taskv3.loop import ToolSpec
+    from skyvern.forge.taskv3.tools import PageProvider
+    from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
 
@@ -151,6 +157,7 @@ SVG_LOCAL_CACHE_MAX_ITEMS = 4096
 SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
 SVGLocalCacheValue = tuple[str, float | None]
 PageOperationContracts = dict[str, dict[str, str | list[str]]]
+CodeBlockExecutionLimits = dict[str, str | int]
 
 # TTLCache has one global TTL, so each value also carries an optional shorter
 # expiry timestamp for negative cache entries.
@@ -237,12 +244,29 @@ class CodeBlockEngineFailure:
     failing_line: int | None
     healability_hint: bool | None
     accepted_user_defined_error: UserDefinedError | None = None
+    # exception_class narrowed to the runner's allowlist of denial guards; the only form of it
+    # that may reach a user-facing payload.
+    denied_exception_class: str | None = None
+    final_url: str | None = None
+    page_title: str | None = None
+    covering_element: str | None = None
+    # Read by the worker from the driver's own error, so a consumer can tell a real browser verdict
+    # from a sentence describing one.
+    nav_error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class CodeBlockDownloadOperationReceipt:
+    """Structured proof that the secure runner invoked the brokered download operation."""
+
+    operation: Literal["click_and_claim_download", "expect_download"] = "click_and_claim_download"
 
 
 @dataclass
 class CodeBlockEngineResult:
     block_result: BlockResult | None
     failure: CodeBlockEngineFailure | None
+    download_operation_receipt: CodeBlockDownloadOperationReceipt | None = None
 
 
 def _remove_rect(element: dict) -> None:
@@ -869,6 +893,21 @@ async def _convert_css_shape_to_string(
     return None
 
 
+@dataclass(frozen=True)
+class RecordingVideoSizeResolution:
+    """Outcome of resolving the recording resolution for a run.
+
+    ``record_video_size`` is the Playwright/Patchright ``record_video_size`` (a feature-selected
+    profile is capped to the effective viewport; an operator override passes through untouched).
+    ``raw_output_bound`` is the UNCAPPED selection — the raw profile or the operator override — used
+    as the whole-display recorder's FFmpeg output bound so it never inherits the viewport-capped
+    Playwright size (which would fit the window twice). ``None`` on either field means "unchanged":
+    keep the existing ``record_video_size`` / fall back to the static display-recording default."""
+
+    record_video_size: dict[str, int] | None
+    raw_output_bound: dict[str, int] | None
+
+
 class AgentFunction:
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
@@ -883,11 +922,39 @@ class AgentFunction:
     ) -> RunEngine:
         return requested_engine
 
-    # OSS resolves auto-observe from the static setting; cloud overrides to bucket a run per task_id.
-    async def resolve_task_v3_auto_observe(
-        self, *, task_id: str | None, organization_id: str | None, workflow_permanent_id: str | None = None
-    ) -> AutoObserveDecision:
-        return auto_observe_from_setting()
+    # OSS has no billing tiers; cloud overrides with the organization_pricing lookup. UNKNOWN keeps
+    # a tier-targeted experiment condition from matching rather than guessing a tier for everyone.
+    async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
+        return BillingTier.UNKNOWN
+
+    # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
+    # behind a flag when the task targets a gated application-tracking-system host.
+    async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
+        return None
+
+    # Whether v3 offers the task's configured error codes to the model, so a terminal verdict names
+    # its own business outcome instead of having one matched on afterwards (SKY-15586). Cloud
+    # overrides behind a flag; False keeps codes out of the loop entirely, which makes the whole
+    # feature byte-identical to before it existed.
+    async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
+        return False
+
+    # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
+    # Returning None is the ONLY safe answer without one: there is deliberately no in-process
+    # execution path here to degrade to, so a deployment with no runner offers no code tool rather
+    # than a weaker version of it. OSS ships no runner and always returns None.
+    async def build_task_v3_code_tool(
+        self,
+        *,
+        page_provider: PageProvider,
+        organization_id: str | None,
+        execution_id: str,
+    ) -> ToolSpec | None:
+        return None
+
+    # Recognition of submit controls whose submission is wired in JS (rendered type=button); base recognizes none.
+    async def is_recognized_submit_control(self, element: SkyvernElement) -> bool:
+        return False
 
     async def record_run_duration(
         self,
@@ -923,6 +990,12 @@ class AgentFunction:
 
     def credential_routes_accept_ui_session(self) -> bool:
         return True
+
+    async def is_onepassword_instance_default_allowed(self, organization_id: str) -> bool:
+        return True
+
+    def onepassword_instance_default_policy_mode(self) -> str:
+        return "unrestricted"
 
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
@@ -1056,13 +1129,14 @@ class AgentFunction:
         organization_id: str | None,
         workflow_permanent_id: str | None = None,
         viewport: dict[str, int] | None = None,
-    ) -> dict[str, int] | None:
+    ) -> RecordingVideoSizeResolution:
         """Resolve the browser recording resolution for this run.
 
-        Returns ``current_size`` unchanged. Cloud overrides this to opt runs into
-        an elevated resolution behind a feature flag.
+        Returns ``current_size`` unchanged as both the Playwright size and the raw output bound (an
+        operator-set ``BROWSER_RECORDING_WIDTH/HEIGHT`` is the only selection OSS knows). Cloud
+        overrides this to opt runs into an elevated resolution behind a feature flag.
         """
-        return current_size
+        return RecordingVideoSizeResolution(current_size, current_size)
 
     async def should_keep_code_mode_for_workflow_run(
         self,
@@ -1106,6 +1180,7 @@ class AgentFunction:
         block_label: str | None,
         browser_session_id: str | None,
         code: str | None = None,
+        authored_code: str | None = None,
     ) -> bool:
         """Whether a workflow CodeBlock run should execute in the secure runner.
 
@@ -1132,6 +1207,18 @@ class AgentFunction:
         return parameters
 
     def page_operation_contracts(self) -> PageOperationContracts | None:
+        return None
+
+    async def codeblock_execution_limits(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CodeBlockExecutionLimits | None:
+        """Cloud reports the secure runner's limits when this session's test runs will execute
+        under them; OSS has no runner, so its budget is unknown rather than unlimited."""
+        return None
+
+    def web_search_provider(self) -> WebSearchProvider | None:
+        """No search engine is configured in OSS; reading a provider's result markup is
+        deployment configuration. Cloud overrides this with its configured provider."""
         return None
 
     def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
@@ -1198,6 +1285,7 @@ class AgentFunction:
         workflow_run_context: WorkflowRunContext,
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
+        authorized_file_materializations: dict[str, AuthorizedFileMaterialization] | None = None,
         recording_page: RecordingPage | None = None,
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
@@ -1279,6 +1367,11 @@ class AgentFunction:
     ) -> dict[str, str] | None:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
+
+    async def get_workflow_run_execution_status(
+        self, workflow_run: WorkflowRun
+    ) -> Literal["running", "terminal", "absent", "unknown"]:
+        return "unknown" if workflow_run.job_id else "absent"
 
     async def is_block_scoped_workflow_run(self, workflow_run: WorkflowRun) -> bool:
         """Return whether this workflow run was created for scoped block execution."""
@@ -1410,6 +1503,10 @@ class AgentFunction:
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
 
+    async def has_retained_browser_egress_guard(self, browser_context: Any) -> bool:
+        """Whether cloud-only retained init scripts still require this context's guard."""
+        return False
+
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
@@ -1450,6 +1547,22 @@ class AgentFunction:
         can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
+
+    async def admit_recipe_step_attempt(
+        self,
+        task: Task,
+        step: Step,
+        *,
+        is_cached: bool,
+    ) -> bool:
+        """Atomically admit a cloud recipe step; OSS has no recipe billing."""
+        del task, step, is_cached
+        return False
+
+    async def is_recipe_step_attempt(self, task: Task, step: Step) -> bool:
+        """Return persisted recipe authority; OSS has no recipe billing."""
+        del task, step
+        return False
 
     async def validate_block_execution(
         self, block: BlockTypeVar, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None
@@ -1747,6 +1860,28 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    def captcha_solver_lifecycle_scope(self, page: Page | RecordingPage) -> AbstractAsyncContextManager[None]:
+        """Async scope entered exactly once around a captcha-solve ladder invocation.
+
+        A deployment can bind a page-scoped solver lifecycle for the duration of the solve and always
+        release it on exit; the OSS base is a no-op so a self-hosted build behaves exactly as before.
+        """
+        return nullcontext()
+
+    def resolve_captcha_solver_extension_timeout(self, page: Page | RecordingPage, default_timeout: float) -> float:
+        """The wait budget for the direct ladder's solver-extension arm, resolved inside the solver scope.
+
+        OSS returns the ladder's own default unchanged. A deployment whose solver runs a longer out-of-band
+        verification while engaged overrides this to widen the window so a slow legitimate solve is not cut off.
+        """
+        return default_timeout
+
+    async def is_captcha_solver_completion_confirmed(self, page: Page | RecordingPage, default_result: bool) -> bool:
+        """Confirm a direct-ladder arm's own success verdict against a deployment's completion truth; OSS
+        returns it unchanged. A vendor override narrows it (a token seeded while the challenge is still open
+        is not yet a real completion) so the solver scope is not disarmed early."""
+        return default_result
 
     async def resolve_google_credential_id(self, organization_id: str, credential_id: str) -> str:
         """Accept a Google connection name or account email wherever a credential id is expected.
@@ -2066,12 +2201,14 @@ class AgentFunction:
         spreadsheet_id: str,
         range_: str,
         values: list[list[Any]],
+        insert_data_option: str = "INSERT_ROWS",
     ) -> dict[str, Any] | None:
         return await google_sheets_service.values_append(
             access_token=access_token,
             spreadsheet_id=spreadsheet_id,
             range_=range_,
             values=values,
+            insert_data_option=insert_data_option,
         )
 
     async def google_sheets_values_update(
@@ -2287,7 +2424,7 @@ class AgentFunction:
         url: str,
         payload: str,
         headers: dict[str, str],
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS,
         organization_id: str | None = None,
         run_id: str | None = None,
         resolved_ips: tuple[str, ...] | None = None,
@@ -2461,28 +2598,44 @@ class AgentFunction:
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
         )
 
+    async def _resolve_copilot_requested_code_block_mode(
+        self,
+        organization_id: str | None,
+        code_block_mode: bool | None,
+    ) -> bool:
+        del organization_id
+        # Code-first is an explicit per-request selection. Callers that omit
+        # the field get plain Build instead of inheriting deployment state.
+        return code_block_mode is True
+
     async def get_copilot_config_for_request(
         self,
         organization_id: str | None = None,
         code_block_mode: bool | None = None,
-        composer_mode: Literal["ask", "build"] | None = None,
     ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
-        del organization_id
-        fallback_code_block_mode = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE
-        config = self.get_copilot_config(code_block_mode)
+        requested_code_block_mode = await self._resolve_copilot_requested_code_block_mode(
+            organization_id,
+            code_block_mode,
+        )
+        try:
+            has_code_block_access = await self.has_code_block_access(organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve Copilot code-block access; using non-code authoring",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            has_code_block_access = False
+        effective_code_block_mode = requested_code_block_mode and has_code_block_access
+        code_block_available = has_code_block_access if code_block_mode is not None else effective_code_block_mode
+        config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.block_authoring_policy = block_authoring_policy_for_request(
-            code_block_mode,
-            composer_mode,
-            fallback_code_block_mode=fallback_code_block_mode,
-        )
+        config.block_authoring_policy = block_authoring_policy_for_request(effective_code_block_mode)
+        config.code_block_available = code_block_available
+        config.effective_code_block_mode = effective_code_block_mode
         return config
-
-    async def should_render_copilot_terminal_from_envelope(self, organization_id: str | None = None) -> bool:
-        del organization_id
-        return settings.WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.
@@ -2654,9 +2807,15 @@ class AgentFunction:
         organization_id: str,
         edited_by: str | None,
         workflow_permanent_id: str | None = None,
+        *,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
-        return None
+        return
 
     async def on_workflow_run_completed(
         self,
@@ -2667,6 +2826,20 @@ class AgentFunction:
         workflow_run: WorkflowRun | None = None,
     ) -> None:
         """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
+        return
+
+    async def on_task_completed(
+        self,
+        *,
+        organization_id: str,
+        task_id: str,
+        status: TaskStatus,
+    ) -> None:
+        """Fired after a top-level (non-workflow) task is persisted as completed.
+
+        Not exactly-once: concurrent finalizers can both observe the completed row, so overrides
+        must be idempotent and must never raise.
+        """
         return None
 
     async def on_credential_saved(
@@ -2675,9 +2848,33 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         credential_type: CredentialType,
+        actor_user_id: str | None = None,
+        vault: str | None = None,
     ) -> None:
         """Fired after a credential is persisted. Overrides must be best-effort and never raise."""
-        return None
+        return
+
+    async def on_api_key_validated(
+        self,
+        organization_id: str,
+        token_id: str,
+        user_agent: str | None = None,
+        fern_language: str | None = None,
+    ) -> None:
+        """Fired after an API key is successfully validated. Overrides must be best-effort."""
+        return
+
+    async def on_integration_connected(
+        self,
+        organization_id: str,
+        provider: str,
+        credential_id: str,
+        is_reconnect: bool,
+        actor_user_id: str | None,
+        connected_at: datetime | None = None,
+    ) -> None:
+        """Fired after an OAuth credential is durably promoted. Overrides must be best-effort."""
+        return
 
     async def on_run_created(
         self,
@@ -2688,7 +2885,7 @@ class AgentFunction:
         caller_type: CallerType,
     ) -> None:
         """Fired after any run type is created; run_type is attribution only. Overrides must be best-effort."""
-        return None
+        return
 
     async def on_workflow_run_terminal(
         self,
@@ -2696,6 +2893,26 @@ class AgentFunction:
         workflow_run_id: str,
         organization_id: str,
         status: WorkflowRunStatus,
+        is_final_attempt: bool = True,
     ) -> None:
-        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
-        return None
+        """Fired after a workflow attempt reaches a final status.
+
+        ``is_final_attempt`` is false for an attempt that will be retried. Overrides must be
+        best-effort and never raise.
+        """
+        return
+
+    async def on_workflow_run_final(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        """Fired once per logical run after its final retry decision.
+
+        A process paused across a side-effect lease takeover may observe a second call only if it
+        resumes between the fresh ownership check and this call. Overrides must be best-effort and
+        never raise.
+        """
+        return

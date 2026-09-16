@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 
-const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
+const { getSpy, runQuerySpy } = vi.hoisted(() => ({
+  getSpy: vi.fn(),
+  runQuerySpy: vi.fn(),
+}));
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: async () => ({ get: getSpy }),
@@ -9,7 +12,10 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => ({ data: null }),
+  useWorkflowRunWithWorkflowQuery: (options?: { workflowRunId?: string }) => {
+    runQuerySpy(options);
+    return { data: null };
+  },
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({ data: [], isLoading: false }),
@@ -135,6 +141,7 @@ function renderActionDiagnosticsHref(
   render(
     <MemoryRouter>
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={activeAction}
         timeline={[buildBlockItem(block)]}
       />
@@ -151,6 +158,7 @@ function renderActionDiagnosticsHref(
 afterEach(() => {
   cleanup();
   getSpy.mockReset();
+  runQuerySpy.mockReset();
 });
 
 describe("WorkflowRunBlockDetail router", () => {
@@ -159,7 +167,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "extraction",
       data_extraction_goal: "Pull the price from the page",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // Header still labels the block type
     expect(screen.getByText("Extraction")).toBeDefined();
     // Goal field is intentionally hidden in the detail body (feedback #4/#6/#9)
@@ -172,7 +186,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "extraction",
       failure_reason: "Could not locate the price element",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // A failed block opens on Summary and shows the failure exactly once — no
     // longer duplicated between the Summary field and a persistent callout.
     expect(screen.getByText("Failure")).toBeDefined();
@@ -213,6 +233,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={onViewScreenshot}
@@ -241,6 +262,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={vi.fn()}
@@ -268,6 +290,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={vi.fn()}
@@ -296,7 +319,11 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <MemoryRouter>
-        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+        <WorkflowRunBlockDetail
+          workflowRunId={undefined}
+          activeItem={block}
+          timeline={[]}
+        />
       </MemoryRouter>,
     );
     expect(screen.getAllByText(reason)).toHaveLength(1);
@@ -316,7 +343,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(
       screen.getByRole("tab", { name: "Extracted Information" }),
@@ -336,7 +369,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(
       screen.getByRole("tab", { name: "Extracted Information" }),
@@ -353,7 +392,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     const tab = screen.getByRole("tab", { name: "Extracted Information" });
     expect(tab.hasAttribute("disabled")).toBe(false);
@@ -376,7 +421,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(screen.getByText("output")).toBeDefined();
     expect(screen.getAllByText("status_code").length).toBeGreaterThanOrEqual(1);
@@ -404,7 +455,11 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <MemoryRouter>
-        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+        <WorkflowRunBlockDetail
+          workflowRunId={undefined}
+          activeItem={block}
+          timeline={[]}
+        />
       </MemoryRouter>,
     );
 
@@ -584,7 +639,13 @@ describe("WorkflowRunBlockDetail router", () => {
       actions: [action],
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     // The bottom timeline already lists every action; the detail panel must
     // not re-list them under an "Actions (N)" section.
@@ -613,7 +674,13 @@ describe("WorkflowRunBlockDetail router", () => {
         ],
       },
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // The branch evaluations section renders the expression as a code chunk
     expect(screen.getByText("{{ x == 1 }}")).toBeDefined();
   });
@@ -623,7 +690,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "for_loop",
       loop_values: [{ name: "alpha" }, { name: "beta" }],
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(screen.queryByText(/iterable values/i)).toBeNull();
     expect(screen.queryByText(/Current iteration/)).toBeNull();
     // Radix tabs activate on mousedown.
@@ -637,12 +710,24 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "http_request",
       url: "https://example.test/endpoint",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(screen.getByText("https://example.test/endpoint")).toBeDefined();
   });
 
   it("renders an empty state when there is no selection and no resolvable target", () => {
-    render(<WorkflowRunBlockDetail activeItem={null} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={null}
+        timeline={[]}
+      />,
+    );
     expect(screen.getByText(/no block selected/i)).toBeDefined();
   });
 
@@ -653,7 +738,13 @@ describe("WorkflowRunBlockDetail router", () => {
       subject: "SKY-10066 approval",
       recipients: ["celal@skyvern.com", "ops@skyvern.com"],
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(
       screen.getByText("Please verify the order total before we ship."),
     ).toBeDefined();
@@ -672,6 +763,7 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem="stream"
         timeline={[buildBlockItem(running)]}
       />,
@@ -709,6 +801,7 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={action}
         timeline={[buildBlockItem(block)]}
       />,
@@ -746,6 +839,7 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={action}
         timeline={[buildBlockItem(block)]}
       />,
@@ -776,6 +870,7 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem="stream"
         activeIteration={2}
         timeline={[buildBlockItem(loop)]}
@@ -807,6 +902,7 @@ describe("WorkflowRunBlockDetail cold-start skeleton", () => {
       await import("./WorkflowRunBlockDetail");
     const { container } = render(
       <ReloadedBlockDetail
+        workflowRunId={undefined}
         activeItem={null}
         timeline={[]}
         timelineReady={false}
@@ -821,5 +917,42 @@ describe("WorkflowRunBlockDetail cold-start skeleton", () => {
     const skeletons = container.querySelectorAll('[class*="animate-pulse"]');
     expect(skeletons.length).toBeGreaterThan(0);
     vi.doUnmock("../hooks/useWorkflowRunTimelineQuery");
+  });
+});
+
+describe("WorkflowRunBlockDetail run resolution", () => {
+  function renderWithRunId(workflowRunId: string | undefined) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunBlockDetail
+          workflowRunId={workflowRunId}
+          activeItem={buildBlock()}
+          timeline={[]}
+          showDownloadedFiles
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("states the caller's run to every run query", () => {
+    renderWithRunId("wr_stated");
+
+    expect(runQuerySpy).toHaveBeenCalled();
+    for (const [options] of runQuerySpy.mock.calls) {
+      expect(options).toEqual({ workflowRunId: "wr_stated" });
+    }
+  });
+
+  it("states no run rather than deferring to the route when the prop is undefined", () => {
+    renderWithRunId(undefined);
+
+    expect(runQuerySpy).toHaveBeenCalled();
+    for (const [options] of runQuerySpy.mock.calls) {
+      expect(options).toEqual({ workflowRunId: undefined });
+    }
   });
 });

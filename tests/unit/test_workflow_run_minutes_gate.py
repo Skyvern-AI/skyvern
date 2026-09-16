@@ -16,7 +16,9 @@ only the post-claim row can say whether the task started.
 
 from __future__ import annotations
 
+import asyncio
 import copy
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -26,11 +28,15 @@ import pytest
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.run_enums import RunEngine
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
 def _make_row(*, started: bool) -> MagicMock:
@@ -41,6 +47,7 @@ def _make_row(*, started: bool) -> MagicMock:
     row.organization_id = "org_gate"
     row.parent_workflow_run_id = None
     row.created_at = now - timedelta(minutes=30)
+    row.queued_at = None
     row.started_at = (now - timedelta(minutes=20)) if started else None
     row.status = WorkflowRunStatus.canceled
     row.run_with = None
@@ -102,6 +109,70 @@ async def test_conditional_cancel_emits_minutes_only_for_runs_that_started(
     await WorkflowService().mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_gate")
 
     _assert_emission(record_run_duration, started=started)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["status_write", "conditional_cancel"])
+async def test_terminal_write_bookkeeping_survives_decision_recording_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+    writer: str,
+) -> None:
+    row = _make_row(started=True)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        service_module, "on_terminal_transition", AsyncMock(side_effect=RuntimeError("read unavailable"))
+    )
+    attempts = make_workflow_run_attempts_fake()
+    undecided = SimpleNamespace(attempt_number=1, retry_decision=None, next_attempt_prepared_at=None)
+    attempts.get_attempts = AsyncMock(return_value=[undecided])
+    monkeypatch.setattr(app.DATABASE, "workflow_run_attempts", attempts)
+    service = WorkflowService()
+
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs, pytest.raises(RuntimeError, match="read unavailable"):
+        if writer == "status_write":
+            await service._update_workflow_run_status(workflow_run_id="wr_gate", status=WorkflowRunStatus.canceled)
+        else:
+            await service.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_gate")
+
+    _assert_emission(record_run_duration, started=True)
+    # The decision was never recorded, so this event is not the run's canonical outcome yet.
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["retry_pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_bookkeeping_survives_attempt_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch, record_run_duration: AsyncMock
+) -> None:
+    row = _make_row(started=True)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", AsyncMock(return_value=row))
+    monkeypatch.setattr(service_module, "on_terminal_transition", AsyncMock())
+    attempts = make_workflow_run_attempts_fake()
+    attempts.get_attempts = AsyncMock(side_effect=RuntimeError("read unavailable"))
+    monkeypatch.setattr(app.DATABASE, "workflow_run_attempts", attempts)
+    service = WorkflowService()
+    sync_task_run = AsyncMock()
+    monkeypatch.setattr(service, "_sync_task_run_from_workflow_run", sync_task_run)
+    terminal_hooks = MagicMock()
+    monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", terminal_hooks)
+
+    await service._update_workflow_run_status(workflow_run_id="wr_gate", status=WorkflowRunStatus.canceled)
+    # The set is shared across service instances; only this loop's task is ours to drain.
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*[task for task in service._background_tasks if task.get_loop() is loop])
+
+    _assert_emission(record_run_duration, started=True)
+    sync_task_run.assert_awaited_once()
+    # Enrolment is unknown, so the no-policy terminal hooks are not fired for a possibly enrolled run.
+    terminal_hooks.assert_not_called()
 
 
 def _make_task(*, status: TaskStatus, started_at: datetime | None, finished_at: datetime | None = None) -> Task:
@@ -228,6 +299,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
             failure_reason=None,
             failure_category=None,
             created_at=started_at,
+            queued_at=None,
             started_at=started_at,
             finished_at=None,
             run_with="agent",
@@ -272,7 +344,11 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
             get_workflow_run_context=lambda _workflow_run_id: SimpleNamespace(browser_session_id=None),
         ),
     )
-    monkeypatch.setattr(service_module.app, "DATABASE", SimpleNamespace(workflow_runs=store))
+    monkeypatch.setattr(
+        service_module.app,
+        "DATABASE",
+        SimpleNamespace(workflow_runs=store, workflow_run_attempts=make_workflow_run_attempts_fake()),
+    )
     monkeypatch.setattr(service_module.workflow_script_service, "workflow_has_conditionals", lambda _workflow: False)
     monkeypatch.setattr(
         service_module.workflow_script_service,
@@ -301,7 +377,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
         return None
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(side_effect=lambda **_: store.snapshot()))
-    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
     monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(side_effect=lambda **_: store.snapshot()))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
@@ -338,3 +414,308 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
     assert sum(call.kwargs["duration_seconds"] for call in record_run_duration.await_args_list) == pytest.approx(
         wall_clock_seconds
     )
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The v1-vs-v3 wall-time dashboard needs an engine discriminator on "Task duration metrics";
+    # a bare task resolves it from its own task_runs row (SKY-15499).
+    from structlog.testing import capture_logs
+
+    from skyvern.schemas.run_enums import RunType
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    claimed_task = _make_task(status=TaskStatus.completed, started_at=now - timedelta(minutes=5), finished_at=now)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(return_value=MagicMock(task_run_type=RunType.task_v3)))
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.completed)
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] == "task_v3"
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_resolves_engine_from_the_block_for_a_workflow_task(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # Workflow-block tasks have no task_runs row; the block row's RESOLVED engine is the
+    # discriminator (task_runs cover bare tasks only).
+    from structlog.testing import capture_logs
+
+    from skyvern.schemas.run_enums import RunEngine
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    entry_task.workflow_run_id = "wr_gate"
+    claimed_task = _make_task(status=TaskStatus.terminated, started_at=now - timedelta(minutes=5), finished_at=now)
+    claimed_task.workflow_run_id = "wr_gate"
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(
+        app.DATABASE.observer,
+        "get_workflow_run_block_engine_by_task_id",
+        AsyncMock(return_value=RunEngine.skyvern_v1),
+    )
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.terminated, failure_reason="blocked")
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] == "task_v1"
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_survives_a_failed_run_type_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The discriminator is best-effort telemetry: a DB error must neither drop the log nor fail the
+    # terminal update.
+    from structlog.testing import capture_logs
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    claimed_task = _make_task(status=TaskStatus.completed, started_at=now - timedelta(minutes=5), finished_at=now)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(side_effect=RuntimeError("db down")))
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.completed)
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] is None
+
+
+def test_run_type_by_engine_mapping_is_exhaustive() -> None:
+    # A new RunEngine member silently maps to None otherwise -- pin the dict to the enum.
+    from skyvern.forge.agent import _RUN_TYPE_BY_ENGINE
+    from skyvern.schemas.run_enums import RunEngine, RunType
+
+    assert set(_RUN_TYPE_BY_ENGINE) == set(RunEngine)
+    assert set(_RUN_TYPE_BY_ENGINE.values()) <= {t.value for t in RunType}
+
+
+@pytest.fixture
+def scoped_context() -> Iterator[SkyvernContext]:
+    context = SkyvernContext()
+    skyvern_context.set(context)
+    try:
+        yield context
+    finally:
+        skyvern_context.reset()
+
+
+def _pin_workflow_block_engine_arm(context: SkyvernContext, *, workflow_run_id: str, engine: RunEngine | None) -> None:
+    # workflow_run_id itself is what marks the context as belonging to THIS run -- an
+    # out-of-band finalizer's context (if any) belongs to whatever request triggered it, not
+    # to this run, so it never has this set.
+    context.workflow_run_id = workflow_run_id
+    context.workflow_block_engine_resolved_run_id = workflow_run_id
+    context.workflow_block_engine_override = engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "engine,expected_arm",
+    [
+        (RunEngine.skyvern_v3, "treatment"),
+        (None, "control"),
+        # Finding 2: only an explicit v3 override reads as treatment -- a future non-v3
+        # override on this field must not silently pass a truthiness check.
+        (RunEngine.openai_cua, "control"),
+    ],
+)
+async def test_after_status_write_duration_log_carries_the_pinned_arm(
+    scoped_context: SkyvernContext,
+    record_run_duration: AsyncMock,
+    engine: RunEngine | None,
+    expected_arm: str,
+) -> None:
+    # SKY-15561: the arm resolved once at execution start (resolve_workflow_block_engine_arm)
+    # is pinned on the run's own context, so the terminal writer reads it back from there --
+    # no new DB lookup needed at finalize time.
+    from structlog.testing import capture_logs
+
+    _pin_workflow_block_engine_arm(scoped_context, workflow_run_id="wr_gate", engine=engine)
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.canceled)
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] == expected_arm
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine,expected_arm", [(RunEngine.skyvern_v3, "treatment"), (None, "control")])
+async def test_conditional_cancel_duration_log_carries_the_pinned_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    scoped_context: SkyvernContext,
+    record_run_duration: AsyncMock,
+    engine: RunEngine | None,
+    expected_arm: str,
+) -> None:
+    # Same field, the other emission site (SKY-15561).
+    from structlog.testing import capture_logs
+
+    row = _make_row(started=True)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=row),
+    )
+    _pin_workflow_block_engine_arm(scoped_context, workflow_run_id="wr_gate", engine=engine)
+
+    with capture_logs() as logs:
+        await WorkflowService().mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_gate")
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] == expected_arm
+
+
+@pytest.mark.asyncio
+async def test_duration_log_reads_unknown_when_no_context_is_current(
+    record_run_duration: AsyncMock,
+) -> None:
+    # No context at all is current (e.g. a worker process finalizing with nothing bound):
+    # attribution is lost, not "confirmed control" -- the field must read "unknown".
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.canceled)
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_duration_log_reads_none_when_this_runs_own_context_never_resolved_an_arm(
+    scoped_context: SkyvernContext,
+    record_run_duration: AsyncMock,
+) -> None:
+    # This run's own context is current (e.g. task_v2 / cached-script helper paths, which never
+    # call resolve_workflow_block_engine_arm) but never resolved an arm: genuinely never
+    # entered the A/B, distinct from the out-of-band "unknown" case below.
+    from structlog.testing import capture_logs
+
+    scoped_context.workflow_run_id = "wr_gate"
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.canceled)
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] is None
+
+
+@pytest.mark.asyncio
+async def test_duration_log_reads_unknown_for_a_different_runs_context(
+    scoped_context: SkyvernContext,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The exact API-cancel/stuck-run-sweep shape (SKY-15561 finding 1): the finalizer for
+    # wr_gate runs in a request/task whose current context belongs to a different run
+    # (wr_other) entirely. Reading that as "control" would silently bias per-arm duration
+    # reads against exactly the canceled/timed-out population; it must read "unknown".
+    from structlog.testing import capture_logs
+
+    _pin_workflow_block_engine_arm(scoped_context, workflow_run_id="wr_other", engine=RunEngine.skyvern_v3)
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.canceled)
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_duration_log_survives_a_failed_arm_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The arm read is best-effort telemetry: a lookup failure must neither drop the log nor
+    # break run finalization (SKY-15561, mirrors SKY-15499's task_run_type discipline).
+    from structlog.testing import capture_logs
+
+    monkeypatch.setattr(
+        service_module,
+        "resolved_workflow_block_engine_arm_label",
+        MagicMock(side_effect=RuntimeError("context lookup blew up")),
+    )
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.canceled)
+
+    duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+    assert record_run_duration.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decisions", "expected"),
+    [([], (None, False)), (["retry"], (1, True)), (["retry", "final"], (2, False)), ([None], (1, True))],
+    ids=["no-rows", "retry", "retry-then-final", "undecided"],
+)
+async def test_duration_log_names_the_attempt_and_whether_a_retry_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+    decisions: list[str | None],
+    expected: tuple[int | None, bool],
+) -> None:
+    # A policy run emits this event once per attempt; the outcome consumers keep the event without a pending retry.
+    # An undecided attempt inside the grace window is still pending: its decision write may have failed.
+    from structlog.testing import capture_logs
+
+    rows = [
+        SimpleNamespace(attempt_number=number, retry_decision=decision, next_attempt_prepared_at=None)
+        for number, decision in enumerate(decisions, 1)
+    ]
+    monkeypatch.setattr(app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=rows))
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.failed)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert (event["attempt_number"], event["retry_pending"]) == expected
+
+
+@pytest.mark.asyncio
+async def test_duration_log_measures_queue_time_from_the_queue_ticket(record_run_duration: AsyncMock) -> None:
+    # A retry re-queues the run long after it was created; its queue wait starts at that ticket.
+    from structlog.testing import capture_logs
+
+    row = _make_row(started=True)
+    row.queued_at = row.started_at - timedelta(minutes=2)
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(row, WorkflowRunStatus.completed)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert event["queued_seconds"] == pytest.approx(120, abs=5)
+    assert event["duration_seconds"] == pytest.approx(20 * 60, abs=5)

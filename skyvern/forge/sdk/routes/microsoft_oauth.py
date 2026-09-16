@@ -6,6 +6,7 @@ from typing import Annotated
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from skyvern.forge import app
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
     CreateMicrosoftOAuthCallbackRequest,
@@ -155,7 +156,6 @@ async def microsoft_oauth_callback(
             status_code=400,
             detail="OAuth consent row is missing the PKCE verifier; restart the consent flow",
         )
-
     try:
         token_data = await microsoft_oauth_service.exchange_code_for_tokens(
             code=request.code,
@@ -192,6 +192,20 @@ async def microsoft_oauth_callback(
             detail="Microsoft did not grant Mail.Read. Please re-connect and accept all requested permissions.",
         )
 
+    prior_state = None
+    prior_state_known = False
+    try:
+        prior_state = await app.DATABASE.microsoft_oauth.get_credential_state(
+            current_org.organization_id, context.credential_id
+        )
+        prior_state_known = True
+    except Exception:
+        LOG.warning(
+            "Failed to read Microsoft OAuth credential state before promotion",
+            organization_id=current_org.organization_id,
+            credential_id=context.credential_id,
+            exc_info=True,
+        )
     try:
         credential = await microsoft_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
@@ -204,6 +218,30 @@ async def microsoft_oauth_callback(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except microsoft_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if not prior_state_known:
+        LOG.warning(
+            "Skipping Microsoft integration lifecycle analytics because prior credential state is unknown",
+            organization_id=current_org.organization_id,
+            credential_id=credential.id,
+        )
+    else:
+        try:
+            await app.AGENT_FUNCTION.on_integration_connected(
+                organization_id=current_org.organization_id,
+                provider="microsoft",
+                credential_id=credential.id,
+                is_reconnect=prior_state in {microsoft_oauth_service.STATE_ACTIVE, microsoft_oauth_service.STATE_ERROR},
+                actor_user_id=current_user_id,
+                connected_at=credential.modified_at,
+            )
+        except Exception:
+            LOG.warning(
+                "Microsoft integration lifecycle analytics hook failed",
+                organization_id=current_org.organization_id,
+                credential_id=credential.id,
+                exc_info=True,
+            )
 
     email_address = None
     should_resolve_email = True

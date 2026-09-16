@@ -123,7 +123,7 @@ When modifying regeneration or caching logic, test these scenarios:
 
 ```bash
 # Run script-related tests
-python -m pytest tests/unit/ -k "script" --ignore=tests/unit/test_security.py -v
+python -m pytest tests/unit/ -k "script" -v
 
 # Run conditional caching tests specifically
 python -m pytest tests/unit/test_conditional_script_caching.py -v

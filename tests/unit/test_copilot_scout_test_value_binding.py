@@ -272,7 +272,7 @@ def test_legacy_demonstrated_run_cannot_override_required_input_unbound() -> Non
     assert outcome.reason_code == "required_input_unbound"
 
 
-def test_not_evaluated_run_wins_over_required_input_unbound() -> None:
+def test_required_input_unbound_wins_over_an_unevaluated_run() -> None:
     outcome = recorded_outcome_from_run_blocks_result(
         _failed_run_result(failure_reason=_LOCATOR_WAIT_REASON),
         recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated"),
@@ -280,7 +280,7 @@ def test_not_evaluated_run_wins_over_required_input_unbound() -> None:
         block_parameter_keys={"search_block": ["search_by_specialty"]},
     )
     assert outcome is not None
-    assert outcome.reason_code != "required_input_unbound"
+    assert outcome.reason_code == "required_input_unbound"
 
 
 def test_required_input_unbound_not_fired_when_block_does_not_reference_key() -> None:

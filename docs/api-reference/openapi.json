@@ -1390,6 +1390,63 @@
         "x-fern-sdk-method-name": "delete_folder"
       }
     },
+    "/v1/browser_types": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "List selectable browser types",
+        "description": "List the selectable browser engines for the workflow/run browser_type setting. The list is runtime-capability aware: a runtime that can honor an explicit engine (the cloud dynamic-browser capability) returns all supported engines, while a runtime without it (OSS/self-host) returns an empty list rather than advertising selections the server would reject.",
+        "operationId": "get_browser_types_v1_browser_types_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully listed selectable browser types",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserTypeOption"
+                  },
+                  "title": "Response Get Browser Types V1 Browser Types Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_types"
+      }
+    },
     "/v1/runs/{workflow_run_id}/tags": {
       "post": {
         "tags": [
@@ -4125,6 +4182,109 @@
               {
                 "sdk": "typescript",
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.closeBrowserSession(\"pbs_123\");\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/browser_sessions/{browser_session_id}/extend": {
+      "post": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Extend a session",
+        "description": "Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.",
+        "operationId": "extend_browser_session_v1_browser_sessions__browser_session_id__extend_post",
+        "parameters": [
+          {
+            "name": "browser_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser session. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
+              "title": "Browser Session Id"
+            },
+            "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtendBrowserSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully extended browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "409": {
+            "description": "Conflict - the browser session has ended, is about to expire, is already at its maximum lifetime, or runs on infrastructure whose lifetime is fixed at creation"
+          },
+          "202": {
+            "description": "Accepted - the extension was requested but its effect could not be confirmed yet. The body carries the session as last recorded and a `warning`; read `timeout` back with a GET rather than retrying, because each retry adds again."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "extend_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.extend_browser_session(browser_session_id=\"pbs_123\", additional_minutes=30)\nprint(browser_session.timeout)  # the session's new total budget in minutes\n"
+              },
+              {
+                "sdk": "curl",
+                "code": "curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_123/extend \\\n  -H \"x-api-key: YOUR_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"additional_minutes\": 30}'\n"
               }
             ]
           }
@@ -7586,6 +7746,353 @@
           }
         }
       }
+    },
+    "/v1/recipes/jobs/extract": {
+      "post": {
+        "tags": [
+          "Recipes"
+        ],
+        "summary": "Extract a job application posting",
+        "description": "Start a workflow run that extracts structured details from a job posting.",
+        "operationId": "extract_job_application_v1_recipes_jobs_extract_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url"
+                ],
+                "title": "JobRecipeExtractRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully started job application extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "422": {
+            "description": "Invalid extract request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Workflow launch failed"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "x-fern-sdk-method-name": "extract_job_application"
+      }
+    },
+    "/v1/recipes/jobs/apply": {
+      "post": {
+        "tags": [
+          "Recipes"
+        ],
+        "summary": "Apply to a job",
+        "description": "Start a workflow run that applies to a job with a résumé and optional credentials.",
+        "operationId": "apply_to_job_v1_recipes_jobs_apply_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  },
+                  "custom_prompt": {
+                    "type": "string",
+                    "title": "Custom Prompt"
+                  },
+                  "resume_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Resume Url"
+                  },
+                  "other_information": {
+                    "title": "Other Information"
+                  },
+                  "username": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Username"
+                  },
+                  "password": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Password"
+                  },
+                  "persist_credentials": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Persist Credentials"
+                  },
+                  "2fa_identifier": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "2Fa Identifier"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url",
+                  "custom_prompt",
+                  "resume_url"
+                ],
+                "title": "JobRecipeApplyJSONRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "job_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "title": "Job Url"
+                  },
+                  "custom_prompt": {
+                    "type": "string",
+                    "title": "Custom Prompt"
+                  },
+                  "resume_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "title": "Resume File"
+                  },
+                  "other_information": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Other Information"
+                  },
+                  "username": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Username"
+                  },
+                  "password": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Password"
+                  },
+                  "persist_credentials": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^true$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Persist Credentials"
+                  },
+                  "2fa_identifier": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "2Fa Identifier"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "job_url",
+                  "custom_prompt",
+                  "resume_file"
+                ],
+                "title": "JobRecipeApplyMultipartRequest",
+                "description": "OpenAPI representation of the text and file parts accepted by Apply."
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully started job application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid multipart structure"
+          },
+          "402": {
+            "description": "Insufficient credits or required billing state"
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "413": {
+            "description": "Résumé file exceeds the upload limit"
+          },
+          "422": {
+            "description": "Invalid apply request"
+          },
+          "429": {
+            "description": "Workflow submission rate limit exceeded"
+          },
+          "500": {
+            "description": "Upload or workflow launch failed"
+          },
+          "502": {
+            "description": "Credential service failed"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "x-fern-sdk-method-name": "apply_to_job"
+      }
+    },
+    "/v1/recipes/jobs/runs": {
+      "get": {
+        "tags": [
+          "Recipes"
+        ],
+        "summary": "List job recipe runs",
+        "description": "List workflow runs started by job recipe requests.",
+        "operationId": "list_job_recipe_runs_v1_recipes_jobs_runs_get",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Number of runs per page.",
+              "default": 25,
+              "title": "Page Size"
+            },
+            "description": "Number of runs per page."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecipeRunListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unauthorized or insufficient organization permission"
+          },
+          "422": {
+            "description": "Invalid pagination parameters"
+          }
+        },
+        "x-fern-sdk-method-name": "list_job_recipe_runs"
+      }
     }
   },
   "components": {
@@ -9770,7 +10277,8 @@
           "google_sheets_write",
           "pdf_fill",
           "split_pdf",
-          "email_inbox"
+          "email_inbox",
+          "data_export"
         ],
         "title": "BlockType"
       },
@@ -10450,7 +10958,7 @@
               }
             ],
             "title": "Warning",
-            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped; null otherwise."
+            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
           }
         },
         "type": "object",
@@ -10462,6 +10970,24 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "BrowserTypeOption": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "BrowserTypeOption"
       },
       "BulkCancelRunsRequest": {
         "properties": {
@@ -12508,6 +13034,249 @@
         ],
         "title": "CustomLLMUpdateRequest"
       },
+      "DataExportBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlock"
+      },
+      "DataExportBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlockYAML"
+      },
       "DeleteScheduleResponse": {
         "properties": {
           "ok": {
@@ -12884,6 +13653,14 @@
         ],
         "title": "DownloadToS3BlockYAML"
       },
+      "EmailBodyFormat": {
+        "type": "string",
+        "enum": [
+          "text",
+          "html"
+        ],
+        "title": "EmailBodyFormat"
+      },
       "EmailInboxBlock": {
         "properties": {
           "label": {
@@ -13252,6 +14029,21 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "ExtendBrowserSessionRequest": {
+        "properties": {
+          "additional_minutes": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Additional Minutes",
+            "description": "Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning."
+          }
+        },
+        "type": "object",
+        "required": [
+          "additional_minutes"
+        ],
+        "title": "ExtendBrowserSessionRequest"
       },
       "Extensions": {
         "type": "string",
@@ -13640,6 +14432,45 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": false
+          },
+          "export_enabled": {
+            "type": "boolean",
+            "title": "Export Enabled",
+            "default": false
+          },
+          "export_data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Data Schema"
+          },
+          "export_file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export File Name"
+          },
+          "export_records": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Records"
           }
         },
         "type": "object",
@@ -13779,6 +14610,45 @@
             "type": "boolean",
             "title": "Disable Cache",
             "default": false
+          },
+          "export_enabled": {
+            "type": "boolean",
+            "title": "Export Enabled",
+            "default": false
+          },
+          "export_data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Data Schema"
+          },
+          "export_file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export File Name"
+          },
+          "export_records": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Records"
           }
         },
         "type": "object",
@@ -15964,6 +16834,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -15972,6 +16845,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -16214,6 +17088,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -17738,6 +18615,10 @@
             "type": "string",
             "title": "Body",
             "default": "Your interaction is required for a workflow run!"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           }
         },
         "type": "object",
@@ -17841,6 +18722,10 @@
             "type": "string",
             "title": "Body",
             "default": "Your interaction is required for a workflow run!"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           }
         },
         "type": "object",
@@ -18065,6 +18950,117 @@
         ],
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
+      },
+      "JobRecipeRunListResponse": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/JobRecipeRunSummary"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "has_next": {
+            "type": "boolean",
+            "title": "Has Next"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "runs",
+          "page",
+          "page_size",
+          "has_next"
+        ],
+        "title": "JobRecipeRunListResponse"
+      },
+      "JobRecipeRunResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "pattern": "^wr_",
+            "title": "Workflow Run Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "JobRecipeRunResponse"
+      },
+      "JobRecipeRunSummary": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "pattern": "^wr_",
+            "title": "Workflow Run Id"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "recipe": {
+            "type": "string",
+            "enum": [
+              "apply",
+              "extract"
+            ],
+            "title": "Recipe"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "job_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Url"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "workflow_permanent_id",
+          "recipe",
+          "status",
+          "created_at",
+          "job_url",
+          "failure_reason"
+        ],
+        "title": "JobRecipeRunSummary"
       },
       "LocateElementAction": {
         "properties": {
@@ -21655,6 +22651,10 @@
             "type": "string",
             "title": "Body"
           },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
+          },
           "file_attachments": {
             "items": {
               "type": "string"
@@ -21885,6 +22885,10 @@
           "body": {
             "type": "string",
             "title": "Body"
+          },
+          "body_format": {
+            "$ref": "#/components/schemas/EmailBodyFormat",
+            "default": "text"
           },
           "file_attachments": {
             "anyOf": [
@@ -27061,6 +28065,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -27069,6 +28076,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -27239,6 +28247,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -27502,6 +28513,17 @@
             "title": "Run With",
             "default": "agent"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
@@ -27664,6 +28686,18 @@
           "title": {
             "type": "string",
             "title": "Title"
+          },
+          "recording_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recording Id",
+            "description": "Durable browser recording to attach to the workflow version created by this save."
           },
           "description": {
             "anyOf": [
@@ -27856,6 +28890,18 @@
             "type": "string",
             "title": "Run With",
             "default": "agent"
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for runs of this workflow, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. Null means the system default."
           },
           "ai_fallback": {
             "type": "boolean",
@@ -28099,6 +29145,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -28107,6 +29156,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -28164,6 +29214,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
           },
           "workflow_system_prompt": {
             "anyOf": [
@@ -28321,6 +29382,9 @@
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -28363,6 +29427,7 @@
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
                   "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
@@ -28420,6 +29485,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
           },
           "workflow_system_prompt": {
             "anyOf": [
@@ -28653,6 +29729,87 @@
         "type": "object",
         "title": "WorkflowRequest"
       },
+      "WorkflowRetryPolicy": {
+        "properties": {
+          "max_retries": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Max Retries",
+            "description": "Maximum number of retries after the initial attempt",
+            "default": 1
+          },
+          "delay_seconds": {
+            "type": "integer",
+            "maximum": 3600.0,
+            "minimum": 0.0,
+            "title": "Delay Seconds",
+            "description": "Fixed delay before the next attempt, in seconds",
+            "default": 0
+          },
+          "webhook_on_retry": {
+            "type": "string",
+            "enum": [
+              "final_only",
+              "every_attempt"
+            ],
+            "title": "Webhook On Retry",
+            "description": "Whether to send a webhook for every attempt or only the final attempt",
+            "default": "final_only"
+          },
+          "retry_on": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRetryRule"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Retry On",
+            "description": "Terminal status rules that enable retries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "retry_on"
+        ],
+        "title": "WorkflowRetryPolicy"
+      },
+      "WorkflowRetryRule": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "terminated",
+              "canceled",
+              "timed_out"
+            ],
+            "title": "Status",
+            "description": "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+          },
+          "error_codes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Codes",
+            "description": "Optional error codes. The rule matches when any listed code is present."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "WorkflowRetryRule"
+      },
       "WorkflowRun": {
         "properties": {
           "workflow_run_id": {
@@ -28749,6 +29906,39 @@
           },
           "status": {
             "$ref": "#/components/schemas/WorkflowRunStatus"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -28954,6 +30144,17 @@
             ],
             "title": "Run With"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
           "script_run": {
             "anyOf": [
               {
@@ -29136,6 +30337,121 @@
         ],
         "title": "WorkflowRun"
       },
+      "WorkflowRunAttempt": {
+        "properties": {
+          "attempt_number": {
+            "type": "integer",
+            "title": "Attempt Number",
+            "description": "One-based number of this workflow run attempt"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus",
+            "description": "Status of this workflow run attempt"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason",
+            "description": "Reason for failure, if the attempt failed"
+          },
+          "error_codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Error Codes",
+            "description": "Error codes reported by this attempt"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At",
+            "description": "Timestamp when this attempt started"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At",
+            "description": "Timestamp when this attempt finished"
+          },
+          "retry_decision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Decision",
+            "description": "Retry decision recorded for this attempt"
+          },
+          "decision_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Reason",
+            "description": "Reason recorded for the retry decision"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next attempt is scheduled"
+          },
+          "webhook_sent_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Sent At",
+            "description": "Timestamp when the webhook for this attempt was sent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "attempt_number",
+          "status"
+        ],
+        "title": "WorkflowRunAttempt"
+      },
       "WorkflowRunBlock": {
         "properties": {
           "workflow_run_block_id": {
@@ -29156,6 +30472,17 @@
           "workflow_run_id": {
             "type": "string",
             "title": "Workflow Run Id"
+          },
+          "attempt_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Number"
           },
           "organization_id": {
             "type": "string",
@@ -29879,6 +31206,21 @@
               "code"
             ]
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
+            ]
+          },
           "run_metadata": {
             "anyOf": [
               {
@@ -30161,6 +31503,21 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
             ]
           },
           "run_metadata": {
@@ -30473,6 +31830,39 @@
             "title": "Run Type",
             "description": "Type of run - always workflow_run for workflow runs"
           },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
+          },
           "run_with": {
             "type": "string",
             "title": "Run With",
@@ -30565,6 +31955,11 @@
           "type": {
             "$ref": "#/components/schemas/WorkflowRunTimelineType"
           },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
+          },
           "block": {
             "anyOf": [
               {
@@ -30627,10 +32022,12 @@
           "mcp",
           "api",
           "scheduled",
-          "webhook"
+          "webhook",
+          "job_recipe_extract",
+          "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -31179,6 +32576,14 @@
           "azure_vault"
         ],
         "title": "CredentialType"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "description": "Your Skyvern API key from https://app.skyvern.com/settings.",
+        "in": "header",
+        "name": "x-api-key"
       }
     }
   },

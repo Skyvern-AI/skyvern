@@ -64,6 +64,7 @@ export function workflowVersionFromSaveData(
     modified_at: workflow.modified_at,
     deleted_at: workflow.deleted_at ?? null,
     run_with: settings.runWith,
+    browser_type: settings.browserType ?? null,
     cache_key: settings.scriptCacheKey,
     ai_fallback: settings.aiFallback,
     enable_self_healing: settings.enableSelfHealing ?? false,

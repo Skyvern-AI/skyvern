@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -18,8 +21,10 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     UnresolvableHost,
 )
+from skyvern.forge.log_redaction import REDACTED
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.forge_log import redact_sensitive_event_fields
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
@@ -147,7 +152,7 @@ async def test_get_verification_code_polling_budget_bounds_a_never_answering_sou
     # A source that never answers must not let the model re-poll for N x the poll window: each call
     # polls for at most the per-call cap and returns "not yet", the cumulative polling is capped at
     # VERIFICATION_CODE_POLLING_TIMEOUT_MINS, and once spent the tool refuses with stop guidance
-    # (warning once) without awaiting the resolver again.
+    # without awaiting the resolver again.
     monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
     monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
     monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
@@ -176,9 +181,13 @@ async def test_get_verification_code_polling_budget_bounds_a_never_answering_sou
     assert results.index(exhausted[0]) == len(not_yet)
     # Exhaustion refuses before touching the resolver.
     assert resolver_calls == len(not_yet) + 1
-    warnings = [e for e in logs if e.get("event") == "task_v3 verification code polling budget exhausted"]
-    assert len(warnings) == 1 and warnings[0]["tool"] == "get_verification_code"
-    assert warnings[0]["call_count"] == len(not_yet) + 1
+    # Every refusal narrates and is counted. The record this replaced was gated to one per task, so it
+    # reported a source that failed repeatedly exactly as loudly as one that failed once.
+    armings = [e for e in logs if e.get("event") == "task_v3 verification source failed"]
+    assert len(armings) == len(exhausted)
+    assert {e["reason"] for e in armings} == {"budget_exhausted"}
+    assert {e["tool"] for e in armings} == {"get_verification_code"}
+    assert [e["arming_count"] for e in armings] == list(range(1, len(exhausted) + 1))
     assert all(cap <= 0.05 for cap in caps) and sum(caps) <= 1.0 + 0.05
 
 
@@ -197,8 +206,9 @@ async def test_verification_state_blocks_completion_only_when_the_budget_ran_dry
         raise NoTOTPVerificationCodeFound(task_id="tsk_1")
 
     monkeypatch.setattr(auth_tools, "resolve_otp_value", _never_answers)
-    state = auth_tools.VerificationState()
-    tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"), state=state)
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, state=state)
     handler = tools[0].handler
 
     result = None
@@ -209,11 +219,12 @@ async def test_verification_state_blocks_completion_only_when_the_budget_ran_dry
     assert result is not None and "budget exhausted" in result.content
     assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
 
-    delivered_state = auth_tools.VerificationState()
+    delivered_task = _task(totp_identifier="user@example.com")
+    delivered_state = auth_tools.VerificationState(task=delivered_task)
     monkeypatch.setattr(
         auth_tools, "resolve_otp_value", AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP))
     )
-    delivered_tools, _ = auth_tools.build_auth_tools(_task(totp_identifier="user@example.com"), state=delivered_state)
+    delivered_tools, _ = auth_tools.build_auth_tools(delivered_task, state=delivered_state)
     ctx = SkyvernContext(task_id="tsk_1")
     skyvern_context.set(ctx)
     try:
@@ -221,7 +232,7 @@ async def test_verification_state_blocks_completion_only_when_the_budget_ran_dry
     finally:
         skyvern_context.reset()
     assert delivered_result.status == "ok"
-    delivered_state.source_failed = True
+    delivered_state.arm(auth_tools.VerificationFailure.NO_CODE_TWICE, "get_verification_code")
     assert await delivered_state.block_completion() is None
 
 
@@ -253,8 +264,8 @@ async def test_verification_state_blocks_completion_after_a_refused_or_errored_s
         SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
     )
     monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
-    state = auth_tools.VerificationState()
     task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
     if case == "lookup_error_streak":
         monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(side_effect=RuntimeError("boom")))
         tools, _ = auth_tools.build_auth_tools(task, state=state)
@@ -325,6 +336,342 @@ async def test_verification_state_blocks_completion_after_a_refused_or_errored_s
     assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
 
 
+# Every condition the module can arm with, and the record each must produce. `source_failed` is written
+# at exactly one place (`VerificationState.arm`), so what this list has to cover is the set of REASONS,
+# which is checked against the enum below rather than asserted here. `link_unreachable` and its
+# origin-page-keeps-fetching variant are two routes into one site; `link_unvalidatable` is the
+# neighbouring branch, split out because our own validator rejecting the URL is a different fact from
+# the site being unreachable. The two "value_not_a_*" rows are defensive branches unreachable while
+# `OTPValue.get_otp_type()` returns only TOTP or MAGIC_LINK, so they are driven with a stand-in type
+# rather than assumed to work.
+_CODE = "get_verification_code"
+_LINK_TOOL = "open_verification_link"
+# (case, reason the arming must narrate, tool the record must name, records the drive must emit).
+_ARMING_CASES: list[tuple[str, str, str, int]] = [
+    ("budget_exhausted", "budget_exhausted", _CODE, 1),
+    ("budget_exhausted_on_the_link_tool", "budget_exhausted", _LINK_TOOL, 1),
+    ("no_code_streak", "no_code_twice", _CODE, 1),
+    ("no_link_streak", "no_link_twice", _LINK_TOOL, 1),
+    ("webhook_failing_streak", "source_errored_twice", _CODE, 1),
+    ("lookup_error_streak", "lookup_failed_twice", _CODE, 1),
+    ("magic_link_unsupported", "magic_link_unsupported", _CODE, 1),
+    # Only reachable on the call after the uncached site armed, so the drive emits both records.
+    ("magic_link_unsupported_cached", "magic_link_unsupported_cached", _CODE, 2),
+    ("value_not_a_code", "value_not_a_code", _CODE, 1),
+    ("value_not_a_link", "value_not_a_link", _LINK_TOOL, 1),
+    ("page_unavailable", "page_unavailable", _LINK_TOOL, 1),
+    ("link_refused", "link_refused", _LINK_TOOL, 1),
+    ("link_unvalidatable", "link_url_unusable", _LINK_TOOL, 1),
+    ("link_unreachable", "link_open_failed", _LINK_TOOL, 1),
+    ("link_unreachable_while_origin_page_keeps_fetching", "link_open_failed", _LINK_TOOL, 1),
+    ("link_rejected", "link_rejected_by_site", _LINK_TOOL, 1),
+]
+
+
+def _arming_setup(
+    monkeypatch: pytest.MonkeyPatch, case: str, state: auth_tools.VerificationState, task: Any
+) -> tuple[Any, int]:
+    """Wire the module so that calling the returned handler `n` times reaches `case`'s arming site."""
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    not_a_known_type = SimpleNamespace(value="x", get_otp_type=lambda: "neither")
+    link = OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)
+
+    if case in {"budget_exhausted", "budget_exhausted_on_the_link_tool"}:
+        monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
+        monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
+
+        async def _never_answers(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+            await asyncio.sleep(max_wait_seconds)
+            raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", _never_answers)
+        # The budget is shared by both tools, so which one drained it is answerable only from the
+        # record's `tool` field. The link tool needs a page provider to be offered at all.
+        link_tool = case == "budget_exhausted_on_the_link_tool"
+        tools, _ = auth_tools.build_auth_tools(task, _provider(_FakePage()) if link_tool else None, state=state)
+        return {t.name: t.handler for t in tools}[_LINK_TOOL if link_tool else _CODE], 30
+    if case in {"no_code_streak", "no_link_streak"}:
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=None))
+    elif case == "webhook_failing_streak":
+        monkeypatch.setattr(
+            auth_tools,
+            "resolve_otp_value",
+            AsyncMock(side_effect=FailedToGetTOTPVerificationCode(task_id="tsk_1", reason="HTTP 500")),
+        )
+    elif case == "lookup_error_streak":
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(side_effect=RuntimeError("boom")))
+    elif case in {"value_not_a_code", "value_not_a_link"}:
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=not_a_known_type))
+    else:
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=link))
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+
+    # A magic link with no link tool on offer is the one case that must NOT be handed a page provider.
+    if case in {"magic_link_unsupported", "magic_link_unsupported_cached"}:
+        tools, _ = auth_tools.build_auth_tools(task, state=state)
+        handler = {t.name: t.handler for t in tools}["get_verification_code"]
+        return handler, 2 if case == "magic_link_unsupported_cached" else 1
+
+    if case == "page_unavailable":
+        provider: Any = AsyncMock(side_effect=RuntimeError("no page"))
+    elif case == "link_rejected":
+        provider = _provider(_FakePage(status=410))
+    elif case == "link_unreachable":
+        provider = _provider(_FakePage(goto_error=RuntimeError("net::ERR_CONNECTION_REFUSED")))
+    elif case == "link_unreachable_while_origin_page_keeps_fetching":
+        page = _FakePage(goto_error=TimeoutError("navigation"))
+        page.subresource_on_goto_error = True
+        provider = _provider(page)
+    elif case in {"link_refused", "link_unvalidatable"}:
+        provider = _provider(_FakePage())
+        validator_error: Exception = (
+            BlockedHost("example.test") if case == "link_refused" else RuntimeError("validator down")
+        )
+
+        def _reject(url: str) -> str:
+            raise validator_error
+
+        monkeypatch.setattr(auth_tools, "validate_fetch_url", _reject)
+    else:
+        provider = _provider(_FakePage())
+
+    tools, _ = auth_tools.build_auth_tools(task, provider, state=state)
+    handlers = {t.name: t.handler for t in tools}
+    code_tool = case in {"lookup_error_streak", "no_code_streak", "webhook_failing_streak", "value_not_a_code"}
+    handler = handlers["get_verification_code" if code_tool else "open_verification_link"]
+    return handler, 2 if case.endswith("_streak") else 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("case", "reason", "tool", "records"), _ARMING_CASES, ids=[c[0] for c in _ARMING_CASES])
+async def test_every_arming_narrates_the_condition_that_armed_the_latch(
+    monkeypatch: pytest.MonkeyPatch, case: str, reason: str, tool: str, records: int
+) -> None:
+    # V1 narrates this failure with the org and the identifier attached
+    # (skyvern/forge/agent.py, "TOTP polling timed out — terminating task"); V3 latched a completion
+    # refusal and said nothing, so a run that died on a silent verification source could not be found
+    # in production at all. Every arming must now emit exactly one record naming WHICH condition armed
+    # it — "the latch armed" without the reason does not answer the question support actually asks.
+    task = _task(
+        totp_verification_url="https://totp.example/poll?key=abc",
+        totp_identifier="jane.doe@example.test",
+        workflow_run_id="wr_1",
+    )
+    state = auth_tools.VerificationState(task=task)
+    handler, calls = _arming_setup(monkeypatch, case, state, task)
+    assert state.task is task
+
+    with capture_logs() as logs:
+        for _ in range(calls):
+            # The cached-magic-link site is only reachable on a call AFTER the latch already armed.
+            if state.source_failed and case != "magic_link_unsupported_cached":
+                break
+            await handler({})
+
+    assert state.source_failed, f"{case} did not arm the latch, so it proves nothing about narration"
+    armings = [entry for entry in logs if entry.get("event") == "task_v3 verification source failed"]
+    assert len(armings) == records, f"{case} emitted {len(armings)} records, expected {records}"
+    record = armings[-1]
+    assert record["reason"] == reason
+    # A `StrEnum` member compares equal to its value, so only the type proves the record carries a
+    # plain string — which is what keeps the swallow in `arm` from hiding a caller that passed a
+    # non-member, where reading `.value` would raise and lose the record with the latch already set.
+    assert type(record["reason"]) is str
+    assert record["tool"] == tool
+    assert record["log_level"] == "warning"
+    # Nothing was delivered in any of these, so every one of them blocks a completed verdict.
+    assert record["values_delivered"] == 0
+    # The identifying fields V1 carries, so the two engines' failures are triaged the same way. These
+    # are the raw kwargs: `capture_logs` swaps out the processor chain, so what production actually
+    # renders is pinned by test_the_rendered_record_masks_the_identifier_and_keeps_the_endpoint.
+    assert record["task_id"] == "tsk_1"
+    assert record["organization_id"] == "o_1"
+    assert record["workflow_run_id"] == "wr_1"
+    assert record["totp_identifier"] == "jane.doe@example.test"
+    # The polling URL is a secret-bearing endpoint: the query must be stripped, as V1 strips it.
+    assert record["totp_verification_url"] == "https://totp.example/poll"
+    assert record["totp_verification_url_configured"] is True
+    assert record["arming_count"] == records
+
+
+@pytest.mark.asyncio
+async def test_every_arming_is_counted_not_collapsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A source that keeps returning nothing arms on every call after the first pair, and every one of
+    # them reports. The record this replaces was gated to one per task, so it answered "did this task
+    # hit the condition" and could not answer "how often" at all — `arming_count` now carries the true
+    # running total, which is the whole difference between a signal and a flag.
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=None))
+    tools, _ = auth_tools.build_auth_tools(task, state=state)
+    handler = tools[0].handler
+
+    with capture_logs() as logs:
+        for _ in range(4):
+            await handler({})
+
+    armings = [entry for entry in logs if entry.get("event") == "task_v3 verification source failed"]
+    assert [entry["arming_count"] for entry in armings] == [1, 2, 3]
+    assert {entry["reason"] for entry in armings} == {"no_code_twice"}
+
+
+@pytest.mark.asyncio
+async def test_an_arming_a_later_delivery_unblocks_is_still_narrated(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `values_delivered` on the record is the count at THAT arming, not a verdict on the run: a value
+    # arriving afterwards unblocks the completed verdict and writes no record of its own. The event
+    # says the source failed, which stays true — but a reader treating the field as "this run was
+    # blocked" would be wrong, so the direction is pinned here rather than left to the comment.
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        auth_tools,
+        "resolve_otp_value",
+        AsyncMock(side_effect=[None, None, OTPValue(value="123456", type=OTPType.TOTP)]),
+    )
+    tools, _ = auth_tools.build_auth_tools(task, state=state)
+    handler = tools[0].handler
+
+    with capture_logs() as logs:
+        await handler({})
+        await handler({})
+        skyvern_context.set(SkyvernContext(task_id="tsk_1"))
+        try:
+            delivered = await handler({})
+        finally:
+            skyvern_context.reset()
+
+    armings = [entry for entry in logs if entry.get("event") == "task_v3 verification source failed"]
+    assert [entry["values_delivered"] for entry in armings] == [0]
+    assert delivered.status == "ok"
+    assert state.source_failed is True and await state.block_completion() is None
+
+    # The other order is the one the field exists to separate: a source that delivered and THEN failed
+    # arms, narrates, and does not block. Without this the field is only ever observed as 0, so a
+    # regression to a constant would read as green.
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=None))
+    with capture_logs() as after_delivery:
+        await handler({})
+        await handler({})
+    late = [entry for entry in after_delivery if entry.get("event") == "task_v3 verification source failed"]
+    assert [entry["values_delivered"] for entry in late] == [1]
+    assert await state.block_completion() is None
+
+
+def test_the_latch_cannot_be_armed_without_narrating_a_named_condition() -> None:
+    # The coverage claim is structural, not an inventory: `source_failed` is derived from the recorded
+    # armings rather than settable on its own, the arming list is not an __init__ parameter, and the
+    # reason is a closed type rather than a string. A future site therefore cannot latch silently. The
+    # inventory has already been wrong once (by six sites), which is why this is enforced, not documented.
+    state = auth_tools.VerificationState(task=_task(navigation_payload={"ssn": "000-00-0000"}))
+    assert state.source_failed is False
+    # `block_completion` is handed to the loop as a bound method, so anything formatting that callback
+    # renders this repr; the task must not be in it.
+    assert "ssn" not in repr(state) and "ssn" not in repr(state.block_completion)
+    with pytest.raises(AttributeError):
+        state.source_failed = True  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        auth_tools.VerificationState(task=_task(), _armings=[])  # type: ignore[call-arg]
+    assert state.source_failed is False
+
+    with capture_logs() as logs:
+        state.arm(auth_tools.VerificationFailure.PAGE_UNAVAILABLE, "open_verification_link")
+    assert state.source_failed is True
+    assert [entry["reason"] for entry in logs if entry.get("event") == "task_v3 verification source failed"] == [
+        "page_unavailable"
+    ]
+
+
+def test_narration_never_costs_the_tool_its_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A record that could raise would leave the latch set, the failure unnarrated, and the model
+    # holding a bare tool_error instead of the "finish as failed" guidance — the exact silent failure
+    # this whole change removes, reintroduced by the fix for it. Behaviour outranks observability.
+    def _explode(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("log pipeline down")
+
+    monkeypatch.setattr(auth_tools.LOG, "warning", _explode)
+    state = auth_tools.VerificationState(task=_task())
+    state.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    assert state.source_failed is True
+
+
+def test_a_polling_url_the_parser_rejects_costs_the_field_not_the_record() -> None:
+    # `Task.totp_verification_url` is an unvalidated string on a hydrated task — the validator sits on
+    # the request model, not here — so a malformed URL must not be able to take the record down with
+    # it. It is also a plausible root cause of a source that never delivers, so "configured but
+    # unparseable" has to be distinguishable from "not configured".
+    state = auth_tools.VerificationState(task=_task(totp_verification_url="https://totp.example:99999/poll?key=s"))
+    with capture_logs() as logs:
+        state.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    record = next(entry for entry in logs if entry.get("event") == "task_v3 verification source failed")
+    assert record["totp_verification_url"] is None
+    assert record["totp_verification_url_configured"] is True
+
+    scheme_less = auth_tools.VerificationState(task=_task(totp_verification_url="totp.example/poll?key=abc"))
+    with capture_logs() as logs:
+        scheme_less.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    record = next(entry for entry in logs if entry.get("event") == "task_v3 verification source failed")
+    # `strip_query_params` answers "" here rather than raising, which would otherwise log as an empty
+    # string and read as a URL that is present and blank.
+    assert record["totp_verification_url"] is None
+    assert record["totp_verification_url_configured"] is True
+
+    unconfigured = auth_tools.VerificationState(task=_task())
+    with capture_logs() as logs:
+        unconfigured.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    record = next(entry for entry in logs if entry.get("event") == "task_v3 verification source failed")
+    assert record["totp_verification_url"] is None
+    assert record["totp_verification_url_configured"] is False
+
+    # The query is what carries the caller's secret, and it is what gets stripped.
+    configured = auth_tools.VerificationState(task=_task(totp_verification_url="https://totp.example/poll?key=abc"))
+    with capture_logs() as logs:
+        configured.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    record = next(entry for entry in logs if entry.get("event") == "task_v3 verification source failed")
+    assert record["totp_verification_url"] == "https://totp.example/poll"
+
+
+def test_the_rendered_record_masks_the_identifier_and_keeps_the_endpoint() -> None:
+    # Every other log assertion here runs under `capture_logs`, which replaces the processor chain, so
+    # none of them can see what production emits. `totp_identifier` is in `SENSITIVE_FIELDS` and is
+    # masked before rendering — the record is not a new PII surface, and the identifier is not the
+    # triage handle it looks like. The query-stripped endpoint is, and it must survive.
+    state = auth_tools.VerificationState(
+        task=_task(totp_identifier="jane.doe@example.test", totp_verification_url="https://totp.example/poll?key=abc")
+    )
+    with capture_logs() as logs:
+        state.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    record = next(entry for entry in logs if entry.get("event") == "task_v3 verification source failed")
+
+    rendered = redact_sensitive_event_fields(logging.getLogger(__name__), "warning", dict(record))
+    assert rendered["totp_identifier"] == REDACTED
+    assert rendered["totp_verification_url"] == "https://totp.example/poll"
+    assert rendered["reason"] == "budget_exhausted" and rendered["task_id"] == "tsk_1"
+
+
+def test_every_condition_the_module_can_arm_with_is_covered_by_a_driven_case() -> None:
+    # The reason is a closed type, so the inventory is the enum and not a hand-kept list — which is
+    # exactly how the earlier 8-site inventory came to be missing six. Adding an arming site means
+    # adding a member here, and this fails until a case drives it.
+    assert {reason for _case, reason, _tool, _records in _ARMING_CASES} == set(auth_tools.VerificationFailure)
+
+
 @pytest.mark.asyncio
 async def test_verification_state_does_not_block_after_a_retryable_not_yet(monkeypatch: pytest.MonkeyPatch) -> None:
     # "Not yet" and a lone lookup error are retryable, not a source failure: a speculative poll on a
@@ -336,8 +683,8 @@ async def test_verification_state_does_not_block_after_a_retryable_not_yet(monke
         SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
     )
     monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
-    state = auth_tools.VerificationState()
     task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
     answers: list[Any] = [
         NoTOTPVerificationCodeFound(task_id="tsk_1"),
         RuntimeError("boom"),
@@ -381,9 +728,10 @@ async def test_lookup_error_streak_resets_on_a_usable_answer_that_is_not_a_deliv
     monkeypatch.setattr(
         auth_tools, "resolve_otp_value", AsyncMock(side_effect=[RuntimeError("boom"), link, RuntimeError("boom")])
     )
-    state = auth_tools.VerificationState()
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
     tools, _ = auth_tools.build_auth_tools(
-        _task(totp_verification_url="https://totp.example"),
+        task,
         _provider(_FakePage(goto_error=TimeoutError("load"), cookie_on_goto_error=True)),
         state=state,
     )
@@ -447,10 +795,9 @@ async def test_open_verification_link_failure_after_a_possible_sign_in_keeps_com
         )
         page = _FakePage()
         expected = auth_tools._LATER_HOP_REFUSED
-    state = auth_tools.VerificationState()
-    tools, _ = auth_tools.build_auth_tools(
-        _task(totp_verification_url="https://totp.example"), _provider(page), state=state
-    )
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, _provider(page), state=state)
     handler = {t.name: t.handler for t in tools}["open_verification_link"]
 
     result = await handler({})
@@ -1215,3 +1562,392 @@ def test_block_credential_parameter_keys_script_mode_returns_none(monkeypatch: p
         assert agent_module.block_credential_parameter_keys(block, "wr_test") is None
     with skyvern_context.scoped(SkyvernContext()):
         assert agent_module.block_credential_parameter_keys(NS(parameters=[]), "wr_test") == []
+
+
+@pytest.mark.parametrize("awaiting", [True, False], ids=["awaiting", "not_awaiting"])
+@pytest.mark.parametrize("armed", [True, False], ids=["source_failed", "source_healthy"])
+@pytest.mark.parametrize("stale", [True, False], ids=["stale", "recent"])
+@pytest.mark.parametrize("spent", [True, False], ids=["budget_spent", "budget_left"])
+@pytest.mark.asyncio
+async def test_giveup_gate_holds_exactly_while_awaiting_a_code_it_has_budget_for(
+    awaiting: bool, armed: bool, stale: bool, spent: bool
+) -> None:
+    # The invariant in one sentence: a non-complete finish is held exactly while the run is actively
+    # awaiting a verification code it has purchased-but-unspent budget for. The four conjuncts are
+    # that sentence's operationalization, so this asserts the BICONDITIONAL over the whole
+    # (awaiting, armed, recency, spend) space rather than four example negative controls -- an
+    # enumerated field list cannot close a class, and a conjunct silently dropped from the gate would
+    # leave every example that does not exercise it green.
+    state = auth_tools.VerificationState(task=_task())
+    state.budget_seconds = 900.0
+    state.polling_spent_seconds = 900.0 - (auth_tools._MIN_SLICE_SECONDS / 2 if spent else 600.0)
+    if awaiting:
+        state.awaiting_code_since = time.monotonic() - (auth_tools._NOT_YET_RECENCY_SECONDS + 1 if stale else 0.0)
+    if armed:
+        # Through `arm`, not by poking the latch: it is the only way the latch is reachable in
+        # production, so a state built any other way would not be one this gate can actually see.
+        state.arm(auth_tools.VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+
+    should_hold = awaiting and not armed and not stale and not spent
+    message = await state.block_giveup("failed")
+
+    assert (message is not None) is should_hold
+    if should_hold:
+        assert "get_verification_code" in message
+        # It must send the model back to the TOOL, not onto the page: holding a `terminated` verdict
+        # keeps a run alive on a page the model declared blocked, and the hold must not widen that.
+        assert "do not act on the page" in message
+    # A completed verdict is a separate question the same primitive answers, and unspent budget is
+    # never a reason to refuse one.
+    assert await state.block_finish("completed") == await state.block_completion()
+    assert await state.block_finish("failed") == await state.block_giveup("failed")
+
+
+@pytest.mark.asyncio
+async def test_a_not_yet_answer_arms_the_giveup_gate_and_says_what_budget_is_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Untestable through the scripted loop test, which finishes regardless of what the tool returned.
+    # The old message gave no indication that any budget remained, so "call it again" was prose the
+    # task prompt's own "do not retry" instruction could simply outweigh. The STATUS deliberately
+    # stays `error`: it is never serialized to the model, and it is what routes a call that blocked
+    # for up to 120s through the loop's batch-poisoning check.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=10))
+    # Two slices far enough apart that the recorded spends differ at the record's own resolution;
+    # a shorter wait would let a constant "remaining" pass the tracking assertion below.
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.2)
+
+    async def _not_yet(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+        await asyncio.sleep(max_wait_seconds)
+        raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _not_yet)
+    state = auth_tools.VerificationState(task=_task(totp_verification_url="https://totp.example"))
+    tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"), state=state)
+
+    with capture_logs() as logs:
+        first = await tools[0].handler({})
+        second = await tools[0].handler({})
+
+    assert first.status == "error" and second.status == "error"
+    # A retryable answer must not arm the terminal latch, or the completed-side gate would fire on it.
+    assert state.source_failed is False
+    assert await state.block_completion() is None
+    # It DOES arm the give-up gate: this is the state the run is in when it throws its budget away.
+    assert state.awaiting_code_since is not None
+    assert await state.block_giveup("failed") is not None
+
+    # The spend curve is only reconstructible today by differencing poll timestamps; the probe that
+    # sizes this fix in production needs it emitted directly, and v3-only (otp_service is v1's path).
+    slices = [e for e in logs if e.get("event") == "task_v3 verification poll slice timed out"]
+    assert len(slices) == 2
+    assert [e["tool"] for e in slices] == ["get_verification_code", "get_verification_code"]
+    assert slices[0]["polling_spent_seconds"] < slices[1]["polling_spent_seconds"]
+    for record in slices:
+        assert record["budget_seconds"] == 600.0
+        assert record["polling_spent_seconds"] + record["remaining_seconds"] == pytest.approx(600.0, abs=0.1)
+
+    # The message carries the remaining budget as a NUMBER, and the number is the budget MINUS THE
+    # SPEND AT THAT CALL -- checked against two different spends, so a constant (or a stale one that
+    # ignores the slice it just paid for) fails. An unquantified "you may retry" is prose competing
+    # with the "do not retry" prose in the task prompt; a number is not.
+    def _minutes(content: str) -> float:
+        return float(re.search(r"about ([\d.]+) minutes of polling budget remain", content).group(1))
+
+    for result, record in zip((first, second), slices):
+        assert _minutes(result.content) == pytest.approx((600.0 - record["polling_spent_seconds"]) / 60.0, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_the_giveup_gate_records_both_the_hold_and_the_budget_it_let_go(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Gate 7's prod probe reads these records, so they have to exist and carry the residual. Today a
+    # give-up with budget left is invisible: nothing logs at a non-complete finish at all.
+    state = auth_tools.VerificationState(task=_task())
+    state.budget_seconds = 900.0
+    state.polling_spent_seconds = 120.0
+    state.awaiting_code_since = time.monotonic()
+
+    with capture_logs() as logs:
+        held = await state.block_giveup("failed")
+        # Same finish again with no polling in between: the model ignored the hold, so the next
+        # verdict stands and the residual it walks away from is recorded.
+        released = await state.block_giveup("failed")
+
+    assert held is not None and released is None
+    records = [e for e in logs if e.get("event") == "task_v3 verification give-up gate"]
+    assert [e["held"] for e in records] == [True, False]
+    assert [e["reason"] for e in records] == ["held", "unproductive"]
+    assert all(e["polling_spent_seconds"] == 120.0 and e["remaining_seconds"] == 780.0 for e in records)
+    assert [e["giveup_deferrals"] for e in records] == [1, 1]
+    # The probe splits held-vs-honored by finish verdict, and this record is the only place the two
+    # populations can be told apart -- without it both verdicts produce identical records.
+    assert all(e["finish_status"] == "failed" for e in records)
+    state.spend_at_last_giveup_deferral = None
+    with capture_logs() as terminated_logs:
+        assert await state.block_giveup("terminated") is not None
+    terminated = [e for e in terminated_logs if e.get("event") == "task_v3 verification give-up gate"]
+    assert [e["finish_status"] for e in terminated] == ["terminated"]
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_code_disarms_the_giveup_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (b) in the negative controls: a run that got its code and later fails for an unrelated reason
+    # must end on its first verdict. The disarm has to happen at the delivery site, not be inferred.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=10))
+    state = auth_tools.VerificationState(task=_task(totp_verification_url="https://totp.example"))
+    state.awaiting_code_since = time.monotonic()
+    monkeypatch.setattr(
+        auth_tools, "resolve_otp_value", AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP))
+    )
+    tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"), state=state)
+
+    with capture_logs() as logs:
+        result = await tools[0].handler({})
+
+    assert result.status == "ok" and "123456" in result.content
+    assert state.awaiting_code_since is None
+    assert await state.block_giveup("failed") is None
+    delivered = [e for e in logs if e.get("event") == "task_v3 verification value delivered"]
+    assert len(delivered) == 1 and delivered[0]["values_delivered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_not_yet_after_a_terminal_failure_does_not_rearm_the_giveup_gate() -> None:
+    # The ordering that makes `source_failed` a real conjunct rather than a restatement of
+    # `awaiting_code_since is None`: the source can terminally fail (two empty answers, say) and a
+    # LATER call still land on the healthy-source "not yet" path, which sets the awaiting latch
+    # again. Clearing the latch inside `arm` would look equivalent and would hold this run, which is
+    # exactly wrong -- the source has already been judged.
+    state = auth_tools.VerificationState(task=_task())
+    state.budget_seconds = 900.0
+    state.polling_spent_seconds = 120.0
+    state.arm(auth_tools.VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+    state.awaiting_code_since = time.monotonic()
+
+    assert state.source_failed is True
+    assert state.awaiting_code_since is not None
+    assert await state.block_giveup("failed") is None
+
+
+@pytest.mark.asyncio
+async def test_the_hold_names_the_tool_the_run_is_actually_waiting_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both tools drain one source and share one budget, so the latch has to remember which one armed
+    # it. A magic-link run told to "call get_verification_code again" is being sent to the wrong tool.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=10))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+
+    async def _not_yet(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+        await asyncio.sleep(max_wait_seconds)
+        raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _not_yet)
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, page_provider=AsyncMock(), state=state)
+
+    link_tool = next(t for t in tools if t.name == "open_verification_link")
+    await link_tool.handler({})
+
+    assert state.awaiting_code_tool == "open_verification_link"
+    message = await state.block_giveup("failed")
+    assert message is not None and "open_verification_link" in message
+    assert "get_verification_code" not in message
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_arrives_but_is_not_delivered_still_disarms_the_giveup_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The latch means "the source has not produced anything yet", so it has to clear when the source
+    # produces something -- not when the model is handed something. Several paths reach a value without
+    # a delivery (a link when a code was asked for, a code when a link was, a link the browser could
+    # not open), and on all of them the run is done waiting on the SOURCE. Holding a give-up there
+    # would contradict the very answer the tool just returned, and would send the model back to
+    # re-poll for a value it already has.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=10))
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    state.awaiting_code_since = time.monotonic()
+    state.polling_spent_seconds = 120.0
+    monkeypatch.setattr(
+        auth_tools,
+        "resolve_otp_value",
+        AsyncMock(return_value=OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)),
+    )
+    tools, _ = auth_tools.build_auth_tools(task, page_provider=AsyncMock(), state=state)
+
+    result = await next(t for t in tools if t.name == "get_verification_code").handler({})
+
+    assert result.status == "error" and result.content == auth_tools._MAGIC_LINK_REDIRECT
+    assert state.values_delivered == 0  # nothing was handed to the model...
+    assert state.awaiting_code_since is None  # ...but the source is no longer being waited on
+    assert await state.block_giveup("failed") is None
+
+
+@pytest.mark.asyncio
+async def test_a_not_yet_with_less_than_one_slice_left_says_so_instead_of_inviting_a_refused_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A slice can end with budget left but not enough to buy another one, because the tail is checked
+    # before the poll and consumed by it. Reporting "about 0.0 minutes remain ... call it again" would
+    # send the model into a call that answers _BUDGET_EXHAUSTED -- and the whole argument for putting a
+    # number in this message is that a number beats prose the task prompt can outweigh.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=0.55 / 60))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.5)
+
+    async def _not_yet(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+        await asyncio.sleep(max_wait_seconds)
+        raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _not_yet)
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, state=state)
+
+    first = await tools[0].handler({})
+    second = await tools[0].handler({})
+
+    assert 0 < state.remaining_budget_seconds < auth_tools._MIN_SLICE_SECONDS
+    assert first.status == "error"
+    assert "the polling budget is now spent" in first.content
+    assert "minutes of polling budget remain" not in first.content
+    # ...and it must not invite the call it just said is pointless. The next call really is refused
+    # without polling, so an invitation costs a tool call and a turn to be told so -- and near the
+    # loop's limits that trades this truthful failure for a generic budget-exhausted exit.
+    assert "Do not call get_verification_code again" in first.content
+    assert "trigger it first" not in first.content
+    assert second.content == auth_tools._BUDGET_EXHAUSTED
+    # ...and it is a TERMINAL answer, so it arms. The budget is exhausted at this point whether or
+    # not the model makes the call that used to be the only thing that armed the latch -- and a model
+    # that obeys "do not call it again" must not thereby be free to claim the step completed.
+    assert state.source_failed is True
+    assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
+    # Giving up IS correct now, so the give-up gate releases rather than holding.
+    assert await state.block_giveup("failed") is None
+
+
+def test_the_giveup_headroom_reservation_still_covers_a_whole_poll_slice() -> None:
+    # The 180s is not a round number: it is one blocking poll slice plus the re-finish cycle the
+    # pre-existing holds already reserve. loop.py cannot import auth_tools to say so (auth_tools
+    # imports loop), and asserting only that it exceeds the 60s reservation still passes at 61 --
+    # which would under-fund the hold and convert an honest failure into budget_exhausted, the exact
+    # conversion the constant exists to prevent. This file imports both, so it can pin the relation.
+    from skyvern.forge.taskv3 import loop as loop_module
+
+    assert loop_module.VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS == (
+        auth_tools._PER_CALL_WAIT_SECONDS + loop_module.FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_spent_budget_answer_names_the_link_tool_on_a_link_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The point of building this message from `_tool_name` is that a magic-link run polls the OTHER
+    # tool, so telling it to stop calling `get_verification_code` names something it never called.
+    # Every other assertion on this message runs the code tool, so without this one the whole
+    # parameterisation can be replaced by the literal and the file stays green.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=20 / 60))
+    clock = [0.0]
+    monkeypatch.setattr(auth_tools, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
+
+    async def _spends_12s(*_a: Any, **_k: Any) -> OTPValue | None:
+        clock[0] += 12.0
+        raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _spends_12s)
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, page_provider=AsyncMock(), state=state)
+
+    result = await next(t for t in tools if t.name == "open_verification_link").handler({})
+
+    assert "no sign-in link available yet" in result.content
+    assert "Do not call open_verification_link again" in result.content
+    assert "get_verification_code" not in result.content
+    assert state.source_failed is True
+
+
+@pytest.mark.asyncio
+async def test_a_terminally_failed_source_is_recorded_as_such_not_as_a_spent_budget() -> None:
+    # The give-up record's `reason` feeds a production probe, and `block_giveup` checks `source_failed`
+    # ahead of both the recency window and the budget -- so once the source is armed, a give-up is
+    # labelled `source_failed` whether the budget ran out or the latch went stale. Nothing pinned that
+    # label, so the shift was invisible to the tests that do pin the held-vs-honored split.
+    state = auth_tools.VerificationState(task=_task())
+    state.budget_seconds = 900.0
+    state.polling_spent_seconds = 895.0
+    state.awaiting_code_since = time.monotonic()
+    state.arm(auth_tools.VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+
+    with capture_logs() as logs:
+        assert await state.block_giveup("failed") is None
+    record = next(e for e in logs if e.get("event") == "task_v3 verification give-up gate")
+    assert record["reason"] == "source_failed"
+    # Still an honored give-up, which is what the probe's held-vs-honored split actually counts.
+    assert record["held"] is False
+
+
+@pytest.mark.parametrize("link_run", [False, True], ids=["code_tool", "link_tool"])
+@pytest.mark.parametrize(
+    "resolver_result",
+    ["returns_nothing", "source_errored", "lookup_raised"],
+)
+@pytest.mark.asyncio
+async def test_every_retryable_answer_arms_the_giveup_gate_not_just_a_not_yet(
+    monkeypatch: pytest.MonkeyPatch, resolver_result: str, link_run: bool
+) -> None:
+    # Four answers ask the model to call again: "not yet", a bare None, a source that errored, and a
+    # lookup that raised. Arming on only the first left the gate holding on one of them, so a run that
+    # gave up right after any of the other three discarded its budget exactly as it did before this
+    # change -- the same defect, on sibling paths.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=10))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+
+    async def _answer(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+        await asyncio.sleep(max_wait_seconds)
+        if resolver_result == "returns_nothing":
+            return None
+        if resolver_result == "source_errored":
+            raise FailedToGetTOTPVerificationCode(task_id="tsk_1", reason="http_status=500")
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _answer)
+    if link_run:
+        monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
+    task = _task(totp_verification_url="https://totp.example")
+    state = auth_tools.VerificationState(task=task)
+    tools, _ = auth_tools.build_auth_tools(task, page_provider=AsyncMock() if link_run else None, state=state)
+    # Both tools drain one source, so the tool the latch records is load-bearing here and cannot be
+    # checked on the code run alone -- "get_verification_code" is also the field's default, so an
+    # assertion that only ever sees that value passes whether or not the tool is recorded at all.
+    expected_tool = "open_verification_link" if link_run else "get_verification_code"
+    handler = {t.name: t.handler for t in tools}[expected_tool]
+
+    first = await handler({})
+
+    # Retryable, not terminal: it invites another call and must not arm the completion refusal.
+    assert first.status == "error"
+    assert state.source_failed is False
+    assert await state.block_completion() is None
+    # ...and it holds a give-up, which is the whole point.
+    assert state.awaiting_code_since is not None
+    assert state.awaiting_code_tool == expected_tool
+    held = await state.block_giveup("failed")
+    assert held is not None and expected_tool in held
+    # The hold must name the right ARTIFACT as well as the right tool: telling a run that polled for
+    # a sign-in link that "the verification code has not arrived" contradicts both the page and the
+    # answer the tool just gave it. Asserted on the link run too, because "verification code" is the
+    # wording a hardcoded default would produce and the code run alone cannot tell them apart.
+    if link_run:
+        assert "sign-in link" in held and "verification code" not in held
+    else:
+        assert "verification code" in held and "sign-in link" not in held
+
+    # The SECOND occurrence is terminal, and then giving up is correct again.
+    await handler({})
+    assert state.source_failed is True
+    assert await state.block_giveup("failed") is None

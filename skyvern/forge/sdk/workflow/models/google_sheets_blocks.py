@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import structlog
 from jinja2 import UndefinedError
@@ -40,6 +40,17 @@ LOG = structlog.get_logger()
 _SHEETS_WRITE_SEQ = count()
 
 
+def _occupancy_marker(cell: dict[str, Any]) -> dict[str, Any]:
+    # Which field carried the occupancy has to survive redaction: a formula rendering "" is occupied
+    # only via userEnteredValue, so collapsing both to formattedValue would make a replayed dump
+    # anchor where the live run did not.
+    if cell.get("formattedValue"):
+        return {"formattedValue": "x"}
+    if cell.get("userEnteredValue"):
+        return {"userEnteredValue": {"stringValue": "x"}}
+    return {}
+
+
 def _occupancy_only_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
     """The snapshot with cell text replaced by a marker. The anchor only reads whether a cell is
     occupied, so this replays identically without carrying the customer's cell contents."""
@@ -50,12 +61,7 @@ def _occupancy_only_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] 
         data = []
         for block in sheet.get("data") or []:
             rows = [
-                {
-                    "values": [
-                        {"formattedValue": "x"} if cell.get("formattedValue") else {}
-                        for cell in (row.get("values") or [])
-                    ]
-                }
+                {"values": [_occupancy_marker(cell) for cell in (row.get("values") or [])]}
                 for row in (block.get("rowData") or [])
             ]
             data.append({"startRow": block.get("startRow", 0), "rowData": rows})
@@ -156,25 +162,30 @@ class GoogleSheetsReadBlock(Block):
     has_header_row: bool = True
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "credential_id",
+            "range",
+            "sheet_name",
+            "spreadsheet_url",
+        }
+    )
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.spreadsheet_url:
-            self.spreadsheet_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.spreadsheet_url, workflow_run_context
+            self.spreadsheet_url = self.render_templatable_field(
+                "spreadsheet_url", self.spreadsheet_url, workflow_run_context
             )
         if self.sheet_name:
-            self.sheet_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.sheet_name, workflow_run_context
-            )
+            self.sheet_name = self.render_templatable_field("sheet_name", self.sheet_name, workflow_run_context)
         if self.range:
-            self.range = self.format_block_parameter_template_from_workflow_run_context(
-                self.range, workflow_run_context
-            )
+            self.range = self.render_templatable_field("range", self.range, workflow_run_context)
         if self.credential_id:
-            self.credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.credential_id, workflow_run_context
+            self.credential_id = self.render_templatable_field(
+                "credential_id", self.credential_id, workflow_run_context
             )
 
     async def execute(
@@ -190,13 +201,13 @@ class GoogleSheetsReadBlock(Block):
         try:
             self._render_templates(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not self.credential_id:
@@ -544,25 +555,31 @@ class GoogleSheetsWriteBlock(Block):
     create_sheet_if_missing: bool = False
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "credential_id",
+            "range",
+            "sheet_name",
+            "spreadsheet_url",
+            "values",
+        }
+    )
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.spreadsheet_url:
-            self.spreadsheet_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.spreadsheet_url, workflow_run_context
+            self.spreadsheet_url = self.render_templatable_field(
+                "spreadsheet_url", self.spreadsheet_url, workflow_run_context
             )
         if self.sheet_name:
-            self.sheet_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.sheet_name, workflow_run_context
-            )
+            self.sheet_name = self.render_templatable_field("sheet_name", self.sheet_name, workflow_run_context)
         if self.range:
-            self.range = self.format_block_parameter_template_from_workflow_run_context(
-                self.range, workflow_run_context
-            )
+            self.range = self.render_templatable_field("range", self.range, workflow_run_context)
         if self.credential_id:
-            self.credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.credential_id, workflow_run_context
+            self.credential_id = self.render_templatable_field(
+                "credential_id", self.credential_id, workflow_run_context
             )
         if self.values:
             self.values = self._render_values_or_raise(workflow_run_context)
@@ -571,7 +588,8 @@ class GoogleSheetsWriteBlock(Block):
         """A reference no upstream block answered would otherwise render as "" and be appended as a
         blank cell the Sheets API reports as a successful write. `| default(...)` passes an empty."""
         try:
-            return self.format_block_parameter_template_from_workflow_run_context(
+            return self.render_templatable_field(
+                "values",
                 self.values,
                 workflow_run_context,
                 env=jinja_json_finalize_required_binding_env,
@@ -684,13 +702,13 @@ class GoogleSheetsWriteBlock(Block):
         try:
             self._render_templates(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not self.credential_id:
@@ -857,6 +875,7 @@ class GoogleSheetsWriteBlock(Block):
                     spreadsheet_id=spreadsheet_id,
                     range_=range_sent,
                     values=rows,
+                    insert_data_option="OVERWRITE" if anchor_source == "resolved" else "INSERT_ROWS",
                 )
             else:
                 payload = await app.AGENT_FUNCTION.google_sheets_values_update(
@@ -979,7 +998,10 @@ class GoogleSheetsWriteBlock(Block):
                 access_token=access_token,
                 spreadsheet_id=spreadsheet_id,
                 ranges=column_range,
-                fields="sheets(properties(title,gridProperties(rowCount)),data(startRow,rowData(values(formattedValue))))",
+                fields=(
+                    "sheets(properties(title,gridProperties(rowCount)),"
+                    "data(startRow,rowData(values(formattedValue,userEnteredValue))))"
+                ),
             )
         except Exception as e:
             LOG.warning(
@@ -1004,7 +1026,9 @@ class GoogleSheetsWriteBlock(Block):
         row_data = first_data.get("rowData") or []
         last_filled = 0
         for index, row in enumerate(row_data, start=1):
-            if any(cell.get("formattedValue") for cell in (row.get("values") or [])):
+            # A formula rendering "" carries no formattedValue, so an anchor keyed on it alone would
+            # overwrite the formula.
+            if any(cell.get("formattedValue") or cell.get("userEnteredValue") for cell in (row.get("values") or [])):
                 last_filled = index
         next_row = int(first_data.get("startRow", 0)) + last_filled + 1
         # Past the last grid row an anchored A1 is rejected outright, while the unanchored range lets

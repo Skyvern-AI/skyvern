@@ -321,19 +321,14 @@ def test_post_report_preserves_local_file_when_no_pr(
     not CLAUDE_QA_EVIDENCE_SKILL.exists(),
     reason=".claude/skills/qa-evidence/SKILL.md not present (OSS checkout)",
 )
-def test_qa_evidence_skill_mentions_linear_signed_upload_flow() -> None:
+def test_qa_evidence_skill_documents_linear_issue_upload_api() -> None:
     skill_text = CLAUDE_QA_EVIDENCE_SKILL.read_text(encoding="utf-8")
+    # Third-party API surface the skill cannot infer: the mutation signatures and the
+    # signing header. Prose is deliberately not pinned here.
     required_markers = [
-        "GitHub has no public API",
-        "GraphQL `fileUpload`",
-        "public-file-urls-expire-in",
         "fileUpload(filename: $filename, contentType: $contentType, size: $size)",
         "commentCreate(input: { issueId: $issueId, body: $body })",
-        "Do **not** embed the unsigned `assetUrl`",
-        "31536000",
-        "`<=3600` seconds",
-        "warm GitHub's camo proxy",
-        "github-pr-screenshot-evidence",
+        "public-file-urls-expire-in",
     ]
     for marker in required_markers:
         assert marker in skill_text

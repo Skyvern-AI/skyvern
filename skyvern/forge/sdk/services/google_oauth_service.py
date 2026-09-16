@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -906,6 +906,47 @@ def _matches_reference(credential: GoogleOAuthCredentialBase, normalized_referen
     )
 
 
+@dataclass(frozen=True)
+class GoogleConnectionResolution:
+    status: str
+    reference: str
+    credential: GoogleOAuthCredentialBase | None
+    candidates: tuple[GoogleOAuthCredentialBase, ...]
+    matches: tuple[GoogleOAuthCredentialBase, ...]
+
+
+def resolve_connection_reference(
+    credentials: Sequence[GoogleOAuthCredentialBase], reference: str
+) -> GoogleConnectionResolution:
+    """Resolve one connection name, account email, or stored id against the rows given.
+
+    Active rows win outright over same-named non-active ones, so a stale connection sharing a name
+    with a healthy one never makes it ambiguous.
+    """
+    reference = reference.strip()
+    normalized = reference.casefold()
+    matches = [
+        credential
+        for credential in credentials
+        if credential.id == reference or _matches_reference(credential, normalized)
+    ]
+    active = [credential for credential in matches if credential.state == STATE_ACTIVE]
+    candidates = active or matches
+    if not candidates:
+        status = "not_found"
+    elif len({credential.id for credential in candidates}) != 1:
+        status = "ambiguous"
+    else:
+        status = "resolved"
+    return GoogleConnectionResolution(
+        status=status,
+        reference=reference,
+        credential=candidates[0] if status == "resolved" else None,
+        candidates=tuple(candidates),
+        matches=tuple(matches),
+    )
+
+
 async def resolve_credential_reference(organization_id: str, reference: str) -> str:
     """Map a caller-supplied Google connection reference onto a stored credential id.
 
@@ -918,13 +959,8 @@ async def resolve_credential_reference(organization_id: str, reference: str) -> 
         return reference
 
     credentials = await get_visible_credentials_for_org(organization_id)
-    normalized = reference.casefold()
-    matches = [credential for credential in credentials if _matches_reference(credential, normalized)]
-    active = [credential for credential in matches if credential.state == STATE_ACTIVE]
-    candidates = active or matches
-    if len({credential.id for credential in candidates}) != 1:
-        return reference
-    return candidates[0].id
+    resolution = resolve_connection_reference(credentials, reference)
+    return resolution.credential.id if resolution.credential is not None else reference
 
 
 async def describe_credential_failure(organization_id: str, reference: str) -> str:
@@ -940,8 +976,7 @@ async def describe_credential_failure(organization_id: str, reference: str) -> s
     if any(credential.id == reference for credential in credentials):
         return reconnect
 
-    normalized = reference.casefold()
-    matches = [credential for credential in credentials if _matches_reference(credential, normalized)]
+    matches = resolve_connection_reference(credentials, reference).matches
     if len(matches) == 1:
         return reconnect
     if len(matches) > 1:

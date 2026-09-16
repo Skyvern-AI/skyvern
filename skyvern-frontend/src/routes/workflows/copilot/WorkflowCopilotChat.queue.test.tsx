@@ -8,12 +8,10 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "@/components/ui/use-toast";
 
 import { getSseClient } from "@/api/sse";
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
@@ -21,64 +19,95 @@ import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes
 // Capture every postStreaming call so a test can assert how many streams
 // started and drive each one to a terminal frame on demand.
 type StreamCall = {
-  body: { message: string };
+  body: {
+    message: string;
+    attached_file_ids?: string[];
+    target_block_label?: string | null;
+    product_action?: string | null;
+  };
   onMessage: (payload: unknown) => boolean;
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const { streamCalls, postStreaming, cancelPost, historyResponse, speechState } =
-  vi.hoisted(() => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: { message: string },
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as {
-          sender: "user" | "ai";
-          content: string;
-          created_at: string;
-          narrative_payload?: Record<string, unknown> | null;
-        }[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    const speech = {
-      isSupported: false,
-      isListening: false,
-      isHearingSpeech: false,
-      start: vi.fn(),
-      stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
-      toggle: vi.fn(),
-      takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-      speechState: speech,
-    };
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  uploadCount,
+  uploadGate,
+  deleteFile,
+  historyResponse,
+  speechState,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const uploadCount = { n: 0 };
+  const deleteFile = vi.fn().mockResolvedValue({});
+  const uploadGate = { hold: false, release: [] as (() => void)[] };
+  const post = vi.fn((path: string) => {
+    if (path !== "/upload_file") return Promise.resolve({});
+    const payload = { data: { file_id: `file_${++uploadCount.n}` } };
+    if (!uploadGate.hold) return Promise.resolve(payload);
+    // Held open so a test can observe a send while the upload is still in flight.
+    return new Promise((resolve) => {
+      uploadGate.release.push(() => resolve(payload));
+    });
   });
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: { message: string },
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as {
+        sender: "user" | "ai";
+        content: string;
+        created_at: string;
+        narrative_payload?: Record<string, unknown> | null;
+      }[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  const speech = {
+    isSupported: false,
+    isListening: false,
+    isHearingSpeech: false,
+    start: vi.fn(),
+    stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
+    toggle: vi.fn(),
+    takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    uploadCount,
+    uploadGate,
+    deleteFile,
+    historyResponse: history,
+    speechState: speech,
+  };
+});
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
 }));
 
+const pageExitDelete = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+
 vi.mock("@/api/AxiosClient", () => ({
+  deleteUploadedFileOnPageExit: pageExitDelete,
   getClient: vi.fn().mockResolvedValue({
     get: vi.fn().mockImplementation(() => Promise.resolve(historyResponse)),
     post: cancelPost,
+    delete: deleteFile,
   }),
 }));
 
@@ -189,55 +218,27 @@ async function renderChat(
 ) {
   const view = render(<WorkflowCopilotChat {...props} />);
   // Let the mount-time chat-history fetch settle.
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
-async function renderChatWithFlags(
-  booleanFlags: Record<string, boolean>,
-  defaultMode: string,
-) {
+async function renderChatWithFlags(booleanFlags: Record<string, boolean>) {
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={() => defaultMode}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>,
   );
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(/Message Skyvern Copilot|Ask Copilot/),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
 // Code-block mode is off in the bare harness (no flag provider), so the turns
-// it drives all carry code_block=null; this one opts into the code composer.
+// it drives all explicitly select non-code Build; this one opts into the code composer.
 function renderChatWithCodeMode() {
-  return renderChatWithFlags(
-    {
-      ENABLE_WORKFLOW_COPILOT_V2: true,
-      WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
-      CODE_BLOCK_ACCESS: true,
-    },
-    "build",
-  );
-}
-
-// The mode pill is the one ask/build control that stays mounted through an
-// in-flight turn. Code-block mode is off so switching mode moves only the mode.
-function renderChatWithModePill() {
-  return renderChatWithFlags(
-    {
-      ENABLE_WORKFLOW_COPILOT_V2: true,
-      WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
-      CODE_BLOCK_ACCESS: false,
-    },
-    "build",
-  );
+  return renderChatWithFlags({
+    WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
+    CODE_BLOCK_ACCESS: true,
+  });
 }
 
 function textarea(): HTMLTextAreaElement {
@@ -248,6 +249,51 @@ async function submit(value: string) {
   fireEvent.change(textarea(), { target: { value } });
   await act(async () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
+  });
+}
+
+async function attachSpreadsheet(
+  filename: string,
+  file = new File(["row_id,url\n"], filename),
+) {
+  const input = document.querySelector(
+    'input[accept*=".pdf"]',
+  ) as HTMLInputElement;
+  if (!input) throw new Error("composer has no attachment input");
+  await act(async () => {
+    fireEvent.change(input, { target: { files: [file] } });
+  });
+}
+
+async function dropAttachments(...files: File[]) {
+  const composer = screen.getByRole("group", {
+    name: "Copilot message composer",
+  });
+  const dataTransfer = {
+    files,
+    types: ["Files"],
+    dropEffect: "none",
+  };
+  let dropWasNotCancelled = true;
+  await act(async () => {
+    dropWasNotCancelled = fireEvent.drop(composer, { dataTransfer });
+  });
+  return dropWasNotCancelled;
+}
+
+function oversizeFile(filename: string) {
+  const file = new File(["x"], filename);
+  Object.defineProperty(file, "size", { value: 11 * 1024 * 1024 });
+  return file;
+}
+
+// Deliver the first SSE frame of the newest pending stream, which is what arms
+// the stop control.
+async function deliverFirstFrame() {
+  const call = streamCalls[streamCalls.length - 1];
+  if (!call) throw new Error("no pending stream to open");
+  await act(async () => {
+    call.onMessage(turnStart());
   });
 }
 
@@ -266,6 +312,13 @@ beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
+  uploadCount.n = 0;
+  uploadGate.hold = false;
+  uploadGate.release.length = 0;
+  deleteFile.mockClear();
+  pageExitDelete.mockClear();
+  pageExitDelete.mockResolvedValue(true);
+  vi.mocked(toast).mockClear();
   postStreaming.mockClear();
   cancelPost.mockClear();
   speechState.isSupported = false;
@@ -295,6 +348,138 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
+  it("shows a stable file-drop affordance across nested drag events", async () => {
+    await renderChat();
+    const composer = screen.getByRole("group", {
+      name: "Copilot message composer",
+    });
+    const dataTransfer = {
+      files: [new File(["row_id,url\n"], "rows.csv")],
+      types: ["Files"],
+      dropEffect: "none",
+    };
+
+    fireEvent.dragEnter(composer, { dataTransfer });
+    fireEvent.dragEnter(textarea(), { dataTransfer });
+    expect(screen.getByText("Drop files to attach")).toBeTruthy();
+
+    fireEvent.dragLeave(textarea(), { dataTransfer });
+    expect(screen.getByText("Drop files to attach")).toBeTruthy();
+
+    fireEvent.dragLeave(composer, { dataTransfer });
+    expect(screen.queryByText("Drop files to attach")).toBeNull();
+  });
+
+  it("uploads supported files dropped on the composer through the attachment flow", async () => {
+    await renderChat();
+
+    const dropWasNotCancelled = await dropAttachments(
+      new File(["row_id,url\n"], "rows.csv"),
+      new File(["%PDF"], "report.pdf"),
+    );
+
+    expect(dropWasNotCancelled).toBe(false);
+    await waitFor(() => expect(uploadCount.n).toBe(2));
+    expect(
+      screen.getByRole("button", { name: "Remove rows.csv" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove report.pdf" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Drop files to attach")).toBeNull();
+  });
+
+  it("ignores unsupported dropped files before upload", async () => {
+    await renderChat();
+
+    await dropAttachments(new File(["hello"], "notes.txt"));
+
+    expect(uploadCount.n).toBe(0);
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Unsupported file type" }),
+    );
+  });
+
+  it("ignores dragged prose and other non-file payloads", async () => {
+    await renderChat();
+    const composer = screen.getByRole("group", {
+      name: "Copilot message composer",
+    });
+    const dataTransfer = {
+      files: [],
+      types: ["text/plain"],
+      dropEffect: "none",
+    };
+
+    expect(fireEvent.dragEnter(composer, { dataTransfer })).toBe(true);
+    expect(screen.queryByText("Drop files to attach")).toBeNull();
+    expect(fireEvent.drop(composer, { dataTransfer })).toBe(true);
+    expect(uploadCount.n).toBe(0);
+  });
+
+  it("admits only the remaining attachment slots from a multi-file drop", async () => {
+    await renderChat();
+    for (let index = 0; index < 19; index += 1) {
+      await attachSpreadsheet(`picked-${index}.csv`);
+    }
+
+    await dropAttachments(
+      new File(["row_id,url\n"], "accepted.csv"),
+      new File(["row_id,url\n"], "over-limit.csv"),
+    );
+
+    await waitFor(() => expect(uploadCount.n).toBe(20));
+    expect(
+      screen.getByRole("button", { name: "Remove accepted.csv" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("over-limit.csv")).toBeNull();
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Too many files" }),
+    );
+  });
+
+  it("does not let an oversized drop consume a remaining attachment slot", async () => {
+    await renderChat();
+    for (let index = 0; index < 19; index += 1) {
+      await attachSpreadsheet(`picked-${index}.csv`);
+    }
+
+    await dropAttachments(
+      new File([new Uint8Array(10 * 1024 * 1024 + 1)], "oversized.csv"),
+      new File(["row_id,url\n"], "accepted.csv"),
+    );
+
+    await waitFor(() => expect(uploadCount.n).toBe(20));
+    expect(
+      screen.getByRole("button", { name: "Remove accepted.csv" }),
+    ).toBeTruthy();
+    expect(screen.getByText("oversized.csv")).toBeTruthy();
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "File too large" }),
+    );
+    expect(vi.mocked(toast)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Too many files" }),
+    );
+  });
+
+  it("keeps the plus-button picker available for attachment uploads", async () => {
+    await renderChat();
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Attach a file",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    await attachSpreadsheet("picked.csv");
+
+    await waitFor(() => expect(uploadCount.n).toBe(1));
+    expect(
+      screen.getByRole("button", { name: "Remove picked.csv" }),
+    ).toBeTruthy();
+  });
+
   it("reserves inline space for a user-message timestamp", async () => {
     const content = "How would I loop the same block over a list of websites?";
     historyResponse.data = {
@@ -322,29 +507,48 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(timestamp.className).not.toContain("absolute");
   });
 
+  it("wraps long unbroken text inside the user-message bubble", async () => {
+    const content = `https://example.test/logs?query=${"encoded-query-segment".repeat(20)}`;
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    expect(message.className).toContain("[overflow-wrap:anywhere]");
+  });
+
   it("leaves the input enabled while a turn is in flight", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     expect(textarea().disabled).toBe(false);
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
   });
 
   it("labels the in-flight follow-up action as the next send", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
-    expect(
-      screen.getByText(
-        "Copilot is working. Your next send will wait for the next turn.",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByTestId("copilot-working-status")).toBeTruthy();
     expect(
       screen.getByPlaceholderText("Type to queue a message…"),
     ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
   });
 
@@ -396,16 +600,17 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     await submit("second message");
 
     // The synchronous in-flight ref must prevent a second concurrent stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("1 message queued")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(
-      screen.getAllByText("Queued — sends when this turn finishes.").length,
-    ).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Edit queued" })).toBeTruthy();
+      screen.getByRole("button", { name: "Edit queued message" }),
+    ).toBeTruthy();
   });
 
   it("drains the queued message into one new stream after the turn ends", async () => {
@@ -423,21 +628,1511 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getAllByText("second message")).toHaveLength(1);
   });
 
-  it("Escape edits the queued message first, preserving the active run", async () => {
+  it("sends a queued message with the file that was attached to it, not a later one", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await submit("second message");
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // A file picked while the message is still queued belongs to the NEXT message.
+    await attachSpreadsheet("later.csv");
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_1"]);
+    // Only the composer chip carries a remove control, so this asserts the later file is
+    // still in the tray waiting for the message it belongs to.
+    expect(
+      screen.getByRole("button", { name: "Remove later.csv" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Remove queued.csv" }),
+    ).toBeNull();
+  });
+
+  it("still drains a text-only queued message while a later attachment is uploading", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // No file on the queued message: the case where the drain carries nothing of its own.
+    await submit("plain follow-up");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    uploadGate.hold = true;
+    await attachSpreadsheet("later.csv");
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("plain follow-up");
+    expect(streamCalls[1]?.body.attached_file_ids ?? []).toEqual([]);
+  });
+
+  it("still drains a queued message while a later attachment is uploading", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // The next message's file is still uploading when the turn ends. The drain has already
+    // consumed the queued prompt, so refusing it here would lose that message outright.
+    uploadGate.hold = true;
+    await attachSpreadsheet("later.csv");
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    expect(streamCalls[1]?.body.message).toBe("parse the queued sheet");
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("keeps the next message's file when a queued message is re-queued for the browser", async () => {
+    const view = await renderChat({
+      requiresLiveBrowser: true,
+      isLiveBrowserReady: true,
+    });
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // Staged for the message after the queued one.
+    await attachSpreadsheet("next.csv");
+
+    // The browser drops before the turn ends, so the drain re-queues the message instead of
+    // sending it. That re-queue carries its own file and must not touch the tray.
+    view.rerender(
+      <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
+    );
+    await completeOldestStream("first done");
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Remove next.csv" }),
+    ).toBeTruthy();
+  });
+
+  it("does not turn the send button into Stop while a file is still uploading", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+
+    // The upload has not finished, so the file is visible in the tray but not yet staged.
+    uploadGate.hold = true;
+    await attachSpreadsheet("mine.csv");
+
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    const cancelled = cancelPost.mock.calls.some((call) =>
+      String(call[0]).includes("cancel"),
+    );
+    expect(cancelled).toBe(false);
+  });
+
+  it("does not turn the send button into Stop while only a file is staged", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+
+    await attachSpreadsheet("mine.csv");
+
+    // With a file staged the control must read as a queue/send affordance, not Stop —
+    // otherwise a user who attaches mid-turn and clicks cancels the turn they were adding to.
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Queue for next turn" }),
+      );
+    });
+    const cancelled = cancelPost.mock.calls.some((call) =>
+      String(call[0]).includes("cancel"),
+    );
+    expect(cancelled).toBe(false);
+  });
+
+  it("shows an oversize file as a failed chip without uploading it", async () => {
+    await renderChat();
+    const big = oversizeFile("scan.png");
+
+    await attachSpreadsheet("scan.png", big);
+
+    expect(screen.getByText("scan.png")).toBeTruthy();
+    expect(screen.getByText("over 10MB")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove scan.png" }),
+    ).toBeTruthy();
+    const uploaded = cancelPost.mock.calls.some(
+      (call) => call[0] === "/upload_file",
+    );
+    expect(uploaded).toBe(false);
+
+    await submit("read the scan");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("over 10MB")).toBeNull();
+  });
+
+  it("drops a failed chip when its message is queued", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const big = oversizeFile("scan.png");
+    await attachSpreadsheet("scan.png", big);
+
+    await submit("read the scan next");
+
+    expect(
+      screen.getByRole("button", { name: "Edit queued message" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("over 10MB")).toBeNull();
+  });
+
+  it("drops a failed chip when it replaces a queued message", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("queued message");
+    const big = oversizeFile("scan.png");
+    await attachSpreadsheet("scan.png", big);
+
+    await submit("read the scan instead");
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("read the scan instead")).toBeTruthy();
+    expect(screen.queryByText("over 10MB")).toBeNull();
+  });
+
+  it("says a file staged before a question will not go with the answer", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await attachSpreadsheet("mine.csv");
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      call.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "wcc_1",
+        cancel_token: null,
+        interactions: [
+          {
+            interaction_id: "qi_1",
+            turn_id: "turn-1",
+            tool_call_id: "tc_1",
+            parts: [{ part_id: "p1", prompt: "Which column?", choices: [] }],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+          },
+        ],
+      });
+    });
+
+    // The answer path sends text only, so the staged file must not read as part of it.
+    expect(
+      screen.getByText(
+        "Attached files will be sent with your next message, not with your answer.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+  });
+
+  it("says a file still uploading when a question arrives will not go with the answer", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    uploadGate.hold = true;
+    await attachSpreadsheet("inflight.csv");
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      call.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "wcc_1",
+        cancel_token: null,
+        interactions: [
+          {
+            interaction_id: "qi_1",
+            turn_id: "turn-1",
+            tool_call_id: "tc_1",
+            parts: [{ part_id: "p1", prompt: "Which column?", choices: [] }],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+          },
+        ],
+      });
+    });
+
+    expect(
+      screen.getByText(
+        "Attached files will be sent with your next message, not with your answer.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("refuses a file past the per-message limit instead of sending one the server rejects", async () => {
+    await renderChat();
+    for (let index = 0; index < 20; index += 1) {
+      await attachSpreadsheet(`sheet-${index}.csv`);
+    }
+    expect(uploadCount.n).toBe(20);
+
+    await attachSpreadsheet("one-too-many.csv");
+
+    expect(uploadCount.n).toBe(20);
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Too many files" }),
+    );
+  });
+
+  it("returns a queued message's file to the tray when the workflow is missing at drain", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // The drain consumes the queued prompt before it learns there is no workflow to send to,
+    // so the file must come back to the tray or it survives only on an inert bubble.
+    const workflowId = saveData.workflow.workflow_id;
+    saveData.workflow.workflow_id = "";
+    try {
+      await completeOldestStream("first done");
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Remove queued.csv" }),
+        ).toBeTruthy(),
+      );
+      expect(postStreaming).toHaveBeenCalledTimes(1);
+    } finally {
+      saveData.workflow.workflow_id = workflowId;
+    }
+  });
+
+  it("asks for a message instead of silently ignoring a send with only a file", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+
+    await submit("");
+
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Add a message" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+  });
+
+  it("sends only the files still in the tray once dictation finishes stopping", async () => {
+    speechState.isListening = true;
+    let finishStopping: () => void = () => {};
+    speechState.stop.mockImplementationOnce(
+      () =>
+        new Promise<Blob | null>((resolve) => {
+          finishStopping = () => resolve(null);
+        }),
+    );
+    await renderChat();
+    await attachSpreadsheet("keep.csv");
+    await attachSpreadsheet("drop.csv");
+
+    await submit("parse these");
+    // The recorder is still finalizing, so the tray is still on screen and removable.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove drop.csv" }));
+    });
+    await act(async () => {
+      finishStopping();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("deletes a sent file whose request never went out because the composer unmounted", async () => {
+    const view = await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishAudioUpload: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAudioUpload = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_1",
+                audio_artifact_id: "aa_1",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+
+    await submit("dictated prompt");
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-audio",
+        expect.any(FormData),
+        expect.any(Object),
+      ),
+    );
+    // The tray is already empty and the chat request has not gone out.
+    view.unmount();
+    await act(async () => {
+      finishAudioUpload();
+    });
+
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
+  });
+
+  it("returns a sent file to the tray when New chat aborts the send before it posts", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishAudioUpload: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAudioUpload = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_1",
+                audio_artifact_id: "aa_1",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+
+    await submit("dictated prompt");
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-audio",
+        expect.any(FormData),
+        expect.any(Object),
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    });
+    await act(async () => {
+      finishAudioUpload();
+    });
+
+    expect(postStreaming).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+    // Never posted, so removing it must reclaim the upload.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("refuses a send once a restored queue pushes the tray past the per-message limit", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    for (let index = 0; index < 20; index += 1) {
+      await attachSpreadsheet(`sheet-${index}.csv`);
+    }
+    await submit("parse all twenty");
+    await attachSpreadsheet("extra.csv");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Edit queued message" }),
+      );
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove sheet-0.csv" }),
+      ).toBeTruthy(),
+    );
+
+    await submit("parse all twenty");
+
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Too many files" }),
+    );
+    // Nothing left the tray, so the user can still pick which file to drop.
+    expect(
+      screen.getByRole("button", { name: "Remove extra.csv" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Edit queued message" }),
+    ).toBeNull();
+  });
+
+  it("hands a sent file back, kept, when New chat aborts the request before the turn starts", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    await submit("parse my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     });
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      // The real streaming client resolves, not rejects, when its signal aborts.
+      call.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+    // The request went out, so the server may hold the file on the old chat's message.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+    expect(deleteFile).not.toHaveBeenCalled();
+  });
+
+  it("deletes an unsent upload on page exit and drops it from a restored cached page", async () => {
+    const view = await renderChat();
+    await attachSpreadsheet("mine.csv");
+
+    // A page parked in the back/forward cache may be evicted without running cleanup, so it deletes too.
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    expect(pageExitDelete).toHaveBeenCalledWith("file_1");
+
+    // Coming back must not show a chip for an upload that no longer exists.
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Remove mine.csv" }),
+      ).toBeNull(),
+    );
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Attachments removed" }),
+    );
+
+    // Already reclaimed on pagehide, so unmount must not delete it a second time. The unmount
+    // delete awaits its client first, so let pending work settle before checking.
+    view.unmount();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(deleteFile).not.toHaveBeenCalled();
+  });
+
+  it("drops a deleted file from a queued message when a cached page is restored", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(screen.getByTitle("queued.csv")).toBeTruthy();
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    expect(pageExitDelete).toHaveBeenCalledWith("file_1");
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+
+    // The queued bubble must not show, and the drain must not send, an upload that was deleted.
+    await waitFor(() => expect(screen.queryByTitle("queued.csv")).toBeNull());
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("parse the queued sheet");
+    expect(streamCalls[1]?.body.attached_file_ids ?? []).toEqual([]);
+  });
+
+  it("does not delete a file on page exit while the request that carries it is still pending", async () => {
+    await renderChat();
+    await attachSpreadsheet("rows.csv");
+    // A same-tick double submit: the first press posts, the second queues a copy holding the same id.
+    await act(async () => {
+      fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
+      const ta = textarea();
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+
+    // No turn_start yet, so the server may be resolving the file right now.
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+
+    expect(pageExitDelete).not.toHaveBeenCalledWith("file_1");
+  });
+
+  it("keeps a file when its page-exit delete failed, and retries on unmount", async () => {
+    const view = await renderChat();
+    await attachSpreadsheet("mine.csv");
+    pageExitDelete.mockResolvedValueOnce(false);
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+
+    // The upload is still stored, so the chip stays and the user is told nothing was removed.
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+    expect(vi.mocked(toast)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Attachments removed" }),
+    );
+
+    view.unmount();
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("deletes an upload that lands after the page was left", async () => {
+    await renderChat();
+    uploadGate.hold = true;
+    await attachSpreadsheet("late.csv");
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    // The upload had no id when the page was left, so page-exit cleanup could not name it.
+    await act(async () => {
+      uploadGate.release.forEach((release) => release());
+      uploadGate.release.length = 0;
+    });
+
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Remove late.csv" }),
+    ).toBeNull();
+  });
+
+  it("does not send a file whose page-exit delete is still pending", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishDelete: () => void = () => {};
+    pageExitDelete.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        finishDelete = () => resolve(true);
+      }),
+    );
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+
+    // Restored before the delete answered: sending the id now could name a file about to go.
+    await submit("parse my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids ?? []).toEqual([]);
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Attachment removed" }),
+    );
+    await act(async () => {
+      finishDelete();
+    });
+  });
+
+  it("does not drain a queued file whose page-exit delete is still pending", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    let finishDelete: () => void = () => {};
+    pageExitDelete.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        finishDelete = () => resolve(true);
+      }),
+    );
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+
+    // The drain carries the queued message's own files, so it has to honour the pending delete too.
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("parse the queued sheet");
+    expect(streamCalls[1]?.body.attached_file_ids ?? []).toEqual([]);
+    // The bubble must not keep showing a file the request did not carry.
+    expect(screen.queryByTitle("queued.csv")).toBeNull();
+    await act(async () => {
+      finishDelete();
+    });
+  });
+
+  it("returns a file the send dropped when its page-exit delete fails", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let failDelete: () => void = () => {};
+    pageExitDelete.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        failDelete = () => resolve(false);
+      }),
+    );
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+    // The send drops the file and clears the tray, so nothing names the upload any more.
+    await submit("parse my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids ?? []).toEqual([]);
+
+    await act(async () => {
+      failDelete();
+    });
+
+    // The upload is still stored, so its chip has to come back.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("puts a chip back when removing its upload fails", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    deleteFile.mockRejectedValueOnce(new Error("network down"));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+
+    // The upload is still stored, so leaving the chip removed would strand it.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Could not remove file" }),
+    );
+  });
+
+  it("drops a file deleted while the request was still being prepared", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishAudioUpload: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAudioUpload = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_1",
+                audio_artifact_id: "aa_1",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+
+    await submit("parse my sheet");
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-audio",
+        expect.any(FormData),
+        expect.any(Object),
+      ),
+    );
+    // The file left the tray with the send, so page exit still reaches it and deletes it.
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      finishAudioUpload();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids ?? []).toEqual([]);
+  });
+
+  it("does not hand back a file whose page-exit delete already claimed it", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishAudioUpload: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAudioUpload = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_1",
+                audio_artifact_id: "aa_1",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+    vi.mocked(getSseClient).mockRejectedValueOnce(new Error("stream refused"));
+
+    await submit("parse my sheet");
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-audio",
+        expect.any(FormData),
+        expect.any(Object),
+      ),
+    );
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      finishAudioUpload();
+    });
+
+    // The failure path hands files back, but this one is already deleted: its chip could never be
+    // removed again, because the second delete answers 404.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(
+      screen.queryByRole("button", { name: "Remove mine.csv" }),
+    ).toBeNull();
+  });
+
+  it("keeps a late upload whose delete failed while the page was away", async () => {
+    await renderChat();
+    uploadGate.hold = true;
+    await attachSpreadsheet("late.csv");
+    deleteFile.mockRejectedValueOnce(new Error("offline"));
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      uploadGate.release.forEach((release) => release());
+      uploadGate.release.length = 0;
+    });
+
+    // The delete never landed, so the upload is still stored and needs a chip to reach it.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove late.csv" }),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("deletes the files of every send still waiting when the composer unmounts", async () => {
+    const view = await renderChat();
+    await attachSpreadsheet("first.csv");
+    let releaseFirstAudio: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirstAudio = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_1",
+                audio_artifact_id: "aa_1",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+    await submit("first message");
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-audio",
+        expect.any(FormData),
+        expect.any(Object),
+      ),
+    );
+
+    // New chat aborts that send while it is still in preflight and lets the next one start.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    });
+    await attachSpreadsheet("second.csv");
+    let releaseSecondAudio: () => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSecondAudio = () =>
+            resolve({
+              data: {
+                workflow_copilot_chat_id: "wcc_2",
+                audio_artifact_id: "aa_2",
+              },
+            });
+        }),
+    );
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+    await submit("second message");
+
+    view.unmount();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // Both sends had taken their file out of the tray, so both uploads need reclaiming.
+    expect(deleteFile).toHaveBeenCalledWith("/files/file_1");
+    expect(deleteFile).toHaveBeenCalledWith("/files/file_2");
+    releaseFirstAudio();
+    releaseSecondAudio();
+  });
+
+  it("does not start a second delete for a file already being reclaimed", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    let finishDelete: () => void = () => {};
+    pageExitDelete.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        finishDelete = () => resolve(true);
+      }),
+    );
+
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pagehide"), { persisted: true }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        Object.assign(new Event("pageshow"), { persisted: true }),
+      );
+    });
+
+    // The chip is still on screen while that delete is unresolved; removing it must not race.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(deleteFile).not.toHaveBeenCalled();
+    await act(async () => {
+      finishDelete();
+    });
+  });
+
+  it("deletes a staged upload the user never sent when the composer unmounts", async () => {
+    const view = await renderChat();
+    await attachSpreadsheet("mine.csv");
+
+    // The id lives only in component state, so leaving without sending would strand the upload.
+    view.unmount();
+
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("deletes an upload that finishes after the composer has unmounted", async () => {
+    const view = await renderChat();
+    uploadGate.hold = true;
+    await attachSpreadsheet("mine.csv");
+
+    view.unmount();
+    expect(deleteFile).not.toHaveBeenCalled();
+
+    // No chip exists to remove it from, so the completed upload must be deleted on arrival.
+    await act(async () => {
+      uploadGate.release.forEach((fn) => fn());
+      uploadGate.release.length = 0;
+    });
+
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("deletes an upload the user removes from the composer before sending it", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("still deletes a returned file when the send failed before its request went out", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    vi.mocked(getSseClient).mockRejectedValueOnce(
+      new Error("credential provider unavailable"),
+    );
+
+    await submit("parse my sheet");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
+
+    // No request reached the server, so nothing else holds this upload.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("keeps an upload that was already posted when its chip is removed after a failed send", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    postStreaming.mockRejectedValueOnce(new Error("connect: refused"));
+    await submit("parse my sheet");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+
+    // The request went out, so the server may already hold the file on that message.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+
+    expect(deleteFile).not.toHaveBeenCalled();
+  });
+
+  it("returns a replaced queued message's file to the tray", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("first.csv");
+    await submit("parse the first sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // Replacing the queued message with a different file must not strand the first one.
+    await attachSpreadsheet("second.csv");
+    await submit("parse the second sheet instead");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Remove first.csv" }),
+    ).toBeTruthy();
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_2"]);
+  });
+
+  it("shows a queued message's attachment on its bubble", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // The tray is cleared on queue, so the bubble is the only place the file is visible.
+    expect(
+      screen.queryByRole("button", { name: "Remove queued.csv" }),
+    ).toBeNull();
+    expect(screen.getByTitle("queued.csv")).toBeTruthy();
+  });
+
+  it("returns the file to the composer, still deletable, when the server errors before a turn starts", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    await submit("parse my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // A terminal error frame ends the stream normally, so the catch-path restore never runs.
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      call.onMessage({
+        type: "error",
+        error: "Copilot is not configured.",
+        turn_id: null,
+      });
+      call.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+    // No turn started, so no message holds the file; removing it must not strand the upload.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove mine.csv" }));
+    });
+    await waitFor(() =>
+      expect(deleteFile).toHaveBeenCalledWith("/files/file_1"),
+    );
+  });
+
+  it("returns a queued message's file to the tray when a new chat is started", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(
+      screen.queryByRole("button", { name: "Remove queued.csv" }),
+    ).toBeNull();
+
+    // Discarding the queue must not strand a file that already left the tray.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove queued.csv" }),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("returns the file to the composer when the send fails before a turn starts", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+    postStreaming.mockRejectedValueOnce(new Error("connect: refused"));
+
+    await submit("parse my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // The upload succeeded and the turn never started, so the id must not be lost with the
+    // failed request — the user would otherwise have to upload the same file again.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove mine.csv" }),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("keeps the composer's file when a programmatic action is queued behind a turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await attachSpreadsheet("mine.csv");
+    // A block regeneration requested mid-turn queues rather than sends. Queued or not, it is
+    // not the user's message and must neither take the staged file nor clear it.
+    await act(async () => {
+      useCopilotActionStore.setState({
+        pendingBuild: { blockLabel: "block_1", prompt: "make it work" },
+      });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.attached_file_ids ?? []).toEqual([]);
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+  });
+
+  it("lets a block build send during an in-flight upload without taking the staged file", async () => {
+    await renderChat();
+    uploadGate.hold = true;
+    await attachSpreadsheet("later.csv");
+
+    // The upload belongs to the user's next message; a block regeneration has no stake in it,
+    // so it neither waits for it nor takes it. Only a user-typed send waits for the tray.
+    await act(async () => {
+      useCopilotActionStore.setState({
+        generatingBlockLabel: "block_1",
+        pendingBuild: { blockLabel: "block_1", prompt: "make it work" },
+      });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids ?? []).toEqual([]);
+
+    await act(async () => {
+      uploadGate.release.forEach((fn) => fn());
+      uploadGate.release.length = 0;
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove later.csv" }),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("keeps the composer's file when a programmatic action sends", async () => {
+    await renderChat();
+    await attachSpreadsheet("mine.csv");
+
+    // A block regeneration is not the user's composed message, so it must neither carry the
+    // staged file nor consume it — the user still means to send it with their own text.
+    await act(async () => {
+      useCopilotActionStore.setState({
+        pendingBuild: { blockLabel: "block_1", prompt: "make it work" },
+      });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids ?? []).toEqual([]);
+    expect(
+      screen.getByRole("button", { name: "Remove mine.csv" }),
+    ).toBeTruthy();
+
+    await completeOldestStream("regenerated");
+    await submit("now use my sheet");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("Escape returns the queued message's files to the composer, not just its text", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    await attachSpreadsheet("queued.csv");
+    await submit("parse the queued sheet");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+    });
+
+    // Editing the message must hand back its attachment too; otherwise the resubmit goes out
+    // with no file and the user has to find and upload it again.
+    expect(textarea().value).toBe("parse the queued sheet");
+    expect(
+      screen.getByRole("button", { name: "Remove queued.csv" }),
+    ).toBeTruthy();
+
+    // Let the in-flight turn finish, then the restored message sends with its file.
+    await completeOldestStream("first done");
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("does not drop a queued message as a duplicate when it carries a new file", async () => {
+    await renderChat();
+    await submit("check these rows");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Same text as the turn in flight, but a file the turn never had — a different request.
+    await attachSpreadsheet("new-rows.csv");
+    await submit("check these rows");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    expect(streamCalls[1]?.body.message).toBe("check these rows");
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("Escape in the composer edits the queued message, preserving the active run", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("second message");
+
+    const ambientEscape = vi.fn();
+    window.addEventListener("keydown", ambientEscape);
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+    });
+    window.removeEventListener("keydown", ambientEscape);
+
+    // Consumed at the composer, so sibling window/document Escape listeners never see it.
+    expect(ambientEscape).not.toHaveBeenCalled();
 
     // Queued text returns to the input; the run was not cancelled.
     expect(textarea().value).toBe("second message");
     expect(textarea().disabled).toBe(false);
     expect(cancelPost).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Queue for next turn" }),
+    ).toBeTruthy();
+  });
+
+  it("an IME Escape in the composer does not discard the queued message", async () => {
+    // Dismissing a conversion candidate is not abandoning the follow-up. The composer
+    // handler consumes Escape before the window guard can see it, so it has to make the
+    // composition check itself — otherwise the queued text is dropped with no bubble
+    // and no text, because the half-composed input wins the restore tiebreak.
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("second message");
+
+    fireEvent.change(textarea(), { target: { value: "にほんご" } });
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape", isComposing: true });
+    });
+
+    // The queued message survives, and the composition text is left alone.
+    expect(textarea().value).toBe("にほんご");
+    expect(screen.getAllByText("second message").length).toBeGreaterThan(0);
+    expect(cancelPost).not.toHaveBeenCalled();
+  });
+
+  it("an Escape pressed during IME composition never cancels the turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    // Dismissing a conversion candidate, not stopping the turn.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(outside, { key: "Escape", isComposing: true });
+    });
+
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+    outside.remove();
+  });
+
+  it("Escape outside the composer stops the turn and records the gesture", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({
+        cancel_token: expect.any(String),
+        source: "escape_key",
+      }),
+    );
+    outside.remove();
+  });
+
+  it("the stop control does not cancel before the turn's first frame arrives", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Sent, but no SSE frame has been delivered to the reducer yet: the control is
+    // mounted and pressable, so a click on it is the negative arm.
+    const pending = screen.getByRole("button", { name: "Starting…" });
+    expect(pending.hasAttribute("disabled")).toBe(false);
+    expect(pending.getAttribute("aria-busy")).not.toBe("true");
+    await act(async () => {
+      fireEvent.click(pending);
+    });
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+
+    await deliverFirstFrame();
+
+    const stop = screen.getByRole("button", { name: "Stop" });
+    await act(async () => {
+      fireEvent.click(stop);
+    });
+
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({
+        cancel_token: expect.any(String),
+        source: "stop_button",
+      }),
+    );
+  });
+
+  it("arms the visible stop shortly after send even when no frame ever streams", async () => {
+    // The gate exists for the second click of a double-tap, not to leave the control a
+    // user reaches for dead while a turn hangs before its first frame.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderChat();
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
+      });
+      expect(cancelPost).not.toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+
+      // Past the double-tap window, with no frame delivered at any point.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(600);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.objectContaining({ source: "stop_button" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a stalled turn's arming deadline arm the turn its queued prompt drains into", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderChat();
+      await submit("first message");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await submit("second message");
+
+      // Stop just short of the first turn's arming deadline, hand over to the turn its
+      // queued prompt drains into, then cross that deadline: it belongs to the turn that
+      // scheduled it and must not arm the one now running.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      await completeOldestStream("first done");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
+      });
+      expect(cancelPost).not.toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+
+      await deliverFirstFrame();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clears the queued block-build target on cancel so it cannot leak into the next message", async () => {
@@ -456,7 +2151,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     // Cancel the queued block-build before it sends.
     await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
     });
 
     // Finish the original turn and send an unrelated follow-up.
@@ -597,7 +2292,9 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Resetting the narrative stops the progress/elapsed indicator from
     // ticking forever beside the error message.
     expect(screen.queryAllByRole("status")).toHaveLength(0);
-    expect(screen.getByText(/I encountered an error/)).toBeTruthy();
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
   });
 
   it("renders a response-only error narrative payload as halted", async () => {
@@ -720,7 +2417,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await act(async () => {
       call.onMessage(turnStart());
       call.onMessage({
-        ...terminalResponse("Cancelled by user."),
+        ...terminalResponse("Stopped. 0 blocks ran this turn."),
         proposal_disposition: "no_proposal",
         cancelled: true,
       });
@@ -1066,6 +2763,66 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     ).toBeNull();
   });
 
+  it("drops a same-tick repeat of a message that carried a file", async () => {
+    await renderChat();
+    await attachSpreadsheet("rows.csv");
+
+    // Two Enter presses before React commits: the second still sees the same text and tray, so it
+    // queues an exact copy of the request the first one just sent.
+    await act(async () => {
+      fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
+      const ta = textarea();
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+
+    await completeOldestStream("first done");
+    await act(async () => {});
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a started turn's file when its queued duplicate is edited and the file removed", async () => {
+    await renderChat();
+    await attachSpreadsheet("rows.csv");
+    await act(async () => {
+      fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
+      const ta = textarea();
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    // Editing the duplicate hands its ids back to the tray while the first turn still uses them.
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove rows.csv" }),
+      ).toBeTruthy(),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove rows.csv" }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(deleteFile).not.toHaveBeenCalled();
+  });
+
   it("drains an identical queued prompt when the turn ends in a response-framed error", async () => {
     await renderChat();
     await submit("build me a workflow");
@@ -1131,9 +2888,14 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
           designActivity: [],
           startedAt: null,
           endedAt: null,
-          terminalEnvelope: {
-            run_verdict: "not_demonstrated",
-            run_display_reason: "The run did not reach the goal.",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: "not_demonstrated",
+            runId: null,
+            runCompleted: true,
+            terminalCause: null,
+            blocksRunThisTurn: 1,
+            ranCleanOnCurrentSource: false,
           },
         },
       });
@@ -1273,36 +3035,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     ).toBe(true);
   });
 
-  it("drains an identical queued prompt when the composer left the mode the turn opened in", async () => {
-    await renderChatWithModePill();
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(
-      (streamCalls[0]!.body as unknown as { mode: string | null }).mode,
-    ).toBe("build");
-
-    await submit("build me a workflow");
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    // Switch the composer to Ask while the turn runs: the queued repeat is now
-    // a question about the same words, not a re-run of the same request.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Ask"));
-    });
-
-    await completeOldestStream("first done");
-
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
-    expect(
-      (streamCalls[1]!.body as unknown as { mode: string | null }).mode,
-    ).toBe("ask");
-  });
-
   it("drains a queued block build that repeats the message of the turn in flight", async () => {
     await renderChat();
     await act(async () => {
@@ -1407,12 +3139,11 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
     await submit("also add a login step");
     expect(screen.getAllByText("also add a login step")).toHaveLength(1);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
-    });
+    await act(async () => useCopilotActionStore.getState().requestCancel());
     // The turn ends only after the stop lands — this is the edge that used to
     // drain the queue and start a whole new build turn.
     await completeOldestStream("stopped");
@@ -1426,8 +3157,9 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
-    const stop = screen.getByRole("button", { name: /Cancel run/ });
+    const stop = screen.getByRole("button", { name: /Stop/ });
     expect(stop.hasAttribute("disabled")).toBe(false);
 
     await act(async () => {
@@ -1472,15 +3204,14 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
     await submit("queued answer");
     // Half-typed replacement, never submitted.
     fireEvent.change(textarea(), {
       target: { value: "half typed replacement" },
     });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
-    });
+    await act(async () => useCopilotActionStore.getState().requestCancel());
 
     expect(textarea().value).toBe("half typed replacement");
   });

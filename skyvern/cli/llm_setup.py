@@ -148,6 +148,7 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
             model_options.extend(
                 [
                     "ANTHROPIC_CLAUDE5_OPUS",
+                    "ANTHROPIC_CLAUDE5.1_FABLE",
                     "ANTHROPIC_CLAUDE5_FABLE",
                     "ANTHROPIC_CLAUDE4.7_OPUS",
                     "ANTHROPIC_CLAUDE4.6_OPUS",

@@ -26,6 +26,7 @@ def _make_context(
     context.values = dict(values or {})
     context.parameters = {}
     context.workflow_run_outputs = {}
+    context.carried_block_labels = set()
     context.blocks_metadata = {}
     context.include_secrets_in_templates = False
     context.credential_totp_identifiers = {}

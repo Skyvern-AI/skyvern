@@ -5,12 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeGuard
 
 from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    SECRET_KEYWORD_LABEL_PATTERN,
+    is_account_row_email,
+    redact_raw_secrets_for_prompt,
+)
 
 
 def requested_output_designation_capability(output_paths: list[str]) -> dict[str, Any]:
@@ -1054,42 +1060,72 @@ def bindable_candidate_headings(flow_evidence: list[dict[str, Any]], *, limit: i
     return []
 
 
-def unbound_candidate_relations(flow_evidence: list[dict[str, Any]], *, limit: int = 8) -> list[tuple[str, str]]:
-    """Label/value pairs the freshest bindable packet is offering.
+_RELATION_TEXT_MAX_CHARS = 240
 
-    The binder joins a minted label to a page label, so a page that names the requested quantity in
-    its own words binds nothing however plainly it displays it. Handing the loop what the page does
-    offer lets it read one of these into the requested path, after which the value witness binds the
-    relation still showing that exact value — a join on the quantity rather than on the wording.
-    """
+
+def _bounded_relation_text(value: str, max_chars: int) -> str:
+    return redact_raw_secrets_for_prompt(" ".join(value.split()))[:max_chars]
+
+
+def page_value_binding_text(label: str, value: str) -> str:
+    """The single rendering of an offered pair, so the redaction guard sees what a reader will."""
+    return f"{' '.join(label.replace('=', ' ').split())}={value}"
+
+
+def _pair_reads_as_secret(label: str, value: str) -> bool:
+    # The capture already split the label from its value, so the label alone decides: an email
+    # address keys an account row, and a credential keyword anywhere in it ("Password (required)")
+    # names one, neither of which the free-text assignment shape would catch.
+    if is_account_row_email(label) or SECRET_KEYWORD_LABEL_PATTERN.search(label):
+        return True
+    binding = page_value_binding_text(label, value)
+    return redact_raw_secrets_for_prompt(binding) != binding
+
+
+def candidate_relations_from_packet(
+    packet: Mapping[str, Any], *, dismiss_texts: set[str], limit: int = 8, max_chars: int = _RELATION_TEXT_MAX_CHARS
+) -> list[tuple[str, str]]:
+    """Label/value pairs the packet offers, each half bounded and the joined pair redacted as one
+    string, because a label and value that are innocuous apart ("Password", "hunter2") only read as
+    a credential once something places them adjacently."""
+    relations = packet.get("key_value_relations")
+    if not isinstance(relations, list):
+        return []
+    offered: list[tuple[str, str]] = []
+    for relation in relations:
+        if not isinstance(relation, dict) or relation.get("visible") is not True:
+            continue
+        if relation.get("value_visible") is not True or relation.get("value_truncated") is True:
+            continue
+        label = str(relation.get("key_text") or "").strip()
+        value = str(relation.get("value_text") or "").strip()
+        # A dialog's dismiss controls are not quantities the page is showing; offering them puts a
+        # button beside the number as if it were an alternative for the same requested output.
+        if label in dismiss_texts or value in dismiss_texts:
+            continue
+        # Guard the full pair before bounding: a cap can cut the credential keyword off a long label
+        # and leave a bare value that the joined check would no longer recognise.
+        if _pair_reads_as_secret(label, value):
+            continue
+        label, value = _bounded_relation_text(label, max_chars), _bounded_relation_text(value, max_chars)
+        if not label or not value:
+            continue
+        if (label, value) not in offered:
+            offered.append((label, value))
+        if len(offered) >= limit:
+            break
+    return offered
+
+
+def unbound_candidate_relations(flow_evidence: list[dict[str, Any]], *, limit: int = 8) -> list[tuple[str, str]]:
+    """Label/value pairs the freshest bindable packet is offering."""
     for entry in reversed(flow_evidence):
         if not _entry_observed_the_page(entry):
             continue
         packet = entry.get("evidence")
         if not isinstance(packet, dict):
             return []
-        relations = packet.get("key_value_relations")
-        if not isinstance(relations, list):
-            return []
-        # A dialog beside readable content keeps the packet composable, but its own dismiss controls
-        # are not quantities the page is showing; offering them puts a button next to the number as
-        # if they were alternatives for the same requested output.
-        dismiss_texts = set(entry.get("dismiss_texts") or ())
-        offered: list[tuple[str, str]] = []
-        for relation in relations:
-            if not isinstance(relation, dict) or relation.get("visible") is not True:
-                continue
-            if relation.get("value_visible") is not True or relation.get("value_truncated") is True:
-                continue
-            label = str(relation.get("key_text") or "").strip()
-            value = str(relation.get("value_text") or "").strip()
-            if label in dismiss_texts or value in dismiss_texts:
-                continue
-            if label and value and (label, value) not in offered:
-                offered.append((label, value))
-            if len(offered) >= limit:
-                break
-        return offered
+        return candidate_relations_from_packet(packet, dismiss_texts=set(entry.get("dismiss_texts") or ()), limit=limit)
     return []
 
 

@@ -65,140 +65,6 @@ def test_streaming_console_event_reifies_for_recording_processor() -> None:
     assert reified[0].params.target.skyId == "sky-1"
 
 
-def test_drafts_to_blocks_preserves_action_parameters_and_sanitizes_duplicate_labels() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    parameter = {
-        "key": "customer_name",
-        "workflow_parameter_type": "string",
-        "default_value": "",
-        "description": "",
-    }
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="123 Submit!",
-            title="Submit form",
-            navigation_goal="Click submit",
-            parameters=[parameter],
-            parameter_keys=["customer_name"],
-        ),
-        RecordingDraftStep(
-            step_id="step-2",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="123 Submit!",
-            title="Type name",
-            navigation_goal="Type the customer name",
-            parameters=[parameter],
-            parameter_keys=["customer_name"],
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks)
-
-    assert [block.label for block in blocks] == ["act_123_Submit", "act_123_Submit_0"]
-    assert blocks[0].parameters == [parameter]
-    assert blocks[0].parameter_keys == ["customer_name"]
-    assert [parameter.key for parameter in parameters] == ["customer_name"]
-
-
-def test_drafts_to_blocks_skips_empty_goto_url() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="visit",
-            url="",
-        )
-    ]
-
-    assert processor.drafts_to_blocks(drafts) == []
-
-
-def test_drafts_to_blocks_goto_url_label_follows_edited_title_and_url() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="goto_wikipedia_com",
-            title="Go to wikipedia.org",
-            url="https://wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "Go_to_wikipedia_org"
-    assert blocks[0].url == "https://wikipedia.org/wiki/Foo"
-
-
-def test_drafts_to_blocks_goto_url_label_derives_from_url_without_title_or_label() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="",
-            url="https://www.wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "goto_www_wikipedia_org"
-    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
-
-
-def test_drafts_to_blocks_goto_url_label_preserves_edited_label_without_title() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="Open Wikipedia",
-            url="https://www.wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "Open_Wikipedia"
-    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
-
-
-@pytest.mark.asyncio
-async def test_processor_process_uses_draft_steps_without_compressed_chunks() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.WAIT,
-            block_type="wait",
-            label="wait",
-            wait_sec=2,
-        )
-    ]
-
-    blocks, parameters = await processor.process([], draft_steps=drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].block_type == "wait"
-    assert blocks[0].wait_sec == 5
-    assert parameters == []
-
-
 def _click_streaming_event(
     *,
     timestamp: float = 1234.0,
@@ -220,6 +86,8 @@ def _click_streaming_event(
                 "id": target_id,
                 "text": ["Submit"],
                 "skyId": sky_id,
+                "selector": f"#{target_id}",
+                "accessibleName": target_id,
             },
             "mousePosition": {"xp": 0.5, "yp": 0.5},
             "activeElement": {"tagName": "BUTTON"},
@@ -231,6 +99,40 @@ def _click_streaming_event(
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_live_interpretation_drops_inferred_waits() -> None:
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+    )
+    first_focus = _click_streaming_event(timestamp=1000.0, capture_seq=0)
+    first_focus.params["type"] = "focus"
+    first_focus.timestamp = 1.0
+    second_focus = _click_streaming_event(timestamp=7000.0, capture_seq=2)
+    second_focus.params["type"] = "focus"
+    second_focus.timestamp = 7.0
+    session.ingest_events(
+        [
+            first_focus,
+            StreamingExfiltratedEvent(
+                event_name="net:activity",
+                source=StreamingExfiltratedEventSource.CDP,
+                timestamp=6.5,
+                capture_seq=1,
+                params={"count": 3},
+            ),
+            second_focus,
+        ]
+    )
+
+    steps = await session.flush()
+
+    assert steps == []
+    assert session.recorded_actions() == []
 
 
 @pytest.mark.asyncio
@@ -254,6 +156,34 @@ async def test_jittered_reclick_yields_single_draft_step(monkeypatch: pytest.Mon
     steps = await session.flush()
 
     assert len(steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_enrichment_carries_recording_correlation_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click submit."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        recording_attempt_id="attempt-1",
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    assert len(calls) == 1
+    assert calls[0]["recording_attempt_id"] == "attempt-1"
+    assert calls[0]["interpretation_session_id"] == session.interpretation_session_id
 
 
 @pytest.mark.asyncio
@@ -800,7 +730,7 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     recording when it lost its in-memory state (e.g. page reload). The registry
     must continue the populated session: resync the panel with the accumulated
     drafts instead of blanking it, keep interpreting new events, and let the
-    finished recording build blocks from everything captured.
+    finished recording retain everything captured.
     """
     from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 
@@ -834,6 +764,7 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     populated_snapshots = [u for u in panel if u.is_snapshot and u.steps]
     assert populated_snapshots, "expected the panel to display the interpreted drafts"
     accumulated_step_count = len(session_one.steps)
+    accumulated_step_ids = {step.step_id for step in session_one.steps}
     assert accumulated_step_count >= 1
 
     # A reconnect arrives with a NEW attempt id (same browser session, not finalized).
@@ -862,9 +793,210 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     await session_two._interpret(finalized=False)
     assert len(session_two.steps) > accumulated_step_count
 
-    # Finishing builds blocks from everything captured across the reconnect.
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks = processor.drafts_to_blocks(session_two.steps)
-    assert len(blocks) == len(session_two.steps)
+    assert accumulated_step_ids < {step.step_id for step in session_two.steps}
+
+    drafts = await registry.stop_session(PBS_ID)
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=session_two.interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id="other-org",
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )
+    actions = registry.get_finalized_actions(
+        interpretation_session_id=session_two.interpretation_session_id,
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+    )
+    blocks, _, _ = await Processor(PBS_ID, ORG_ID, WP_ID).process(
+        [],
+        draft_steps=drafts,
+        recorded_actions=actions,
+    )
+    code = "\n".join(block.code for block in blocks)
+    assert "#a" in code
+    assert "#b" in code
+    assert "#c" in code
+
+    registry.discard_finalized_actions(session_two.interpretation_session_id)
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=session_two.interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id=ORG_ID,
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )
 
     registry.discard_session(PBS_ID)
+
+
+@pytest.mark.asyncio
+async def test_process_recording_discards_finalized_actions_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    registry = MagicMock()
+    registry.get_finalized_actions.return_value = [MagicMock()]
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
+
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(return_value=([], [], None, None))
+    route_app = MagicMock(
+        PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+        BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+        AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+    )
+    monkeypatch.setattr(browser_sessions_routes, "app", route_app)
+
+    await browser_sessions_routes.process_recording(
+        browser_session_id=PBS_ID,
+        recording_request=ProcessBrowserSessionRecordingRequest(
+            workflow_permanent_id=WP_ID,
+            interpretation_session_id="interpretation-1",
+        ),
+        current_org=MagicMock(organization_id=ORG_ID),
+    )
+
+    registry.discard_finalized_actions.assert_called_once_with("interpretation-1")
+
+
+@pytest.mark.asyncio
+async def test_process_recording_retains_finalized_actions_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    registry = MagicMock()
+    registry.get_finalized_actions.return_value = [MagicMock()]
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
+
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(side_effect=RuntimeError("processing failed"))
+    route_app = MagicMock(
+        PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+        BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+        AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+    )
+    monkeypatch.setattr(browser_sessions_routes, "app", route_app)
+
+    with pytest.raises(RuntimeError, match="processing failed"):
+        await browser_sessions_routes.process_recording(
+            browser_session_id=PBS_ID,
+            recording_request=ProcessBrowserSessionRecordingRequest(
+                workflow_permanent_id=WP_ID,
+                interpretation_session_id="interpretation-1",
+            ),
+            current_org=MagicMock(organization_id=ORG_ID),
+        )
+
+    registry.discard_finalized_actions.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_recording_requires_code_block_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.exceptions import DisabledBlockExecutionError
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock()
+    agent_function = MagicMock()
+    agent_function.validate_code_block = AsyncMock(side_effect=DisabledBlockExecutionError("CodeBlock is disabled"))
+    monkeypatch.setattr(
+        browser_sessions_routes,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+            BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+            AGENT_FUNCTION=agent_function,
+        ),
+    )
+
+    with pytest.raises(DisabledBlockExecutionError, match="CodeBlock is disabled"):
+        await browser_sessions_routes.process_recording(
+            browser_session_id=PBS_ID,
+            recording_request=ProcessBrowserSessionRecordingRequest(workflow_permanent_id=WP_ID),
+            current_org=MagicMock(organization_id=ORG_ID),
+        )
+
+    recording_service.process_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_recording_waits_for_late_finalized_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    finalized_actions = [MagicMock()]
+    registry = MagicMock()
+    registry.get_finalized_actions.side_effect = [None, finalized_actions]
+    registry.stop_session = AsyncMock(return_value=[])
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
+
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(return_value=([], [], None, None))
+    monkeypatch.setattr(
+        browser_sessions_routes,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=MagicMock(get_session=AsyncMock(return_value=MagicMock())),
+            BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+            AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+        ),
+    )
+
+    await browser_sessions_routes.process_recording(
+        browser_session_id=PBS_ID,
+        recording_request=ProcessBrowserSessionRecordingRequest(
+            workflow_permanent_id=WP_ID,
+            interpretation_session_id="interpretation-1",
+        ),
+        current_org=MagicMock(organization_id=ORG_ID),
+    )
+
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+    assert recording_service.process_recording.await_args.kwargs["recorded_actions"] == finalized_actions
+    registry.discard_finalized_actions.assert_called_once_with("interpretation-1")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stop_session_waits_for_the_same_flush() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _update: None,
+    )
+    session = registry._sessions[PBS_ID]
+    flush_started = asyncio.Event()
+    release_flush = asyncio.Event()
+
+    async def delayed_flush() -> list[RecordingDraftStep]:
+        flush_started.set()
+        await release_flush.wait()
+        return []
+
+    session.flush = AsyncMock(side_effect=delayed_flush)
+    first = asyncio.create_task(registry.stop_session(PBS_ID))
+    await flush_started.wait()
+    second = asyncio.create_task(registry.stop_session(PBS_ID))
+    await asyncio.sleep(0)
+
+    assert not second.done()
+    release_flush.set()
+    assert await first == []
+    assert await second == []
+    session.flush.assert_awaited_once()

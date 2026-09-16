@@ -24,6 +24,13 @@ def _normalize(text: str) -> str:
     return _NORMALIZE_RE.sub("", text.lower().strip())
 
 
+def normalize_option_label(text: str) -> str:
+    """Public form of this module's matching fold. External pre-filters that ask "which options did the
+    exact/stem tier see as equal" (Task V3's duplicate-row collapse) must use THIS, not a re-derived
+    fold — any drift silently desynchronizes them from the tiers they interrogate."""
+    return _normalize(text)
+
+
 def match_option(candidate: str, options: list[str], *, min_substring_len: int = 3) -> int | None:
     """Find the best matching option index for a candidate value.
 

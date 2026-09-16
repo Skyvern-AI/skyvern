@@ -1,0 +1,57 @@
+{
+  "provenance": {
+    "kind": "branch_local_witness",
+    "source": "derived from captured_repair_then_completed_run.json",
+    "notes": "branch_local_witness derived from the captured run in captured_repair_then_completed_run.json: the same recorded failure and success bodies, re-scripted to the situation named below. Not an independently captured run. The failing block is widened past the stored call-ref cap so the ref list is incomplete."
+  },
+  "steps": [
+    {
+      "workflow_yaml": "title: Retrieve deferred freight quote total\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: code\n      label: calculate_and_extract_quote_total\n      prompt: Open quote QF-4821, calculate its shipping-inclusive order total, and return the page-displayed total as a number.\n      code: |\n        await page.goto(\"http://localhost:8900/deferred_total_quote/\")\n        quote_heading = page.get_by_text(\"Quote QF-4821\", exact=True)\n        await quote_heading.wait_for(state=\"visible\", timeout=10000)\n        total_panel = page.locator(\"div.totals\")\n        await total_panel.wait_for(state=\"visible\", timeout=10000)\n        await page.locator(\"#calculate-total\").click()\n        await total_panel.locator(\"strong\").wait_for(state=\"visible\", timeout=10000)\n        total_text = (await total_panel.locator(\"strong\").inner_text()).strip()\n        normalized_total = total_text.replace(\"$\", \"\").replace(\",\", \"\").strip()\n        order_total = float(normalized_total)\n        return {\n          \"quote_id\": \"QF-4821\",\n          \"order_total\": order_total,\n          \"displayed_total\": total_text,\n          \"evidence_text\": (await total_panel.inner_text()).strip()\n        }\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "attempted_block_label": "calculate_and_extract_quote_total",
+        "attempted_call_ref": "locator:div.totals",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "workflow_run_id": "wr_569288173990568574",
+        "block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "executed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "structural_failure_identity": "code-block-exception:wr_569288173990568574"
+      }
+    },
+    {
+      "workflow_yaml": "title: Retrieve deferred freight quote total\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: code\n      label: calculate_and_extract_quote_total\n      code: |\n        await page.locator(\"#field-0\").click()\n        await page.locator(\"#field-1\").click()\n        await page.locator(\"#field-2\").click()\n        await page.locator(\"#field-3\").click()\n        await page.locator(\"#field-4\").click()\n        await page.locator(\"#field-5\").click()\n        await page.locator(\"#field-6\").click()\n        await page.locator(\"#field-7\").click()\n        await page.locator(\"#field-8\").click()\n        await page.locator(\"#field-9\").click()\n        await page.locator(\"#field-10\").click()\n        await page.locator(\"#field-11\").click()\n        await page.locator(\"#field-12\").click()\n        await page.locator(\"#field-13\").click()\n        await page.locator(\"#field-14\").click()\n        await page.locator(\"#field-15\").click()\n        await page.locator(\"#field-16\").click()\n        await page.locator(\"#field-17\").click()\n        await page.locator(\"#field-18\").click()\n        await page.locator(\"#field-19\").click()\n        await page.locator(\"#field-20\").click()\n        await page.locator(\"#field-21\").click()\n        await page.locator(\"#field-22\").click()\n        await page.locator(\"#field-23\").click()\n        await page.locator(\"#field-24\").click()\n        await page.locator(\"#field-25\").click()\n        await page.locator(\"#field-26\").click()\n        await page.locator(\"#field-27\").click()\n        await page.locator(\"#field-28\").click()\n        await page.locator(\"#field-29\").click()\n        await page.locator(\"#field-30\").click()\n        await page.locator(\"#field-31\").click()\n        await page.locator(\"#field-32\").click()\n        await page.locator(\"#field-33\").click()\n        await page.locator(\"#field-34\").click()\n        await page.locator(\"#field-35\").click()\n        await page.locator(\"#field-36\").click()\n        await page.locator(\"#field-37\").click()\n        await page.locator(\"#field-38\").click()\n        await page.locator(\"#field-39\").click()\n        await page.locator(\"#field-40\").click()\n        await page.locator(\"#field-41\").click()\n        await page.locator(\"#field-42\").click()\n        await page.locator(\"#field-43\").click()\n        await page.locator(\"#field-44\").click()\n        await page.locator(\"#field-45\").click()\n        await page.locator(\"#field-46\").click()\n        await page.locator(\"#field-47\").click()\n        await page.locator(\"#field-48\").click()\n        await page.locator(\"#field-49\").click()\n        await page.locator(\"#field-50\").click()\n        await page.locator(\"#field-51\").click()\n        await page.locator(\"#field-52\").click()\n        await page.locator(\"#field-53\").click()\n        await page.locator(\"#field-54\").click()\n        await page.locator(\"#field-55\").click()\n        await page.locator(\"#field-56\").click()\n        await page.locator(\"#field-57\").click()\n        await page.locator(\"#field-58\").click()\n        await page.locator(\"#field-59\").click()\n        await page.locator(\"#field-60\").click()\n        await page.locator(\"#field-61\").click()\n        await page.locator(\"#field-62\").click()\n        await page.locator(\"#field-63\").click()\n        await page.locator(\"#field-64\").click()\n        await page.locator(\"#field-65\").click()\n        await page.locator(\"#field-66\").click()\n        await page.locator(\"#field-67\").click()\n        await page.locator(\"#field-68\").click()\n        await page.locator(\"#field-69\").click()\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "verdict": "not_authoritative",
+        "reason_code": "run_completed_unevaluated",
+        "workflow_run_id": "wr_569288397328868066",
+        "block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "executed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "evidence_refs": [
+          "calculate_and_extract_quote_total_output"
+        ]
+      }
+    }
+  ],
+  "reported_workflow_yaml": null,
+  "expect": {
+    "baseline_disposition": "no_reported_candidate",
+    "baseline_attached": true,
+    "disposition": "no_reported_candidate",
+    "attached": true,
+    "history_retains_failure": true
+  }
+}

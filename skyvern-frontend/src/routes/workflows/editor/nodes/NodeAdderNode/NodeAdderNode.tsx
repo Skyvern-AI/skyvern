@@ -114,7 +114,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const isUploadingSOP = sopToBlocksMutation.isPending;
 
   const isProcessing =
-    processRecordingMutation.isPending || recordingStore.isCommitting;
+    processRecordingMutation.isPending ||
+    recordingStore.finishRequested ||
+    recordingStore.isCommitting;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -140,7 +142,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     : isBlockedByFinally
       ? "Finally block must run last - choose a position above it"
       : !isBusy && recordingStore.isRecording
-        ? "Stop recording to add a block"
+        ? "Finish recording the task to add a block"
         : null;
 
   const updateWorkflowPanelState = (
@@ -181,6 +183,10 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   };
 
   const onEndRecord = () => {
+    if (isProcessing) {
+      return;
+    }
+
     // With live interpretation, the recording panel owns the commit so user
     // edits/deletes to draft steps are honored.
     if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {

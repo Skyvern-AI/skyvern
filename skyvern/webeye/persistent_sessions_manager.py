@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -10,13 +13,40 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_retirement import (
+    BrowserOperationRejected,
+    BrowserRetirement,
+    BrowserRetirementReason,
+)
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal  # noqa: F401
 
 # Not a RunType member, so the reaper cannot resolve it by matching that enum. Both the writer of
 # a standalone-task lease and the reaper's liveness check must agree on this exact string, or the
 # reaper protects the row forever.
 PBS_TASK_RUNNABLE_TYPE = "task"
+
+
+@dataclass(frozen=True)
+class BrowserOperation:
+    browser_state: BrowserState
+    retirement: BrowserRetirement
+
+    @property
+    def retirement_started(self) -> asyncio.Event:
+        return self.retirement.started
+
+    @property
+    def retirement_reason(self) -> BrowserRetirementReason | None:
+        return self.retirement.reason
+
+
+@dataclass(frozen=True)
+class BrowserSessionExtension:
+    session: PersistentBrowserSession
+    granted_minutes: int
 
 
 class PersistentSessionsManager(Protocol):
@@ -93,8 +123,20 @@ class PersistentSessionsManager(Protocol):
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        url: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState | None:
         """Get the browser state for a session."""
+        ...
+
+    def browser_operation(
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+    ) -> AbstractAsyncContextManager[BrowserOperation | BrowserOperationRejected]:
+        """Admit one browser operation on the exact current cached generation."""
         ...
 
     def get_cached_browser_state_for_release(
@@ -126,7 +168,7 @@ class PersistentSessionsManager(Protocol):
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:
-        """Set the browser state for a session."""
+        """Set the browser state, or raise when the session has stopped accepting generations."""
         ...
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
@@ -178,6 +220,16 @@ class PersistentSessionsManager(Protocol):
         """Renew a session or close it if renewal fails."""
         ...
 
+    async def extend_session(
+        self, session_id: str, organization_id: str, additional_minutes: int
+    ) -> BrowserSessionExtension:
+        """Grant a live session more lifetime, clamped to what remains under the maximum extended lifetime.
+
+        Raises BrowserSessionNotExtendable when the session has ended, is about to expire, is already at
+        the maximum lifetime, or runs on infrastructure whose deadline is fixed at creation.
+        """
+        ...
+
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
         """Seconds until this session's infrastructure ends it no matter what the caller does.
 
@@ -185,6 +237,12 @@ class PersistentSessionsManager(Protocol):
         is nothing here to pre-empt. Read-only: a caller asking how long it has must not have the
         answer changed by asking.
         """
+        ...
+
+    async def remaining_lifetime_seconds(self, session_id: str, organization_id: str) -> float | None:
+        """Seconds until this session ends regardless of activity or renewal, measured on the clock its own
+        retirement uses and bounded by a pinned-infrastructure deadline. None when no such deadline exists or
+        it cannot be read."""
         ...
 
     async def update_status(
@@ -226,8 +284,10 @@ class PersistentSessionsManager(Protocol):
         expected: BrowserState | None = None,
         *,
         detach_remote_driver: bool = False,
-    ) -> None:
-        """Drop any in-process cache entry so the next lookup reconnects.
+        only_if_unleased: bool = False,
+    ) -> bool:
+        """Drop any in-process cache entry so the next lookup reconnects, reporting whether a
+        live entry was actually evicted.
 
         When ``expected`` is provided the eviction is race-safe: callers can pass the
         stale BrowserState they just navigated against, and the manager skips eviction
@@ -238,11 +298,19 @@ class PersistentSessionsManager(Protocol):
         ``detach_remote_driver`` is for a known local CDP-client loss while the remote
         persistent browser remains healthy. It stops only the adopted Playwright driver
         instead of closing the remote context that another proxy client may still use.
+        ``only_if_unleased`` refuses the eviction while an admitted operation or a run on this
+        process still leases the cached generation, since retiring it would cut that work off.
         """
         ...
 
-    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
-        """Close a specific browser session."""
+    async def close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
+        """Close a specific browser session; ``reason`` is recorded on its row, and an abort lands it on failed."""
         ...
 
     async def close_all_sessions(self, organization_id: str) -> None:

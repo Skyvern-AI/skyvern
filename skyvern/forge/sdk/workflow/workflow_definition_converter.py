@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.data_export_block import DataExportBlock
 from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
@@ -345,6 +346,7 @@ def convert_workflow_definition(
         version=dag_version,
         finally_block_label=workflow_definition_yaml.finally_block_label,
         error_code_mapping=workflow_definition_yaml.error_code_mapping,
+        retry_policy=workflow_definition_yaml.retry_policy,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
         completion_contract=workflow_definition_yaml.completion_contract,
     )
@@ -733,6 +735,7 @@ def block_yaml_to_block(
             recipients=block_yaml.recipients,
             subject=block_yaml.subject,
             body=block_yaml.body,
+            body_format=block_yaml.body_format,
             file_attachments=block_yaml.file_attachments or [],
         )
     elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
@@ -834,9 +837,15 @@ def block_yaml_to_block(
             recipients=block_yaml.recipients,
             subject=block_yaml.subject,
             body=block_yaml.body,
+            body_format=block_yaml.body_format,
         )
 
     elif block_yaml.block_type == BlockType.EXTRACTION:
+        if block_yaml.export_enabled and not block_yaml.export_data_schema:
+            raise InvalidWorkflowDefinition(
+                f"Extraction block '{block_yaml.label}' has export enabled but no export_data_schema. "
+                "A Parquet export needs a schema for the exported records."
+            )
         extraction_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return ExtractionBlock(
             **base_kwargs,
@@ -850,6 +859,10 @@ def block_yaml_to_block(
             max_retries=block_yaml.max_retries,
             disable_cache=block_yaml.disable_cache,
             complete_verification=False,
+            export_enabled=block_yaml.export_enabled,
+            export_data_schema=block_yaml.export_data_schema,
+            export_file_name=block_yaml.export_file_name,
+            export_records=block_yaml.export_records,
         )
 
     elif block_yaml.block_type == BlockType.LOGIN:
@@ -892,6 +905,15 @@ def block_yaml_to_block(
         return WaitBlock(
             **base_kwargs,
             wait_sec=block_yaml.wait_sec,
+        )
+
+    elif block_yaml.block_type == BlockType.DATA_EXPORT:
+        return DataExportBlock(
+            **base_kwargs,
+            data=block_yaml.data,
+            data_schema=block_yaml.data_schema,
+            file_name=block_yaml.file_name,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:

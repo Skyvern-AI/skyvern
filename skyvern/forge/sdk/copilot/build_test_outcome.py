@@ -6,14 +6,18 @@ import json
 import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Literal, Protocol
+from itertools import islice
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit
 
 import structlog
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
-from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     carrier_backed_anti_bot_categories,
     interactive_challenge_controls,
@@ -25,7 +29,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import page_evidence_source_matches_run, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
-from skyvern.forge.sdk.copilot.failure_tracking import selector_identities_in_text, selector_identity_from_failure
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    selector_identities_in_text,
+    selector_identity_from_failure,
+    selector_identity_from_literal,
+)
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
@@ -70,11 +78,34 @@ BuildTestOutcomeReasonCode = Literal[
 _TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset({"terminal_challenge_blocker"})
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
-BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
-BuildTestPacketUnfinishedKind = Literal["unverified_block", "missing_requested_output"]
+BuildTestPacketWorkflowSource = Literal[
+    "accepted_write_readback",
+    "turn_start_persisted_readback",
+    "unavailable",
+    "staged_execution_snapshot",
+    "canonical_execution_snapshot",
+]
+BuildTestPacketUnfinishedKind = Literal[
+    "unverified_block",
+    "missing_requested_output",
+    "requested_output_observation",
+]
 BuildTestPacketPageCaptureStatus = Literal["captured", "unavailable"]
 BuildTestPacketPageCaptureOmission = Literal["screenshot_capture_failed", "page_capture_unavailable"]
 BuildTestFailedOperationKind = Literal["browser_operation_failed"]
+# Why a turn stopped: an empty model completion, a capacity limit, the failed
+# operation's own kind, or the browser connection state the run could not get past.
+TerminalCause = Literal[
+    "empty_completion",
+    "deadline_expired",
+    "max_turns_exceeded",
+    "browser_operation_failed",
+    "already_closed",
+    "provisioning_unavailable",
+    "cdp_connect_failed",
+    "occupied",
+    "billing_credit_admission_refusal",
+]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
     "run_browser_unavailable",
@@ -88,15 +119,22 @@ _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
 _TEXT_MAX = 180
 _REF_TEXT_MAX = 96
+_RECORDED_BLOCK_OUTCOME_FACT_LIMIT = 12
+_RECORDED_BLOCK_OUTCOME_HEAD_ROWS = 4
+_ExecutedRow = tuple[str, str, Mapping[str, object]]
+_RECORDED_BLOCK_OUTCOME_FIELD_LIMIT = 8
 _VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
+_PAGE_RESULT_REF_MAX_ITEMS = 6
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_OPERATION_FAILED: BuildTestFailedOperationKind = "browser_operation_failed"
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
-# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
-# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
-# a saturated runner gate says nothing about the code, so rewriting it cannot help.
+_FAILED_BLOCK_STATUSES = frozenset({"failed", "terminated", "canceled", "timed_out"})
+_COMPLETED_BLOCK_STATUSES = frozenset({BlockStatus.completed.value})
+# Sandbox-process faults, not authored-code faults. ``timeout``, ``user_code_error``, and input
+# reassembly OOM stay out: workflow edits can make each repairable. ``busy`` is in — a saturated
+# runner gate says nothing about the code, so rewriting it cannot help.
 INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
     {
         "runner_unavailable",
@@ -106,6 +144,7 @@ INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
         "child_no_request",
         "child_malformed_request",
         "busy",
+        "parameter_transfer_failed",
     }
 )
 
@@ -162,6 +201,8 @@ class BuildTestPacketRun(BaseModel):
     browser_session_id: str | None = None
     status: str | None = None
     browser: BuildTestPacketRunBrowser | None = None
+    execution_source: dict[str, Any] | None = None
+    browser_start: dict[str, Any] | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -174,6 +215,7 @@ class BuildTestPacketPageState(BaseModel):
     observed_after_workflow_run: bool = False
     rendered_value_excerpt: str | None = None
     form_summaries: list[str] = Field(default_factory=list)
+    value_bindings: list[str] = Field(default_factory=list)
     result_summaries: list[str] = Field(default_factory=list)
     action_summaries: list[str] = Field(default_factory=list)
     challenge_summaries: list[str] = Field(default_factory=list)
@@ -263,6 +305,9 @@ class BuildTestPacketFailure(BaseModel):
     block_type: str | None = None
     block_status: str | None = None
     reason: str | None = None
+    final_url: str | None = None
+    page_title: str | None = None
+    covering_element: str | None = None
     error_codes: list[str] = Field(default_factory=list)
     failing_line: int | None = None
     failed_operation: BuildTestFailedOperation | None = None
@@ -275,13 +320,21 @@ class BuildTestPacketFailure(BaseModel):
 class BuildTestPacketRegisteredOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    label: str | None = None
+    status: str | None = None
+    output: JsonValue = None
+    value_complete: bool = True
+
+
+class _RegisteredOutputParameterValue(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
     workflow_run_id: str | None = None
     output_parameter_id: str | None = None
     output_parameter_key: str | None = None
     block_label: str | None = None
     block_type: str | None = None
     value: JsonValue = None
-    value_complete: bool = True
 
 
 class BuildTestPacketRequestedOutput(BaseModel):
@@ -318,6 +371,201 @@ class BuildTestPacketUnfinishedItem(BaseModel):
     reason_code: str | None = None
 
 
+SOLVER_ATTEMPT_KEY = "solver_attempt"
+
+
+class ChallengeEffects(BaseModel):
+    """What the product observed and did about an anti-bot wall on this run; facts, not a verdict."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str | None = None
+    solver_available: bool | None = None
+    solver_attempted: bool | None = None
+    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] = "unresolved"
+    solver_failure: str | None = None
+
+
+def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -> list[str]:
+    """Prose facts for the typed record, so a reader that skips the keys still meets them; no ranking."""
+    notices: list[str] = []
+    if challenge is not None:
+        kind = challenge.kind or "unclassified"
+        if challenge.solver_available is True:
+            availability = "the managed captcha solver is available for this run"
+        elif challenge.solver_available is False:
+            availability = (
+                "the managed captcha solver is not available for this page or run (an organization setting or a "
+                "per-site exclusion)"
+            )
+        else:
+            availability = "the managed captcha solver's availability was not resolved"
+        if challenge.solver_result == "attempted":
+            outcome = (
+                "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
+                "itself mean the challenge cleared: the no-solver fallback also returns success"
+            )
+        elif challenge.solver_result == "failed":
+            outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
+            if challenge.solver_failure:
+                outcome += f" ({challenge.solver_failure})"
+        elif challenge.solver_result == "not_attempted":
+            outcome = (
+                "no `solve_captcha(page)` call appears in this run's recorded actions; a code block reaches the "
+                "solver only when its code calls that builtin"
+            )
+        else:
+            outcome = "whether this run called `solve_captcha(page)` is unresolved, so do not state either way"
+        notices.append(f"challenge: {kind}; {availability}; {outcome}.")
+    if levers:
+        names = ", ".join(lever.mechanism for lever in levers)
+        notices.append(
+            f"levers are the product capabilities that exist for this wall ({names}); each `knowledge_topic` is a "
+            "`get_workflow_knowledge` topic id and `availability` is the current state, not a recommendation."
+        )
+    return notices
+
+
+LeverMechanism = Literal[
+    "captcha_solver", "proxy_location", "browser_profile", "credential_totp_or_inbox", "human_interaction"
+]
+LeverTopic = Literal["captcha_solver", "proxy_location", "login_block", "human_interaction_block"]
+
+
+class Lever(BaseModel):
+    """A product capability that exists for this wall, with its availability state; never a recommendation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mechanism: LeverMechanism
+    knowledge_topic: LeverTopic
+    availability: str | None = None
+
+
+_ValueT = TypeVar("_ValueT")
+
+BLOCK_FACT_MAX_LABELS = 12
+BLOCK_FACT_MAX_OBSERVATIONS = 6
+BLOCK_FACT_MAX_CHARS = 300
+# An over-long URL is refused rather than cut everywhere it is bounded: a cut URL still parses, so
+# it would be reported as a page the run reached while being unresumable.
+BLOCK_FACT_URL_MAX_CHARS = 2000
+# A notice describing the map must not outgrow the map: nothing downstream bounds omission_notices.
+BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS = 1000
+
+OBSERVED_BLOCK_END_URLS_WITHHELD = (
+    "observed_block_end_urls withheld: this run touched a sensitive origin, so the pages its blocks "
+    "ended on are not reported."
+)
+OBSERVED_BLOCK_END_URLS_UNREPORTABLE = (
+    "observed_block_end_urls omitted: no recorded per-block end URL reduced to a reportable origin."
+)
+OBSERVED_BLOCK_END_URLS_EMPTY = "observed_block_end_urls empty: no per-block end URL was recorded for this run."
+ACTION_OBSERVATIONS_EMPTY = "action_observations empty: no same-run typed action observation was recorded."
+
+# block.py masks a secret in the at-failure URL before persisting it, so a login/MFA failure can
+# leave a final_url that parses but is not the page: it cannot be resumed and must not be reported.
+URL_SECRET_MASK = "*****"
+
+
+def append_omission_notice(notices: list[str], notice: str) -> None:
+    if notice not in notices:
+        notices.append(notice)
+
+
+def _usable_labelled_entries(
+    value: object,
+    *,
+    field_name: str,
+    notices: list[str] | None,
+) -> list[tuple[str, object]]:
+    """Entries of a label map whose label is present and inside the bound.
+    An over-long label is dropped rather than clipped, because a clipped label can collide with a
+    different block's and silently replace its facts."""
+    if not isinstance(value, dict):
+        return []
+    usable = [
+        (label, item)
+        for label, item in value.items()
+        if isinstance(label, str) and 0 < len(label) <= BLOCK_FACT_MAX_CHARS
+    ]
+    unusable = len(value) - len(usable)
+    if unusable and notices is not None:
+        append_omission_notice(
+            notices, f"{field_name} omitted {unusable} block(s): the recorded label was missing or over-long."
+        )
+    return usable
+
+
+def _newest_capped_entries(
+    entries: list[tuple[str, _ValueT]],
+    *,
+    field_name: str,
+    notices: list[str] | None,
+) -> list[tuple[str, _ValueT]]:
+    dropped = max(len(entries) - BLOCK_FACT_MAX_LABELS, 0)
+    if dropped and notices is not None:
+        append_omission_notice(notices, f"{field_name} shortened: the {dropped} oldest block(s) omitted.")
+    return entries[-BLOCK_FACT_MAX_LABELS:]
+
+
+def coerce_block_end_urls(value: object, notices: list[str] | None = None) -> dict[str, str]:
+    """The newest labelled end URLs a raw run result carries."""
+    entries = _usable_labelled_entries(value, field_name="observed_block_end_urls", notices=notices)
+    kept = [(label, url) for label, url in entries if isinstance(url, str) and 0 < len(url) <= BLOCK_FACT_URL_MAX_CHARS]
+    refused = len(entries) - len(kept)
+    if refused and notices is not None:
+        append_omission_notice(
+            notices,
+            f"observed_block_end_urls omitted {refused} block(s): the recorded URL was missing or exceeded "
+            f"{BLOCK_FACT_URL_MAX_CHARS} characters.",
+        )
+    return dict(_newest_capped_entries(kept, field_name="observed_block_end_urls", notices=notices))
+
+
+def coerce_block_action_observations(value: object, notices: list[str] | None = None) -> dict[str, list[str]]:
+    """The newest labelled action observations a raw run result carries, newest-retained per label
+    so a block's terminal action outlives its filler ones."""
+    entries = _usable_labelled_entries(value, field_name="per_block_action_observations", notices=notices)
+    usable: list[tuple[str, list[str]]] = []
+    unusable = 0
+    for label, observations in entries:
+        if not isinstance(observations, list):
+            unusable += 1
+            continue
+        retained_items = [item for item in observations if isinstance(item, str) and item]
+        if not retained_items:
+            unusable += 1
+            continue
+        usable.append((label, retained_items))
+    if unusable and notices is not None:
+        append_omission_notice(
+            notices,
+            f"per_block_action_observations omitted {unusable} block(s): no recorded observation was reportable.",
+        )
+    coerced: dict[str, list[str]] = {}
+    dropped = 0
+    clipped = 0
+    for label, observations in _newest_capped_entries(
+        usable, field_name="per_block_action_observations", notices=notices
+    ):
+        dropped += max(len(observations) - BLOCK_FACT_MAX_OBSERVATIONS, 0)
+        retained: list[str] = []
+        for item in observations[-BLOCK_FACT_MAX_OBSERVATIONS:]:
+            if len(item) > BLOCK_FACT_MAX_CHARS:
+                clipped += 1
+                item = item[: BLOCK_FACT_MAX_CHARS - 3] + "..."
+            retained.append(item)
+        coerced[label] = retained
+    if notices is not None and dropped:
+        append_omission_notice(
+            notices, f"per_block_action_observations shortened: the {dropped} oldest observation(s) omitted."
+        )
+    if notices is not None and clipped:
+        append_omission_notice(notices, f"per_block_action_observations shortened: {clipped} text value(s) clipped.")
+    return coerced
+
+
 class BuildTestEvidencePacket(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -330,6 +578,8 @@ class BuildTestEvidencePacket(BaseModel):
     executed_block_labels: list[str] = Field(default_factory=list)
     run: BuildTestPacketRun
     action_observations: list[str] = Field(default_factory=list)
+    observed_block_end_urls: dict[str, str] = Field(default_factory=dict)
+    per_block_action_observations: dict[str, list[str]] = Field(default_factory=dict)
     failure: BuildTestPacketFailure | None = None
     page_state: BuildTestPacketPageState | None = None
     page_capture: BuildTestPacketPageCapture | None = None
@@ -339,6 +589,9 @@ class BuildTestEvidencePacket(BaseModel):
     screenshot: BuildTestPacketScreenshot
     unfinished_items: list[BuildTestPacketUnfinishedItem] = Field(default_factory=list)
     omission_notices: list[str] = Field(default_factory=list)
+    challenge: ChallengeEffects | None = None
+    levers: list[Lever] = Field(default_factory=list)
+    challenge_notices: list[str] = Field(default_factory=list)
 
 
 class CodeSafetyRejectionFact(BaseModel):
@@ -360,6 +613,23 @@ class CodeSafetyRejectionFact(BaseModel):
         return redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
 
 
+class RecordedBlockOutcomeFact(BaseModel):
+    """One executed run-block row's own recorded output, projected verbatim. ``status`` is the
+    runner's machine word for the row and carries no claim that the step achieved what it was
+    authored for; ``output_fields`` keeps a recorded empty value as an empty string so an empty
+    observation stays distinguishable from one that was never recorded.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    label: str
+    status: str
+    output_recorded: bool
+    output_fields: dict[str, str] = Field(default_factory=dict)
+    fields_omitted: int = 0
+    output_text: str = ""
+
+
 class RecordedBuildTestOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -375,6 +645,9 @@ class RecordedBuildTestOutcome(BaseModel):
     block_labels: list[str] = Field(default_factory=list)
     requested_block_labels: list[str] = Field(default_factory=list)
     executed_block_labels: list[str] = Field(default_factory=list)
+    # ``failed_operation`` is only populated for browser-operation failures, so it cannot stand in
+    # for "this run had no failed block": a plain Python exception leaves it None.
+    failed_block_labels: list[str] = Field(default_factory=list)
     block_shape_hashes: dict[str, str] = Field(default_factory=dict)
     structural_failure_identity: str = ""
     verified_progress_marker: str = ""
@@ -383,6 +656,8 @@ class RecordedBuildTestOutcome(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
+    recorded_block_outcome_facts: list[RecordedBlockOutcomeFact] = Field(default_factory=list)
+    recorded_block_outcome_rows_omitted: int = 0
     code_safety_rejection_facts: list[CodeSafetyRejectionFact] = Field(default_factory=list)
     page_path_failure: PostRunPagePathFailure | None = None
     failed_operation: BuildTestFailedOperation | None = None
@@ -390,6 +665,7 @@ class RecordedBuildTestOutcome(BaseModel):
     failed_operation_call_signature: str | None = Field(default=None, exclude=True, repr=False)
     failed_operation_code_signature: str | None = Field(default=None, exclude=True, repr=False)
     executed_block_associations: tuple[str, ...] = Field(default=(), exclude=True, repr=False)
+    completed_block_associations: tuple[str, ...] = Field(default=(), exclude=True, repr=False)
     authored_structure_signature: str | None = None
     display_text: str = ""
     observed_page_value_excerpt: str = ""
@@ -456,6 +732,50 @@ class _RecordedBuildTestOutcomeContext(Protocol):
     recorded_persisted_block_run_workflow_run_id: str | None
 
 
+def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome) -> dict[str, object]:
+    return {
+        "phase": outcome.phase,
+        "reason_code": outcome.reason_code,
+        "verdict": outcome.verdict,
+        "structural_key": outcome.structural_key,
+        "is_authoritative": outcome.is_authoritative,
+        "workflow_run_id": outcome.workflow_run_id,
+        "authored_structure_signature": outcome.authored_structure_signature,
+        "block_labels": list(outcome.block_labels),
+        "attempted_block_label": outcome.attempted_block_label,
+        "attempted_block_signature": _attempted_block_signature(ctx, outcome),
+        "attempted_block_code_hash": _attempted_block_code_hash(ctx, outcome),
+        "attempted_call_ref": outcome.attempted_call_ref,
+        "code_safety_rejection_facts": [fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts],
+        "failed_operation": (
+            outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
+        ),
+        "connect_failure": (
+            outcome.connect_failure.model_dump(mode="json") if outcome.connect_failure is not None else None
+        ),
+        "failed_operation_call_signature": outcome.failed_operation_call_signature,
+        "executed_block_evidence": _executed_block_evidence(ctx, outcome),
+    }
+
+
+def _releasing_associations(
+    ctx: _RecordedBuildTestOutcomeContext, failed_operation: BuildTestFailedOperation
+) -> set[str]:
+    """Identities whose completion resolves this failure.
+
+    A full replacement mints a fresh identity for the same label, so the recorded association can
+    never run again; without the label's current identity that repair shape has no way to clear.
+    """
+    releasing: set[str] = set()
+    if failed_operation.block_association:
+        releasing.add(failed_operation.block_association)
+    if failed_operation.block_label:
+        current = ctx.runner_code_block_associations_by_label.get(failed_operation.block_label)
+        if current:
+            releasing.add(current)
+    return releasing
+
+
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
     if outcome is None:
         latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
@@ -465,7 +785,31 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     prior = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if not isinstance(prior, RecordedBuildTestOutcome):
         prior = None
-    if outcome.failed_operation is not None:
+    # Keyed on the failure itself, not on ``failed_operation``: that projection exists only for
+    # browser-operation failures, so a block that died on an ordinary Python exception would
+    # otherwise keep none of its diagnosis.
+    # An acquisition failure that never reached a run names none, so it cannot contradict the prior
+    # failure and merges into it; the merged record keeps that run's identity, since the rebase below
+    # starts from it. Only a record naming a *different* run is a separate outcome.
+    prior_same_run_block_failure = (
+        prior is not None
+        and prior.reason_code == "runtime_block_failure"
+        and bool(prior.workflow_run_id)
+        and outcome.workflow_run_id in (None, "", prior.workflow_run_id)
+    )
+    merged_into_prior_failure = False
+    if outcome.connect_failure is not None and prior is not None and prior_same_run_block_failure:
+        # An acquisition failure concluded nothing about the blocks, so the run's own failure record
+        # stands and the acquisition fact rides along with it. Rebased on that record rather than
+        # copied field by field: the repair prompt reads a dozen diagnostic fields -- evidence refs,
+        # page capture, observed summary -- and a copy list would silently drop each one it grows.
+        # The acquisition fact stays typed in ``connect_failure``; the repair prompt renders it from
+        # there. Folding it into the summary would put two failures through one 160-character clip.
+        # The page-path continuation is dropped: it binds the model to act on the page the prior run
+        # left behind, and the browser holding that page is the one this record says was not acquired.
+        outcome = prior.model_copy(update={"connect_failure": outcome.connect_failure, "page_path_failure": None})
+        merged_into_prior_failure = True
+    elif outcome.failed_operation is not None:
         source_yaml = _executed_workflow_yaml(ctx)
         association = outcome.failed_operation.block_association
         failed_code = _code_for_runner_association(ctx, source_yaml, association)
@@ -478,22 +822,13 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
             }
         )
     elif prior is not None and prior.failed_operation is not None:
-        source_yaml = _executed_workflow_yaml(ctx)
-        association = prior.failed_operation.block_association
-        tested_code = _code_for_runner_association(ctx, source_yaml, association)
-        changed_attempt_was_tested = (
+        releasing = _releasing_associations(ctx, prior.failed_operation)
+        failed_block_completed_later = (
             outcome.phase == "persisted_block_run"
-            and outcome.verdict == "progress_observed"
             and outcome.workflow_run_id not in (None, prior.failed_operation.workflow_run_id)
-            and association is not None
-            and association in outcome.executed_block_associations
-            and _failed_operation_changed(
-                tested_code,
-                prior.failed_operation_call_signature,
-                prior.failed_operation_code_signature,
-            )
+            and bool(releasing & set(outcome.completed_block_associations))
         )
-        if not changed_attempt_was_tested:
+        if not failed_block_completed_later:
             outcome = outcome.model_copy(
                 update={
                     "failed_operation": prior.failed_operation,
@@ -504,31 +839,11 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     ctx.latest_recorded_build_test_outcome = outcome
     raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
-    history.append(
-        {
-            "phase": outcome.phase,
-            "reason_code": outcome.reason_code,
-            "verdict": outcome.verdict,
-            "structural_key": outcome.structural_key,
-            "is_authoritative": outcome.is_authoritative,
-            "workflow_run_id": outcome.workflow_run_id,
-            "authored_structure_signature": outcome.authored_structure_signature,
-            "block_labels": list(outcome.block_labels),
-            "attempted_block_label": outcome.attempted_block_label,
-            "attempted_block_signature": _attempted_block_signature(ctx, outcome),
-            "attempted_call_ref": outcome.attempted_call_ref,
-            "code_safety_rejection_facts": [
-                fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts
-            ],
-            "failed_operation": (
-                outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
-            ),
-            "connect_failure": (
-                outcome.connect_failure.model_dump(mode="json") if outcome.connect_failure is not None else None
-            ),
-            "failed_operation_call_signature": outcome.failed_operation_call_signature,
-        }
-    )
+    # A merged record adds no block outcome -- the prior entry already holds this failure, snapshotted
+    # against the code the run executed. Appending would re-snapshot it against the current draft,
+    # so a later clearance check would compare the failure to code it never ran.
+    if not merged_into_prior_failure:
+        history.append(_history_entry(ctx, outcome))
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
     if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
@@ -558,8 +873,86 @@ def _attempted_block_signature(ctx: _RecordedBuildTestOutcomeContext, outcome: R
     return authored_block_signatures_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
 
 
+def _attempted_block_code_hash(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome) -> str:
+    """Code text alone, so a parameter-only or output-metadata edit cannot read as a code change."""
+    if outcome.reason_code != "runtime_block_failure" or not outcome.attempted_block_label:
+        return ""
+    return authored_block_code_hashes_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
+
+
 def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str:
     return ctx.staged_workflow_yaml or ctx.workflow_yaml
+
+
+_EXECUTED_CALL_REF_LIMIT = 64
+
+
+class ExecutedBlockEvidence(BaseModel):
+    """Source binding for a block a run actually executed, captured when that run was recorded."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    signature: str = ""
+    call_refs: list[str] = Field(default_factory=list)
+    call_refs_truncated: bool = False
+    removal_provable: bool = False
+    yaml_digest: str = "absent"
+
+
+def _failed_block_labels(blocks: Sequence[Mapping[str, object]]) -> list[str]:
+    """Every failed block, not just the first: the block being judged may be a later one."""
+    return [
+        label
+        for block in blocks
+        if _safe_str(block.get("status")).lower() in _FAILED_BLOCK_STATUSES and (label := _safe_str(block.get("label")))
+    ]
+
+
+def _executed_block_evidence(
+    ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome
+) -> dict[str, dict[str, object]]:
+    """Bind the executed snapshot at record time; re-deriving it later would read a draft the run
+    never ran. Digests and labels only -- ``_HISTORY_LIMIT`` bounds entry count, not entry size."""
+    if not outcome.executed_block_labels:
+        return {}
+    executed_yaml = _executed_workflow_yaml(ctx)
+    if not executed_yaml:
+        return {}
+    yaml_digest = _yaml_digest(executed_yaml)
+    signatures = authored_block_signatures_from_workflow(executed_yaml)
+    code_by_label = _code_blocks_by_label(executed_yaml)
+    failed = set(outcome.failed_block_labels)
+    evidence: dict[str, dict[str, object]] = {}
+    for label in outcome.executed_block_labels:
+        # A block that failed in this run proves nothing about its own repair.
+        if label in failed:
+            continue
+        code = code_by_label.get(label)
+        call_refs = sorted(selector_identities_in_text(code)) if code else []
+        truncated = len(call_refs) > _EXECUTED_CALL_REF_LIMIT
+        evidence[label] = ExecutedBlockEvidence(
+            signature=signatures.get(label, ""),
+            # Stored whole rather than shortened: absence is what clears a failure, and a shortened
+            # ref would read as absent while the call it names is still there.
+            call_refs=call_refs[:_EXECUTED_CALL_REF_LIMIT],
+            call_refs_truncated=truncated,
+            removal_provable=(not truncated and _selector_removal_is_provable(code)) if code else False,
+            yaml_digest=yaml_digest,
+        ).model_dump(mode="json")
+    return evidence
+
+
+def _executed_block_evidence_for_label(entry: Mapping[str, object], label: str) -> ExecutedBlockEvidence | None:
+    raw = entry.get("executed_block_evidence")
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get(label)
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return ExecutedBlockEvidence.model_validate(dict(value))
+    except ValidationError:
+        return None
 
 
 def _code_for_runner_association(
@@ -630,27 +1023,6 @@ def _failed_operation_call_signature(code: str | None, failing_line: int | None)
     return _stable_hash(ast.dump(outermost, include_attributes=False))
 
 
-def _failed_operation_changed(
-    tested_code: str | None,
-    prior_call_signature: str | None,
-    prior_code_signature: str | None,
-) -> bool:
-    """Prove the recorded operation changed, or use whole-block change for a typed line omission."""
-    if not tested_code:
-        return False
-    wrapper = _parse_block_code(tested_code)
-    if wrapper is None:
-        return False
-    current_call_signatures = {
-        _stable_hash(ast.dump(node, include_attributes=False))
-        for node in ast.walk(wrapper)
-        if isinstance(node, ast.Call)
-    }
-    if prior_call_signature is not None:
-        return prior_call_signature not in current_call_signatures
-    return prior_code_signature is not None and _stable_hash(tested_code) != prior_code_signature
-
-
 # Every construct that can reach the end of a block without running something inside it, including
 # expression-level ones: a zero-length comprehension skips its body exactly as an unentered loop does.
 # Over-detection only costs a redundant note; a miss silently drops a real failure.
@@ -677,13 +1049,25 @@ def _selector_removal_is_provable(code: str) -> bool:
     wrapper = _parse_block_code(code)
     if wrapper is None:
         return False
+    scanned = selector_identities_in_text(code)
     for node in ast.walk(wrapper):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             continue
         if node.func.attr not in _SELECTOR_CALL_ATTRS:
             continue
         selector_args = [*node.args, *(kw.value for kw in node.keywords if kw.arg == "name")]
-        if any(not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in selector_args):
+        literals = [arg.value for arg in selector_args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+        if len(literals) != len(selector_args):
+            return False
+        # The scan and this proof must read the same selector. Adjacent literals ("#a" "#b") and
+        # triple quotes parse to one constant the text scan spells differently, so a selector the
+        # scan never recorded would read as one the edit removed.
+        identity = selector_identity_from_literal(
+            node.func.attr,
+            literals[0] if literals else "",
+            literals[1] if len(literals) > 1 else "",
+        )
+        if identity and identity not in scanned:
             return False
     return True
 
@@ -691,6 +1075,44 @@ def _selector_removal_is_provable(code: str) -> bool:
 def _yaml_digest(text: str | None) -> str:
     """Identity of a workflow's bytes, so sources can be compared without logging their content."""
     return hashlib.sha256((text or "").encode()).hexdigest()[:16] if text else "absent"
+
+
+def _executed_snapshot_clearance(
+    later_runs: Sequence[object],
+    *,
+    label: str,
+    signature: str,
+    call_ref: str,
+    source_digest: str,
+) -> str | None:
+    """Clearance from a run's own receipts: the run executed this block, and the snapshot it ran
+    carries the same proof of change the delivered workflow would have to carry."""
+    for entry_after in later_runs:
+        if not isinstance(entry_after, Mapping):
+            continue
+        # A run that completed without evaluating its outputs still carries a failed_operation when one
+        # of its blocks re-failed; admitting that would clear the failure and record no new one.
+        completed_unevaluated = (
+            entry_after.get("verdict") == "not_authoritative"
+            and entry_after.get("reason_code") == "run_completed_unevaluated"
+            and entry_after.get("failed_operation") is None
+        )
+        if not (entry_after.get("verdict") == "progress_observed" or completed_unevaluated):
+            continue
+        evidence = _executed_block_evidence_for_label(entry_after, label)
+        if evidence is None:
+            continue
+        # The snapshot that ran has to still be the source being judged. Any edit after that run --
+        # a revert to the code that failed included -- leaves the run proving nothing about it.
+        if evidence.yaml_digest != source_digest:
+            continue
+        run_id = _safe_str(entry_after.get("workflow_run_id"))
+        if call_ref:
+            if call_ref not in evidence.call_refs and evidence.removal_provable:
+                return f"executed_snapshot_call_removed:{run_id}:{label}"
+        elif signature and evidence.signature and evidence.signature != signature:
+            return f"executed_snapshot_signature_changed:{run_id}:{label}"
+    return None
 
 
 def unresolved_runtime_block_failure(
@@ -709,6 +1131,7 @@ def unresolved_runtime_block_failure_with_disposition(
     *,
     reported_workflow_yaml: str | None = None,
     pending_later_run_id: str | None = None,
+    reported_workflow_is_persisted: bool = False,
 ) -> tuple[UnresolvedRuntimeFailure | None, str]:
     """The newest runtime block failure the retained evidence does not show was resolved.
 
@@ -716,6 +1139,10 @@ def unresolved_runtime_block_failure_with_disposition(
     the condition that failed: a login step can fail against an already-authenticated page and pass
     against a signed-out one, same lines, opposite precondition. Only evidence that the code itself
     changed -- the failing call removed, or the block's signature changed -- clears the failure.
+
+    ``reported_workflow_is_persisted`` says what an absent ``reported_workflow_yaml`` means. Callers
+    reading persistence pass it, so absence means nothing is saved and the run's own receipts may
+    stand in; a caller judging a proposal leaves it false, where absence only means it has none.
     """
     raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
@@ -741,8 +1168,18 @@ def unresolved_runtime_block_failure_with_disposition(
         # failure and decline.
         if pending_later_run_id and pending_later_run_id != run_id:
             later_runs.append({"workflow_run_id": pending_later_run_id})
-        # Clearance reads only the workflow the user can actually run. A draft that drops the failing
-        # call would clear a failure the delivered workflow still carries.
+        if label and run_id and later_runs and (reported_workflow_yaml or reported_workflow_is_persisted):
+            executed_snapshot_disposition = _executed_snapshot_clearance(
+                later_runs,
+                label=label,
+                signature=signature,
+                call_ref=call_ref,
+                source_digest=_yaml_digest(reported_workflow_yaml or _executed_workflow_yaml(ctx)),
+            )
+            if executed_snapshot_disposition is not None:
+                return None, executed_snapshot_disposition
+        # Absence answers a different question per caller: the run-level carrier reads the snapshot
+        # the run executed, the terminal reads what is saved. reported_workflow_is_persisted says which.
         delivered_yaml = reported_workflow_yaml
         code = _code_blocks_by_label(delivered_yaml).get(label) if delivered_yaml else None
         if not (label and run_id and later_runs and code):
@@ -774,6 +1211,75 @@ def unresolved_runtime_block_failure_with_disposition(
     return None, "no_runtime_failure"
 
 
+class PriorAttemptChangeIdentity(BaseModel):
+    """Whether the code a failing run executed differs from the code the prior failing attempt ran.
+    ``changed`` is ``None`` when ``basis`` is ``unavailable``, which is not the same as "unchanged"."""
+
+    model_config = ConfigDict(frozen=True)
+
+    prior_workflow_run_id: str
+    block_label: str
+    changed: bool | None
+    basis: Literal["code_hash", "unavailable"]
+
+
+def prior_attempt_change_identity(
+    ctx: _RecordedBuildTestOutcomeContext,
+    *,
+    attempted_block_label: str,
+    current_workflow_run_id: str,
+) -> PriorAttemptChangeIdentity | None:
+    """Compare two retained attempts of one block, never a retained attempt against the current draft.
+    The draft moves between the run and the hand-back, so it would answer a different question."""
+    if not attempted_block_label or not current_workflow_run_id:
+        return None
+    history = ctx.recorded_build_test_outcome_history
+    current_index = _latest_runtime_failure_index(
+        history, attempted_block_label, matching_run_id=current_workflow_run_id
+    )
+    if current_index is None:
+        return None
+    prior_index = _latest_runtime_failure_index(
+        history[:current_index], attempted_block_label, excluded_run_id=current_workflow_run_id
+    )
+    if prior_index is None:
+        return None
+    current_hash = _safe_str(history[current_index].get("attempted_block_code_hash"))
+    prior_entry = history[prior_index]
+    prior_hash = _safe_str(prior_entry.get("attempted_block_code_hash"))
+    comparable = bool(current_hash and prior_hash)
+    return PriorAttemptChangeIdentity(
+        prior_workflow_run_id=_safe_str(prior_entry.get("workflow_run_id")),
+        block_label=attempted_block_label,
+        changed=(current_hash != prior_hash) if comparable else None,
+        basis="code_hash" if comparable else "unavailable",
+    )
+
+
+def _latest_runtime_failure_index(
+    history: Sequence[Mapping[str, object]],
+    block_label: str,
+    *,
+    matching_run_id: str | None = None,
+    excluded_run_id: str | None = None,
+) -> int | None:
+    for index in range(len(history) - 1, -1, -1):
+        entry = history[index]
+        if entry.get("reason_code") != "runtime_block_failure":
+            continue
+        if _safe_str(entry.get("attempted_block_label")) != block_label:
+            continue
+        run_id = _safe_str(entry.get("workflow_run_id"))
+        if not run_id:
+            continue
+        if matching_run_id is not None and run_id != matching_run_id:
+            continue
+        if excluded_run_id is not None and run_id == excluded_run_id:
+            continue
+        return index
+    return None
+
+
 def bind_post_run_page_path_failure(
     ctx: _RecordedBuildTestOutcomeContext,
     page_evidence: Mapping[str, object],
@@ -797,6 +1303,58 @@ def bind_post_run_page_path_failure(
     if condition is None:
         return False
     ctx.latest_recorded_build_test_outcome = latest.model_copy(update={"page_path_failure": condition})
+    return True
+
+
+def bind_post_run_page_evidence(
+    ctx: _RecordedBuildTestOutcomeContext,
+    data: Mapping[str, object],
+    page_evidence: Mapping[str, object] | None,
+    *,
+    regraded: RecordedBuildTestOutcome | None = None,
+) -> bool:
+    """Settle the outcome for this run now that post-run page evidence exists, replacing the
+    entry recorded before it rather than appending a second one. Page evidence is a grading
+    input rather than a decoration, so ``regraded`` supersedes a verdict reached without it."""
+    run_id = _safe_str(data.get("workflow_run_id"))
+    if not run_id:
+        return False
+    if regraded is not None and (regraded.phase != "persisted_block_run" or regraded.workflow_run_id != run_id):
+        regraded = None
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None or latest.phase != "persisted_block_run" or latest.workflow_run_id != run_id:
+        # Grading before enrichment had no page to key on, so this run may have recorded nothing at all.
+        if regraded is None:
+            return False
+        record_build_test_outcome(ctx, regraded)
+        return True
+    graded = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
+    page_fields: dict[str, object] = {
+        "page_evidence_refs": _page_evidence_refs(graded),
+        "page_capture": post_run_page_capture_from_result(data, graded),
+        "page_path_failure": _post_run_page_path_failure(graded, run_id),
+        "observed_page_value_excerpt": _observed_page_value_excerpt(graded),
+    }
+    if regraded is not None:
+        # record_build_test_outcome resolved these against the executed code; the regrade cannot see it.
+        carried = (
+            {
+                "failed_operation": latest.failed_operation,
+                "failed_operation_call_signature": latest.failed_operation_call_signature,
+                "failed_operation_code_signature": latest.failed_operation_code_signature,
+            }
+            if latest.failed_operation is not None
+            else {}
+        )
+        updated = regraded.model_copy(update={**page_fields, **carried})
+    else:
+        updated = latest.model_copy(update=page_fields)
+    ctx.latest_recorded_build_test_outcome = updated
+    history = ctx.recorded_build_test_outcome_history
+    if history and history[-1].get("workflow_run_id") == run_id:
+        history[-1] = _history_entry(ctx, updated)
+    if updated.is_authoritative:
+        ctx.recorded_persisted_block_run_workflow_run_id = run_id
     return True
 
 
@@ -835,6 +1393,24 @@ def authored_block_signatures_from_workflow(
             }
         )
     return signatures
+
+
+def authored_block_code_hashes_from_workflow(workflow_yaml: str | None) -> dict[str, str]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, None)
+    if payload is None:
+        return {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return {}
+    hashes: dict[str, str] = {}
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        code_hash = _safe_str(block.get("code_hash"))
+        if label and code_hash:
+            hashes[label] = code_hash
+    return hashes
 
 
 def authored_block_parameter_keys_from_workflow(
@@ -1061,11 +1637,53 @@ def recorded_outcome_from_run_blocks_result(
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
+    runtime_failure_class: str | None = None,
+) -> RecordedBuildTestOutcome | None:
+    outcome = _recorded_outcome_from_run_blocks_result(
+        result,
+        page_evidence=page_evidence,
+        recorded_run_outcome=recorded_run_outcome,
+        completion_verification=completion_verification,
+        authored_structure_signature=authored_structure_signature,
+        requested_output_parameter_payloads=requested_output_parameter_payloads,
+        registered_output_parameter_payloads=registered_output_parameter_payloads,
+        declared_goal_path_omissions=declared_goal_path_omissions,
+        unbound_required_parameter_keys=unbound_required_parameter_keys,
+        block_parameter_keys=block_parameter_keys,
+        block_shape_hashes=block_shape_hashes,
+        block_associations_by_label=block_associations_by_label,
+        runtime_failure_class=runtime_failure_class,
+    )
+    if outcome is None:
+        return None
+    facts, rows_omitted = _recorded_block_outcome_facts(_block_dicts(_dict(result.get("data")).get("blocks")))
+    if not facts:
+        return outcome
+    return outcome.model_copy(
+        update={"recorded_block_outcome_facts": facts, "recorded_block_outcome_rows_omitted": rows_omitted}
+    )
+
+
+def _recorded_outcome_from_run_blocks_result(
+    result: Mapping[str, object],
+    *,
+    page_evidence: Mapping[str, object] | None = None,
+    recorded_run_outcome: RecordedRunOutcome | None = None,
+    completion_verification: CompletionVerificationResult | None = None,
+    authored_structure_signature: str | None = None,
+    requested_output_parameter_payloads: Sequence[BuildTestPacketRequestedOutput] | None = None,
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
+    declared_goal_path_omissions: Sequence[Mapping[str, object]] | None = None,
+    unbound_required_parameter_keys: Sequence[str] | None = None,
+    block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
+    block_shape_hashes: Mapping[str, str] | None = None,
+    block_associations_by_label: Mapping[str, str] | None = None,
+    runtime_failure_class: str | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
-    failed_block = _first_failed_block(blocks)
+    failed_block = _newest_failed_block(blocks)
     failed_operation = failed_operation_from_run_blocks_result(
         result, block_associations_by_label=block_associations_by_label
     )
@@ -1091,7 +1709,7 @@ def recorded_outcome_from_run_blocks_result(
             requested_block_labels=requested_block_labels,
             structural_failure_identity=f"build_test_connect:{connect_failure.state}",
             connect_failure=connect_failure,
-            observed_evidence_summary=f"Build-test browser acquisition stopped: {connect_failure.state}.",
+            observed_evidence_summary=build_test_connect_failure_sentence(connect_failure),
             key_provenance={"structural_failure_identity": "typed build-test browser acquisition fact"},
         )
     executed_block_labels = _clean_list(
@@ -1102,14 +1720,8 @@ def recorded_outcome_from_run_blocks_result(
             if (redacted := _redacted_terminal_text(_safe_str(block.get("label"))))
         ]
     )
-    executed_block_associations = tuple(
-        dict.fromkeys(
-            association
-            for block in blocks
-            if _safe_str(block.get("status")) in _EXECUTED_BLOCK_STATUSES
-            if (association := (block_associations_by_label or {}).get(_safe_str(block.get("label"))))
-        )
-    )
+    executed_block_associations = _block_associations(blocks, block_associations_by_label, _EXECUTED_BLOCK_STATUSES)
+    completed_block_associations = _block_associations(blocks, block_associations_by_label, _COMPLETED_BLOCK_STATUSES)
     block_shape_hashes = dict(block_shape_hashes or {})
     referenced_unbound_keys = _referenced_unbound_input_keys(
         result,
@@ -1140,10 +1752,10 @@ def recorded_outcome_from_run_blocks_result(
             _mapping_list(raw_registered_output_payloads) if isinstance(raw_registered_output_payloads, list) else None
         )
     )
-    registered_output_models: list[BuildTestPacketRegisteredOutput] = []
+    registered_output_models: list[_RegisteredOutputParameterValue] = []
     for payload in omission_registered_output_payloads or []:
         try:
-            registered_output_models.append(BuildTestPacketRegisteredOutput.model_validate(payload))
+            registered_output_models.append(_RegisteredOutputParameterValue.model_validate(payload))
         except ValueError:
             continue
     typed_output_omission_facts = _merge_missing_requested_output_facts(
@@ -1159,6 +1771,7 @@ def recorded_outcome_from_run_blocks_result(
         _declared_goal_path_omission_facts(
             declared_goal_path_omissions or [],
             authoritative_workflow_run_id,
+            blocks,
         ),
     )
     missing_output_facts = _merge_missing_requested_output_facts(
@@ -1173,9 +1786,7 @@ def recorded_outcome_from_run_blocks_result(
         authoritative_workflow_run_id,
     )
     if recorded_run_outcome is not None and (
-        failed_block is None
-        or _run_outcome_reason_code(recorded_run_outcome) in _TERMINAL_CHALLENGE_REASON_CODES
-        or recorded_run_outcome.verdict == "not_evaluated"
+        failed_block is None or _run_outcome_reason_code(recorded_run_outcome) in _TERMINAL_CHALLENGE_REASON_CODES
     ):
         reason_code = _run_outcome_reason_code(recorded_run_outcome)
         if reason_code in _TERMINAL_CHALLENGE_REASON_CODES:
@@ -1190,6 +1801,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1208,6 +1820,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 verified_progress_marker=verification_identity or "run_completed_verified",
                 page_capture=page_capture,
                 evidence_refs=output_refs,
@@ -1219,7 +1832,7 @@ def recorded_outcome_from_run_blocks_result(
                     "evidence_refs": "run output structure",
                 },
             )
-        if recorded_run_outcome.verdict == "not_evaluated" and not typed_output_omission_facts:
+        if recorded_run_outcome.verdict == "not_evaluated":
             return RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1229,13 +1842,21 @@ def recorded_outcome_from_run_blocks_result(
                 block_labels=block_labels,
                 requested_block_labels=requested_block_labels,
                 executed_block_labels=executed_block_labels,
+                failed_block_labels=_failed_block_labels(blocks),
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
+                # Only the excerpt: page_evidence_refs feed structural_key, which would mint
+                # authority on an outcome whose whole point is that nothing was evaluated.
+                observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
-                key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
+                key_provenance={
+                    "structural_failure_identity": "run outcome was not evaluated",
+                    "observed_page_value_excerpt": "bounded post-run page evidence",
+                },
             )
         if referenced_unbound_keys:
             return _required_input_unbound_outcome(
@@ -1264,6 +1885,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1286,6 +1908,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1312,6 +1935,8 @@ def recorded_outcome_from_run_blocks_result(
             authored_structure_signature=authored_structure_signature,
             failed_operation=failed_operation,
             executed_block_associations=executed_block_associations,
+            completed_block_associations=completed_block_associations,
+            observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
                 "structural_failure_identity": (
@@ -1319,6 +1944,7 @@ def recorded_outcome_from_run_blocks_result(
                     if typed_output_omission_facts
                     else "CompletionVerificationResult verdict structure"
                 ),
+                "observed_page_value_excerpt": "bounded post-run page evidence",
                 "page_evidence_refs": "bounded post-run page evidence",
                 "evidence_refs": "run output structure",
                 "missing_requested_output_facts": (
@@ -1334,7 +1960,7 @@ def recorded_outcome_from_run_blocks_result(
     failure_type = _safe_str(data.get("failure_type"))
     failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
-    runtime_failure_identity = _runtime_failure_identity(failed_block)
+    runtime_failure_identity = _runtime_failure_identity(failed_block, runtime_failure_class)
     failed_operation_identity = (
         _stable_hash(
             {
@@ -1427,6 +2053,9 @@ def recorded_outcome_from_run_blocks_result(
         block_labels=block_labels,
         requested_block_labels=requested_block_labels,
         executed_block_labels=executed_block_labels,
+        failed_block_labels=_clean_list(
+            [redacted for label in _failed_block_labels(blocks) if (redacted := _redacted_terminal_text(label))]
+        ),
         block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
@@ -1436,6 +2065,7 @@ def recorded_outcome_from_run_blocks_result(
         authored_structure_signature=authored_structure_signature,
         failed_operation=failed_operation,
         executed_block_associations=executed_block_associations,
+        completed_block_associations=completed_block_associations,
         observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
         # The failed block's recorded reason carries the exception and its line; the run status is
         # the word "failed" and says nothing a repair can act on.
@@ -1464,7 +2094,7 @@ def failed_operation_from_run_blocks_result(
     """Project the runner's exact browser-operation code without interpreting failure prose."""
 
     data = _dict(result.get("data"))
-    failed_block = _first_failed_block(_block_dicts(data.get("blocks")))
+    failed_block = _newest_failed_block(_block_dicts(data.get("blocks")))
     if failed_block is None:
         return None
     error_codes = failed_block.get("error_codes")
@@ -1667,6 +2297,89 @@ def _redacted_terminal_text(value: str | None) -> str | None:
     return redacted or None
 
 
+def _recorded_output_field_text(value: object) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str, separators=(",", ":"))
+    return (_redacted_terminal_text(text) or "")[:_TEXT_MAX]
+
+
+def scrubbed_slice(text: str, limit: int) -> str:
+    """`text` bounded to `limit`, with registered secrets taken out before the bound can cut one.
+
+    A registered value is matched whole, so cutting one leaves a prefix that no later pass knows to
+    redact. The scrub runs whatever the length, because a value that fits here can still be cut once
+    it is escaped: one accented character renders as six.
+    """
+    return scrub_all_registered_from_text(text)[:limit]
+
+
+def _retained_rows(executed: list[_ExecutedRow]) -> tuple[list[_ExecutedRow], int]:
+    """The run's first rows and its last, in run order, with the count dropped between them.
+
+    A long run keeps both ends because that is where the answer is: the step that was to establish
+    the session runs early and the step that failed runs last. Nothing here reads a row to decide
+    which is which; the position is the whole rule.
+    """
+    if len(executed) <= _RECORDED_BLOCK_OUTCOME_FACT_LIMIT:
+        return executed, 0
+    tail = _RECORDED_BLOCK_OUTCOME_FACT_LIMIT - _RECORDED_BLOCK_OUTCOME_HEAD_ROWS
+    retained = executed[:_RECORDED_BLOCK_OUTCOME_HEAD_ROWS] + executed[-tail:]
+    return retained, len(executed) - _RECORDED_BLOCK_OUTCOME_FACT_LIMIT
+
+
+def _disambiguated(key: str, taken: Mapping[str, object]) -> str:
+    """A key that scrubbing or bounding made identical to one already used, numbered so both survive."""
+    if key not in taken:
+        return key
+    suffix = 2
+    while f"{key} ({suffix})" in taken:
+        suffix += 1
+    return f"{key} ({suffix})"
+
+
+def _recorded_block_outcome_facts(
+    blocks: Sequence[Mapping[str, object]],
+) -> tuple[list[RecordedBlockOutcomeFact], int]:
+    """Project each executed row's recorded output without reading its keys. Nothing here
+    interprets what a field means, so a row whose recorded output happens to describe a page the
+    step never got past reaches the model as the row's own words rather than as a verdict.
+    """
+    executed: list[_ExecutedRow] = []
+    for block in blocks:
+        label = _redacted_terminal_text(_safe_str(block.get("label")))
+        status = _safe_str(block.get("status"))
+        if not label or status not in _EXECUTED_BLOCK_STATUSES:
+            continue
+        executed.append((label, status, block))
+    facts: list[RecordedBlockOutcomeFact] = []
+    retained, rows_omitted = _retained_rows(executed)
+    for label, status, block in retained:
+        output = block.get("output")
+        fields: dict[str, str] = {}
+        output_text = ""
+        fields_omitted = 0
+        if isinstance(output, Mapping):
+            fields_omitted = max(0, len(output) - _RECORDED_BLOCK_OUTCOME_FIELD_LIMIT)
+            for key, value in islice(output.items(), _RECORDED_BLOCK_OUTCOME_FIELD_LIMIT):
+                # A key is as free-form as a value, so it gets both passes its value gets before it is
+                # bounded — a generic secret shape cut at 96 characters is no longer a shape — and two keys
+                # that come out alike keep both rows rather than one replacing the other.
+                screened_key = _bounded_ref(_redacted_terminal_text(str(key)) or "")
+                fields[_disambiguated(screened_key, fields)] = _recorded_output_field_text(value)
+        elif output is not None:
+            output_text = _recorded_output_field_text(output)
+        facts.append(
+            RecordedBlockOutcomeFact(
+                label=label,
+                status=status,
+                output_recorded=output is not None,
+                output_fields=fields,
+                output_text=output_text,
+                fields_omitted=fields_omitted,
+            )
+        )
+    return facts, rows_omitted
+
+
 def _bounded_ref(value: object, max_chars: int = _REF_TEXT_MAX) -> str:
     if not isinstance(value, str):
         return ""
@@ -1685,9 +2398,26 @@ def _block_dicts(value: object) -> list[Mapping[str, object]]:
     return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
 
 
-def _first_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:
-    for block in blocks:
-        if _safe_str(block.get("status")).lower() in {"failed", "terminated", "canceled", "timed_out"}:
+def _block_associations(
+    blocks: Sequence[Mapping[str, object]],
+    block_associations_by_label: Mapping[str, str] | None,
+    statuses: frozenset[str],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            association
+            for block in blocks
+            if _safe_str(block.get("status")) in statuses
+            if (association := (block_associations_by_label or {}).get(_safe_str(block.get("label"))))
+        )
+    )
+
+
+def _newest_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:
+    """``data["blocks"]`` is chronological, so the run's newest failure is the last match: the
+    failed operation must name the failure the run stopped on, not an earlier survivable one."""
+    for block in reversed(blocks):
+        if _safe_str(block.get("status")).lower() in _FAILED_BLOCK_STATUSES:
             return block
     return None
 
@@ -1708,10 +2438,14 @@ def _referenced_unbound_input_keys(
     return [key for key in dict.fromkeys(unbound_required_parameter_keys) if key in referenced_set]
 
 
-def _runtime_failure_identity(failed_block: Mapping[str, object] | None) -> str:
+def _runtime_failure_identity(
+    failed_block: Mapping[str, object] | None, runtime_failure_class: str | None = None
+) -> str:
     if failed_block is None:
         return ""
-    return _locator_wait_failure_identity(failed_block) or _code_execution_failure_identity(failed_block)
+    return _locator_wait_failure_identity(failed_block) or _code_execution_failure_identity(
+        failed_block, runtime_failure_class
+    )
 
 
 def _attempted_call_ref(failed_block: Mapping[str, object] | None) -> str:
@@ -1746,27 +2480,27 @@ def _runner_authored_reason(failure_reason: str) -> str:
     return failure_reason.split(": ", 1)[0].strip()
 
 
-def _code_execution_failure_identity(failed_block: Mapping[str, object]) -> str:
-    """Identity of a generated-code execution failure: the runner's typed error codes and the
-    account of the failure the runner itself authored.
-
-    Without this a raised exception carries no identity at all, so two different exceptions in the
-    same block are indistinguishable and a run whose only evidence is the raise records nothing.
-    """
+def _code_execution_failure_identity(
+    failed_block: Mapping[str, object], runtime_failure_class: str | None = None
+) -> str:
+    """Identity of a generated-code execution failure: the runner's typed error codes plus either the
+    classifier's ``runtime_failure_class`` or, absent one, the runner's own account of the raise."""
     if not _is_code_block_failure(failed_block):
         return ""
     error_codes = _clean_list(_string_list(failed_block.get("error_codes")))
     if not error_codes or any(code in _NOT_AUTHORED_CODE_ERROR_CODES for code in error_codes):
         return ""
-    return _stable_hash(
-        {
-            "source": "generated_code_execution",
-            "error_codes": error_codes,
-            "runner_reason": _runner_authored_reason(_safe_str(failed_block.get("failure_reason"))),
-            "block_label": _safe_str(failed_block.get("label")),
-            "block_status": _safe_str(failed_block.get("status")),
-        }
-    )
+    payload: dict[str, object] = {
+        "source": "generated_code_execution",
+        "error_codes": error_codes,
+        "block_label": _safe_str(failed_block.get("label")),
+        "block_status": _safe_str(failed_block.get("status")),
+    }
+    if runtime_failure_class:
+        payload["failure_class"] = _bounded_ref(runtime_failure_class)
+    else:
+        payload["runner_reason"] = _runner_authored_reason(_safe_str(failed_block.get("failure_reason")))
+    return _stable_hash(payload)
 
 
 def _locator_wait_failure_identity(failed_block: Mapping[str, object]) -> str:
@@ -1824,8 +2558,14 @@ def observed_value_extraction_scaffold_lines(observed_values: str, output_paths:
     if not paths:
         return [f"observed_page_values: {observed_values}"]
     lines = [
-        "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
-        "each required output_path to its observed value.",
+        (
+            "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
+            "each required output_path to the element that showed it."
+        ),
+        (
+            "These values were read after the last run and may already have changed. Locate each one on the page "
+            "at run time; never carry an observed value into the code as a literal."
+        ),
         f"observed_values: {observed_values}",
         "bind_output_paths:",
     ]
@@ -1860,7 +2600,7 @@ def _page_refs_from_authoring_context(repair_context: CodeAuthoringRepairContext
         refs.append(f"origin:{_bounded_ref(repair_context.current_origin)}")
     for summary in repair_context.page_form_summaries[:3]:
         refs.append(f"form:{_bounded_ref(summary)}")
-    for summary in repair_context.page_result_summaries[:3]:
+    for summary in repair_context.page_result_summaries[:_PAGE_RESULT_REF_MAX_ITEMS]:
         refs.append(f"result:{_bounded_ref(summary)}")
     for summary in repair_context.page_action_summaries[:3]:
         refs.append(f"action:{_bounded_ref(summary)}")
@@ -2198,23 +2938,32 @@ def _missing_requested_output_facts(
 
 def _typed_requested_output_omission_facts(
     requested_outputs: Sequence[BuildTestPacketRequestedOutput],
-    registered_outputs: Sequence[BuildTestPacketRegisteredOutput],
+    registered_outputs: Sequence[_RegisteredOutputParameterValue],
     workflow_run_id: str,
 ) -> list[dict[str, object]]:
     if not workflow_run_id:
         return []
     registered_values_by_id: dict[str, list[JsonValue]] = {}
+    registered_values_by_key: dict[str, list[JsonValue]] = {}
     for output in registered_outputs:
-        if output.workflow_run_id != workflow_run_id or not output.output_parameter_id:
+        if output.workflow_run_id != workflow_run_id:
             continue
-        registered_values_by_id.setdefault(output.output_parameter_id, []).append(output.value)
+        if output.output_parameter_id:
+            registered_values_by_id.setdefault(output.output_parameter_id, []).append(output.value)
+        if output.output_parameter_key:
+            registered_values_by_key.setdefault(output.output_parameter_key, []).append(output.value)
     facts: list[dict[str, object]] = []
     for requested in requested_outputs:
         if requested.workflow_run_id != workflow_run_id:
             continue
         output_parameter_id = requested.output_parameter_id
         output_parameter_key = requested.output_parameter_key
-        registered_values = registered_values_by_id.get(output_parameter_id)
+        # Persisting a run snapshot regenerates output-parameter ids. The semantic key remains
+        # stable across the in-memory draft and the run-pinned definition, so prefer it and retain
+        # the id lookup for older payloads that did not carry a key.
+        registered_values = registered_values_by_key.get(output_parameter_key)
+        if registered_values is None:
+            registered_values = registered_values_by_id.get(output_parameter_id)
         if registered_values is None:
             reason_code, value_status = "registered_output_missing", "not_registered"
         elif all(value is None for value in registered_values):
@@ -2238,9 +2987,38 @@ def _typed_requested_output_omission_facts(
     return sorted(facts, key=lambda item: str(item["output_path"]))
 
 
+def _declared_path_returned_empty_scalar(
+    blocks: Sequence[Mapping[str, object]],
+    output_path: str,
+    block_label: str,
+) -> bool:
+    """True when every value this path yielded is a blank string, which is the run reaching the page
+    and reading nothing, unlike a null (nothing produced) or an empty collection (a real value).
+    An unlabelled omission cannot be attributed to one block, so it stays the absent reading rather
+    than borrowing a sibling's blank value."""
+    if not block_label:
+        return False
+    returned: list[object] = []
+    for block in blocks:
+        if _bounded_ref(block.get("label")) != block_label:
+            continue
+        extracted = block.get("extracted_data")
+        if extracted is None:
+            continue
+        value, present = _value_at_output_path(extracted, output_path)
+        if not present or value is None:
+            continue
+        if "[]" in output_path and isinstance(value, list):
+            returned.extend(value)
+        else:
+            returned.append(value)
+    return bool(returned) and all(isinstance(value, str) and not value.strip() for value in returned)
+
+
 def _declared_goal_path_omission_facts(
     declared_goal_path_omissions: Sequence[Mapping[str, object]],
     workflow_run_id: str,
+    blocks: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     """Same-run declared goal-value paths the completed run retained no value for."""
     if not workflow_run_id:
@@ -2253,17 +3031,18 @@ def _declared_goal_path_omission_facts(
         output_path = _bounded_text(omission.get("output_path"))
         if not output_path:
             continue
+        block_label = _bounded_ref(omission.get("block_label"))
+        empty = _declared_path_returned_empty_scalar(blocks, output_path, block_label)
         fact: dict[str, object] = {
             "output_path": output_path,
-            "reason_code": "declared_goal_path_absent",
-            "value_status": "no_typed_value",
+            "reason_code": "declared_goal_path_empty" if empty else "declared_goal_path_absent",
+            "value_status": "empty_typed_value" if empty else "no_typed_value",
         }
         # A top-level array path such as ``[].number`` has no root to group under. The root is
         # diagnostic grouping only, so its absence must not withhold the path itself.
         output_root = _output_path_root(output_path)
         if output_root:
             fact["output_root"] = output_root
-        block_label = _bounded_ref(omission.get("block_label"))
         if block_label:
             fact["block_label"] = block_label
         facts.append(fact)

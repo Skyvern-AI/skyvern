@@ -67,6 +67,47 @@ describe("WorkflowCopilotHistory", () => {
     expect(screen.getByText("Scrape the news")).toBeTruthy();
   });
 
+  it("marks only the chats the copilot is waiting on", async () => {
+    mockChats([
+      [
+        { ...chats[0]!, awaiting_user_input: true },
+        { ...chats[1]!, awaiting_user_input: false },
+      ],
+    ]);
+    render(
+      <WorkflowCopilotHistory
+        workflowPermanentId="wpid_a"
+        currentChatId={null}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /history/i }));
+
+    expect(await screen.findByText("Build a login flow")).toBeTruthy();
+    const badges = screen.getAllByText("Waiting on you");
+    expect(badges).toHaveLength(1);
+    expect(badges[0]!.closest("button")?.textContent).toContain(
+      "Build a login flow",
+    );
+  });
+
+  it("marks nothing for a backend that does not send the field", async () => {
+    mockChats([chats]);
+    render(
+      <WorkflowCopilotHistory
+        workflowPermanentId="wpid_a"
+        currentChatId={null}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /history/i }));
+
+    expect(await screen.findByText("Build a login flow")).toBeTruthy();
+    expect(screen.queryByText("Waiting on you")).toBeNull();
+  });
+
   it("calls onSelect with the chosen chat", async () => {
     mockChats([chats]);
     const onSelect = vi.fn();

@@ -136,9 +136,10 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
 
     DOWNLOAD_PATH is swept only when the active storage backend uploads run downloads
     elsewhere (S3/Azure/GCS), leaving the local copy as scratch. On the local backend
-    LocalStorage.save_downloaded_files is a no-op and get_downloaded_files serves the files
-    in place via file:// URIs, so DOWNLOAD_PATH/<run_id> is the run's permanent artifact
-    record — sweeping it would silently delete user data — and it is left untouched.
+    LocalStorage.save_downloaded_files copies each file into the artifact path, but a file it
+    skips (an upload failure, an older-attempt file) is still served only from
+    DOWNLOAD_PATH/<run_id> via file:// URIs, so that directory stays the fallback record and
+    is left untouched.
 
     Returns:
         Number of entries removed.

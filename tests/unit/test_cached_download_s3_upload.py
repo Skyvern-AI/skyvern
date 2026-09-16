@@ -11,6 +11,8 @@ Validates that the cached download flow:
 from __future__ import annotations
 
 import asyncio
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.api import files as files_module
+from skyvern.services import script_service
 from tests.unit._fingerprint_expectations import expected_fingerprint
 
 MODULE = "skyvern.services.script_service"
@@ -240,6 +244,7 @@ async def test_cached_download_awaits_in_flight_downloads_before_snapshot(setup,
                 download_dir=download_dir,
                 organization_id="o_test_org",
                 browser_session_id=None,
+                attempt_started_at=None,
             )
 
         with patch.object(
@@ -261,6 +266,7 @@ async def test_cached_download_awaits_in_flight_downloads_before_snapshot(setup,
             download_dir=download_dir,
             organization_id="o_test_org",
             browser_session_id=None,
+            attempt_started_at=None,
         )
         dispatch_files.assert_awaited_once()
     finally:
@@ -1090,5 +1096,85 @@ async def test_poll_succeeds_with_late_start_and_long_running_crdownload(setup, 
         refs["fallback"].assert_not_called()
         refs["update_block"].assert_called_once()
         refs["storage"].save_downloaded_files.assert_called_once()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_does_not_dispatch_stale_file_appearing_after_baseline(setup, tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    stale = download_dir / "old.pdf"
+    fresh = download_dir / "fresh.pdf"
+    for path, offset in ((stale, -1), (fresh, 0)):
+        path.write_bytes(b"download")
+        os.utime(path, (started_at.timestamp() + offset,) * 2)
+    refs = setup(
+        get_side_effect=[[], ["fresh.pdf"]],
+        list_files_side_effect=[[], [str(stale), str(fresh)]],
+    )
+    try:
+        with (
+            patch(
+                "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+                AsyncMock(return_value=("wr_test_run", 2, started_at)),
+            ),
+            patch.object(script_service.FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch,
+        ):
+            await script_service.download(
+                prompt="Download report",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+                region_name="us-east-1",
+            )
+        assert dispatch.await_args.kwargs["files_to_upload"] == [str(fresh)]
+        refs["fallback"].assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_retry_download_does_not_wait_for_retained_partial(setup):
+    refs = setup(get_side_effect=[[], ["current.pdf"]])
+    download_dir = refs["download_dir"]
+    stale = download_dir / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    current = download_dir / "current.pdf"
+
+    async def download_current(*_args, **_kwargs):
+        current.write_bytes(b"new download")
+
+    refs["run_cached"].side_effect = download_current
+    try:
+        with (
+            patch(
+                "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+                new=AsyncMock(return_value=("wr_test_run", 2, datetime.fromtimestamp(200, tz=UTC))),
+            ),
+            patch.object(script_service, "list_files_in_directory", files_module.list_files_in_directory),
+            patch.object(
+                script_service,
+                "check_downloading_files_and_wait_for_download_to_complete",
+                files_module.check_downloading_files_and_wait_for_download_to_complete,
+            ),
+            patch.object(script_service.FileDownloadBlock, "_dispatch_files_to_storage", new=AsyncMock()) as dispatch,
+        ):
+            async with asyncio.timeout(2):
+                await script_service.download(
+                    prompt="Download report",
+                    label="download",
+                    download_target="s3",
+                    s3_bucket="bucket",
+                    aws_access_key_id="test-key",
+                    aws_secret_access_key="test-secret",
+                    region_name="us-east-1",
+                )
+        assert dispatch.await_args.kwargs["files_to_upload"] == [str(current)]
+        assert stale.read_bytes() == b"old partial"
+        refs["fallback"].assert_not_awaited()
     finally:
         _cleanup(refs)

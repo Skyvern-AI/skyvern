@@ -25,7 +25,12 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import BROWSER_TARGET_PARAM_NAME, SchemaOverlay, SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools import (
+    BROWSER_BOUND_TOOL_NAMES,
+    NATIVE_TOOLS,
+    _build_skyvern_mcp_overlays,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotStreamResponseUpdate,
@@ -123,6 +128,37 @@ def test_browser_ablation_projects_registered_tab_and_page_tools_without_workflo
     assert surface.ordered_mcp_names == _EXPECTED_BROWSER_ABLATION_MCP_TOOLS
     assert "skyvern_open_tabs" not in surface.ordered_mcp_names
     assert "skyvern_workflow_run" not in surface.ordered_mcp_names
+
+
+def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
+    aliases = get_skyvern_mcp_alias_map()
+    overlays = _build_skyvern_mcp_overlays()
+
+    withheld = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+        browser_tools_available=False,
+    )
+    granted = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+        browser_tools_available=True,
+    )
+
+    assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
+    assert withheld.ordered_native_names
+    assert withheld.ordered_mcp_names == ("get_workflow_knowledge", "get_block_schema", "validate_block")
+    assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
+    assert withheld.overlays == {name: overlays[name] for name in withheld.ordered_mcp_names}
+    assert all(not overlay.requires_browser for overlay in withheld.overlays.values())
+    assert BROWSER_BOUND_TOOL_NAMES <= set(granted.ordered_native_names)
+    assert granted.alias_map == aliases
+    assert granted.overlays == overlays
+    assert granted.ordered_mcp_names == tuple(aliases)
 
 
 def test_normal_copilot_frame_contracts_are_shared_with_browser_ablation_and_hashed() -> None:

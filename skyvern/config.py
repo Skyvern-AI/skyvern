@@ -1,6 +1,7 @@
 import logging
 import os
 import platform
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -91,7 +92,24 @@ class Settings(BaseSettings):
 
     ADDITIONAL_MODULES: list[str] = []
 
+    # Whole-display recording is opt-in and intended for packaged Linux workers only. Default OFF keeps
+    # ordinary local/OSS users on the existing Playwright per-page recording path. Enabling replaces
+    # per-page recording with one change-driven whole-display MP4 for an explicitly selected cohort.
+    EXCLUSIVE_DISPLAY_RECORDING: bool = False
+    # Narrow, validated whole-display recording profile (safe defaults; invalid values fall back explicitly).
+    DISPLAY_RECORDING_OUTPUT_WIDTH: int = 1280
+    DISPLAY_RECORDING_OUTPUT_HEIGHT: int = 720
+    DISPLAY_RECORDING_MAX_FPS: int = 15
+    DISPLAY_RECORDING_CRF: int = 28
+    DISPLAY_RECORDING_KEYFRAME_SECONDS: int = 5
+    # How many browser runs one worker drives at once (mirrors the worker env of the same name; default 1 =
+    # historical pod-per-run). Whole-display recording captures the ENTIRE display, and the per-display flock
+    # only blocks a second recorder, not a second browser sharing the display — so it is display-ownership-safe
+    # only at concurrency == 1. The recorder reads this to fail closed above 1.
+    BROWSER_WORKER_MAX_CONCURRENT_ACTIVITIES: int = 1
+
     BROWSER_TYPE: str = "chromium-headful"
+    BROWSER_SESSION_STARTUP_TIMEOUT_SECONDS: float = 55.0
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
@@ -110,6 +128,10 @@ class Settings(BaseSettings):
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     VIDEO_COMPRESSION_ENABLED: bool = True
+    # SKY-15288: when enabled, in-progress recording snapshots copy the already-uploaded prefix
+    # server-side (UploadPartCopy against the prior ETag) and upload only the new tail; any unsupported
+    # condition or failure falls back to the Phase 1 full-prefix stream. Off by default.
+    RECORDING_INCREMENTAL_COMPOSE_ENABLED: bool = False
     VIDEO_COMPRESSION_CRF: int = 28
     VIDEO_COMPRESSION_PRESET: str = "veryfast"
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
@@ -238,20 +260,14 @@ class Settings(BaseSettings):
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
-    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
-    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
-    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
-    # Per-environment canary; default off until we are confident.
-    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     # Internal eval-only selector for the least-privileged direct-browser Copilot surface.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED: bool = False
     # Enabling the process-level kill switch is insufficient on a shared deployment: only API
     # credentials belonging to these explicitly configured eval organizations may select the mode.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = []
-    # Experimental Workflow Copilot v2 branch mode.
+    # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
@@ -325,7 +341,7 @@ class Settings(BaseSettings):
 
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
-    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
@@ -522,14 +538,40 @@ class Settings(BaseSettings):
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
-    # Append a fresh observe digest to a page-changing action batch's tool result, so the model can act
-    # from it without spending a separate perception turn.
-    TASK_V3_AUTO_OBSERVE: bool = False
+    # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
+    # probe consulted before the shape heuristics, which remain the fallback either way.
+    TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
+    # Read, act in and verify inside child frames (SKY-14657). Covers perception, actuation and the
+    # element-probe realm as ONE unit on purpose: every partial state is worse than leaving it off.
+    # Perception alone mints refs a frame-blind resolver then reports stale, and perception plus
+    # actuation without the probe realm gives working actions whose readbacks answer about the main
+    # document instead of the element's own -- a verdict reported without being measured.
+    TASK_V3_FRAME_PERCEPTION: bool = False
+    # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
+    # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
+    # because the benchmark separated add from replace on speed alone, not on success. The code tool
+    # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
+    # there is no in-process execution path to fall back to.
+    TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
+    # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
+    # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
+    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default). Setting it is not
+    # enough on its own: the rule fires only for runs whose TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT
+    # evaluation returns a conclusive true, so the cutoff stays inert until that flag enrols someone.
+    # Every off-state of that flag -- disabled, deleted, 0%, an excluding condition, an evaluation
+    # that raised, no flag provider at all -- leaves the run on the A/B, so there is no off-state that
+    # enrols. A naive value is read as UTC. Per-call platform workflows are excluded twice over -- by
+    # an auto_generated executing version, which covers the login, download_files, credential
+    # test-login and SDK endpoints, and by a per-call trigger kind, which covers the job recipe
+    # endpoints because those build a published definition. Enrolled runs are not randomized, so every
+    # per-arm read must exclude them by route_reason and read them against the unenrolled control cell
+    # instead.
+    TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -725,6 +767,7 @@ class Settings(BaseSettings):
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
+    TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS: int = 20
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -903,6 +946,8 @@ class Settings(BaseSettings):
     """How often the OSS/local scheduler scans for due workflow schedules."""
     WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
+    RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
+    """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
@@ -981,6 +1026,16 @@ class Settings(BaseSettings):
     def _api_limit_concurrency_unlimited_sentinels(cls, value: Any) -> Any:
         # gt=0 otherwise leaves the unlimited setting unreachable from the environment.
         if value is None or str(value).strip().lower() in ("", "0", "none", "null"):
+            return None
+        return value
+
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", mode="before")
+    @classmethod
+    def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
+        # This setting is the rule's settings-side kill path, and blanking an already-set env var is
+        # how it gets turned off mid-incident. Without this, every off-spelling fails datetime
+        # validation and crashes the process at import instead of disabling the rule.
+        if value is None or str(value).strip().lower() in ("", "0", "none", "null", "off", "disabled"):
             return None
         return value
 
@@ -1143,6 +1198,18 @@ class Settings(BaseSettings):
             mapping["claude-fable-5"] = {
                 "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
                 "label": "Anthropic Claude Fable 5",
+            }
+
+        # Anthropic Claude Fable 5.1: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Fable 5.1",
+            }
+        else:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5.1_FABLE",
+                "label": "Anthropic Claude Fable 5.1",
             }
 
         # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API

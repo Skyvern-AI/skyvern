@@ -1,5 +1,6 @@
 import { QuestionMarkIcon } from "@radix-ui/react-icons";
 import { BrainIcon } from "@/components/icons/BrainIcon";
+import { BlockMarkdown } from "@/components/AgentMarkdown";
 import { cn } from "@/util/utils";
 import { ObserverThought } from "../types/workflowRunTypes";
 
@@ -40,8 +41,8 @@ function ThoughtCard({ thought, onClick, active, cardClassName }: Props) {
           </span>
         </div>
         {body && (
-          <div className="whitespace-pre-wrap break-words text-xs text-foreground dark:text-slate-200">
-            {body}
+          <div className="break-words text-xs text-foreground dark:text-slate-200">
+            <BlockMarkdown text={body} />
           </div>
         )}
       </button>

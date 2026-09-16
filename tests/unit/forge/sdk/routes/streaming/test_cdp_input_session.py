@@ -92,6 +92,59 @@ class _FakePage:
         self.url = url
 
 
+class _FakeFileInput:
+    def __init__(self) -> None:
+        self.files: dict[str, str | bytes] | None = None
+
+    async def count(self) -> int:
+        return 1
+
+    async def set_input_files(self, files: dict[str, str | bytes]) -> None:
+        self.files = files
+
+
+class _FakeUploadPage:
+    def __init__(self) -> None:
+        self.input = _FakeFileInput()
+        self.selector = ""
+
+    def locator(self, selector: str) -> _FakeFileInput:
+        self.selector = selector
+        return self.input
+
+
+class _FakeUploadWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self.sent.append(value)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_dispatches_to_the_pages_only_file_input() -> None:
+    page = _FakeUploadPage()
+    websocket = _FakeUploadWebSocket()
+
+    await cdp_input._dispatch_file_upload_event(
+        page,
+        {
+            "fileName": "equipment_checklist.txt",
+            "mimeType": "text/plain",
+            "content": "Y2hlY2tsaXN0",
+        },
+        websocket,  # type: ignore[arg-type]
+    )
+
+    assert page.selector == 'input[type="file"]'
+    assert page.input.files == {
+        "name": "equipment_checklist.txt",
+        "mimeType": "text/plain",
+        "buffer": b"checklist",
+    }
+    assert websocket.sent == [{"kind": "file-upload-complete"}]
+
+
 def _build(monkeypatch: pytest.MonkeyPatch, page: Any) -> tuple[cdp_input.ActivePageCdpInputSession, list[Any]]:
     resolved: list[Any] = [page]
 

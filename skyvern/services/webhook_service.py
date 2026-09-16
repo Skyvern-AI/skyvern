@@ -30,6 +30,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
 )
+from skyvern.forge.sdk.workflow.retry_policy import (
+    RETRY_DECISION_ABANDONED,
+    RETRY_DECISION_FINAL,
+    RETRY_DECISION_REVOKED,
+    compute_attempt_view,
+)
 from skyvern.schemas.runs import (
     ProxyLocation,
     RunStatus,
@@ -239,6 +245,25 @@ async def replay_run_webhook(
     API key from the database. This is useful for endpoints that authenticate with an API key and want the replay
     signature to match the caller-provided key.
     """
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=run_id,
+        organization_id=organization_id,
+    )
+    if workflow_run is not None:
+        attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(run_id)
+        attempt_view = compute_attempt_view(workflow_run, attempt_rows)
+        # A run without attempt rows replays at any status, as before retry policies existed.
+        if attempt_rows and (
+            not workflow_run.status.is_final()
+            or attempt_view.retry_pending
+            or attempt_view.attempts[-1].retry_decision
+            not in {RETRY_DECISION_FINAL, RETRY_DECISION_REVOKED, RETRY_DECISION_ABANDONED}
+        ):
+            raise SkyvernHTTPException(
+                f"Run {run_id} is not final; webhook replay is unavailable until it is final.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
     payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
     signing_key = api_key if api_key else await _get_api_key(organization_id=organization_id)
     signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=signing_key)
@@ -427,6 +452,10 @@ async def _build_workflow_payload(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
         status=RunStatus(status_response.status),
+        attempt=status_response.attempt,
+        retry_pending=status_response.retry_pending,
+        next_attempt_at=status_response.next_attempt_at,
+        attempts=status_response.attempts,
         output=status_response.outputs,
         downloaded_files=status_response.downloaded_files,
         recording_url=status_response.recording_url,

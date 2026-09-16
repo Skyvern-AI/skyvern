@@ -16,7 +16,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels import exfiltration as streaming_exfiltration
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEventSource
-from skyvern.services.browser_recording.redact import credential_kind_for_target, redact_console_event
+from skyvern.services.browser_recording.redact import credential_kind_for_action, redact_console_event
 from skyvern.services.browser_recording.service import (
     Processor,
     deterministic_input_text_parameter_key,
@@ -25,10 +25,9 @@ from skyvern.services.browser_recording.service import (
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
-    ActionClick,
     ActionInputText,
     ActionKind,
-    CredentialKind,
+    ActionPressKey,
     ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
@@ -113,19 +112,6 @@ def _extra_field(block: OutputBlock, field_name: str, fallback: t.Any) -> t.Any:
     return fallback
 
 
-def _credential_kind_for_action(action: Action) -> CredentialKind | None:
-    if not isinstance(action, (ActionClick, ActionInputText)):
-        return None
-    return credential_kind_for_target(
-        action.target.input_type,
-        action.target.autocomplete,
-        field_id=action.target.id,
-        accessible_name=action.target.accessible_name,
-        texts=action.target.texts,
-        tag_name=action.target.tag_name,
-    )
-
-
 def _draft_step_from_block(
     *,
     browser_session_id: str,
@@ -154,7 +140,7 @@ def _draft_step_from_block(
             parameter_keys=block.parameter_keys or [],
             timestamp_start=action.timestamp_start,
             timestamp_end=action.timestamp_end,
-            credential_kind=_credential_kind_for_action(action),
+            credential_kind=credential_kind_for_action(action),
         )
 
     if isinstance(block, WorkflowDefinitionYamlBlocksItem_GotoUrl):
@@ -193,18 +179,27 @@ def _draft_step_from_block(
 
 
 def _action_display_text(action: Action) -> str:
-    for text in action.target.texts or []:
+    target = action.target
+
+    # A <select>'s texts can be its option labels, so taken literally a country dropdown reads
+    # "Fill 'Germany'". Its accessible name is the field's own label whenever it has one.
+    if (target.tag_name or "").lower() == "select":
+        label = target.accessible_name or target.id
+        return label[:80] if label else (target.tag_name or "element").lower()
+
+    for text in target.texts or []:
         cleaned = " ".join(text.split())
         if cleaned:
             return cleaned[:80]
 
-    return (action.target.tag_name or "element").lower()
+    return (target.tag_name or "element").lower()
 
 
 _PLACEHOLDER_VERBS: dict[ActionKind, str] = {
     ActionKind.CLICK: "Click",
     ActionKind.HOVER: "Hover over",
     ActionKind.INPUT_TEXT: "Fill",
+    ActionKind.PRESS_KEY: "Press",
 }
 
 
@@ -219,7 +214,7 @@ def _placeholder_step_from_action(
     immediately while LLM enrichment runs in the background.
     """
     step_id = f"{browser_session_id}-recording-step-{action_index}"
-    text = _action_display_text(action)
+    text = action.key if isinstance(action, ActionPressKey) else _action_display_text(action)
     verb = _PLACEHOLDER_VERBS[action.kind]
     title = f"{verb} '{text}'"
 
@@ -251,7 +246,7 @@ def _placeholder_step_from_action(
         parameter_keys=parameter_keys,
         timestamp_start=action.timestamp_start,
         timestamp_end=action.timestamp_end,
-        credential_kind=_credential_kind_for_action(action),
+        credential_kind=credential_kind_for_action(action),
     )
 
 
@@ -295,17 +290,15 @@ class RecordingInterpretationSession:
             sm.Click(),
             sm.Hover(),
             sm.InputText(),
+            sm.Select(),
+            # After InputText: an Enter that submits a field must record as the fill
+            # followed by the keypress, not replace it.
+            sm.PressKey(),
             sm.UrlChange(),
-            sm.Wait(),
         ]
         self._all_actions: list[Action] = []
         self._processed_event_count = 0
         self._capture_paused = False
-
-    def reset_wait_capture(self) -> None:
-        for machine in self._action_machines:
-            if isinstance(machine, sm.Wait):
-                machine.reset()
 
     def set_deltas_enabled(self, enabled: bool) -> None:
         # Deltas require both the client capability and the server kill switch.
@@ -313,11 +306,9 @@ class RecordingInterpretationSession:
 
     def pause_capture(self) -> None:
         self._capture_paused = True
-        self.reset_wait_capture()
 
     def resume_capture(self) -> None:
         self._capture_paused = False
-        self.reset_wait_capture()
         # Enrichment deltas that landed while paused were dropped client-side, so
         # send an authoritative snapshot to resync on resume.
         if self.session_revision > 0:
@@ -363,6 +354,9 @@ class RecordingInterpretationSession:
         await self._interpret(finalized=True)
         return self.steps
 
+    def recorded_actions(self) -> list[Action]:
+        return list(self._all_actions)
+
     def _cancel_debounce(self) -> None:
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -395,6 +389,8 @@ class RecordingInterpretationSession:
                 self.browser_session_id,
                 self.organization_id,
                 self.workflow_permanent_id,
+                recording_attempt_id=self.recording_attempt_id,
+                interpretation_session_id=self.interpretation_session_id,
             )
 
             if self._processed_event_count < len(self.events):
@@ -453,7 +449,7 @@ class RecordingInterpretationSession:
         (goto_url, wait) come back final; agent-action kinds come back as
         placeholders with LLM enrichment scheduled in the background.
         """
-        if action.kind in (ActionKind.CLICK, ActionKind.HOVER, ActionKind.INPUT_TEXT):
+        if action.kind in (ActionKind.CLICK, ActionKind.HOVER, ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY):
             blockable = t.cast(ActionBlockable, action)
             step = _placeholder_step_from_action(
                 browser_session_id=self.browser_session_id,

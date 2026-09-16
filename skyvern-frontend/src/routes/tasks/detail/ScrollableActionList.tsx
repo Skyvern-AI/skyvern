@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes } from "@/api/types";
+import { BlockMarkdown } from "@/components/AgentMarkdown";
 import { StatusPill } from "@/components/ui/status-pill";
 import {
   Tooltip,
@@ -119,7 +120,9 @@ function ScrollableActionList({
                 )}
               </div>
             </div>
-            <div className="text-xs text-slate-400">{action.reasoning}</div>
+            <div className="text-xs text-slate-400">
+              <BlockMarkdown text={action.reasoning} />
+            </div>
             {action.type === ActionTypes.InputText && (
               <>
                 <Separator />

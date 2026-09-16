@@ -46,6 +46,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
@@ -68,7 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.proxy_pinning import redact_proxy_location
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse, read_browser_type
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
@@ -376,6 +377,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extra_http_headers=task_obj.extra_http_headers,
         cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
+        attempt_number=task_obj.attempt_number,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
         retry=task_obj.retry,
@@ -430,12 +432,25 @@ def convert_to_workflow_copilot_chat_message(
     parsed_narrative = typing.cast(
         "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
     )
+    raw_attachments = message_model.attached_files
+    attached_files: list[CopilotAttachedFile] = []
+    if isinstance(raw_attachments, list):
+        for entry in raw_attachments:
+            try:
+                attached_files.append(CopilotAttachedFile.model_validate(entry))
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to parse an attached file from a chat row, dropping it",
+                    workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                    exc_info=exc,
+                )
     return WorkflowCopilotChatMessageSchema(
         workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
         content=message_model.content,
         audio_artifact_id=message_model.audio_artifact_id,
+        attached_files=attached_files,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
@@ -618,6 +633,7 @@ def convert_to_workflow(
         extra_http_headers=workflow_model.extra_http_headers,
         cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
+        browser_type=read_browser_type(workflow_model),
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
@@ -684,6 +700,7 @@ def convert_to_workflow_run(
         if workflow_run_model.script_run
         else None,
         run_with=workflow_run_model.run_with,
+        browser_type=read_browser_type(workflow_run_model),
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
@@ -870,6 +887,7 @@ def convert_to_workflow_run_block(
     block = WorkflowRunBlock(
         workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
         workflow_run_id=workflow_run_block_model.workflow_run_id,
+        attempt_number=workflow_run_block_model.attempt_number,
         block_workflow_run_id=workflow_run_block_model.block_workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,

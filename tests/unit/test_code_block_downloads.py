@@ -12,14 +12,16 @@ Covers the three acceptance behaviors:
 import asyncio
 import hashlib
 import json
+import logging
 import os
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 from structlog.testing import capture_logs
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -38,11 +40,17 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.utils import downloaded_file_count_from_output
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+    AuthorizedFileMaterializationFailure,
+    MaterializedAuthorizedFile,
+)
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -54,6 +62,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _BLOCK_CREATED_AT = datetime(2026, 6, 14, 11, 0, tzinfo=UTC)
 
@@ -123,15 +133,16 @@ def _wire_block_runtime(
     )
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
 
-    context = SimpleNamespace(
-        organization_id="o_1",
-        workflow=workflow,
-        workflow_permanent_id="wpid_test",
+    context = WorkflowRunContext(
+        workflow_title="Test Workflow",
         workflow_id="w_test",
-        secrets={},
-        get_value=lambda key: (values or {}).get(key),
-        mask_secrets_in_data=lambda data, mask="*****": data,
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_1",
+        aws_client=None,  # type: ignore[arg-type]
+        workflow=workflow,  # type: ignore[arg-type]
     )
+    context.organization_id = "o_1"
+    context.values.update(values or {})
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda self, workflow_run_id: context)
     monkeypatch.setattr(CodeBlock, "format_potential_template_parameters", lambda self, workflow_run_context: None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
@@ -144,6 +155,7 @@ def _wire_secure_runner(
     output: dict,
     on_execute: Callable[[], None] | None = None,
     downgrade: bool = False,
+    download_operation_invoked: bool = False,
 ) -> None:
     """Route execute() down the secure sidecar arm, whose returned payload is what the host binds.
 
@@ -162,7 +174,11 @@ def _wire_secure_runner(
             on_execute()
         if downgrade:
             return None
-        return SimpleNamespace(block_result=block_result, failure=None)
+        return SimpleNamespace(
+            block_result=block_result,
+            failure=None,
+            download_operation_receipt=object() if download_operation_invoked else None,
+        )
 
     fake_app = block_module.app
     fake_app.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=True)
@@ -230,7 +246,8 @@ def _fake_storage_app(
         ),
         STORAGE=SimpleNamespace(
             save_downloaded_files=save,
-            get_downloaded_files=get,
+            get_current_attempt_downloaded_files=get,
+            get_downloaded_file_signature_aliases=lambda _: [],
             list_downloading_files_in_browser_session=in_flight or AsyncMock(return_value=[]),
         ),
         AGENT_FUNCTION=SimpleNamespace(
@@ -574,7 +591,7 @@ async def test_code_block_tolerates_get_failure(monkeypatch: pytest.MonkeyPatch,
 
 
 @pytest.mark.asyncio
-async def test_code_block_materializes_file_parameter_to_local_path(
+async def test_code_block_materializes_authorized_file_parameter_to_local_path(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
     run_dir = os.path.join(_isolated_download_path, "wr_1")
@@ -599,13 +616,253 @@ async def test_code_block_materializes_file_parameter_to_local_path(
 
     assert result.success is True
     resolved = result.output_parameter_value["resolved"]
-    assert resolved == os.path.realpath(local_path)
-    assert resolved.startswith(os.path.realpath(run_dir) + os.sep)
+    assert os.path.dirname(resolved) == os.path.realpath(run_dir)
+    with open(resolved, "rb") as f:
+        assert f.read() == b"%PDF-1.4 upload"
     download_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_code_block_file_parameter_empty_uri_left_unchanged(
+async def test_an_oversized_remote_file_still_reaches_inline_code_as_a_local_path(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """The upload ceiling belongs to the attach helper, not to materialization other code opens by path."""
+    monkeypatch.setattr(block_module.settings, "MAX_UPLOAD_FILE_SIZE", 4)
+
+    async def fake_download(url: str, *, output_dir: str, organization_id: str | None = None) -> str:
+        path = os.path.join(output_dir, "large.pdf")
+        with open(path, "wb") as f:
+            f.write(b"more than four bytes")
+        return path
+
+    monkeypatch.setattr(block_module, "download_file", fake_download)
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch, values={"resume": "https://files.example.com/large.pdf"})
+
+    block = CodeBlock(
+        label="code_upload",
+        code="resolved = resume",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("resume")],
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    resolved = result.output_parameter_value["resolved"]
+    assert resolved != "https://files.example.com/large.pdf"
+    with open(resolved, "rb") as f:
+        assert f.read() == b"more than four bytes"
+
+
+@pytest.mark.asyncio
+async def test_rematerializing_a_file_input_replaces_its_root_file_instead_of_adding_copies(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A loop re-runs the block every iteration; the input must keep one stable root file."""
+    downloads = iter([b"first iteration", b"second iteration"])
+
+    async def fake_download(url: str, *, output_dir: str, organization_id: str | None = None) -> str:
+        path = os.path.join(output_dir, "resume.pdf")
+        with open(path, "wb") as f:
+            f.write(next(downloads))
+        return path
+
+    monkeypatch.setattr(block_module, "download_file", fake_download)
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch, values={"resume": "https://files.example.com/resume.pdf"})
+    block = CodeBlock(
+        label="code_upload",
+        code="resolved = resume",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("resume")],
+    )
+
+    first = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+    second = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert first.success is True, first.failure_reason
+    assert second.success is True, second.failure_reason
+    assert first.output_parameter_value["resolved"] == second.output_parameter_value["resolved"]
+    run_dir = os.path.realpath(os.path.join(_isolated_download_path, "wr_1"))
+    assert os.listdir(run_dir) == ["resume.pdf"]
+    with open(second.output_parameter_value["resolved"], "rb") as f:
+        assert f.read() == b"second iteration"
+
+
+@pytest.mark.asyncio
+async def test_a_file_url_naming_another_runs_download_is_not_copied_into_this_run(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A file:// input is a local path: it must resolve inside this run, not be copied in from another run."""
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.ENV", "local")
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.REPO_ROOT_DIR", os.path.dirname(_isolated_download_path))
+    other_run = os.path.join(_isolated_download_path, "wr_other")
+    this_run = os.path.join(_isolated_download_path, "wr_1")
+    os.makedirs(other_run)
+    os.makedirs(this_run)
+    other_file = os.path.join(other_run, "secret.pdf")
+    own_file = os.path.join(this_run, "mine.pdf")
+    with open(other_file, "wb") as f:
+        f.write(b"another run's file")
+    with open(own_file, "wb") as f:
+        f.write(b"this run's file")
+    block = CodeBlock(
+        label="code_upload",
+        code="pass",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("resume")],
+    )
+
+    foreign = await block._materialize_file_parameter_path(
+        f"file://{other_file}",
+        parameter_key="resume",
+        materialized_file_paths={},
+        workflow_run_id="wr_1",
+        organization_id="o_1",
+    )
+    assert isinstance(foreign, AuthorizedFileMaterializationFailure)
+    assert os.listdir(this_run) == ["mine.pdf"]
+
+    own = await block._materialize_file_parameter_path(
+        f"file://{own_file}",
+        parameter_key="resume",
+        materialized_file_paths={},
+        workflow_run_id="wr_1",
+        organization_id="o_1",
+    )
+    assert isinstance(own, MaterializedAuthorizedFile)
+
+
+@pytest.mark.asyncio
+async def test_rematerializing_under_a_new_downloaded_name_moves_the_input_to_that_name(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A stable export URL can switch formats; the input must carry the latest name, still as one file."""
+    downloads = iter([("report.csv", b"a,b\n1,2\n"), ("report.xlsx", b"PK spreadsheet bytes")])
+
+    async def fake_download(url: str, *, output_dir: str, organization_id: str | None = None) -> str:
+        name, content = next(downloads)
+        path = os.path.join(output_dir, name)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    monkeypatch.setattr(block_module, "download_file", fake_download)
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch, values={"report": "https://files.example.com/export"})
+    block = CodeBlock(
+        label="code_upload",
+        code="resolved = report",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("report")],
+    )
+
+    first = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+    second = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert first.success is True, first.failure_reason
+    assert second.success is True, second.failure_reason
+    run_dir = os.path.realpath(os.path.join(_isolated_download_path, "wr_1"))
+    assert os.listdir(run_dir) == ["report.xlsx"]
+    resolved = second.output_parameter_value["resolved"]
+    assert os.path.basename(resolved) == "report.xlsx"
+    with open(resolved, "rb") as f:
+        assert f.read() == b"PK spreadsheet bytes"
+
+
+@pytest.mark.asyncio
+async def test_two_file_inputs_sharing_a_basename_each_keep_their_own_bytes_and_upload_name(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """Downloads are named by basename; a second input must not overwrite the first before the block runs, and the
+    collision-free name it is stored under must not become the filename the destination site receives."""
+
+    async def fake_download(url: str, *, output_dir: str, organization_id: str | None = None) -> str:
+        path = os.path.join(output_dir, "resume.pdf")
+        with open(path, "wb") as f:
+            f.write(url.encode())
+        return path
+
+    monkeypatch.setattr(block_module, "download_file", fake_download)
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(
+        monkeypatch,
+        values={"first": "https://files.example.com/a/resume.pdf", "second": "https://files.example.com/b/resume.pdf"},
+    )
+
+    uploads: list[dict[str, str | bytes]] = []
+
+    class UploadTarget:
+        async def set_input_files(self, files: dict[str, str | bytes]) -> None:
+            uploads.append(files)
+
+    class UploadPage:
+        context = SimpleNamespace()
+        url = "https://example.test/"
+
+        def locator(self, selector: str) -> UploadTarget:
+            return UploadTarget()
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=UploadPage()),
+                browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.RUN_DIR),
+            )
+        ),
+    )
+
+    block = CodeBlock(
+        label="code_upload",
+        code='first_path = first\nsecond_path = second\nreceipt = await attach_authorized_file(page, second, "#file")',
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("first"), _file_url_parameter("second")],
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    first_path = result.output_parameter_value["first_path"]
+    second_path = result.output_parameter_value["second_path"]
+    assert first_path != second_path
+    with open(first_path, "rb") as f:
+        assert f.read() == b"https://files.example.com/a/resume.pdf"
+    with open(second_path, "rb") as f:
+        assert f.read() == b"https://files.example.com/b/resume.pdf"
+    # File upload and email blocks list only root-level files and count directories toward their limit.
+    run_dir = os.path.realpath(os.path.join(_isolated_download_path, "wr_1"))
+    assert {os.path.dirname(first_path), os.path.dirname(second_path)} == {run_dir}
+    assert all(os.path.isfile(os.path.join(run_dir, entry)) for entry in os.listdir(run_dir))
+    assert os.path.basename(second_path) != "resume.pdf"
+    assert [(upload["name"], upload["buffer"]) for upload in uploads] == [
+        ("resume.pdf", b"https://files.example.com/b/resume.pdf")
+    ]
+    assert result.output_parameter_value["receipt"]["filename"] == "resume.pdf"
+
+
+@pytest.mark.asyncio
+async def test_a_parameter_named_after_the_attach_helper_still_wins(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """The name only became a safe global here, so persisted blocks may already declare it."""
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch, values={"attach_authorized_file": "persisted value"})
+
+    block = CodeBlock(
+        label="code_collision",
+        code="resolved = attach_authorized_file",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("attach_authorized_file")],
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    assert result.output_parameter_value["resolved"] == "persisted value"
+
+
+@pytest.mark.asyncio
+async def test_code_block_authorized_file_parameter_empty_uri_left_unchanged(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
     download_mock = AsyncMock()
@@ -2301,6 +2558,146 @@ async def test_secure_runner_session_download_reaches_registration(
 
 
 @pytest.mark.asyncio
+async def test_secure_runner_typed_download_waits_for_delayed_final_session_row(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A completed typed download is sufficient reason to settle a delayed final watcher row even
+    after its partial marker has disappeared. The first empty read must not end the custody handoff."""
+    skyvern_context.set(_session_context())
+
+    # Baseline read, host pre-registration read, and first registration read are empty. The
+    # watcher row becomes visible only to the receipt-gated settle attempt.
+    reads = [[], [], [], [_SESSION_FILE]]
+
+    async def _get(**_kwargs: object) -> list[FileInfo]:
+        return reads.pop(0) if len(reads) > 1 else list(reads[0])
+
+    claim = AsyncMock(return_value=1)
+    in_flight = AsyncMock(return_value=[])
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(side_effect=_get),
+        claim=claim,
+        in_flight=in_flight,
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    in_flight.assert_awaited_once()
+    assert claim.await_count == 2
+    assert result.success is True
+    assert result.output_parameter_value["downloaded_file_urls"] == [_SESSION_FILE.url]
+    assert result.output_parameter_value["downloaded_file_artifact_ids"] == [_SESSION_FILE.artifact_id]
+    persisted = _persisted_output()
+    assert isinstance(persisted, dict)
+    assert persisted["downloaded_file_artifact_ids"] == [_SESSION_FILE.artifact_id]
+
+    packet = build_test_evidence_packet(
+        make_copilot_ctx(),
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "completed",
+                "requested_block_labels": ["download_statement"],
+                "executed_block_labels": ["download_statement"],
+                "blocks": [
+                    {
+                        "label": "download_statement",
+                        "status": "completed",
+                        "extracted_data": persisted,
+                    }
+                ],
+            },
+        },
+    )
+    assert [download.artifact_id for download in packet.downloads] == [_SESSION_FILE.artifact_id]
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_without_typed_download_does_not_settle_an_empty_session_row(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(_session_context())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    claim = AsyncMock(return_value=0)
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        claim=claim,
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(monkeypatch, output={"status": "ok"})
+
+    block = CodeBlock(
+        label="read_page",
+        code="return {'status': 'ok'}",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    sleep.assert_not_awaited()
+    assert claim.await_count == 1
+    assert result.success is True
+    assert "downloaded_file_artifact_ids" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_typed_download_with_no_final_row_is_bounded_and_invents_nothing(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(_session_context())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    claim = AsyncMock(return_value=0)
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        claim=claim,
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert claim.await_count == 1 + block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
+    assert sleep.await_count == block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
+    assert result.success is True
+    assert "downloaded_file_artifact_ids" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
 async def test_in_flight_partial_is_never_bound_as_the_users_file(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2427,7 +2824,7 @@ async def test_download_that_never_lands_falls_through_to_finalization(
     in_flight = AsyncMock(return_value=["s3://bucket/session.pdf.crdownload"])
     wait = AsyncMock(side_effect=DownloadFileMaxWaitingTime(downloading_files=["session.pdf.crdownload"]))
     monkeypatch.setattr(block_module, "wait_for_download_finished", wait)
-    monkeypatch.setattr(block_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
     _fake_storage_app(
         monkeypatch,
         save=AsyncMock(),
@@ -2560,6 +2957,20 @@ def _empty_read_rows(logs: list[dict]) -> list[dict]:
     return [entry for entry in logs if entry.get("event") == "downloads.empty_read"]
 
 
+@contextmanager
+def _capture_empty_read_logs() -> Iterator[list[dict]]:
+    # downloads.empty_read logs at DEBUG; the suite's bound logger filters at INFO and
+    # capture_logs only swaps processors, not the level gate, so lower the level for the
+    # capture window and restore it after.
+    previous_config = structlog.get_config()
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+    try:
+        with capture_logs() as logs:
+            yield logs
+    finally:
+        structlog.configure(**previous_config)
+
+
 def _artifact_row_storage(
     monkeypatch: pytest.MonkeyPatch, *, keyring: str | None, file_infos: list[FileInfo]
 ) -> S3Storage:
@@ -2593,7 +3004,7 @@ async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytes
         AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
     )
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2612,7 +3023,7 @@ async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.Mon
     listing = AsyncMock(return_value=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2635,7 +3046,7 @@ async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
     monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2649,7 +3060,7 @@ async def test_downloads_empty_read_reports_unqueried_rows_on_legacy_path(monkey
     storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2822,7 +3233,7 @@ async def test_downloads_empty_read_reports_every_empty_read_for_a_run(monkeypat
     storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as repeated:
+    with _capture_empty_read_logs() as repeated:
         await storage.get_downloaded_files("o_1", "wr_repeat")
         await storage.get_downloaded_files("o_1", "wr_repeat")
 

@@ -245,10 +245,18 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordTokenSource = "organization" | "instance_default";
+
+export type OnePasswordTokenStatus = {
+  configured: boolean;
+  source: OnePasswordTokenSource | null;
+  instance_default_available: boolean;
+  modified_at: string | null;
+};
+
 export type OnePasswordTokenApiResponse = {
   id: string;
   organization_id: string;
-  token: string;
   created_at: string;
   modified_at: string;
   token_type: string;
@@ -266,6 +274,7 @@ export type OnePasswordItemApiResponse = {
 
 export type OnePasswordItemsApiResponse = {
   configured: boolean;
+  source: OnePasswordTokenSource | null;
   items: Array<OnePasswordItemApiResponse>;
 };
 
@@ -795,6 +804,26 @@ export type DebugLoginBlockCompatibilityResponse = {
   reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
+export type WorkflowRunAttempt = {
+  attempt_number: number;
+  status: Status;
+  failure_reason: string | null;
+  error_codes: Array<string>;
+  started_at: string | null;
+  finished_at: string | null;
+  retry_decision: string | null;
+  decision_reason: string | null;
+  next_attempt_at: string | null;
+  webhook_sent_at: string | null;
+};
+
+export type WorkflowRunRetryFields = {
+  attempt?: number;
+  retry_pending?: boolean;
+  next_attempt_at?: string | null;
+  attempts?: Array<WorkflowRunAttempt>;
+};
+
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
@@ -816,7 +845,10 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_title: string | null;
   retried_from_workflow_run_id?: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export const TaskRunType = {
   TaskV1: "task_v1",
@@ -844,7 +876,10 @@ export type TaskRunListItem = {
   script_run: boolean;
   trigger_type?: TriggerType | null;
   searchable_text: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
@@ -887,7 +922,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+} & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_id: string;
@@ -923,6 +958,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   browser_profile_id: string | null;
+  browser_type?: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   workflow: WorkflowApiResponse;
@@ -931,7 +967,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+} & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;

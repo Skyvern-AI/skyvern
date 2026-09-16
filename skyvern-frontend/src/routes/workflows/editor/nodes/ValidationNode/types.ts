@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 export type ValidationNodeData = NodeBaseData & {
   completeCriterion: string;
@@ -7,6 +8,7 @@ export type ValidationNodeData = NodeBaseData & {
   errorCodeMapping: string;
   parameterKeys: Array<string>;
   disableCache: boolean;
+  engine: RunEngine | null;
 };
 
 export type ValidationNode = Node<ValidationNodeData, "validation">;
@@ -22,6 +24,7 @@ export const validationNodeDefaultData: ValidationNodeData = {
   parameterKeys: [],
   disableCache: false,
   model: null,
+  engine: RunEngine.SkyvernV1,
 };
 
 export function isValidationNode(node: Node): node is ValidationNode {

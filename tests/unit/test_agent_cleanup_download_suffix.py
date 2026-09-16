@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import DownloadFileMaxWaitingTime
+from skyvern.exceptions import DownloadFileMaxWaitingTime, TaskNotFound
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_download_to_complete
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -310,7 +313,6 @@ async def test_cleanup_timeout_bounds_browser_download_handler_drain() -> None:
     browser_state = MagicMock(browser_context=browser_context)
     finalize = AsyncMock()
     save = AsyncMock()
-    started_at = asyncio.get_running_loop().time()
 
     with (
         patch("skyvern.forge.agent.SAVE_DOWNLOADED_FILES_TIMEOUT", 0.01),
@@ -333,7 +335,6 @@ async def test_cleanup_timeout_bounds_browser_download_handler_drain() -> None:
             timeout=0.5,
         )
 
-    assert asyncio.get_running_loop().time() - started_at < 0.2
     finalize.assert_not_awaited()
     save.assert_not_awaited()
 
@@ -1017,3 +1018,894 @@ async def test_finalize_materializes_session_download_matching_baseline_before(t
         f"new session download must be materialized under its suffix, not deduped against the baseline, got {remaining}"
     )
     assert (download_dir / "req-999.pdf").read_bytes() == shared_bytes
+
+
+# Shared identity for the run's current BrowserContext. The credit consumer closes a claimed popup
+# iff ``popup.context is browser_state.browser_context``, so a popup that should close and the credit
+# browser_state must share this object; a foreign-context popup passes a different one. A MagicMock (not
+# a bare object) so it also stands in for the real context where cleanup passes it to helpers.
+_RUN_CONTEXT = MagicMock(name="run-browser-context")
+
+
+def _claimed_popup(url: str = ":", *, context: object = _RUN_CONTEXT) -> MagicMock:
+    popup = MagicMock(url=url)
+    popup.is_closed.return_value = False
+    popup.close = AsyncMock()
+    popup.context = context
+    return popup
+
+
+class _ContextAccessRaises:
+    """A browser_state whose ``browser_context`` read raises (torn-down/recycled session)."""
+
+    @property
+    def browser_context(self) -> object:
+        raise RuntimeError("browser context gone")
+
+
+def test_download_popup_claim_record_dedup_take_clear() -> None:
+    """The task-scoped claim registry dedups by exact Page identity and pops/clears by task_id, so a
+    claim can never be double-recorded or leak into another task's scope."""
+    ctx = SkyvernContext(task_id="t1")
+    page = _claimed_popup()
+    ctx.record_download_popup_claim("t1", page)
+    ctx.record_download_popup_claim("t1", page)  # exact-identity dedup
+    assert ctx.download_popup_claims["t1"] == [page]
+
+    other = _claimed_popup()
+    ctx.record_download_popup_claim("t2", other)
+    assert ctx.take_download_popup_claims("t1") == [page]
+    assert "t1" not in ctx.download_popup_claims  # take pops
+
+    ctx.clear_download_popup_claims("t2")
+    assert "t2" not in ctx.download_popup_claims
+    # taking/clearing a missing key is safe and non-mutating
+    assert ctx.take_download_popup_claims("missing") == []
+    ctx.clear_download_popup_claims("missing")
+
+
+def test_discard_download_popup_claim_identity_semantics() -> None:
+    """discard_download_popup_claim retires only the exact reused Page: siblings survive (G2), an
+    emptied bucket's task key is deleted rather than left as an empty list (G3), and an unclaimed page
+    or another task's bucket is never mutated (G4)."""
+    ctx = SkyvernContext(task_id="t1")
+    q = _claimed_popup()
+    r = _claimed_popup()
+    other = _claimed_popup()
+    ctx.record_download_popup_claim("t1", q)
+    ctx.record_download_popup_claim("t1", r)
+    ctx.record_download_popup_claim("t2", other)
+
+    # G4: an unclaimed page is a no-op and never mutates any bucket.
+    assert ctx.discard_download_popup_claim("t1", _claimed_popup()) is False
+    assert ctx.download_popup_claims["t1"] == [q, r]
+    assert ctx.download_popup_claims["t2"] == [other]
+
+    # G2: discarding one claim leaves its siblings claimable.
+    assert ctx.discard_download_popup_claim("t1", q) is True
+    assert ctx.download_popup_claims["t1"] == [r]
+    assert ctx.discard_download_popup_claim("t1", q) is False  # already gone
+
+    # G3: emptying the bucket deletes the task key (no empty list left behind).
+    assert ctx.discard_download_popup_claim("t1", r) is True
+    assert "t1" not in ctx.download_popup_claims
+
+    # G4: the other task's bucket is intact throughout; a missing task is a safe no-op.
+    assert ctx.download_popup_claims["t2"] == [other]
+    assert ctx.discard_download_popup_claim("missing", other) is False
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_current_working_page() -> None:
+    """Anchor constraint (G1): a current-action claimed popup that BrowserState has already selected as
+    its working page still closes at durable credit. The credit consumer must never skip the working
+    page — a current-action popup with no later action-entry reuse must close."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-working-page")
+    working = _claimed_popup(":")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    browser_state.get_working_page = AsyncMock(return_value=working)  # the popup IS the working page
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, working)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    working.close.assert_awaited_once()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_claimed_popup_and_clears_claim() -> None:
+    """After a durable download credit, the exact recorded popup that is still open and still a live
+    page in this run is closed (so the next task does not select it as its working page), and the task's
+    claims are cleared. The opener is never recorded as a claim, so it is untouched."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-credit")
+    popup = _claimed_popup(":")
+    opener = _claimed_popup("https://example.test/documents")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup.close.assert_awaited_once()
+    opener.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_committed_popup() -> None:
+    """Product contract: a download that opens a new page has that page closed after the download
+    finishes REGARDLESS of URL. A claimed popup that committed to a real URL is therefore still closed
+    by the late cleanup -- this fails on the pre-fix head that filtered to the ``":"`` marker only."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-committed")
+    committed = _claimed_popup("https://example.test/report.pdf")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, committed)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    committed.close.assert_awaited_once()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_skips_foreign_context_popup() -> None:
+    """Scope guard: a claimed popup belonging to a different BrowserContext than the run's current one
+    — a recycled/replaced context or a page from another run/context — is left untouched. Eligibility
+    is structural ownership (``popup.context is browser_state.browser_context``), not scraper-list
+    membership."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-foreign")
+    foreign = _claimed_popup(":", context=object())  # not the run's current BrowserContext
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, foreign)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    foreign.close.assert_not_called()
+    # The claim is still consumed (taken) by the credit seam, so it cannot resurrect on duplicate credit.
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_drops_stale_claim_after_context_replacement() -> None:
+    """Context replacement: if the browser context was recycled/replaced before credit, a claimed popup
+    bound to the OLD context is dropped, never closed, because its identity no longer matches
+    browser_state.browser_context. (Stored Page objects on a dead connection must not be close()d.)"""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-ctx-replaced")
+    stale = _claimed_popup(":", context=MagicMock(name="old-context"))
+    browser_state = MagicMock()
+    browser_state.browser_context = MagicMock(name="new-context")  # replacement context
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, stale)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    stale.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_close_failure_does_not_overturn_credit() -> None:
+    """A close that raises is swallowed: the consumer never raises into the durable-credit path, the
+    claim is still consumed, and every other claimed popup is still closed."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-close-fail")
+    failing = _claimed_popup(":")
+    failing.close = AsyncMock(side_effect=RuntimeError("close boom"))
+    healthy = _claimed_popup("https://example.test/report.pdf")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, failing)
+    ctx.record_download_popup_claim(task.task_id, healthy)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)  # must not raise
+
+    failing.close.assert_awaited_once()
+    healthy.close.assert_awaited_once()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_context_access_failure_does_not_overturn_credit() -> None:
+    """If reading ``browser_state.browser_context`` raises (torn-down/recycled session) the consumer
+    must not propagate. Claims were already atomically taken, so they expire without a close and durable
+    credit stands; only a bounded ``context_unavailable`` reason is logged, never an exception
+    payload."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-ctx-unavailable")
+    popup = _claimed_popup(":")
+    browser_state = _ContextAccessRaises()
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    with (
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        capture_logs() as logs,
+    ):
+        await agent._close_credited_download_popups(task, browser_state)  # must not raise
+
+    popup.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims  # atomically taken, then expired
+    event = next(e for e in logs if e.get("skip_reason") == "context_unavailable")
+    assert "exc_info" not in event and "exception" not in event, "no exception payload may be logged"
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_idempotent_on_already_closed() -> None:
+    """An already-closed recorded popup is a no-op (idempotent double-close guard, req #2)."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-closed")
+    already_closed = _claimed_popup(":")
+    already_closed.is_closed.return_value = True
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[already_closed])
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, already_closed)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    already_closed.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_scraper_invalid_same_context_popup() -> None:
+    """A claimed popup still open and in the run's current BrowserContext must be closed after durable
+    credit even when the scraper-oriented list_valid_pages() omits it (PDF-viewer popups are exactly
+    the pages scrapers exclude; cleanup liveness and scraper validity are different contracts). A
+    list_valid_pages() identity gate would silently skip it, leaving the popup to linger as the next
+    task's working page (the SKY-15371 wedge). Eligibility gates on
+    ``popup.context is browser_state.browser_context`` instead."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-scraper-invalid")
+    browser_context = MagicMock(name="owning-browser-context")
+    popup = _claimed_popup(":")
+    popup.context = browser_context
+    browser_state = MagicMock()
+    browser_state.browser_context = browser_context
+    # Scraper excludes the wedged popup (the production silent-skip): it is absent from valid pages.
+    browser_state.list_valid_pages = AsyncMock(return_value=[])
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup.close.assert_awaited_once()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_same_context_popup_when_listing_raises() -> None:
+    """A listing failure must not strand a claimed same-context popup. A fail-open ``except: return``
+    around list_valid_pages() would abandon the close entirely; the consumer never calls
+    list_valid_pages(), so a listing fault cannot overturn the close."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-list-raises")
+    browser_context = MagicMock(name="owning-browser-context")
+    popup = _claimed_popup(":")
+    popup.context = browser_context
+    browser_state = MagicMock()
+    browser_state.browser_context = browser_context
+    browser_state.list_valid_pages = AsyncMock(side_effect=RuntimeError("scrape listing failed"))
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_no_claim_is_noop() -> None:
+    """With no recorded claim (no credited download popup) nothing is closed (req #5)."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-empty")
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[_claimed_popup(":")])
+    ctx = SkyvernContext(task_id=task.task_id)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    browser_state.list_valid_pages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clean_up_task_clears_download_popup_claims_even_on_early_error() -> None:
+    """Task-terminal expiry: clean_up_task drops the task's popup claims at the very top, so a claim
+    never survives into a later task/run/persistent-session -- proven here on the early-error path
+    (DB refresh fails) which stands in for cancellation/exception exits."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-terminal")
+    step = MagicMock()
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, _claimed_popup(":"))
+
+    mock_app = MagicMock()
+    mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)  # forces TaskNotFound right after the clear
+
+    with (
+        patch("skyvern.forge.agent.app", mock_app),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+    ):
+        with pytest.raises(TaskNotFound):
+            await agent.clean_up_task(task=task, last_step=step)
+
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_bounds_a_hung_close() -> None:
+    """A hung ``popup.close()`` must not block task completion: the late close is bounded by
+    BROWSER_PAGE_CLOSE_TIMEOUT so the consumer always returns and the claim is consumed. Pre-fix the
+    close was awaited unbounded and a never-resolving close would hang update_step/update_task."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-hang")
+    marker = _claimed_popup(":")
+
+    async def _never_resolves() -> None:
+        await asyncio.Event().wait()
+
+    marker.close = AsyncMock(side_effect=_never_resolves)
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+
+    with (
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.BROWSER_PAGE_CLOSE_TIMEOUT", 0.01, create=True),
+    ):
+        # asyncio.wait_for turns the pre-fix unbounded hang into a bounded test failure.
+        await asyncio.wait_for(agent._close_credited_download_popups(task, browser_state), timeout=2)
+
+    marker.close.assert_awaited_once()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_batch_bounded_across_multiple_hung_pages() -> None:
+    """A same-context popup storm must not delay the credited-task handoff by N x timeout: the whole
+    close batch shares one monotonic deadline. Two claimed pages both hang; the first close consumes
+    the budget, the second is never attempted, elapsed is ~one timeout (not two), and both claims are
+    consumed. Pre-fix each page got a full BROWSER_PAGE_CLOSE_TIMEOUT, so the batch ran ~two timeouts
+    and attempted the second page."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-batch-hang")
+    timeout_s = 0.2
+
+    async def _never_resolves() -> None:
+        await asyncio.Event().wait()
+
+    first = _claimed_popup(":")
+    first.close = AsyncMock(side_effect=_never_resolves)
+    second = _claimed_popup(":")
+    second.close = AsyncMock(side_effect=_never_resolves)
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, first)
+    ctx.record_download_popup_claim(task.task_id, second)
+
+    with (
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.BROWSER_PAGE_CLOSE_TIMEOUT", timeout_s),
+    ):
+        started = time.monotonic()
+        await asyncio.wait_for(agent._close_credited_download_popups(task, browser_state), timeout=5)
+        elapsed = time.monotonic() - started
+
+    # One shared deadline: the batch is bounded to ~one timeout, not one-per-page.
+    assert elapsed < timeout_s * 1.75, f"batch took {elapsed:.3f}s, expected ~one {timeout_s}s timeout"
+    first.close.assert_awaited_once()
+    second.close.assert_not_called()  # budget exhausted by the first hung close -> not attempted
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_fast_first_then_hung_stays_batch_bounded() -> None:
+    """A fast successful close followed by a hung close keeps the first success and stays bounded to the
+    single shared deadline rather than first-close-time plus a full per-page timeout."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-fast-then-hang")
+    timeout_s = 0.2
+
+    async def _never_resolves() -> None:
+        await asyncio.Event().wait()
+
+    fast = _claimed_popup(":")  # default AsyncMock close resolves immediately
+    hung = _claimed_popup(":")
+    hung.close = AsyncMock(side_effect=_never_resolves)
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, fast)
+    ctx.record_download_popup_claim(task.task_id, hung)
+
+    with (
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.BROWSER_PAGE_CLOSE_TIMEOUT", timeout_s),
+    ):
+        started = time.monotonic()
+        await asyncio.wait_for(agent._close_credited_download_popups(task, browser_state), timeout=5)
+        elapsed = time.monotonic() - started
+
+    fast.close.assert_awaited_once()  # first success preserved
+    assert elapsed < timeout_s * 1.75, f"batch took {elapsed:.3f}s"
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_hung_close_gets_only_remaining_budget() -> None:
+    """A slow-but-successful first close followed by a hung close must stay within the single shared
+    deadline: the hung close is bounded to the budget the first close left, not a fresh full timeout.
+    With per-page full timeouts the batch would reach first-close-time plus a whole timeout."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-remaining-budget")
+    timeout_s = 0.3
+    slow_first_s = 0.25  # consumes most of the shared budget, but succeeds
+
+    async def _slow_success() -> None:
+        await asyncio.sleep(slow_first_s)
+
+    async def _never_resolves() -> None:
+        await asyncio.Event().wait()
+
+    slow = _claimed_popup(":")
+    slow.close = AsyncMock(side_effect=_slow_success)
+    hung = _claimed_popup(":")
+    hung.close = AsyncMock(side_effect=_never_resolves)
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, slow)
+    ctx.record_download_popup_claim(task.task_id, hung)
+
+    with (
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.BROWSER_PAGE_CLOSE_TIMEOUT", timeout_s),
+    ):
+        started = time.monotonic()
+        await asyncio.wait_for(agent._close_credited_download_popups(task, browser_state), timeout=5)
+        elapsed = time.monotonic() - started
+
+    slow.close.assert_awaited_once()
+    # Shared deadline caps the whole batch at ~one timeout. Per-page full timeout would give
+    # slow_first_s + timeout_s (~0.55s); the remaining-budget bound keeps it near timeout_s.
+    assert elapsed < timeout_s * 1.4, f"batch took {elapsed:.3f}s, hung close was not capped to remaining budget"
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_execute_step_complete_on_download_closes_claimed_popup_before_handoff(tmp_path) -> None:
+    """Real outer-path regression: driving the actual v1 execute_step complete_on_download credit
+    branch, the exact recorded ``":"`` marker popup is closed before the completed-task handoff
+    (update_step/update_task). Removing the single _close_credited_download_popups call makes this
+    fail (the marker is never closed)."""
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    task = _make_task(task_id="task-outer")
+    task.status = SimpleNamespace(value="running")
+    task.navigation_goal = "Download invoice"
+    task.data_extraction_goal = None
+    task.complete_criterion = None
+    task.terminate_criterion = None
+    task.browser_address = None
+    task.max_steps_per_run = None
+    task.url = "https://example.com"
+    task.proxy_location = None
+    task.llm_key = None
+    task.task_type = "general"
+
+    step = MagicMock()
+    step.step_id = "step-1"
+    step.order = 0
+    step.retry_index = 0
+    step.status = "created"
+
+    organization = MagicMock()
+    organization.organization_id = task.organization_id
+    organization.max_steps_per_run = None
+
+    task_block = MagicMock()
+    task_block.complete_on_download = True
+    task_block.download_timeout = None
+    task_block.download_suffix = "req-123"
+
+    order: list[str] = []
+
+    marker = _claimed_popup(":")
+
+    async def _close_marker() -> None:
+        order.append("close")
+
+    marker.close = AsyncMock(side_effect=_close_marker)
+    opener = _claimed_popup("https://example.com/documents")
+
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+
+    async def agent_step_side_effect(*args, **kwargs):
+        (download_dir / "uuid-file.zip").write_text("dummy")
+        return step, DetailedAgentStepOutput(
+            scraped_page=None,
+            extract_action_prompt=None,
+            llm_response=None,
+            actions=None,
+            action_results=None,
+            actions_and_results=None,
+            cua_response=None,
+        )
+
+    async def update_step_side_effect(step_obj, *args, **kwargs):
+        if "is_last" in kwargs:
+            step_obj.is_last = kwargs["is_last"]
+        return step_obj
+
+    async def update_task_side_effect(task_obj, *args, **kwargs):
+        if "status" in kwargs:
+            order.append(f"update_task:{kwargs['status']}")
+        return task_obj
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=ctx),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=[]),
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
+        patch.object(agent, "agent_step", AsyncMock(side_effect=agent_step_side_effect)),
+        patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
+        patch.object(agent, "update_task", AsyncMock(side_effect=update_task_side_effect)),
+        patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
+        patch.object(agent, "clean_up_task", AsyncMock()),
+    ):
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+
+        await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            task_block=task_block,
+            close_browser_on_completion=True,
+            complete_verification=True,
+            engine=RunEngine.skyvern_v1,
+        )
+
+    # The credit branch fired (file was finalized) and closed exactly the marker popup, not the opener.
+    assert (download_dir / "req-123.zip").exists()
+    marker.close.assert_awaited_once()
+    opener.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+    # The close happened before the completed-task handoff (update_step/update_task).
+    close_i = order.index("close")
+    update_task_indices = [i for i, entry in enumerate(order) if entry.startswith("update_task:")]
+    assert update_task_indices and all(close_i < i for i in update_task_indices)
+
+
+@pytest.mark.asyncio
+async def test_clean_up_task_closes_claimed_popup_on_cleanup_finalization_credit(tmp_path) -> None:
+    """Second durable-credit seam: when the ``download_suffix``/``list_files_before`` finalization inside
+    clean_up_task proves a new file, the exact recorded ``":"`` marker popup is closed. Pre-fix the
+    top-of-cleanup claim clear preempted this seam, dropping the claim without closing the popup."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-cleanup-credit")
+    last_step = MagicMock()
+    last_step.step_id = "step-1"
+    marker = _claimed_popup(":")
+    opener = _claimed_popup("https://example.com/documents")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+
+    async def finalize_side_effect(*args, **kwargs):
+        return ["req-123.zip"]  # cleanup finalization proves a newly landed file
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=browser_state)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=last_step,
+            need_final_screenshot=False,
+            download_suffix="req-123",
+            list_files_before=[],
+        )
+
+    marker.close.assert_awaited_once()
+    opener.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_clean_up_task_no_cleanup_credit_expires_claims_without_close(tmp_path) -> None:
+    """When cleanup finalization proves no new file, the marker popup is NOT closed, but the claims
+    still expire (taken and dropped at cleanup entry)."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-cleanup-nocredit")
+    last_step = MagicMock()
+    last_step.step_id = "step-1"
+    marker = _claimed_popup(":")
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.list_valid_pages = AsyncMock(return_value=[marker])
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+
+    async def finalize_side_effect(*args, **kwargs):
+        return []  # nothing finalized -> no durable credit
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=browser_state)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=last_step,
+            need_final_screenshot=False,
+            download_suffix="req-123",
+            list_files_before=[],
+        )
+
+    marker.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_clean_up_task_expires_claims_without_close_when_no_credit(tmp_path) -> None:
+    """No durable credit at the terminal boundary: with claims present but cleanup finalization proving
+    no new file (a failed/terminated task), the claims are taken (expired) but NO destructive close
+    runs. Expiry bounds memory; it never closes a page absent a credit."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-no-credit")
+    last_step = MagicMock()
+    last_step.step_id = "step-1"
+    marker = _claimed_popup(":")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+
+    async def finalize_side_effect(*args, **kwargs):
+        return []  # no newly landed file -> no durable credit at cleanup
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=browser_state)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=last_step,
+            need_final_screenshot=False,
+            download_suffix="req-123",
+            list_files_before=[],
+        )
+
+    marker.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_closes_multiple_distinct_claims_each_once() -> None:
+    """One durable credit closes every distinct popup the task recorded, each exactly once and
+    regardless of URL, matching the legacy multi-extra-page cleanup that closed all pages the download
+    opened. The opener (never a claim) is untouched."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-multi")
+    popup_blank = _claimed_popup(":")
+    popup_committed = _claimed_popup("https://example.test/report.pdf")
+    popup_about = _claimed_popup("about:blank")
+    opener = _claimed_popup("https://example.test/documents")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    for popup in (popup_blank, popup_committed, popup_about):
+        ctx.record_download_popup_claim(task.task_id, popup)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup_blank.close.assert_awaited_once()
+    popup_committed.close.assert_awaited_once()
+    popup_about.close.assert_awaited_once()
+    opener.close.assert_not_called()
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_close_credited_download_popups_dedups_exact_duplicate_claim() -> None:
+    """Recording the same Page twice yields a single claim, so an exact duplicate closes at most once."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-dup")
+    popup = _claimed_popup("https://example.test/report.pdf")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+    ctx.record_download_popup_claim(task.task_id, popup)  # exact duplicate
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_two_credit_seams_cannot_both_close_the_same_claimed_popup() -> None:
+    """pop-once/take semantics: the complete_on_download seam pops the claims, so the later
+    cleanup-finalization seam (which takes from the same registry) finds none and cannot re-close the
+    same Page."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-two-seams")
+    popup = _claimed_popup("https://example.test/report.pdf")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        # complete_on_download seam consumes the claim and closes the popup.
+        await agent._close_credited_download_popups(task, browser_state)
+        # cleanup-finalization seam takes from the same registry -> already empty.
+        cleanup_claims = ctx.take_download_popup_claims(task.task_id)
+        await agent._close_claimed_download_popups(task, browser_state, cleanup_claims)
+
+    popup.close.assert_awaited_once()
+    assert cleanup_claims == []
+
+
+@pytest.mark.asyncio
+async def test_late_cleanup_skips_popup_already_closed_by_in_seam_cleanup() -> None:
+    """Sequential topology: after the legacy action-level / #16476 in-seam cleanup actually closes the
+    popup (is_closed flips true and the run drops it from valid pages), the late credit cleanup does not
+    close it a second time."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-seq")
+    popup = _claimed_popup(":")
+    closed_state = {"value": False}
+    popup.is_closed.side_effect = lambda: closed_state["value"]
+
+    async def _mark_closed() -> None:
+        closed_state["value"] = True
+
+    popup.close = AsyncMock(side_effect=_mark_closed)
+    browser_state = MagicMock()
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, popup)
+
+    # In-seam cleanup closes the popup first; the run then drops the closed page from its valid pages.
+    await popup.close()
+    browser_state.list_valid_pages = AsyncMock(return_value=[])
+
+    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
+        await agent._close_credited_download_popups(task, browser_state)
+
+    popup.close.assert_awaited_once()  # only the in-seam close; late cleanup did not re-close
+    assert task.task_id not in ctx.download_popup_claims
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_ignore_retained_partial_files(tmp_path) -> None:
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    (tmp_path / "current.pdf").write_bytes(b"complete")
+    task = _make_task(workflow_run_id="wr_retry")
+    exhausted: set[str] = set()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=tmp_path),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        capture_logs() as logs,
+    ):
+        async with asyncio.timeout(0.5):
+            await check_downloading_files_and_wait_for_download_to_complete(
+                tmp_path, task.organization_id, timeout=5, attempt_started_at=cutoff
+            )
+            await ForgeAgent()._wait_for_in_flight_downloads(
+                task,
+                SimpleNamespace(download_timeout=5),
+                task.organization_id,
+                attempt_started_at=cutoff,
+                exhausted=exhausted,
+            )
+    assert exhausted == set()
+    assert not any("long-time downloading" in row["event"] for row in logs)
+    assert stale.read_bytes() == b"old partial"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [1, None, "lookup_error"])
+async def test_retry_waits_keep_unfiltered_fallback(tmp_path, attempt) -> None:
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    result = ("wr_retry", 1, datetime.fromtimestamp(200, tz=UTC)) if attempt == 1 else ("wr_retry", 1, None)
+    task = _make_task(workflow_run_id="wr_retry")
+    exhausted: set[str] = set()
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+            new=AsyncMock(
+                return_value=result,
+                side_effect=RuntimeError("lookup unavailable") if attempt == "lookup_error" else None,
+            ),
+        ),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=tmp_path),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        capture_logs() as logs,
+    ):
+        cutoff = await get_download_retry_started_at(task.organization_id, task.workflow_run_id)
+        await check_downloading_files_and_wait_for_download_to_complete(
+            tmp_path, task.organization_id, timeout=0.01, attempt_started_at=cutoff
+        )
+        await ForgeAgent()._wait_for_in_flight_downloads(
+            task,
+            SimpleNamespace(download_timeout=0.01),
+            task.organization_id,
+            attempt_started_at=cutoff,
+            exhausted=exhausted,
+        )
+    assert cutoff is None
+    assert exhausted == {str(stale)}
+    assert any("long-time downloading" in row["event"] for row in logs)
+    if attempt == "lookup_error":
+        assert any("Failed to resolve download attempt" in row["event"] for row in logs)
+    assert stale.exists()

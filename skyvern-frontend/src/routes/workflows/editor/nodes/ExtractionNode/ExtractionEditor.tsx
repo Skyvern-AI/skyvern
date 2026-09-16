@@ -10,6 +10,8 @@ import {
 } from "@/components/ui/accordion";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { RunEngineSelector } from "@/components/EngineSelector";
@@ -23,7 +25,11 @@ import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
-import type { ExtractionNode, ExtractionNodeData } from "./types";
+import {
+  extractionExportDataSchemaDefault,
+  type ExtractionNode,
+  type ExtractionNodeData,
+} from "./types";
 import { dataSchemaExampleValue } from "../types";
 import { useUpdate } from "../../useUpdate";
 import {
@@ -31,6 +37,38 @@ import {
   getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
+
+const exportDataSchemaExampleValue = {
+  type: "array",
+  items: {
+    type: "object",
+    properties: { value: { type: "string" } },
+  },
+};
+
+// One-time convenience: when the user first turns export on, seed its schema
+// from the extraction schema they already wrote instead of leaving it blank.
+// Only fires while exportDataSchema still holds its untouched default -- after
+// that the two schemas are independent, so editing the extraction schema later
+// never silently changes what gets exported.
+function deriveExportDataSchema(dataSchema: string): string | null {
+  try {
+    const parsed = JSON.parse(dataSchema);
+    if (parsed && typeof parsed === "object") {
+      // Already array-of-objects shaped (the common "extract a list of rows"
+      // case) -- pass it through as-is rather than wrapping it again.
+      if (parsed.type === "array") {
+        return JSON.stringify(parsed, null, 2);
+      }
+      if (parsed.type === "object") {
+        return JSON.stringify({ type: "array", items: parsed }, null, 2);
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 function ExtractionEditor({ blockId }: { blockId: string }) {
   // Subscribe to this node's data slice. The sidebar mount lives outside the
@@ -128,6 +166,92 @@ function ExtractionEditorBody({
                   current_schema: data.dataSchema,
                 }}
               />
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        <AccordionItem value="export">
+          <AccordionTrigger>Export</AccordionTrigger>
+          <AccordionContent className="pl-[1.5rem] pr-1">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
+                    Export as Parquet
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["extraction"]["exportEnabled"]}
+                  />
+                </div>
+                <div className="w-52">
+                  <Switch
+                    checked={data.exportEnabled}
+                    data-testid="extraction-export-enabled-switch"
+                    onCheckedChange={(checked) => {
+                      if (!editable) return;
+                      if (
+                        checked &&
+                        data.exportDataSchema ===
+                          extractionExportDataSchemaDefault
+                      ) {
+                        const derived = deriveExportDataSchema(data.dataSchema);
+                        if (derived) {
+                          update({
+                            exportEnabled: true,
+                            exportDataSchema: derived,
+                          });
+                          return;
+                        }
+                      }
+                      update({ exportEnabled: checked });
+                    }}
+                  />
+                </div>
+              </div>
+              {data.exportEnabled ? (
+                <>
+                  <WorkflowDataSchemaInputGroup
+                    value={data.exportDataSchema}
+                    onChange={(value) => update({ exportDataSchema: value })}
+                    exampleValue={exportDataSchemaExampleValue}
+                    suggestionContext={{
+                      current_schema: data.exportDataSchema,
+                    }}
+                  />
+                  <div className="space-y-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Filename (optional)
+                    </Label>
+                    <Input
+                      className="nopan text-xs"
+                      disabled={!editable}
+                      onChange={(event) =>
+                        update({ exportFileName: event.target.value })
+                      }
+                      placeholder="records"
+                      value={data.exportFileName}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-tertiary-foreground">
+                        Records (optional)
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["extraction"]["exportRecords"]}
+                      />
+                    </div>
+                    <Textarea
+                      className="nopan min-h-16 font-mono text-xs"
+                      disabled={!editable}
+                      onChange={(event) =>
+                        update({ exportRecords: event.target.value })
+                      }
+                      placeholder="Defaults to this block's own extracted output"
+                      value={data.exportRecords}
+                    />
+                  </div>
+                </>
+              ) : null}
             </div>
           </AccordionContent>
         </AccordionItem>

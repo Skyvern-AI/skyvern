@@ -5,6 +5,9 @@ import {
 } from "@radix-ui/react-icons";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { buildBlockStatusMap, runOutcomeFromStatus } from "./runProjections";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { getRunAttempt } from "../workflowRun/runRetryState";
+import { filterTimelineToAttempt } from "../workflowRun/workflowTimelineUtils";
 import { useStudioRunId } from "./useStudioRunId";
 
 /**
@@ -17,15 +20,30 @@ import { useStudioRunId } from "./useStudioRunId";
  */
 export function BlockStatusBar({ blockLabel }: { blockLabel: string }) {
   const runId = useStudioRunId();
-  const { data: timeline } = useWorkflowRunTimelineQuery(
-    runId ? { workflowRunId: runId } : undefined,
+  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery(runId ? { workflowRunId: runId } : undefined);
+  const timeline = timelineIsPlaceholder ? undefined : retainedTimeline;
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: runId ?? undefined,
+  });
+  const statusMap = useMemo(
+    () =>
+      buildBlockStatusMap(
+        timeline
+          ? filterTimelineToAttempt(
+              timeline,
+              workflowRun?.attempts ?? [],
+              getRunAttempt(workflowRun ?? {}),
+            )
+          : undefined,
+      ),
+    [timeline, workflowRun],
   );
-  const statusMap = useMemo(() => buildBlockStatusMap(timeline), [timeline]);
   const state = statusMap[blockLabel];
   if (!state || !state.status) {
     return null;
   }
-  const outcome = runOutcomeFromStatus(state.status);
+  const outcome = runOutcomeFromStatus({ status: state.status });
 
   if (outcome === "running") {
     return (

@@ -2,7 +2,12 @@ import { describe, expect, test } from "vitest";
 
 import { ProxyLocation, RunEngine } from "@/api/types";
 
-import type { WorkflowBlock, WorkflowSettings } from "../types/workflowTypes";
+import type {
+  DataExportBlock,
+  ExtractionBlock,
+  WorkflowBlock,
+  WorkflowSettings,
+} from "../types/workflowTypes";
 
 import { getElements, getWorkflowBlocks } from "./workflowEditorUtils";
 
@@ -30,6 +35,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
 };
 
 describe("getElements is robust to blocks with undefined parameters", () => {
@@ -71,5 +77,83 @@ describe("engine round-trips through node data", () => {
 
     const [savedBlock] = getWorkflowBlocks(nodes, edges);
     expect(savedBlock).toMatchObject({ engine: "skyvern-3.0" });
+  });
+});
+
+describe("data export blocks", () => {
+  test("an API-authored export block loads and saves without changing its contract", () => {
+    const block = {
+      label: "export_records",
+      block_type: "data_export",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      parameters: [],
+      data: "{{ extraction_output.extracted_information }}",
+      data_schema: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: { type: "integer" } },
+        },
+      },
+      file_name: "records",
+    } as unknown as DataExportBlock;
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const exportNode = nodes.find(
+      (node) => node.data.label === "export_records",
+    );
+
+    expect(exportNode?.type).toBe("dataExport");
+    expect(exportNode?.data).toMatchObject({
+      data: "{{ extraction_output.extracted_information }}",
+      fileName: "records",
+    });
+    expect(getWorkflowBlocks(nodes, edges)).toEqual([
+      expect.objectContaining({
+        block_type: "data_export",
+        data: "{{ extraction_output.extracted_information }}",
+        data_schema: block.data_schema,
+        file_name: "records",
+      }),
+    ]);
+  });
+});
+
+describe("extraction block export fields (SKY-15396)", () => {
+  test("export_data_schema survives a load/save round trip while export is disabled", () => {
+    // The schema must persist even with export_enabled: false, or toggling
+    // export off then back on silently loses whatever the user authored.
+    const exportDataSchema = {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { name: { type: "string" } },
+      },
+    };
+    const block = {
+      label: "extract",
+      block_type: "extraction",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      parameters: [],
+      data_extraction_goal: "extract names",
+      data_schema: null,
+      export_enabled: false,
+      export_data_schema: exportDataSchema,
+      export_file_name: "names",
+      export_records: null,
+    } as unknown as ExtractionBlock;
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const [savedBlock] = getWorkflowBlocks(nodes, edges);
+
+    expect(savedBlock).toMatchObject({
+      export_enabled: false,
+      export_data_schema: exportDataSchema,
+      export_file_name: "names",
+    });
   });
 });

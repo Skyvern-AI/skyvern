@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,10 +27,35 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
+from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
+from skyvern.forge.sdk.copilot.runtime import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    AgentContext,
+    ensure_browser_session,
+    mcp_browser_context,
+    mcp_to_copilot,
+)
+from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.webeye.persistent_sessions_manager import (
+    BrowserOperation,
+    BrowserRetirement,
+    BrowserSessionCreditAdmissionRefusal,
+)
+from tests.unit.copilot_test_helpers import (
+    TURN_EXIT_PATHS,
+    make_copilot_ctx,
+    run_concurrent_turns_on_one_session,
+    run_turn_attaching_during_release,
+    run_turn_cancelled_during_cleanup,
+    run_turn_to_exit,
+)
 from tests.unit.test_copilot_secret_scrub import _make_server
 
 
@@ -110,6 +136,22 @@ def _make_ctx(*, api_key: str | None = "test-api-key") -> AgentContext:
         stream=stream,
         api_key=api_key,
     )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_browser_authority_is_told_so_not_that_creation_failed() -> None:
+    ctx = _make_ctx()
+    ctx.copilot_config = CopilotConfig(browser_tools_available=False)
+
+    assert await ensure_browser_session(ctx) == {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
+
+
+def _admit_mock_browser_operations(manager: MagicMock) -> None:
+    @asynccontextmanager
+    async def _operation(_session_id: str, browser_state: Any) -> AsyncIterator[BrowserOperation]:
+        yield BrowserOperation(browser_state, BrowserRetirement())
+
+    manager.browser_operation = _operation
 
 
 def _manager_reporting_fixed_deadline(remaining_seconds: float | None) -> MagicMock:
@@ -219,6 +261,73 @@ async def test_ensure_browser_session_error_dict_omits_raw_exception(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "expected"),
+    [
+        (
+            runtime.ensure_browser_session,
+            {
+                "ok": False,
+                "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+                "data": {
+                    "browser_session_acquisition_failure": {
+                        "state": "billing_credit_admission_refusal",
+                        "retry_action": None,
+                    }
+                },
+            },
+        ),
+        (
+            runtime.ensure_build_test_browser_session,
+            {
+                "ok": False,
+                "error": (
+                    "Build test did not start because credits are exhausted. "
+                    "No browser or run started. Upgrade your plan in Billing."
+                ),
+                "data": {
+                    "overall_status": "setup_failed",
+                    "failure_reason": (
+                        "Build test did not start because credits are exhausted. "
+                        "No browser or run started. Upgrade your plan in Billing."
+                    ),
+                    "browser_session_id": None,
+                    "build_test_connect_failure": {
+                        "state": "billing_credit_admission_refusal",
+                        "workflow_run_id": None,
+                        "workflow_run_block_id": None,
+                        "task_id": None,
+                        "browser_session_id": None,
+                        "occupier_run_id": None,
+                        "diagnostic": None,
+                        "retry_action": None,
+                    },
+                    "blocks": [],
+                },
+            },
+        ),
+    ],
+)
+async def test_billing_credit_refusal_survives_both_acquisition_callers(
+    monkeypatch: pytest.MonkeyPatch,
+    caller: Callable[[AgentContext], Awaitable[object]],
+    expected: object,
+) -> None:
+    manager = MagicMock()
+    manager.create_session = AsyncMock(side_effect=BrowserSessionCreditAdmissionRefusal())
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    result = await caller(ctx)
+
+    assert result == expected
+    assert ctx.browser_session_id is None
+    manager.create_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pytest.MonkeyPatch) -> None:
     # DefaultPersistentSessionsManager.create_session returns before chromium
     # has finished booting; ensure_browser_session must poll until
@@ -246,6 +355,7 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert result is None
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
+    assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
 
 
 @pytest.mark.asyncio
@@ -271,7 +381,40 @@ async def test_ensure_browser_session_times_out_and_cleans_up(monkeypatch: pytes
     result = await ensure_browser_session(ctx)
     assert result == {"ok": False, "error": "Failed to create browser session"}
     assert ctx.browser_session_id is None
-    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_2")
+    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_2", reason=BrowserSessionCloseReason.aborted)
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_session_from_a_creation_race_closes_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-15022: the loser of a create race closes a healthy browser it never used; that is not an abort.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    ctx = _make_ctx()
+    loser = MagicMock()
+    loser.persistent_browser_session_id = "bs_loser"
+
+    async def _create(**_kwargs: object) -> MagicMock:
+        ctx.browser_session_id = "bs_winner"
+        return loser
+
+    ready_state = MagicMock()
+    ready_state.browser_context = _FakeBrowserContext()
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(side_effect=_create)
+    mock_manager.get_browser_state = AsyncMock(return_value=ready_state)
+    mock_manager.close_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    result = await ensure_browser_session(ctx)
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_winner"
+    mock_manager.close_session.assert_awaited_once_with(
+        "org_1", "bs_loser", reason=BrowserSessionCloseReason.user_requested
+    )
 
 
 @pytest.mark.asyncio
@@ -300,7 +443,9 @@ async def test_cancelled_browser_boot_closes_the_partially_created_session(monke
     with pytest.raises(asyncio.CancelledError):
         await task
     assert ctx.browser_session_id is None
-    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_cancelled_boot")
+    mock_manager.close_session.assert_awaited_once_with(
+        "org_1", "bs_cancelled_boot", reason=BrowserSessionCloseReason.aborted
+    )
 
 
 @pytest.mark.asyncio
@@ -343,6 +488,7 @@ async def test_attach_retires_session_id_when_context_is_not_attachable(
 
     mock_manager = MagicMock()
     mock_manager.get_browser_state = AsyncMock(return_value=dead_state)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -388,6 +534,7 @@ async def test_attach_does_not_retire_a_session_replaced_underneath_it(
         ctx.browser_session_id = "bs_replacement"
 
     mock_manager.get_browser_state = AsyncMock(side_effect=_replace_then_report_dead)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -424,6 +571,7 @@ async def test_attach_keeps_session_when_health_signal_is_unavailable(
 
     mock_manager = MagicMock()
     mock_manager.get_browser_state = AsyncMock(return_value=state)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -449,6 +597,7 @@ async def test_an_undetermined_attach_is_not_read_as_session_loss(monkeypatch: p
     undetermined_state = MagicMock()
     undetermined_state.browser_context = _UnreachableSignalContext()
     mock_manager.get_browser_state = AsyncMock(return_value=undetermined_state)
+    _admit_mock_browser_operations(mock_manager)
     ctx = _make_ctx()
     ctx.browser_session_id = "bs_live"
     with pytest.raises(RuntimeError) as undetermined:
@@ -565,6 +714,7 @@ def _install_dispatch_stack(
     mock_manager = MagicMock()
     mock_manager.get_browser_state = lookup
     mock_manager.create_session = AsyncMock(return_value=created)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.DATABASE.browser_sessions.get_persistent_browser_session = MagicMock(return_value=None)
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
@@ -577,7 +727,7 @@ def _install_dispatch_stack(
     monkeypatch.setattr(runtime, "register_copilot_session", MagicMock())
     monkeypatch.setattr(runtime, "unregister_copilot_session", MagicMock())
 
-    async def _close(_organization_id: str, _session_id: str) -> None:
+    async def _close(_organization_id: str, _session_id: str, **_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(runtime, "close_browser_session_quietly", _close)
@@ -688,6 +838,7 @@ async def test_a_cancelled_caller_leaves_the_determination_running_and_never_inh
 
     mock_manager = MagicMock()
     mock_manager.get_browser_state = AsyncMock(side_effect=_get_browser_state)
+    mock_manager.supports_evict_and_reconnect = MagicMock(return_value=False)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -720,6 +871,7 @@ async def test_a_cancelled_caller_leaves_the_determination_running_and_never_inh
 _COPILOT_PACKAGE = Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "sdk" / "copilot"
 _MANAGER_ENTRY_POINTS = frozenset(
     {
+        "evict_cached_browser_state",
         "resolve_persistent_browser_state",
         "resolve_browser_state_for_context",
         "_resolve_self_heal_browser_state",
@@ -731,11 +883,9 @@ _MANAGER_ENTRY_POINTS = frozenset(
 )
 
 
-# Copilot legitimately bounds two LIFECYCLE calls: the create-and-boot poll (the OSS default
-# manager returns before Chrome exists) and the quiet close (the backend is usually why we are
-# closing). Both are recorded in cloud_docs/persistent-browser-sessions/BOUNDS.md. Every other
-# clock around a manager call is the shape decision 0032 forbids, so adding one means adding its
-# constant here - a visible line in the diff, not a silent exemption.
+# Three LIFECYCLE calls are legitimately bounded and recorded in BOUNDS.md: the create-and-boot
+# poll, the quiet close, and the turn-exit driver release. Every other clock around a manager call
+# is the shape decision 0032 forbids, so adding one means adding its constant here.
 _DOCUMENTED_LIFECYCLE_BOUNDS = frozenset({"_BROWSER_BOOT_WAIT_SECONDS", "_SESSION_CLEANUP_TIMEOUT_SECONDS"})
 
 
@@ -758,11 +908,28 @@ def _called_name(node: ast.AST) -> str | None:
         node = node.value
     if not isinstance(node, ast.Call):
         return None
+    # A shield is transparent to this rule: the bound still lands on the manager call inside it.
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "shield" and node.args:
+        return _called_name(node.args[0])
     if isinstance(node.func, ast.Name):
         return node.func.id
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     return None
+
+
+def _calls_in_own_scope(fn: ast.AsyncFunctionDef | ast.FunctionDef) -> list[ast.Call]:
+    """Calls this function makes itself; a nested function owns its own calls."""
+    calls: list[ast.Call] = []
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call):
+            calls.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return calls
 
 
 def _wait_for_bound(node: ast.Call) -> str:
@@ -898,6 +1065,39 @@ async def test_the_verified_caller_attaches_once_and_reports_what_the_attach_sai
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "verify",
+    [
+        pytest.param(runtime.verify_browser_session_by_attaching, id="run"),
+        pytest.param(runtime.verify_build_test_browser_session_by_attaching, id="build-test"),
+    ],
+)
+async def test_attach_verification_follows_one_concurrent_generation_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    verify: Any,
+) -> None:
+    attach_attempts = 0
+
+    @asynccontextmanager
+    async def _attach(_ctx: AgentContext) -> AsyncIterator[None]:
+        nonlocal attach_attempts
+        attach_attempts += 1
+        if attach_attempts == 1:
+            raise runtime.CopilotBrowserGenerationRetired("bs_live")
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    _install_occupancy_app(monkeypatch, sessions=[_session_row(runnable_id=None)])
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+
+    assert await verify(ctx) is None
+    assert attach_attempts == 2
+    assert ctx.browser_session_id == "bs_live"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("attach_effect", "expected_state"),
     [
         pytest.param(runtime.CopilotBrowserSessionUnavailable("bs_live"), "already_closed", id="closed"),
@@ -999,3 +1199,1138 @@ async def test_build_test_provisioning_failure_retains_created_session_identity(
         "retry_action": "test_end_to_end",
     }
     manager.create_session.assert_awaited_once()
+
+
+def _session_row(*, runnable_id: str | None, runnable_type: str | None = "workflow_run") -> PersistentBrowserSession:
+    now = datetime.now(UTC)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="bs_live",
+        organization_id="org_1",
+        runnable_id=runnable_id,
+        runnable_type=runnable_type,
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _owner_run(
+    *,
+    copilot_session_id: str | None,
+    status: WorkflowRunStatus = WorkflowRunStatus.running,
+    parent_workflow_run_id: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_prior",
+        copilot_session_id=copilot_session_id,
+        status=status,
+        parent_workflow_run_id=parent_workflow_run_id,
+    )
+
+
+def _install_occupancy_app(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sessions: list[PersistentBrowserSession],
+    owner: SimpleNamespace | None = None,
+) -> MagicMock:
+    remaining = list(sessions)
+
+    async def _get_session(**_kwargs: Any) -> PersistentBrowserSession:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    manager = MagicMock()
+    manager.get_session = AsyncMock(side_effect=_get_session)
+    manager.release_browser_session = AsyncMock()
+    manager.create_session = AsyncMock(side_effect=AssertionError("must not replace automatically"))
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=owner)
+    # A row back means the conditional cancel actually claimed the transition; ``None`` is the
+    # no-op the holder's own terminal write already won.
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(
+        return_value=SimpleNamespace(workflow_run_id="wr_prior")
+    )
+    mock_app.DATABASE.workflow_params.record_superseded_build_test_run = AsyncMock()
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS", 0.0)
+    return mock_app
+
+
+@pytest.fixture
+def attached_build_test_ctx(monkeypatch: pytest.MonkeyPatch) -> AgentContext:
+    @asynccontextmanager
+    async def _attach(_ctx: AgentContext) -> AsyncIterator[None]:
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+    return ctx
+
+
+async def _acquire(ctx: AgentContext, *, chat_id: str | None = "wcc_1") -> dict[str, Any] | None:
+    return await runtime.verify_build_test_browser_session_by_attaching(ctx, copilot_chat_id=chat_id)
+
+
+@pytest.mark.asyncio
+async def test_an_unheld_session_dispatches_without_resolving_any_run(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(monkeypatch, sessions=[_session_row(runnable_id=None)])
+
+    assert await _acquire(attached_build_test_ctx) is None
+    assert attached_build_test_ctx.browser_session_id == "bs_live"
+    mock_app.DATABASE.workflow_runs.get_workflow_run.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_this_chats_older_test_run_is_superseded_and_the_same_session_is_reused(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior"), _session_row(runnable_id=None)],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+
+    assert await _acquire(attached_build_test_ctx) is None
+    assert attached_build_test_ctx.browser_session_id == "bs_live"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once_with(
+        "wr_prior", failure_reason=SUPERSEDED_BY_NEWER_TEST_REASON
+    )
+    mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_supersede_whose_owner_never_releases_the_lease_reports_occupied(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session", "owner", "build_test_calls_in_response", "expected_occupier_run_id"),
+    [
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_other"),
+            1,
+            "wr_prior",
+            id="foreign-chat",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id=None),
+            1,
+            "wr_prior",
+            id="no-chat-identity",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1", status=WorkflowRunStatus.completed),
+            1,
+            "wr_prior",
+            id="terminal-owner",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1", status=WorkflowRunStatus.paused),
+            1,
+            "wr_prior",
+            id="paused-owner",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1"),
+            2,
+            "wr_prior",
+            id="sibling-dispatched-this-response",
+        ),
+        pytest.param(_session_row(runnable_id="tsk_1", runnable_type="task"), None, 1, None, id="task-owner"),
+    ],
+)
+async def test_an_occupier_this_turn_may_not_supersede_is_reported_without_a_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    attached_build_test_ctx: AgentContext,
+    session: PersistentBrowserSession,
+    owner: SimpleNamespace | None,
+    build_test_calls_in_response: int,
+    expected_occupier_run_id: str | None,
+) -> None:
+    attached_build_test_ctx.build_test_tool_calls_in_model_response = build_test_calls_in_response
+    mock_app = _install_occupancy_app(monkeypatch, sessions=[session], owner=owner)
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    expected_failure = {
+        "state": "occupied",
+        "browser_session_id": "bs_live",
+        "retry_action": "test_end_to_end",
+    }
+    if expected_occupier_run_id is not None:
+        expected_failure["occupier_run_id"] = expected_occupier_run_id
+    assert result["data"]["build_test_connect_failure"] == expected_failure
+    if expected_occupier_run_id is None:
+        assert "tsk_1" not in result["error"]
+    else:
+        assert expected_occupier_run_id in result["error"]
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+    mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_supersede_cancel_write_reports_occupied_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(
+        side_effect=SQLATimeoutError("cancel write failed")
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+
+
+@pytest.mark.asyncio
+async def test_the_release_wait_reports_occupied_before_the_turn_deadline_fires(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_WAIT_SECONDS", 30.0)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS", 1.0)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS", 0.05)
+
+    async with asyncio.timeout(1.5) as deadline:
+        attached_build_test_ctx.model_stream_deadline = deadline
+        result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_holder_that_ended_on_its_own_is_not_recorded_as_superseded(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """The conditional cancel returns nothing when the holder already reached terminal, so this turn
+    superseded nothing and must not leave a record saying it did."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior"), _session_row(runnable_id=None)],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(return_value=None)
+
+    assert await _acquire(attached_build_test_ctx) is None
+    mock_app.DATABASE.workflow_params.record_superseded_build_test_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_child_run_of_a_live_parent_is_never_superseded(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """Descendant runs inherit the parent's chat id, so a child clears every other guard. Ending it
+    would leave the parent running and reporting a failed child block it did not cause."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1", parent_workflow_run_id="wr_parent"),
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_release_budget_leaves_the_older_test_running(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """Cancelling with no time left to watch the lease drop would end the older test and start
+    nothing in its place, so the older test keeps the browser and this dispatch reports occupied."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    monkeypatch.setattr(runtime, "_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS", 30.0)
+
+    async with asyncio.timeout(0.5) as deadline:
+        attached_build_test_ctx.model_stream_deadline = deadline
+        result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_suspended_turn_deadline_leaves_the_release_wait_unclamped(
+    attached_build_test_ctx: AgentContext,
+) -> None:
+    async with asyncio.timeout(5.0) as deadline:
+        deadline.reschedule(None)
+        attached_build_test_ctx.model_stream_deadline = deadline
+        budget = runtime._supersede_release_budget_seconds(attached_build_test_ctx)
+
+    assert budget == runtime._SUPERSEDE_RELEASE_WAIT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_restored_session_is_consumed_and_the_authored_navigation_survives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner hands back a session it proved answers, so the caller attaches to it rather than
+    minting a replacement, and the work already authored against the old one is still there."""
+    authored_yaml = "blocks:\n  - block_type: goto\n    url: https://example.com/search\n"
+    lookup = _SharedSessionLookup()
+    manager = _install_dispatch_stack(monkeypatch, lookup)
+    manager.get_session = AsyncMock(return_value=_session_row(runnable_id=None))
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_restored"
+    ctx.workflow_yaml = authored_yaml
+
+    assert await runtime.verify_build_test_browser_session_by_attaching(ctx) is None
+
+    result, _ = await _dispatch_browser_tool(ctx)
+
+    assert ctx.browser_session_id == "bs_restored"
+    assert ctx.workflow_yaml == authored_yaml
+    assert '"result": 7' in result.content[0].text
+    assert "browser session was lost" not in result.content[0].text
+    manager.create_session.assert_not_awaited()
+    assert lookup.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_owner_refusing_the_replacement_retires_the_session_and_leaves_a_route_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven-defunct upstream has to reach the user explicitly AND release the held id, or the
+    same authoring request re-attaches to the same corpse for the rest of the chat."""
+    authored_yaml = "blocks:\n  - block_type: goto\n    url: https://example.com/search\n"
+    manager = MagicMock()
+    manager.get_browser_state = AsyncMock(
+        side_effect=BrowserTargetClosedError("Replacement browser state did not answer a CDP roundtrip.")
+    )
+    _admit_mock_browser_operations(manager)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_unusable"
+    ctx.workflow_yaml = authored_yaml
+
+    result = await runtime.verify_build_test_browser_session_by_attaching(ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["data"]["build_test_connect_failure"] == {
+        "state": "already_closed",
+        "browser_session_id": "bs_unusable",
+        "retry_action": "test_end_to_end",
+    }
+    assert "extracted" not in result["data"]
+    assert result["data"].get("overall_status") != "completed"
+    assert ctx.workflow_yaml == authored_yaml
+    assert not ctx.browser_session_id
+
+    provision = AsyncMock(return_value=None)
+    monkeypatch.setattr(runtime, "ensure_build_test_browser_session", provision)
+    assert await runtime.verify_build_test_browser_session_by_attaching(ctx) is None
+    provision.assert_awaited_once()
+
+
+_TURN_EXIT_TERMINAL_REASONS = {
+    "normal": None,
+    "model_error": "unexpected_error",
+    "deadline": "timeout",
+    "cancel": "cancel",
+}
+
+
+def _release_manager(*, evict: AsyncMock | None = None, supported: bool = True) -> MagicMock:
+    manager = MagicMock()
+    manager.supports_evict_and_reconnect = MagicMock(return_value=supported)
+    manager.evict_cached_browser_state = evict or AsyncMock(return_value=True)
+    manager.close_session = AsyncMock()
+    return manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
+async def test_every_turn_exit_releases_the_driver_it_attached(monkeypatch: pytest.MonkeyPatch, exit_path: str) -> None:
+    attached = MagicMock()
+    manager = _release_manager()
+
+    with capture_logs() as logs:
+        result, _ = await run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path=exit_path,
+            session_id="pbs_turn",
+            browser_state=attached,
+        )
+
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_turn",
+        "org-1",
+        expected=attached,
+        detach_remote_driver=True,
+        only_if_unleased=True,
+    )
+    manager.close_session.assert_not_awaited()
+    released = [log for log in logs if log["event"] == "copilot_browser_driver_released"]
+    assert [(log["session_id"], log["had_cached_driver"]) for log in released] == [("pbs_turn", True)]
+    assert result is not None
+    assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS[exit_path]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_prior_run_hydration_still_releases_the_driver_it_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading the origin run attaches to that run's browser before the model loop starts; a
+    cancel landing there must still reach the finalizer with the attach on record."""
+    attached = MagicMock()
+    manager = _release_manager()
+
+    with capture_logs() as logs:
+        result, raised = await run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="cancel",
+            session_id="pbs_origin_run",
+            browser_state=attached,
+            attach_through="prior_run_hydration",
+        )
+
+    assert result is None
+    assert isinstance(raised, asyncio.CancelledError)
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_origin_run",
+        "org-1",
+        expected=attached,
+        detach_remote_driver=True,
+        only_if_unleased=True,
+    )
+    manager.close_session.assert_not_awaited()
+    released = [log for log in logs if log["event"] == "copilot_browser_driver_released"]
+    assert [(log["session_id"], log["had_cached_driver"]) for log in released] == [("pbs_origin_run", True)]
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", [None, "pbs_turn"])
+async def test_a_turn_that_attached_nothing_releases_nothing(
+    monkeypatch: pytest.MonkeyPatch, session_id: str | None
+) -> None:
+    """A turn that never attached must not retire a generation a concurrent turn is driving."""
+    manager = _release_manager()
+
+    await run_turn_to_exit(monkeypatch, manager=manager, exit_path="normal", session_id=session_id, browser_state=None)
+
+    manager.evict_cached_browser_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_manager_that_cannot_reconnect_after_eviction_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OSS default manager drives the browser in-process: detaching its driver would strand
+    the browser and leave the session uncacheable for the rest of its life."""
+    manager = _release_manager(supported=False)
+
+    await run_turn_to_exit(monkeypatch, manager=manager, exit_path="normal", browser_state=MagicMock())
+
+    manager.evict_cached_browser_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raises", "hangs", "cancelled"])
+@pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
+async def test_a_failed_release_does_not_replace_the_turns_own_terminal(
+    monkeypatch: pytest.MonkeyPatch, failure: str, exit_path: str
+) -> None:
+    detached = asyncio.Event()
+
+    async def _hang(*args: object, **kwargs: object) -> bool:
+        await asyncio.sleep(runtime._SESSION_CLEANUP_TIMEOUT_SECONDS * 4)
+        detached.set()
+        return True
+
+    evicts = {
+        "raises": AsyncMock(side_effect=RuntimeError("evict exploded")),
+        "hangs": AsyncMock(side_effect=_hang),
+        "cancelled": AsyncMock(side_effect=asyncio.CancelledError()),
+    }
+    monkeypatch.setattr(runtime, "_SESSION_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+    with capture_logs() as logs:
+        result, raised = await run_turn_to_exit(
+            monkeypatch,
+            manager=_release_manager(evict=evicts[failure]),
+            exit_path=exit_path,
+            browser_state=MagicMock(),
+        )
+
+    assert [log for log in logs if log["event"] == "copilot_browser_driver_released"] == []
+    assert raised is None
+    assert result is not None
+    assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS[exit_path]
+    if failure == "hangs":
+        # The detach outliving the caller's bound is the shield: without it the timed-out wait
+        # cancels the evict and strands the popped cache entry this release exists to drop.
+        await asyncio.wait_for(detached.wait(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_resolve_for_another_session_is_released_by_the_turn_that_attached_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool resolving a run's own session caches that driver on this pod exactly like the chat
+    session's, so the turn that attached it is the only thing that will ever hand it back."""
+    attached = MagicMock()
+    manager = _release_manager()
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        session_id="pbs_turn",
+        resolve_session_id="pbs_other",
+        browser_state=attached,
+    )
+
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_other", "org-1", expected=attached, detach_remote_driver=True, only_if_unleased=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_self_heal_turn_leaves_the_healers_injected_driver_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The healer's injected browser state never entered this pod's cache, so evicting it could
+    only retire a generation this turn does not own."""
+    manager = _release_manager()
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        browser_state=MagicMock(),
+        turn_origin=runtime.TurnOrigin.runtime_self_heal,
+    )
+
+    manager.evict_cached_browser_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_the_last_concurrent_turn_on_a_session_releases_its_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retiring the cached generation cancels its admitted operations, so a turn that exits while
+    a sibling turn is still attached to the same session must leave the driver where it is."""
+    state = MagicMock()
+    manager = _release_manager()
+
+    def _after_first_exit() -> None:
+        manager.evict_cached_browser_state.assert_not_awaited()
+
+    await run_concurrent_turns_on_one_session(
+        monkeypatch, manager=manager, browser_states=(state, state), after_first_exit=_after_first_exit
+    )
+
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_turn", "org-1", expected=state, detach_remote_driver=True, only_if_unleased=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_delivered_while_the_release_waits_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn cancelled mid-cleanup must still report as cancelled, and the detach it already
+    started must finish rather than stranding the popped cache entry."""
+    evicting = asyncio.Event()
+    detached = asyncio.Event()
+
+    async def _slow_evict(*args: object, **kwargs: object) -> bool:
+        evicting.set()
+        await asyncio.sleep(0.05)
+        detached.set()
+        return True
+
+    result, raised = await run_turn_cancelled_during_cleanup(
+        monkeypatch,
+        manager=_release_manager(evict=AsyncMock(side_effect=_slow_evict)),
+        browser_state=MagicMock(),
+        evicting=evicting,
+    )
+
+    assert result is None
+    assert isinstance(raised, asyncio.CancelledError)
+    await asyncio.wait_for(detached.wait(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_only_probed_the_session_still_releases_the_driver_it_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The liveness probe attaches through the same cache as every other lookup, so a turn that
+    never touched the browser afterwards still owns the driver the probe left behind."""
+    attached = MagicMock()
+    manager = _release_manager()
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        browser_state=attached,
+        attach_through="liveness_probe",
+    )
+
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_turn", "org-1", expected=attached, detach_remote_driver=True, only_if_unleased=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_build_test_run_on_the_turns_own_session_records_the_driver_it_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build test that reuses the chat's own browser resolves it outside the tool funnel, so
+    without its own recording the turn exits owing a driver nothing released."""
+    ctx = make_copilot_ctx(browser_session_id="pbs_turn")
+    attached = MagicMock()
+    monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", AsyncMock(return_value=attached))
+
+    await run_execution._observe_authored_locators(
+        ctx,
+        run_session_id="pbs_turn",
+        failed_block_code="page.locator('#pay').click()",
+    )
+
+    assert list(ctx.attached_browser_drivers) == ["pbs_turn"]
+    assert ctx.attached_browser_drivers["pbs_turn"].browser_state is attached
+
+
+@pytest.mark.asyncio
+async def test_a_build_test_run_on_a_separate_session_records_that_session_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_turn")
+    attached = MagicMock()
+    monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", AsyncMock(return_value=attached))
+
+    await run_execution._observe_authored_locators(
+        ctx,
+        run_session_id="pbs_minted",
+        failed_block_code="page.locator('#pay').click()",
+    )
+
+    assert ctx.attached_browser_drivers["pbs_minted"].browser_state is attached
+
+
+def test_every_copilot_resolve_of_a_cached_browser_state_records_what_it_attached() -> None:
+    """The turn-exit release can only retire generations the turn recorded, so a resolve that
+    reaches the pod's cache without a recording beside it strands its driver until the session dies."""
+    offenders: list[str] = []
+    for path in sorted(_COPILOT_PACKAGE.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            names = [_called_name(call) for call in _calls_in_own_scope(node)]
+            if "resolve_persistent_browser_state" in names and "record_attached_browser_driver" not in names:
+                offenders.append(f"{path.name}:{node.lineno} {node.name}")
+    assert offenders == [], "Copilot resolves that never record the driver they attached:\n" + "\n".join(offenders)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_attached_two_sessions_releases_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recording only the newest attach would leave the first session's driver cached for the rest
+    of its lifetime — the exact pileup this release exists to stop."""
+    first, second = MagicMock(), MagicMock()
+    manager = _release_manager()
+    states = {"pbs_first": first, "pbs_second": second}
+    manager.get_browser_state = AsyncMock(side_effect=lambda session_id, *a, **k: states[session_id])
+
+    async def _attach_a_second_session(ctx: runtime.AgentContext) -> None:
+        ctx.browser_session_id = "pbs_second"
+        await runtime.resolve_browser_state_for_context(ctx, session_id="pbs_second")
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        session_id="pbs_first",
+        browser_state=first,
+        on_attached=_attach_a_second_session,
+    )
+
+    released = [call.args[0] for call in manager.evict_cached_browser_state.await_args_list]
+    assert sorted(released) == ["pbs_first", "pbs_second"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_session_does_not_strand_the_first_sessions_attach_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A count left behind by an unreleased session reads as a live sibling turn forever, so every
+    later turn on that session would skip its own release."""
+    first, second = MagicMock(), MagicMock()
+    manager = _release_manager()
+    states = {"pbs_first": first, "pbs_second": second}
+    manager.get_browser_state = AsyncMock(side_effect=lambda session_id, *a, **k: states[session_id])
+
+    async def _attach_a_second_session(ctx: runtime.AgentContext) -> None:
+        ctx.browser_session_id = "pbs_second"
+        await runtime.resolve_browser_state_for_context(ctx, session_id="pbs_second")
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        session_id="pbs_first",
+        browser_state=first,
+        on_attached=_attach_a_second_session,
+    )
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+
+    later = _release_manager()
+    later.get_browser_state = AsyncMock(return_value=first)
+    await run_turn_to_exit(monkeypatch, manager=later, exit_path="normal", session_id="pbs_first", browser_state=first)
+
+    later.evict_cached_browser_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_last_turn_out_retires_the_generation_the_pod_now_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling turn that attached a replacement generation and exited first leaves this turn
+    holding a superseded state, and evicting that one would cache the live driver for good."""
+    superseded, replacement = MagicMock(), MagicMock()
+    manager = _release_manager()
+
+    await run_concurrent_turns_on_one_session(
+        monkeypatch, manager=manager, browser_states=(superseded, replacement), exit_order=(1, 0)
+    )
+
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_turn", "org-1", expected=replacement, detach_remote_driver=True, only_if_unleased=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resolve_abandoned_by_a_cancel_releases_the_driver_it_landed_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lookup is shielded, so a cancelled turn leaves it running and it caches a driver the
+    turn's finalizer never saw recorded."""
+    attached = MagicMock()
+    resolving, evicted = asyncio.Event(), asyncio.Event()
+
+    async def _slow_resolve(**_kwargs: object) -> MagicMock:
+        resolving.set()
+        await asyncio.sleep(0.05)
+        return attached
+
+    async def _evict(*_args: object, **_kwargs: object) -> bool:
+        evicted.set()
+        return True
+
+    manager = _release_manager(evict=AsyncMock(side_effect=_evict))
+    turn = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=attached,
+            get_browser_state=AsyncMock(side_effect=_slow_resolve),
+        )
+    )
+    await resolving.wait()
+    turn.cancel()
+    await turn
+
+    await asyncio.wait_for(evicted.wait(), timeout=2)
+    manager.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_turn", "org-1", expected=attached, detach_remote_driver=True, only_if_unleased=True
+    )
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_already_in_flight", [False, True])
+async def test_a_turn_attaching_while_the_last_release_is_in_flight_ends_on_a_live_generation(
+    monkeypatch: pytest.MonkeyPatch, lookup_already_in_flight: bool
+) -> None:
+    """A lookup that answers with the generation an evict is retiring hands the new turn a driver
+    whose next operation is refused as session_ending, which closes the user's session."""
+    retiring, reconnected = MagicMock(name="retiring"), MagicMock(name="reconnected")
+    manager = _release_manager()
+
+    await run_turn_attaching_during_release(
+        monkeypatch,
+        manager=manager,
+        browser_states=(retiring, reconnected),
+        lookup_already_in_flight=lookup_already_in_flight,
+    )
+
+    evicted = [call.kwargs["expected"] for call in manager.evict_cached_browser_state.await_args_list]
+    assert evicted == [retiring, reconnected]
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+    assert runtime._DRIVER_RELEASES_IN_FLIGHT == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_mid_cleanup_still_hands_back_every_session_the_turn_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Releasing one session at a time lets the cancel that lands on the first one skip the rest,
+    stranding their drivers for the life of the pod."""
+    evicting, both_detached = asyncio.Event(), asyncio.Event()
+    detached: list[str] = []
+
+    async def _slow_evict(session_id: str, *_args: object, **_kwargs: object) -> bool:
+        evicting.set()
+        await asyncio.sleep(0.05)
+        detached.append(session_id)
+        if len(detached) == 2:
+            both_detached.set()
+        return True
+
+    async def _attach_a_second_session(ctx: runtime.AgentContext) -> None:
+        await runtime.resolve_browser_state_for_context(ctx, session_id="pbs_second")
+
+    _result, raised = await run_turn_cancelled_during_cleanup(
+        monkeypatch,
+        manager=_release_manager(evict=AsyncMock(side_effect=_slow_evict)),
+        browser_state=MagicMock(),
+        evicting=evicting,
+        on_attached=_attach_a_second_session,
+    )
+
+    assert isinstance(raised, asyncio.CancelledError)
+    await asyncio.wait_for(both_detached.wait(), timeout=2)
+    assert sorted(detached) == ["pbs_second", "pbs_turn"]
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_outlives_its_wait_still_holds_off_the_next_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manager's own detach bound is longer than the turn's wait, so a lookup admitted after the
+    wait gives up but before the evict pops the entry would be handed the retiring generation."""
+    retiring, reconnected = MagicMock(name="retiring"), MagicMock(name="reconnected")
+    evict_may_finish, evicted = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(runtime, "_SESSION_CLEANUP_TIMEOUT_SECONDS", 0.05)
+
+    async def _slow_evict(*_args: object, **_kwargs: object) -> bool:
+        if not evicted.is_set():
+            await evict_may_finish.wait()
+            evicted.set()
+        return True
+
+    async def _current_generation(**_kwargs: object) -> MagicMock:
+        return reconnected if evicted.is_set() else retiring
+
+    manager = _release_manager(evict=AsyncMock(side_effect=_slow_evict))
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="normal",
+        browser_state=retiring,
+        get_browser_state=AsyncMock(side_effect=_current_generation),
+    )
+    assert "pbs_turn" in runtime._DRIVER_RELEASES_IN_FLIGHT
+
+    second = asyncio.ensure_future(
+        run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="normal",
+            browser_state=reconnected,
+            get_browser_state=AsyncMock(side_effect=_current_generation),
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not second.done()
+    evict_may_finish.set()
+    await asyncio.wait_for(second, 5)
+
+    evicted_generations = [call.kwargs["expected"] for call in manager.evict_cached_browser_state.await_args_list]
+    assert evicted_generations == [retiring, reconnected]
+    assert runtime._DRIVER_RELEASES_IN_FLIGHT == {}
+
+
+@pytest.mark.asyncio
+async def test_a_manager_that_rejects_the_release_call_outright_neither_masks_the_turn_nor_blocks_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synchronous raise (a manager without the newer keyword) happens before any evict task
+    exists; it must be logged like any other failed release and must never leave a marker that
+    every later resolve of the session would wait on forever."""
+    manager = _release_manager()
+    manager.evict_cached_browser_state = MagicMock(side_effect=TypeError("unexpected keyword argument"))
+
+    with capture_logs() as logs:
+        result, _ = await run_turn_to_exit(monkeypatch, manager=manager, exit_path="normal", browser_state=MagicMock())
+
+    assert result is not None
+    assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS["normal"]
+    assert [log["error_type"] for log in logs if log["event"] == "Failed to release browser driver"] == ["TypeError"]
+    assert runtime._DRIVER_RELEASES_IN_FLIGHT == {}
+
+    later = _release_manager()
+    await asyncio.wait_for(
+        run_turn_to_exit(monkeypatch, manager=later, exit_path="normal", browser_state=MagicMock()), 5
+    )
+    later.evict_cached_browser_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_landing_on_the_finalizers_own_await_still_hands_back_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release created inside the awaited gather is cancelled before its first line when the
+    cancel lands there, so the attach count never comes down and every later turn on the session
+    skips its own release."""
+    from skyvern.forge.sdk.copilot import agent as copilot_agent
+
+    manager = _release_manager()
+    real_finalize = copilot_agent.finalize_outcome_verification_trace
+
+    def _finalize_then_cancel(*args: object, **kwargs: object) -> None:
+        real_finalize(*args, **kwargs)
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+    monkeypatch.setattr(copilot_agent, "finalize_outcome_verification_trace", _finalize_then_cancel)
+
+    _, raised = await run_turn_to_exit(monkeypatch, manager=manager, exit_path="normal", browser_state=MagicMock())
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert isinstance(raised, asyncio.CancelledError)
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+    manager.evict_cached_browser_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_release_on_another_session_does_not_reissue_an_overlapping_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a busy pod, steady turn exits on other sessions would otherwise re-issue every slow
+    attach in flight and leave it without a bound."""
+    other_released = asyncio.Event()
+    lookups = 0
+
+    async def _slow_lookup(**_kwargs: object) -> MagicMock:
+        nonlocal lookups
+        lookups += 1
+        await asyncio.wait_for(other_released.wait(), 5)
+        return MagicMock(name="pbs_slow generation")
+
+    slow_manager = _release_manager()
+    slow_manager.get_browser_state = AsyncMock(side_effect=_slow_lookup)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = slow_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    slow = asyncio.ensure_future(
+        runtime.resolve_persistent_browser_state(session_id="pbs_slow", organization_id="org-1")
+    )
+    await asyncio.sleep(0)
+    other = runtime.AttachedBrowserDriver("pbs_other", MagicMock())
+    runtime._hold_attached_browser_driver("pbs_other", other.browser_state, new_holder=True)
+    await runtime.release_browser_driver_quietly("org-1", other)
+    other_released.set()
+
+    assert await asyncio.wait_for(slow, 5) is not None
+    assert lookups == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unwind_seconds", [0.02, 2.0], ids=["unwinds_within_the_bound", "outlives_the_bound"])
+async def test_a_release_refused_for_the_turns_own_unwinding_operation_waits_it_out(
+    monkeypatch: pytest.MonkeyPatch, unwind_seconds: float
+) -> None:
+    """A cancelled turn's tool task can still be inside its admitted operation when the finalizer
+    runs. Taking the manager's refusal as done would leave the driver cached for the session's life,
+    and an unwind slower than the turn's cleanup bound must delay the release, not the turn."""
+    monkeypatch.setattr(runtime, "_SESSION_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    admitted: set[asyncio.Task[object]] = set()
+    let_tool_finish = asyncio.Event()
+    tool_entered = asyncio.Event()
+    attached = MagicMock()
+    attached.browser_context = _FakeBrowserContext()
+
+    @asynccontextmanager
+    async def _operation(_session_id: str, browser_state: Any) -> AsyncIterator[BrowserOperation]:
+        task = asyncio.current_task()
+        assert task is not None
+        admitted.add(task)
+        try:
+            yield BrowserOperation(browser_state, BrowserRetirement())
+        finally:
+            admitted.discard(task)
+
+    async def _evict_only_if_unleased(*_args: object, **_kwargs: object) -> bool:
+        return not admitted
+
+    manager = _release_manager(evict=AsyncMock(side_effect=_evict_only_if_unleased))
+    manager.browser_operation = _operation
+    monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
+    monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *_a, **_kw: MagicMock(workflow_run_id=None))
+    monkeypatch.setattr(runtime, "set_api_key_override", lambda _key: object())
+    monkeypatch.setattr(runtime, "reset_api_key_override", lambda _token: None)
+    monkeypatch.setattr(runtime, "register_copilot_session", MagicMock())
+    monkeypatch.setattr(runtime, "unregister_copilot_session", MagicMock())
+
+    async def _tool_call(ctx: runtime.AgentContext) -> None:
+        async with mcp_browser_context(ctx):
+            tool_entered.set()
+            await let_tool_finish.wait()
+
+    tool: asyncio.Task[None] | None = None
+
+    async def _start_tool(ctx: runtime.AgentContext) -> None:
+        nonlocal tool
+        tool = asyncio.ensure_future(_tool_call(ctx))
+        await asyncio.wait_for(tool_entered.wait(), 5)
+        asyncio.get_running_loop().call_later(unwind_seconds, let_tool_finish.set)
+
+    refused_while_busy: list[bool] = []
+    real_evict = manager.evict_cached_browser_state
+
+    async def _evict_recording_busy(*args: object, **kwargs: object) -> bool:
+        refused_while_busy.append(bool(admitted))
+        return await real_evict(*args, **kwargs)
+
+    manager.evict_cached_browser_state = AsyncMock(side_effect=_evict_recording_busy)
+
+    with capture_logs() as logs:
+        result, _ = await run_turn_to_exit(
+            monkeypatch,
+            manager=manager,
+            exit_path="cancel",
+            browser_state=attached,
+            on_attached=_start_tool,
+        )
+        assert tool is not None
+        turn_exited_first = not tool.done()
+        await tool
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    assert refused_while_busy == [False], "the release evicted while the tool was still admitted"
+    if unwind_seconds > 0.05:
+        assert turn_exited_first, "the turn's exit waited on the tool past the cleanup bound"
+
+    assert result is not None and result.turn_outcome.terminal_reason == "cancel"
+    assert runtime._ATTACHED_TURNS_PER_SESSION == {}
+    released = [log["had_cached_driver"] for log in logs if log["event"] == "copilot_browser_driver_released"]
+    assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_operation_on_one_session_does_not_hold_another_sessions_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Waiting on a turn-wide operation set would let a stuck tool on session A strand session B's
+    driver for the pod's life."""
+    monkeypatch.setattr(runtime, "_SESSION_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    wedged = asyncio.Event()
+    tool_entered = asyncio.Event()
+    first, second = MagicMock(name="first"), MagicMock(name="second")
+    for state in (first, second):
+        state.browser_context = _FakeBrowserContext()
+    states = {"pbs_first": first, "pbs_second": second}
+
+    @asynccontextmanager
+    async def _operation(_session_id: str, browser_state: Any) -> AsyncIterator[BrowserOperation]:
+        yield BrowserOperation(browser_state, BrowserRetirement())
+
+    manager = _release_manager()
+    manager.browser_operation = _operation
+    manager.get_browser_state = AsyncMock(side_effect=lambda session_id, *a, **k: states[session_id])
+    monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
+    monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *_a, **_kw: MagicMock(workflow_run_id=None))
+    monkeypatch.setattr(runtime, "set_api_key_override", lambda _key: object())
+    monkeypatch.setattr(runtime, "reset_api_key_override", lambda _token: None)
+    monkeypatch.setattr(runtime, "register_copilot_session", MagicMock())
+    monkeypatch.setattr(runtime, "unregister_copilot_session", MagicMock())
+
+    async def _wedged_tool_on_first(ctx: runtime.AgentContext) -> None:
+        async with mcp_browser_context(ctx):
+            tool_entered.set()
+            await wedged.wait()
+
+    tool: asyncio.Task[None] | None = None
+
+    async def _attach_second_and_wedge_first(ctx: runtime.AgentContext) -> None:
+        nonlocal tool
+        tool = asyncio.ensure_future(_wedged_tool_on_first(ctx))
+        await asyncio.wait_for(tool_entered.wait(), 5)
+        ctx.browser_session_id = "pbs_second"
+        await runtime.resolve_browser_state_for_context(ctx, session_id="pbs_second")
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path="cancel",
+        session_id="pbs_first",
+        browser_state=first,
+        on_attached=_attach_second_and_wedge_first,
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    released = [call.args[0] for call in manager.evict_cached_browser_state.await_args_list]
+    assert released == ["pbs_second"], "the idle session waited on the other session's stuck tool"
+
+    wedged.set()
+    assert tool is not None
+    await tool
+    for _ in range(5):
+        await asyncio.sleep(0)
+    released = [call.args[0] for call in manager.evict_cached_browser_state.await_args_list]
+    assert sorted(released) == ["pbs_first", "pbs_second"]

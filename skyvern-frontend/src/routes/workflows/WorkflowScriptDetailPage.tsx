@@ -404,7 +404,7 @@ function WorkflowScriptDetailPage() {
                   <TableRow key={run.workflow_run_id}>
                     <TableCell>
                       <Link
-                        to={`/agents/${workflowPermanentId}/${run.workflow_run_id}/overview`}
+                        to={`/runs/${run.workflow_run_id}`}
                         className="font-mono text-sm text-blue-700 hover:underline dark:text-blue-400"
                       >
                         {run.workflow_run_id}

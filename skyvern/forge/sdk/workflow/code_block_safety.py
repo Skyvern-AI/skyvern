@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import builtins
+import datetime
+import html
+import json
+import re
 import textwrap
 from collections import Counter
 from collections.abc import Callable
 from string import Formatter
+from types import SimpleNamespace
+from typing import Any
 
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 
@@ -161,6 +169,85 @@ ALLOWED_SELF_SUPER_DUNDERS: frozenset[str] = frozenset({"__init__", "__post_init
 ALLOWED_SCRIPT_DUNDER_READS: frozenset[str] = frozenset({"__all__", "__doc__", "__file__", "__name__"})
 ALLOWED_SCRIPT_DUNDER_WRITES: frozenset[str] = frozenset({"__all__"})
 ALLOWED_SCRIPT_NAMEDTUPLE_ATTRS: frozenset[str] = frozenset({"_asdict", "_fields", "_make", "_replace"})
+
+# Twins of codeblock/codeblock_runtime.py's _ALWAYS_DENIED_BUILTINS / _SANDBOX_ONLY_BUILTINS; the
+# runner image carries its own copy and tests/cloud asserts the two stay equal.
+ALWAYS_DENIED_BUILTINS: frozenset[str] = frozenset(
+    {
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "breakpoint",
+        "help",
+        "exit",
+        "quit",
+        "copyright",
+        "credits",
+        "license",
+        "BaseException",
+        "BaseExceptionGroup",
+        "GeneratorExit",
+        "KeyboardInterrupt",
+        "SystemExit",
+        "format",
+        "memoryview",
+    }
+)
+SANDBOX_ONLY_BUILTINS: frozenset[str] = frozenset(
+    {
+        "getattr",
+        "setattr",
+        "delattr",
+        "vars",
+        "globals",
+        "locals",
+        "type",
+        "super",
+        "staticmethod",
+        "classmethod",
+        "property",
+    }
+)
+
+
+def safe_builtins() -> dict[str, Any]:
+    """Builtins a CodeBlock may use while sharing the worker process; dunders drop out via the underscore filter."""
+    denied = ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS
+    return {name: value for name, value in vars(builtins).items() if not name.startswith("_") and name not in denied}
+
+
+def module_shims() -> dict[str, SimpleNamespace]:
+    """Fresh module-shaped namespaces both CodeBlock executors bind as globals."""
+    return {
+        "asyncio": SimpleNamespace(sleep=asyncio.sleep),
+        "re": SimpleNamespace(
+            match=re.match,
+            search=re.search,
+            findall=re.findall,
+            finditer=re.finditer,
+            fullmatch=re.fullmatch,
+            sub=re.sub,
+            compile=re.compile,
+            split=re.split,
+            escape=re.escape,
+            I=re.I,
+            S=re.S,
+            IGNORECASE=re.IGNORECASE,
+            MULTILINE=re.MULTILINE,
+            DOTALL=re.DOTALL,
+        ),
+        "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
+        "html": SimpleNamespace(escape=html.escape),
+        "datetime": SimpleNamespace(
+            datetime=datetime.datetime,
+            date=datetime.date,
+            timedelta=datetime.timedelta,
+            timezone=datetime.timezone,
+            UTC=datetime.UTC,
+        ),
+    }
 
 
 def _import_roots(node: ast.Import | ast.ImportFrom) -> tuple[str, ...]:
@@ -439,6 +526,18 @@ def _validate_tree(
             )
             if not is_allowed_read and not is_self_super_private:
                 raise error_factory("Not allowed to access private methods or attributes")
+        # MatchClass keyword patterns read attributes without creating ast.Attribute nodes.
+        if isinstance(node, ast.MatchClass):
+            for attr in node.kwd_attrs:
+                if attr in blocked_private_attrs:
+                    raise error_factory(f"Not allowed to access '{attr}'")
+                if attr.startswith("_") and attr not in allowed_dunder_reads and attr not in allowed_private_reads:
+                    raise error_factory("Not allowed to access private methods or attributes")
+                if attr in blocked_attrs:
+                    raise error_factory(f"Not allowed to access '{attr}'")
+            # Positional patterns hide attribute names behind runtime-defined __match_args__.
+            if node.patterns:
+                raise error_factory("Not allowed to use positional patterns in match statements")
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in blocked_names:
             raise error_factory(f"Not allowed to use '{node.id}'")
         if (
@@ -539,7 +638,16 @@ def is_safe_code(
     *,
     error_factory: Callable[[str], Exception] = InsecureCodeDetected,
 ) -> None:
-    """Reject imports, private members, and known escape hatches."""
+    """Reject imports, private members, and known escape hatches.
+
+    Leaves bare builtin names like `globals`/`locals` unblocked here; the caller decides
+    whether and how those (and any other) builtins are bound in the dict it execs the
+    validated code against, and owns making sure nothing reachable through that dict is an
+    escape. The legacy in-process path (CodeBlock.build_safe_vars) never binds them, so a bare
+    call there raises NameError. is_safe_script_code instead blocks the bare names outright,
+    because it validates a real importlib-loaded module with the genuine `__builtins__`
+    attached and no sandbox underneath.
+    """
     tree = ast.parse(textwrap.dedent(code))
     _validate_tree(
         tree,

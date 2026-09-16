@@ -4,7 +4,6 @@ import { toast } from "@/components/ui/use-toast";
 import { buildOptimisticStep } from "@/routes/workflows/editor/recording/optimisticSteps";
 import {
   useRecordingStore,
-  type ExfiltratedEventConsoleParams,
   type MessageInExfiltratedEvent,
   type RecordingInterpretationUpdate,
 } from "@/store/useRecordingStore";
@@ -22,8 +21,6 @@ export interface UseRecordingMessageChannelOptions {
   /** recording active: drives begin/end-exfiltration on edges */
   exfiltrate: boolean;
   workflowPermanentId: string | null;
-  /** returns a data URL of the current frame for click screenshots, or null */
-  getFrameDataUrl?: () => string | null;
   clipboard: RecordingClipboardMode;
   socketUrl?: string;
   reconnectTrigger?: number;
@@ -48,6 +45,9 @@ interface CommandCedeControl {
 
 interface CommandEndExfiltration {
   kind: "end-exfiltration";
+  discard: boolean;
+  interpretation_session_id?: string;
+  workflow_permanent_id?: string;
 }
 
 interface CommandTakeControl {
@@ -247,38 +247,10 @@ function getMessage(data: unknown): MessageIn | undefined {
   }
 }
 
-function captureRecordingScreenshot(
-  params: ExfiltratedEventConsoleParams,
-  getFrameDataUrl: (() => string | null) | undefined,
-) {
-  const schedule =
-    typeof requestIdleCallback === "function"
-      ? (fn: () => void) => requestIdleCallback(fn, { timeout: 750 })
-      : (fn: () => void) => window.setTimeout(fn, 0);
-
-  schedule(() => {
-    try {
-      const dataUrl = getFrameDataUrl?.();
-      if (!dataUrl) {
-        return;
-      }
-      useRecordingStore.getState().addScreenshot({
-        timestampMs: params.timestamp,
-        dataUrl,
-        xp: params.mousePosition.xp,
-        yp: params.mousePosition.yp,
-      });
-    } catch {
-      // toDataURL can throw on a tainted/headless canvas; shots are optional
-    }
-  });
-}
-
 function handleMessage(
   data: unknown,
   ws: WebSocket | null,
   clipboard: RecordingClipboardMode,
-  getFrameDataUrl: (() => string | null) | undefined,
   onBeginExfiltrationError: () => void,
 ) {
   const message = getMessage(data);
@@ -383,13 +355,6 @@ function handleMessage(
       }
       if (
         store.isRecording &&
-        message.source === "console" &&
-        message.params.type === "click"
-      ) {
-        captureRecordingScreenshot(message.params, getFrameDataUrl);
-      }
-      if (
-        store.isRecording &&
         !store.finishRequested &&
         message.source === "cdp" &&
         (message.event_name === "nav:frame_navigated" ||
@@ -448,6 +413,10 @@ export function useRecordingMessageChannel(
   const optionsRef = useRef(options);
   const exfiltrateRef = useRef(exfiltrate);
   const beganRef = useRef(false);
+  const retainedFinalizationRef = useRef<{
+    interpretationSessionId: string;
+    workflowPermanentId: string;
+  } | null>(null);
   const previousExfiltrateRef = useRef(false);
   const beginRetryAttemptsRef = useRef(0);
   const beginRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -460,6 +429,38 @@ export function useRecordingMessageChannel(
       beginRetryTimerRef.current = null;
     }
   }, []);
+
+  const sendEndExfiltration = useCallback(
+    (socket: WebSocket, discard: boolean) => {
+      const store = useRecordingStore.getState();
+      const finalizationIdentity = retainedFinalizationRef.current ?? {
+        interpretationSessionId: store.interpretationSessionId,
+        workflowPermanentId: optionsRef.current.workflowPermanentId,
+      };
+      socket.send(
+        JSON.stringify({
+          kind: "end-exfiltration",
+          discard,
+          interpretation_session_id:
+            finalizationIdentity.interpretationSessionId ?? undefined,
+          workflow_permanent_id:
+            finalizationIdentity.workflowPermanentId ?? undefined,
+        }),
+      );
+      if (discard) {
+        retainedFinalizationRef.current = null;
+      } else if (
+        finalizationIdentity.interpretationSessionId &&
+        finalizationIdentity.workflowPermanentId
+      ) {
+        retainedFinalizationRef.current = {
+          interpretationSessionId: finalizationIdentity.interpretationSessionId,
+          workflowPermanentId: finalizationIdentity.workflowPermanentId,
+        };
+      }
+    },
+    [],
+  );
 
   const sendBeginExfiltration = useCallback(() => {
     const socket = messageSocketRef.current;
@@ -555,7 +556,6 @@ export function useRecordingMessageChannel(
             message,
             ws,
             currentOptions.clipboard,
-            currentOptions.getFrameDataUrl,
             scheduleBeginRetry,
           );
         } catch (e) {
@@ -588,13 +588,14 @@ export function useRecordingMessageChannel(
       // session resumable (SKY-12429), so it does not send END. Once the store
       // says recording ended, cleanup flushes END for a same-commit panel
       // unmount that prevented the exfiltrate falling-edge effect from running.
-      if (
-        ws?.readyState === WebSocket.OPEN &&
-        beganRef.current &&
-        !useRecordingStore.getState().isRecording
-      ) {
-        ws.send(JSON.stringify({ kind: "end-exfiltration" }));
-        beganRef.current = false;
+      const store = useRecordingStore.getState();
+      if (ws?.readyState === WebSocket.OPEN && !store.isRecording) {
+        if (beganRef.current) {
+          sendEndExfiltration(ws, !store.finishRequested);
+          beganRef.current = false;
+        } else if (retainedFinalizationRef.current && !store.finishRequested) {
+          sendEndExfiltration(ws, true);
+        }
       }
       messageSocketRef.current = null;
       try {
@@ -612,6 +613,7 @@ export function useRecordingMessageChannel(
     enabled,
     reconnectTrigger,
     scheduleBeginRetry,
+    sendEndExfiltration,
     socketUrl,
   ]);
 
@@ -639,7 +641,10 @@ export function useRecordingMessageChannel(
       beginRetryAttemptsRef.current = 0;
       const socket = messageSocketRef.current;
       if (socket?.readyState === WebSocket.OPEN && beganRef.current) {
-        socket.send(JSON.stringify({ kind: "end-exfiltration" }));
+        sendEndExfiltration(
+          socket,
+          !useRecordingStore.getState().finishRequested,
+        );
         beganRef.current = false;
       }
     }
@@ -649,6 +654,7 @@ export function useRecordingMessageChannel(
     messageSocket,
     recordingAttemptId,
     sendBeginExfiltration,
+    sendEndExfiltration,
     workflowPermanentId,
   ]);
 

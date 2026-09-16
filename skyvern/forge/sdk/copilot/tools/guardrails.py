@@ -169,6 +169,7 @@ def _authority_tool_error(
             "run_blocks_and_collect_debug",
             "edit_block_and_run",
             "discover_workflow_entrypoint",
+            "search_web",
         }
         and isinstance(policy, RequestPolicy)
         and policy.raw_secret_detected

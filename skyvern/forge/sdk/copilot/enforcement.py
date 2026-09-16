@@ -13,10 +13,16 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
+from agents.exceptions import MaxTurnsExceeded
+from agents.memory.session import Session
 from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
+from skyvern.forge.sdk.copilot.budget_expiry import (
+    BudgetExpirySource,
+    serialize_budget_expiry_observation,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     credential_scout_gap,
@@ -45,8 +51,9 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
-from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
+from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
@@ -100,6 +107,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -113,6 +121,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
+BUDGET_DRAIN_HEADROOM = 4
+HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -156,30 +166,21 @@ _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
 
 
-def _normalized_proxy_label(proxy_location: Any) -> str | None:
-    if proxy_location is None:
-        return None
-    raw_value = getattr(proxy_location, "value", proxy_location)
-    if isinstance(raw_value, dict):
-        country = raw_value.get("country")
-        subdivision = raw_value.get("subdivision")
-        city = raw_value.get("city")
-        parts = [str(part).strip() for part in (country, subdivision, city) if part]
-        return "-".join(parts) if parts else None
-    value = str(raw_value).strip()
-    if not value or value.upper() in {"NONE", "NULL", "NO_PROXY"}:
-        return None
-    return value
-
-
-def _effective_proxy_label(ctx: Any) -> str | None:
-    effective_raw = getattr(ctx, "effective_workflow_proxy_location", None)
-    if effective_raw is not None:
-        return _normalized_proxy_label(effective_raw)
-    workflow = getattr(ctx, "last_workflow", None)
-    if workflow is None:
-        return None
-    return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
+def proxy_hop_failure_reason(
+    ctx: AgentContext,
+    reason: str,
+    session_proxy_location: ProxyLocationInput = None,
+    session_made_hop: bool = False,
+) -> str:
+    # A session that made the hop is the authority on the proxy it used. Reading the workflow's
+    # declared proxy when that session named none would label a location the hop never went through.
+    label = (
+        None
+        if session_made_hop and session_proxy_location is None
+        else effective_proxy_label(ctx, session_proxy_location)
+    )
+    hop = "Skyvern proxy hop failed" if label is None else f"Skyvern proxy hop failed (proxy_location={label})"
+    return f"{hop}: {reason}"
 
 
 def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
@@ -285,6 +286,8 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
 def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
     already_marked = ctx.copilot_total_timeout_exceeded is True
     ctx.copilot_total_timeout_exceeded = True
+    if ctx.budget_expiry_state.source is None:
+        ctx.budget_expiry_state.source = "deadline"
     if already_marked:
         return
     LOG.warning(
@@ -296,7 +299,7 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
-    """Wall-clock elapsed since ``start_time``, minus time spent in a credential pause.
+    """Wall-clock elapsed since ``start_time``, minus completed and active human-input waits.
 
     Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
     time, so a paused-and-resumed turn isn't penalized for pause time.
@@ -308,7 +311,15 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
     if not isinstance(pause_seconds, (int, float)):
         pause_seconds = 0.0
-    return time.monotonic() - start_time - pause_seconds
+    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
+    if not isinstance(question_seconds, (int, float)):
+        question_seconds = 0.0
+    now = time.monotonic()
+    wait = getattr(ctx, "human_input_wait", None)
+    # Overlapping waits credit their union only when the last waiter exits.
+    # Until then, exclude the active union at model/tool completion boundaries.
+    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
+    return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
 def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
@@ -601,6 +612,9 @@ def is_synthetic_user_message(item: Any) -> bool:
 _PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
 _PACKET_LIST_CAP = 6
 _PACKET_REASON_CAP = 200
+# The challenge notices are whole sentences whose trailing clauses carry the qualification
+# ("availability ... is not a recommendation"), so the failure-reason cap would cut the meaning out.
+_PACKET_NOTICE_CAP = 400
 
 
 def _bounded_error_codes(codes: Any) -> list[str]:
@@ -622,6 +636,15 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
         bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
         if bounded_run:
             kept["run"] = bounded_run
+    challenge = packet.get("challenge")
+    if isinstance(challenge, dict) and challenge:
+        kept["challenge"] = challenge
+    levers = packet.get("levers")
+    if isinstance(levers, list) and levers:
+        kept["levers"] = [lever for lever in levers[:_PACKET_LIST_CAP] if isinstance(lever, dict)]
+    notices = packet.get("challenge_notices")
+    if isinstance(notices, list) and notices:
+        kept["challenge_notices"] = [str(notice)[:_PACKET_NOTICE_CAP] for notice in notices[:_PACKET_LIST_CAP]]
     failure = packet.get("failure")
     if isinstance(failure, dict):
         bounded: dict[str, Any] = {}
@@ -714,6 +737,11 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
         kept["challenge_state"] = {
             key: challenge_state.get(key) for key in ("detected", "kind", "source") if challenge_state.get(key)
         }
+        # The lever inventory is the author-time half of this change; summarizing it away leaves
+        # the model with a detected wall and nothing the product can do about it.
+        levers = challenge_state.get("levers")
+        if isinstance(levers, list) and levers:
+            kept["challenge_state"]["levers"] = [lever for lever in levers if isinstance(lever, dict)]
     indicators = data.get("anti_bot_indicators")
     if isinstance(indicators, list) and indicators:
         kept["anti_bot_indicators"] = indicators[:8]
@@ -746,6 +774,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
 
     data = parsed.get("data")
+    # Session continuation can compact the same output again. Re-bound the
+    # structured synopsis instead of discarding its already-retained facts.
+    if not isinstance(data, dict) and isinstance(parsed.get("page_evidence"), dict):
+        data = parsed["page_evidence"]
     if isinstance(data, dict) and _is_page_evidence(data):
         synopsis["page_evidence"] = _summarize_page_evidence(parsed, data)
         synopsis["_summarized"] = "older page evidence — bounded facts retained, raw excerpts dropped"
@@ -776,6 +808,10 @@ def _summarize_tool_output(output: str) -> str:
         unresolved = data.get("unresolved_earlier_failure")
         if isinstance(unresolved, dict) and unresolved:
             synopsis["unresolved_earlier_failure"] = unresolved
+
+        change_identity = data.get("prior_attempt_change_identity")
+        if isinstance(change_identity, dict) and change_identity:
+            synopsis["prior_attempt_change_identity"] = change_identity
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
@@ -1150,36 +1186,114 @@ async def _run_streamed_with_deadline(
     agent: Agent,
     current_input: str | list,
     ctx: Any,
-    session: Any,
+    session: Session | None,
     tracked_stream: _SendTrackingStream,
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
 ) -> Any:
-    """Run ``Runner.run_streamed`` + ``stream_to_sse`` with a deadline
-    against ``TOTAL_TIMEOUT_SECONDS``.
+    """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
     The top-of-loop elapsed check only fires between iterations; a
-    long-running tool inside ``Runner.run_streamed`` needs ``wait_for``
-    to raise ``CopilotTotalTimeoutError`` mid-tool so the caller's
-    ``_build_exit_result`` path emits a non-empty REPLY before the
-    client's own transport timeout closes the stream.
+    long-running tool inside ``Runner.run_streamed`` needs this watchdog
+    to raise ``CopilotTotalTimeoutError`` after the soft budget and drain
+    allowance are both spent. The live watchdog is
+    published on the context so a tool that parks on a user decision (the
+    credential card) can suspend it for the length of that wait.
 
-    ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so
-    ``wait_for(timeout=0)`` never panics on an already-spent budget.
+    ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so a zero
+    timeout never panics on an already-spent budget.
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
-    remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
+    remaining = max(
+        MIN_DEADLINE_REMAINING_SECONDS,
+        TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
+    )
     with pending_operation("turn.stream", span=True):
         result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+
+        def check_model_work_deadline() -> None:
+            if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
+                # SDK after_turn finishes pending tools and persists their outputs before
+                # returning, so the drain can see them without another ordinary model call.
+                result.cancel(mode="after_turn")
+
+        ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
         try:
             try:
-                await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+                async with asyncio.timeout(remaining) as deadline:
+                    ctx.model_stream_deadline = deadline
+                    await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                ctx.model_stream_deadline = None
+                ctx.check_model_work_deadline = None
+                # A request_credential call the SDK rejected before its handler ran leaves the gate
+                # armed with no releaser, and arm_credential_pause_gate skips a stranded Event, so
+                # every later response's run tools would park on it. A rejected call never sets the
+                # in-flight flag, so this still cannot open the gate under a card that is on screen.
+                if not ctx.credential_ask_in_flight:
+                    release_credential_pause_gate(ctx)
                 _accumulate_usage(result, ctx)
         except TimeoutError:
+            ctx.budget_expiry_state.hard_backstop_reached = True
             _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
             raise CopilotTotalTimeoutError() from None
+    return result
+
+
+def _mark_budget_expiry(ctx: CopilotContext, source: BudgetExpirySource) -> None:
+    state = ctx.budget_expiry_state
+    if state.source is None:
+        state.source = source
+    if source == "deadline":
+        ctx.copilot_total_timeout_exceeded = True
+    else:
+        ctx.copilot_max_turns_exceeded = True
+    if state.staged_draft_id is None and ctx.staged_workflow is not None:
+        state.staged_draft_id = ctx.staged_workflow.workflow_id
+
+
+async def _run_budget_drain(
+    agent: Agent,
+    ctx: CopilotContext,
+    session: Session | None,
+    stream: EventSourceStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+    source: BudgetExpirySource,
+) -> RunResultStreaming:
+    _mark_budget_expiry(ctx, source)
+    state = ctx.budget_expiry_state
+    if state.drain_attempted:
+        raise MaxTurnsExceeded("Budget drain already attempted")
+    drain_kwargs = dict(runner_kwargs)
+    drain_kwargs["max_turns"] = BUDGET_DRAIN_HEADROOM
+    observation = serialize_budget_expiry_observation(
+        source=state.source or source,
+        headroom=BUDGET_DRAIN_HEADROOM,
+        staged_draft=state.staged_draft_id,
+    )
+    state.begin_drain()
+    LOG.info(
+        "copilot_budget_drain_started",
+        source=state.source,
+        drain_fingerprint=state.drain_fingerprint,
+        staged_draft_id=state.staged_draft_id,
+    )
+    try:
+        result = await _run_streamed_with_deadline(
+            agent,
+            observation,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            drain_kwargs,
+            start_time,
+            iteration,
+        )
+    finally:
+        state.drain_active = False
     return result
 
 
@@ -1711,9 +1825,18 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if elapsed > TOTAL_TIMEOUT_SECONDS:
+        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-            raise CopilotTotalTimeoutError()
+            return await _run_budget_drain(
+                agent,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                "deadline",
+            )
 
         # When the current turn contains image payloads, the session-backed
         # input filter cannot protect us — the payload is in current_input,
@@ -1749,6 +1872,17 @@ async def run_with_enforcement(
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
+            except MaxTurnsExceeded:
+                return await _run_budget_drain(
+                    agent,
+                    ctx,
+                    session,
+                    stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                    "max_turns",
+                )
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1793,6 +1927,17 @@ async def run_with_enforcement(
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
+                except MaxTurnsExceeded:
+                    return await _run_budget_drain(
+                        agent,
+                        ctx,
+                        session,
+                        stream,
+                        runner_kwargs,
+                        start_time,
+                        iteration,
+                        "max_turns",
+                    )
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
@@ -1802,6 +1947,20 @@ async def run_with_enforcement(
                         has_session=session is not None,
                     )
                     raise
+
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        if elapsed >= TOTAL_TIMEOUT_SECONDS:
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
+            return await _run_budget_drain(
+                agent,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                "deadline",
+            )
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace

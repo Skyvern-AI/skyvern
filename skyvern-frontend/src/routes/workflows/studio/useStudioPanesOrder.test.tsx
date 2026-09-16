@@ -8,11 +8,12 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { type StudioPaneId } from "./panes";
+import { StudioShellContext } from "./StudioShellContext";
 import { useStudioPanes } from "./useStudioPanes";
 
 beforeEach(() => {
@@ -54,6 +55,7 @@ function CopilotMemoryProbe() {
       <button onClick={() => togglePane("copilot")}>toggle-copilot</button>
       <button onClick={() => togglePane("browser")}>toggle-browser</button>
       <button onClick={() => togglePane("editor")}>toggle-editor</button>
+      <button onClick={() => openPane("browser")}>open-browser</button>
       <button
         onClick={() =>
           openPane("copilot", {
@@ -92,6 +94,31 @@ function renderCopilotMemory(entry: string) {
 }
 
 describe("useStudioPanes Copilot context memory", () => {
+  test("restores an expanded pane before a nested pane action, even when the target is already open", () => {
+    const restoreExpandedPane = vi.fn();
+    render(
+      <StudioShellContext.Provider
+        value={{
+          copilotPortalEl: null,
+          panelPortalEl: null,
+          setEditorStreamSlot: vi.fn(),
+          setBrowserStreamSlot: vi.fn(),
+          setRunStreamSlot: vi.fn(),
+          restoreExpandedPane,
+        }}
+      >
+        <MemoryRouter initialEntries={["/studio?panes=editor,browser"]}>
+          <CopilotMemoryProbe />
+        </MemoryRouter>
+      </StudioShellContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByText("open-browser"));
+
+    expect(restoreExpandedPane).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("panes").textContent).toBe("editor,browser");
+  });
+
   test("restores independent Studio and past-run selections without changing the URL", () => {
     const studioAddress =
       "/studio?via=blank&panes=copilot,editor,browser#proof";

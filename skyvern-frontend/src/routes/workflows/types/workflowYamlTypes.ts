@@ -3,12 +3,15 @@ import {
   CodeBlockStep,
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
+  EmailBodyFormat,
   WorkflowBlockType,
   WorkflowModel,
+  WorkflowRetryPolicy,
 } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
+  recording_id?: string | null;
   description?: string | null;
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
@@ -27,6 +30,7 @@ export type WorkflowCreateYAMLRequest = {
   cdp_connect_headers?: Record<string, string> | null;
   status?: string | null;
   run_with?: string | null;
+  browser_type?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
   enable_self_healing?: boolean;
@@ -39,6 +43,7 @@ export type WorkflowCreateYAMLRequest = {
 };
 
 export type WorkflowDefinitionYAML = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
@@ -155,6 +160,7 @@ export type BlockYAML =
   | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
+  | DataExportBlockYAML
   | ActionBlockYAML
   | NavigationBlockYAML
   | ExtractionBlockYAML
@@ -220,6 +226,7 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+  engine: RunEngine | null;
 };
 
 export type HumanInteractionBlockYAML = BlockYAMLBase & {
@@ -234,6 +241,15 @@ export type HumanInteractionBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
+};
+
+export type DataExportBlockYAML = BlockYAMLBase & {
+  block_type: "data_export";
+  data: string;
+  data_schema: Record<string, unknown>;
+  file_name: string | null;
+  parameter_keys?: Array<string> | null;
 };
 
 export type ActionBlockYAML = BlockYAMLBase & {
@@ -284,6 +300,10 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  export_enabled?: boolean;
+  export_data_schema?: Record<string, unknown> | null;
+  export_file_name?: string | null;
+  export_records?: string | null;
 };
 
 export type LoginBlockYAML = BlockYAMLBase & {
@@ -417,6 +437,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments?: Array<string> | null;
 };
 

@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_resolver import make_copilot_call_model_input_filter
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -1000,6 +1000,61 @@ def test_block_end_urls_keep_only_rows_that_can_anchor_a_resumed_frontier() -> N
     }
 
 
+def test_the_model_visible_end_urls_refuse_what_the_terminal_url_screen_refuses() -> None:
+    rows = [
+        _FakeRunBlockRow("login_to_site", "https://app.example.com/dashboard?token=*****"),
+        _FakeRunBlockRow("open_long_page", "https://app.example.com/" + "u" * 2100),
+        _FakeRunBlockRow("inspect_summary", "https://app.example.com/dashboard/logs"),
+    ]
+
+    anchors = tools._block_end_urls_by_label(rows)
+    visible = run_execution_module._model_visible_block_end_urls(rows)
+
+    assert set(anchors) == {"login_to_site", "open_long_page", "inspect_summary"}
+    assert visible == {"inspect_summary": "https://app.example.com/dashboard/logs"}
+
+
+def test_the_model_visible_end_urls_drop_every_query_and_refuse_a_rewritten_one() -> None:
+    rows = [
+        _FakeRunBlockRow("run_search", "https://app.example.com/directory/results?access_code=4A0XF9&q=cardiology"),
+        _FakeRunBlockRow("open_session", "https://app.example.com/home?access_token=abcdef1234567890xyz"),
+        _FakeRunBlockRow("browse_area", "https://app.example.com/directory?zip_code=90210&specialty=cardiology"),
+        _FakeRunBlockRow("inspect_summary", "https://app.example.com/dashboard/logs"),
+    ]
+    notices: list[str] = []
+
+    visible = run_execution_module._model_visible_block_end_urls(rows, notices)
+
+    assert visible == {
+        "run_search": "https://app.example.com/directory/results",
+        "browse_area": "https://app.example.com/directory",
+        "inspect_summary": "https://app.example.com/dashboard/logs",
+    }
+    assert notices == [
+        ("observed_block_end_urls omitted block(s): open_session: the recorded URL carried masked or secret material."),
+        (
+            "observed_block_end_urls reduced block(s) to their path: browse_area: the recorded URL carried a query "
+            "or fragment; run_search: the recorded URL carried a query or fragment."
+        ),
+    ]
+
+
+def test_the_model_visible_end_urls_refuse_a_userinfo_credential_whole() -> None:
+    rows = [
+        _FakeRunBlockRow("run_search", "https://svc:hunter2@app.example.com/directory/results?q=cardiology"),
+        _FakeRunBlockRow("browse_area", "https://app.example.com/directory/listings"),
+    ]
+    notices: list[str] = []
+
+    visible = run_execution_module._model_visible_block_end_urls(rows, notices)
+
+    assert visible == {"browse_area": "https://app.example.com/directory/listings"}
+    assert "hunter2" not in json.dumps(visible)
+    assert notices == [
+        "observed_block_end_urls omitted block(s): run_search: the recorded URL carried credentials in its host.",
+    ]
+
+
 def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() -> None:
     old = _FakeDefinition([_FakeBlock("click", "action", {"selector": "#a"}), _FakeBlock("download", "download_to_s3")])
     new = _FakeDefinition([_FakeBlock("click", "action", {"selector": "#b"}), _FakeBlock("download", "download_to_s3")])
@@ -1065,8 +1120,7 @@ def test_referenced_output_labels_finds_block_form_jinja_refs() -> None:
                 "text_prompt",
                 {
                     "prompt": (
-                        "Summarize {{ extract_article_info.output.extracted_information.abstract }} "
-                        "and {{ extract_article_info.title }}."
+                        "Summarize {{ extract_article_info.output.abstract }} and {{ extract_article_info.title }}."
                     )
                 },
             ),
@@ -1078,7 +1132,96 @@ def test_referenced_output_labels_finds_block_form_jinja_refs() -> None:
     assert refs == {"extract_article_info"}
 
 
-def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run() -> None:
+def test_referenced_output_labels_finds_bare_block_form_jinja_refs() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "Summarize {{ extract_article_info }} in one sentence."},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info"}
+
+
+def test_referenced_output_labels_finds_every_ref_in_one_expression() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock("extract_author", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "{{ extract_article_info.output.title ~ extract_author.output.name }}"},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info", "extract_author"}
+
+
+def test_referenced_output_labels_finds_a_ref_in_a_templated_mapping_key() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_result", "extraction"),
+            _FakeBlock(
+                "report_failure",
+                "text_prompt",
+                # error_code_mapping renders its keys, so a key can carry the only reference.
+                {"error_code_mapping": {"ERR_{{ extract_result.output.code }}": "the run failed"}},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["report_failure"], new)
+
+    assert refs == {"extract_result"}
+
+
+def test_referenced_output_labels_finds_refs_around_a_quoted_jinja_literal() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock("extract_author", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                # The config is serialized as JSON, so these quotes reach the classifier escaped.
+                {"prompt": '{{ extract_article_info.output.title ~ " by " ~ extract_author.output.name }}'},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info", "extract_author"}
+
+
+def test_referenced_output_labels_finds_a_bare_ref_followed_by_an_operator() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "Summarize {{ extract_article_info or {} }} in one sentence."},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info"}
+
+
+def test_plan_frontier_falls_back_to_a_full_run_when_a_bare_ref_has_no_verified_output() -> None:
     old = _FakeDefinition(
         [
             _FakeBlock("open_page", "navigation"),
@@ -1092,12 +1235,35 @@ def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run()
             _FakeBlock(
                 "summarize_article",
                 "text_prompt",
-                {
-                    "prompt": (
-                        "Summarize the main findings from "
-                        "{{ extract_article_info.output.extracted_information.abstract }}."
-                    )
-                },
+                {"prompt": "Summarize {{ extract_article_info }} in one sentence."},
+            ),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page", "extract_article_info"]
+    ctx.verified_block_outputs = {"open_page": "nav_ok"}
+
+    requested = ["open_page", "extract_article_info", "summarize_article"]
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, requested, old, new)
+
+    assert (labels, seed, frontier) == (requested, {}, "open_page")
+
+
+def test_plan_frontier_append_with_block_form_jinja_ref_seeds_the_prefix_output() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": ("Summarize the main findings from {{ extract_article_info.output.abstract }}.")},
             ),
         ]
     )
@@ -1115,9 +1281,12 @@ def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run()
         new,
     )
 
-    assert labels == ["open_page", "extract_article_info", "summarize_article"]
-    assert seed == {}
-    assert frontier == "open_page"
+    assert labels == ["summarize_article"]
+    assert seed == {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
+    assert frontier == "summarize_article"
 
 
 def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
@@ -2167,7 +2336,6 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     ctx.last_run_blocks_block_ids = ["wrb_old"]
     ctx.last_run_blocks_block_labels = ["extract"]
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")
-    ctx.last_run_outcome_block_labels = ["extract"]
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.completion_verification_result = object()  # type: ignore[assignment]
     ctx.outcome_verification_trace_snapshot = {"old": True}
@@ -2176,10 +2344,17 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     ctx.post_run_page_observation_workflow_run_id = "wr_old"
     ctx.post_run_page_observation_after_failed_test = True
     ctx.post_run_current_page_inspection_workflow_run_id = "wr_old"
-    ctx.block_state_map = {"extract": "completed"}
-    ctx.block_started_at_map = {"extract": "2026-08-10T01:00:00Z"}
-    ctx.block_ended_at_map = {"extract": "2026-08-10T01:00:01Z"}
-
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_old",
+        workflow_run_id="wr_old",
+        label="extract",
+        block_type="extraction",
+        status="failed",
+        iteration=1,
+        started_at="2026-08-10T01:00:00Z",
+        ended_at="2026-08-10T01:00:01Z",
+    )
     _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, None)
 
     assert ctx.last_run_blocks_workflow_run_id is None
@@ -2187,7 +2362,6 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     assert ctx.last_run_blocks_block_ids == []
     assert ctx.last_run_blocks_block_labels == []
     assert ctx.last_run_outcome is None
-    assert ctx.last_run_outcome_block_labels == []
     assert ctx.last_test_anti_bot is None
     assert ctx.completion_verification_result is None
     assert ctx.outcome_verification_trace_snapshot == {}
@@ -2196,10 +2370,8 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     assert ctx.post_run_page_observation_workflow_run_id is None
     assert ctx.post_run_page_observation_after_failed_test is False
     assert ctx.post_run_current_page_inspection_workflow_run_id is None
-    assert ctx.block_state_map == {}
-    assert ctx.block_started_at_map == {}
-    assert ctx.block_ended_at_map == {}
-    assert ctx.terminal_envelope_run_outcomes == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
+    assert ctx.run_outcome_trace == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
+    assert ctx.narrative_block_attempts["wrb_old"]["rawStatus"] == "failed"
 
 
 def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2593,26 +2765,192 @@ def test_a_workflow_with_no_resolvable_labels_is_not_vacuously_tested() -> None:
     assert (
         terminal_ready_for_latch(
             current_workflow_labels=[],
-            has_executed_blocks=True,
+            planned_block_labels=[],
+            completed_block_labels=[],
+            all_run_blocks_completed=True,
             unverified=[],
             composition_unverified=[],
             artifact_reason=None,
             structured_blocker=None,
-            empty_data_blocks=None,
+            empty_data_blocks=False,
         )
         is False
     )
     assert (
         terminal_ready_for_latch(
             current_workflow_labels=["open"],
-            has_executed_blocks=True,
+            planned_block_labels=["open"],
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
             unverified=[],
             composition_unverified=[],
             artifact_reason=None,
             structured_blocker=None,
-            empty_data_blocks=None,
+            empty_data_blocks=False,
         )
         is True
+    )
+
+
+def test_a_partial_or_failed_current_run_is_not_tested() -> None:
+    common = {
+        "current_workflow_labels": ["open", "collect"],
+        "planned_block_labels": ["open", "collect"],
+        "artifact_reason": None,
+        "structured_blocker": None,
+        "composition_unverified": [],
+        "empty_data_blocks": False,
+    }
+
+    assert (
+        terminal_ready_for_latch(
+            **common,
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
+            unverified=["collect"],
+        )
+        is False
+    )
+    assert (
+        terminal_ready_for_latch(
+            **common,
+            completed_block_labels=["open", "collect"],
+            all_run_blocks_completed=False,
+            unverified=[],
+        )
+        is False
+    )
+
+
+def test_completed_rows_from_other_blocks_do_not_mark_the_current_workflow_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "unrelated"],
+            completed_block_labels=["open", "unrelated"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is False
+    )
+
+
+def test_completed_nested_rows_do_not_disqualify_a_clean_container_run() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "conditional"],
+            planned_block_labels=["open", "conditional"],
+            completed_block_labels=["open", "conditional", "taken_branch_child"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is True
+    )
+
+
+def test_recording_nested_rows_uses_the_planned_container_labels() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("conditional", "conditional", {}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.last_requested_block_labels = ["open", "conditional"]
+    ctx.last_executed_block_labels = ["open", "conditional"]
+    ctx.verified_prefix_labels = ["open", "conditional"]
+    ctx.composition_verified_labels = ["open", "conditional"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_nested_rows",
+                # An observer readback may enumerate the nested rows even though the tool
+                # requested the two top-level workflow blocks recorded on the context.
+                "requested_block_labels": ["open", "conditional", "taken_branch_child"],
+                "executed_block_labels": ["open", "conditional", "taken_branch_child"],
+                "blocks": [
+                    {"label": "open", "status": "completed"},
+                    {"label": "conditional", "status": "completed"},
+                    {"label": "taken_branch_child", "status": "completed"},
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.verified_terminal_proposal_ready is True
+
+
+def test_missing_completed_row_for_an_executed_label_does_not_mark_the_run_tested() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("collect", "extraction", {"prompt": "collect the total"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "collect"]
+    ctx.composition_verified_labels = ["open", "collect"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_missing_row",
+                "requested_block_labels": ["open", "collect"],
+                "executed_block_labels": ["open", "collect"],
+                "blocks": [{"label": "open", "status": "completed"}],
+            },
+        },
+    )
+
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+def test_missing_completion_for_a_planned_label_does_not_mark_the_run_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "collect"],
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is False
+    )
+
+
+def test_a_run_whose_data_blocks_are_all_empty_is_not_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "collect"],
+            completed_block_labels=["open", "collect"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=True,
+        )
+        is False
     )
 
 
@@ -2735,6 +3073,8 @@ def test_editing_a_composed_block_truncates_composition_credit_at_that_block() -
     ctx.last_workflow_yaml = "workflow: yaml"
     _credit_composition_verified_labels(ctx, labels, provenance)
     ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.last_requested_block_labels = ["open", "extract"]
+    ctx.last_executed_block_labels = ["extract"]
 
     _record_run_blocks_result(
         ctx,
@@ -2844,14 +3184,16 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         block_outputs_to_seed: dict[str, Any] | None = None,
         frontier_start_label: str | None = None,
         force_fresh_session: bool = False,
-        definition_unpersisted: bool = False,
+        execution_snapshot: Any = None,
+        explicit_blank: bool = False,
+        use_ephemeral_inputs: bool = True,
     ) -> dict[str, Any]:
         captured["requested"] = list(params["block_labels"])
-        captured["definition_unpersisted"] = definition_unpersisted
+        captured["has_staged_proposal"] = ctx.has_staged_proposal
         captured["executed"] = list(labels_to_execute or [])
         captured["frontier_start_label"] = frontier_start_label
         captured["force_fresh_session"] = force_fresh_session
-        captured["provenance"] = ctx.frontier_start_provenance or "unanchored"
+        captured["explicit_blank"] = explicit_blank
         return {"ok": True, "data": {}}
 
     async def _fake_verify(copilot_ctx: Any, result: dict[str, Any], handler_start: float) -> None:
@@ -2871,8 +3213,8 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
     assert captured["executed"] == ["open", "add_to_cart"]
     assert captured["frontier_start_label"] == "open"
     assert captured["force_fresh_session"] is True
-    assert captured["definition_unpersisted"] is True
-    assert captured["provenance"] == "initial"
+    assert captured["has_staged_proposal"] is True
+    assert captured["explicit_blank"] is True
 
 
 @pytest.mark.asyncio
@@ -2982,6 +3324,7 @@ workflow_definition:
                 {
                     "label": "inspect_result",
                     "status": "completed",
+                    "output": "prefix customer-secret suffix",
                     "action_trace": [{"action": "click", "status": "completed", "element": "sensitive-target"}],
                 }
             ],
@@ -3023,7 +3366,7 @@ workflow_definition:
     assert packet["attempted_block_labels"] == ["inspect_result"]
     assert packet["executed_block_labels"] == ["inspect_result"]
     assert packet["action_observations"] == ["click completed"]
-    assert packet["registered_outputs"][0]["value"] == "prefix [REDACTED_SECRET] suffix"
+    assert packet["registered_outputs"][0]["output"] == "prefix [REDACTED_SECRET] suffix"
     assert any("registered_outputs redacted" in notice for notice in packet["omission_notices"])
     assert MCP_RESULT_PROVENANCE_KEY not in output
     assert set(output) == {"ok", "data"}
@@ -3082,6 +3425,42 @@ async def test_test_end_to_end_provider_input_excludes_target_controlled_action_
     packet = json.loads(provider_input)["data"]["build_test_packet"]
     assert packet["action_observations"] == ["click completed"]
     assert hostile not in provider_input
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_handoff_keeps_prior_attempt_change_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This handoff rebuilds its data from a whitelist, so a fact the run attached is dropped unless
+    it is named here — and this is the surface where a repeat failing attempt reaches the model."""
+    change_identity = {
+        "prior_workflow_run_id": "wr_first_attempt",
+        "block_label": "price_the_trip",
+        "changed": False,
+        "basis": "code_hash",
+    }
+    monkeypatch.setattr(
+        agent_module,
+        "run_workflow_end_to_end",
+        AsyncMock(
+            return_value={
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_second_attempt",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["price_the_trip"],
+                    "executed_block_labels": ["price_the_trip"],
+                    "prior_attempt_change_identity": change_identity,
+                },
+            }
+        ),
+    )
+    ctx = _make_ctx(workflow_permanent_id="wpid_repeat_failing_attempt")
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    provider_input = json.loads(handoff[1]["output"])
+    assert provider_input["data"]["prior_attempt_change_identity"] == change_identity
 
 
 @pytest.mark.asyncio
@@ -3366,8 +3745,8 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
             assert packet["attempted_block_labels"] == ["inspect_result"]
             assert packet["executed_block_labels"] == executed_labels
             assert packet["action_observations"] == ["click completed code_line=7"]
-            assert packet["registered_outputs"][0]["output_parameter_key"] == "recorded_result"
-            assert packet["registered_outputs"][0]["value"] == "recorded value"
+            assert packet["registered_outputs"][0]["label"] == "inspect_result"
+            assert packet["registered_outputs"][0]["output"] == "recorded value"
             page_state = packet["failure"]["page_state"]
             assert page_state["current_origin"] == "https://example.test/"
             assert "current_url" not in page_state
@@ -3497,6 +3876,7 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
                 {
                     "label": "inspect_result",
                     "status": "failed",
+                    "output": "recorded value",
                     "failure_reason": f"{hostile_instruction}: {secret_marker}",
                     "error_codes": [hostile_instruction, secret_marker],
                     "action_trace": [

@@ -134,6 +134,8 @@ export interface RecordingDraftStep {
     | "secret"
     | "magic_link"
     | null;
+  /** Vault credential the user attached to this step; drives login/credential block generation. */
+  credential_id?: string | null;
 }
 
 export interface RecordingInterpretationUpdate {
@@ -176,7 +178,7 @@ export function upsertDraftSteps(
 export type RecordingDraftStepPatch = Partial<
   Pick<
     RecordingDraftStep,
-    "label" | "title" | "navigation_goal" | "url" | "wait_sec"
+    "label" | "title" | "navigation_goal" | "url" | "wait_sec" | "credential_id"
   >
 >;
 
@@ -204,25 +206,6 @@ export interface OptimisticStep {
 let optimisticStepSeq = 0;
 export const nextOptimisticStepId = (): string =>
   `optimistic-${(optimisticStepSeq += 1)}`;
-
-/**
- * The last committed frame of the live browser stream, grabbed at the moment
- * of a recorded click, matched to draft steps by source-event timestamp
- * (ms epoch).
- */
-export interface RecordingScreenshot {
-  timestampMs: number;
-  dataUrl: string;
-  xp: number | null;
-  yp: number | null;
-}
-
-const MAX_SCREENSHOTS = 40;
-// dataUrl.length tracks base64-encoded JPEG bytes; cap total in-memory footprint.
-const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
-
-/** Tolerance when matching a screenshot to a step's source-event window. */
-const SCREENSHOT_MATCH_TOLERANCE_MS = 750;
 
 /**
  * Number of events per compressed chunk.
@@ -303,7 +286,6 @@ interface RecordingStore {
    * resumed.
    */
   manualCapturePaused: boolean;
-  screenshots: Array<RecordingScreenshot>;
   /**
    * Set when the user hits Done: exfiltration stops, and the commit fires once
    * the finalized interpretation snapshot arrives (or a timeout elapses).
@@ -327,13 +309,13 @@ interface RecordingStore {
   endDraftEdit: () => void;
   setManualCapturePaused: (paused: boolean) => void;
   isCapturePaused: () => boolean;
-  addScreenshot: (screenshot: RecordingScreenshot) => void;
   requestFinish: () => void;
   setIsCommitting: (isCommitting: boolean) => void;
   /**
    * Draft steps to commit: snapshot minus user deletions, with user edits
-   * applied. Null when live interpretation never produced a revision (caller
-   * should fall back to raw event processing).
+   * applied. Null when live interpretation produced no draft steps (caller
+   * should fall back to raw event processing). An empty array is reserved for
+   * the intentional case where the user deleted every generated draft.
    */
   getFinalDraftSteps: () => Array<RecordingDraftStep> | null;
   /**
@@ -453,38 +435,6 @@ export function countVisibleDraftSteps(
   return count;
 }
 
-/**
- * The screenshot taken closest to the step's source-event window, if any.
- *
- * Both sides of the comparison are the same clock: the screenshot's
- * `timestampMs` is the exfiltrated event's `params.timestamp` (remote-browser
- * `Date.now()`, ms epoch), and the step's `timestamp_start`/`timestamp_end`
- * are the backend echoing that same source-event timestamp back
- * (RecordingDraftStep "Source-action event timestamps (ms epoch)").
- */
-export function findScreenshotForStep(
-  step: RecordingDraftStep,
-  screenshots: Array<RecordingScreenshot>,
-): RecordingScreenshot | null {
-  const start = step.timestamp_start;
-  if (start === null || start === undefined) {
-    return null;
-  }
-  const end = step.timestamp_end ?? start;
-
-  let best: RecordingScreenshot | null = null;
-  let bestDistance = Infinity;
-  for (const screenshot of screenshots) {
-    const t = screenshot.timestampMs;
-    const distance = t < start ? start - t : t > end ? t - end : 0; // 0 inside the window
-    if (distance <= SCREENSHOT_MATCH_TOLERANCE_MS && distance < bestDistance) {
-      best = screenshot;
-      bestDistance = distance;
-    }
-  }
-  return best;
-}
-
 const EXPOSED_CONSOLE_EVENT_TYPES = new Set(["focus", "click", "keypress"]);
 
 const isExposedEvent = (event: MessageInExfiltratedEvent): boolean => {
@@ -524,7 +474,6 @@ function emptyRecordingState() {
     dismissedCredentialStepIds: [] as Array<string>,
     draftEditDepth: 0,
     manualCapturePaused: false,
-    screenshots: [] as Array<RecordingScreenshot>,
     finishRequested: false,
     isCommitting: false,
   };
@@ -551,7 +500,6 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   dismissedCredentialStepIds: [],
   draftEditDepth: 0,
   manualCapturePaused: false,
-  screenshots: [],
   finishRequested: false,
   isCommitting: false,
 
@@ -703,24 +651,6 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     return state.manualCapturePaused || state.draftEditDepth > 0;
   },
 
-  addScreenshot: (screenshot) => {
-    const screenshots = [...get().screenshots, screenshot];
-    let totalBytes = screenshots.reduce(
-      (sum, item) => sum + item.dataUrl.length,
-      0,
-    );
-    while (screenshots.length > 1 && totalBytes > MAX_SCREENSHOT_BYTES) {
-      const removed = screenshots.shift();
-      if (removed) {
-        totalBytes -= removed.dataUrl.length;
-      }
-    }
-    if (screenshots.length > MAX_SCREENSHOTS) {
-      screenshots.splice(0, screenshots.length - MAX_SCREENSHOTS);
-    }
-    set({ screenshots });
-  },
-
   requestFinish: () => {
     if (get().finishRequested) {
       return;
@@ -732,7 +662,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
 
   getFinalDraftSteps: () => {
     const state = get();
-    if (state.sessionRevision === 0) {
+    if (state.sessionRevision === 0 || state.draftSteps.length === 0) {
       return null;
     }
     return applyDraftStepOverlays(

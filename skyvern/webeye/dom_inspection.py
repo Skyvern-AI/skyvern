@@ -4,6 +4,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 _READ_CURRENT_URL = "() => document.location.href"
 _READ_LOCATOR_TAG_NAME = "element => element.tagName"
+_READ_LOCATOR_IS_CONTENT_EDITABLE = "element => element.isContentEditable"
 _READ_RESOLVED_ANCHOR_HREF = "(element) => element instanceof HTMLAnchorElement ? element.href : null"
 _READ_WHETHER_LINK_OR_BUTTON = "(element) => element.matches('a[href], button')"
 
@@ -65,6 +66,11 @@ async def read_locator_tag_name(locator: Locator, *, timeout: float | None = Non
 
 async def read_locator_selected_state(locator: Locator, *, timeout: float | None = None) -> bool | None:
     value = await locator.evaluate(_READ_LOCATOR_SELECTED_STATE, timeout=timeout)
+    return value if isinstance(value, bool) else None
+
+
+async def read_locator_is_content_editable(locator: Locator, *, timeout: float | None = None) -> bool | None:
+    value = await locator.evaluate(_READ_LOCATOR_IS_CONTENT_EDITABLE, timeout=timeout)
     return value if isinstance(value, bool) else None
 
 

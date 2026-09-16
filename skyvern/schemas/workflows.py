@@ -9,9 +9,10 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
-from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_serializer, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -23,7 +24,8 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
+from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.utils.templating import replace_jinja_reference
@@ -502,6 +504,7 @@ class BlockType(StrEnum):
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
+    DATA_EXPORT = "data_export"
 
 
 class AIFallbackMode(StrEnum):
@@ -541,6 +544,9 @@ class BlockResult:
     # missing block label) so callers can distinguish them from real child-block
     # results. Set explicitly at the synthetic construction sites in loop helpers.
     is_synthetic_loop_failure: bool = False
+    # False when retry/continuation cannot change the outcome, such as invalid
+    # CodeBlock source that fails before execution.
+    can_continue_after_failure: bool = True
 
 
 class FileType(StrEnum):
@@ -909,13 +915,68 @@ class CodeBlockStepYAML(BaseModel):
 
 
 ERROR_CODE_MAX_LENGTH = 128
-ERROR_CODE_REASONING_MAX_LENGTH = 2000
 ERROR_CODE_MAPPING_MAX_ENTRIES = 64
 ERROR_CODE_MAPPING_MAX_UTF8_BYTES = 32768
 
 
 def _contains_unicode_category_c(value: str) -> bool:
     return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def error_code_key_error(code: Any) -> str | None:
+    """Whether a key is unusable, as a reason string.
+
+    Split out from the whole-entry check because a key and a description fail differently. A key IS
+    the identifier the model names and the customer matches on, so an unusable one cannot be repaired
+    and the entry has to go. A description is prose; see normalize_error_code_description.
+    """
+    if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
+        return "error code keys must be trimmed, non-empty strings of at most 128 characters"
+    if _contains_unicode_category_c(code):
+        return "error code keys must not contain Unicode category-C characters"
+    return None
+
+
+def normalize_error_code_description(description: Any) -> str | None:
+    """Make a rendered description usable, or None if there is nothing to salvage.
+
+    Repair rather than reject. These rules were written where the mapping feeds generated code; on a
+    task block the description is prose shown to a model, and prose legitimately carries newlines and
+    surrounding whitespace. Dropping the entry over that deletes a customer's error code -- and if it
+    was the only entry the mapping goes falsy, which turns error detection off silently. Measured on
+    production: 3,691 tasks in a week carry an untrimmed description and 90 would lose every entry.
+    """
+    if type(description) is not str:
+        return None
+    collapsed = "".join(
+        " " if unicodedata.category(character).startswith("C") else character for character in description
+    )
+    collapsed = collapsed.strip()
+    if not collapsed:
+        return None
+    return collapsed[:ERROR_CODE_REASONING_MAX_LENGTH]
+
+
+def error_code_mapping_entry_error(code: Any, description: Any) -> str | None:
+    """The per-entry rules, as a reason string rather than an exception.
+
+    Two callers need the same rules with opposite dispositions: the code-block schema rejects the
+    whole mapping at author time, while the runtime render path drops the offending entry. Both read
+    from here so a rule cannot be enforced in one place and quietly not the other.
+    """
+    key_reason = error_code_key_error(code)
+    if key_reason:
+        return key_reason
+    if (
+        type(description) is not str
+        or not description
+        or description != description.strip()
+        or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
+    ):
+        return "error code descriptions must be trimmed, non-empty strings of at most 2000 characters"
+    if _contains_unicode_category_c(description):
+        return "error code descriptions must not contain Unicode category-C characters"
+    return None
 
 
 def _validate_code_block_error_code_mapping(mapping: Any) -> None:
@@ -927,19 +988,9 @@ def _validate_code_block_error_code_mapping(mapping: Any) -> None:
         raise ValueError("error_code_mapping must contain at most 64 entries")
     aggregate_size = 0
     for code, description in mapping.items():
-        if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
-            raise ValueError("error code keys must be trimmed, non-empty strings of at most 128 characters")
-        if _contains_unicode_category_c(code):
-            raise ValueError("error code keys must not contain Unicode category-C characters")
-        if (
-            type(description) is not str
-            or not description
-            or description != description.strip()
-            or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
-        ):
-            raise ValueError("error code descriptions must be trimmed, non-empty strings of at most 2000 characters")
-        if _contains_unicode_category_c(description):
-            raise ValueError("error code descriptions must not contain Unicode category-C characters")
+        reason = error_code_mapping_entry_error(code, description)
+        if reason:
+            raise ValueError(reason)
         aggregate_size += len(code.encode("utf-8")) + len(description.encode("utf-8"))
     if aggregate_size > ERROR_CODE_MAPPING_MAX_UTF8_BYTES:
         raise ValueError("error_code_mapping keys and values must total at most 32768 UTF-8 bytes")
@@ -1141,6 +1192,7 @@ class SendEmailBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] | None = None
 
 
@@ -1232,6 +1284,13 @@ class ExtractionBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
 
+    # Export as a Parquet file, as an output option of this block rather than a
+    # separate Data Export block. See skyvern.forge.sdk.workflow.models.data_export_block.
+    export_enabled: bool = False
+    export_data_schema: dict[str, Any] | None = None
+    export_file_name: str | None = None
+    export_records: str | None = None
+
 
 class LoginBlockYAML(BlockYAML):
     block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
@@ -1271,6 +1330,16 @@ class HumanInteractionBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
+
+
+class DataExportBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.DATA_EXPORT] = BlockType.DATA_EXPORT  # type: ignore
+
+    data: str
+    data_schema: dict[str, Any]
+    file_name: str | None = None
+    parameter_keys: list[str] | None = None
 
 
 class FileDownloadBlockYAML(BlockYAML):
@@ -1494,6 +1563,7 @@ BLOCK_YAML_SUBCLASSES = (
     | WaitBlockYAML
     | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
+    | DataExportBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
@@ -1519,12 +1589,67 @@ def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASS
     return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
 
 
+class WorkflowRetryRule(BaseModel):
+    status: Literal["completed", "failed", "terminated", "canceled", "timed_out"] = Field(
+        description=(
+            "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, "
+            "but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+        )
+    )
+    error_codes: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        default=None,
+        description="Optional error codes. The rule matches when any listed code is present.",
+    )
+
+    @field_validator("error_codes")
+    @classmethod
+    def deduplicate_error_codes(cls, error_codes: list[str] | None) -> list[str] | None:
+        if error_codes is None:
+            return None
+        return list(dict.fromkeys(error_codes))
+
+
+class WorkflowRetryPolicy(BaseModel):
+    max_retries: StrictInt = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of retries after the initial attempt",
+    )
+    delay_seconds: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        description="Fixed delay before the next attempt, in seconds",
+    )
+    webhook_on_retry: Literal["final_only", "every_attempt"] = Field(
+        default="final_only",
+        description="Whether to send a webhook for every attempt or only the final attempt",
+    )
+    retry_on: list[WorkflowRetryRule] = Field(
+        min_length=1,
+        description="Terminal status rules that enable retries",
+    )
+
+    @field_validator("retry_on")
+    @classmethod
+    def validate_unique_statuses(cls, retry_on: list[WorkflowRetryRule]) -> list[WorkflowRetryRule]:
+        statuses = [rule.status for rule in retry_on]
+        if len(statuses) != len(set(statuses)):
+            raise ValueError("retry_on must contain each status at most once")
+        return retry_on
+
+
 class WorkflowDefinitionYAML(BaseModel):
     version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    retry_policy: WorkflowRetryPolicy | None = Field(
+        default=None,
+        description="Optional policy for retrying eligible terminal workflow runs",
+    )
     workflow_system_prompt: str | None = None
     completion_contract: dict[str, Any] | None = Field(
         default=None,
@@ -1563,6 +1688,10 @@ class WorkflowDefinitionYAML(BaseModel):
 
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
+    recording_id: str | None = Field(
+        default=None,
+        description="Durable browser recording to attach to the workflow version created by this save.",
+    )
     description: str | None = None
     proxy_location: ProxyLocation | GeoTarget | dict | None = None
     webhook_callback_url: str | None = None
@@ -1587,6 +1716,12 @@ class WorkflowCreateYAMLRequest(BaseModel):
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
+    browser_type: str | None = Field(
+        default=None,
+        description="Browser engine for runs of this workflow, one of the supported browser types "
+        "(e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. "
+        "Null means the system default.",
+    )
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
@@ -1609,6 +1744,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
 
     @field_validator("browser_profile_key", mode="before")
     @classmethod

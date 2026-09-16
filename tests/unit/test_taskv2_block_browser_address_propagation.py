@@ -76,7 +76,11 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
             get_recent_task_screenshot_artifacts=AsyncMock(return_value=[]),
             get_recent_workflow_screenshot_artifacts=AsyncMock(return_value=[]),
         ),
-        STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[], []])),
+        STORAGE=SimpleNamespace(
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=[[], []]),
+            get_downloaded_file_signature_aliases=lambda _: [],
+        ),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(has_workflow_run_context=lambda _run_id: False),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
 
@@ -133,3 +137,84 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
     assert kwargs["browser_address"] == "wss://sessions.skyvern.com/abc123"
     assert kwargs["extra_http_headers"] == {"x-api-key": "sk-test"}
     assert kwargs["cdp_connect_headers"] == {"x-cdp-auth": "tok"}
+
+
+@pytest.mark.asyncio
+async def test_taskv2_block_settles_the_child_capture_when_the_runner_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise out of run_task_v2 still hands the shared page back to the parent, and a
+    continue_on_failure parent can start its next browser block, so a failed child code block's
+    owned capture must be settled on that path too."""
+    skyvern_context.set(SkyvernContext(organization_id="org_1", workflow_run_id="wr_parent", run_id="wr_parent"))
+    settled: list[str] = []
+
+    async def cancel_child_capture() -> None:
+        settled.append("wr_child")
+
+    child_context = SimpleNamespace(cancel_failure_evidence_capture=cancel_child_capture)
+    organization = SimpleNamespace(
+        organization_id="org_1",
+        max_steps_per_run=None,
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            organizations=SimpleNamespace(get_organization=AsyncMock(return_value=organization)),
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(
+                    return_value=SimpleNamespace(
+                        proxy_location=None,
+                        max_screenshot_scrolls=None,
+                        browser_address=None,
+                        extra_http_headers=None,
+                        cdp_connect_headers=None,
+                        failure_reason=None,
+                    )
+                ),
+                update_workflow_run=AsyncMock(),
+            ),
+            observer=SimpleNamespace(update_task_v2=AsyncMock(), update_workflow_run_block=AsyncMock()),
+        ),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+            has_workflow_run_context=lambda run_id: run_id == "wr_child",
+            get_workflow_run_context=lambda _run_id: child_context,
+        ),
+    )
+    monkeypatch.setattr(block_module, "app", fake_app)
+
+    from skyvern.services import task_v2_service
+
+    monkeypatch.setattr(
+        task_v2_service,
+        "initialize_task_v2",
+        AsyncMock(return_value=SimpleNamespace(observer_cruise_id="tsk_v2_1", workflow_run_id="wr_child")),
+    )
+
+    async def exploding_run_task_v2(**_: object) -> SimpleNamespace:
+        raise RuntimeError("child finalization failed")
+
+    monkeypatch.setattr(task_v2_service, "run_task_v2", exploding_run_task_v2)
+    monkeypatch.setattr(
+        TaskV2Block,
+        "get_workflow_run_context",
+        lambda self, workflow_run_id: SimpleNamespace(credential_totp_identifiers={}),
+    )
+    monkeypatch.setattr(TaskV2Block, "format_potential_template_parameters", lambda self, _: None)
+
+    block = TaskV2Block(
+        label="task1",
+        output_parameter=_output_parameter("task1_output"),
+        prompt="do the thing",
+        url="https://example.com",
+    )
+
+    with pytest.raises(RuntimeError, match="child finalization failed"):
+        await block.execute(
+            workflow_run_id="wr_parent",
+            workflow_run_block_id="wrb_1",
+            organization_id="org_1",
+        )
+
+    assert settled == ["wr_child"]

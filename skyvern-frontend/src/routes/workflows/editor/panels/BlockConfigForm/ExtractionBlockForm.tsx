@@ -39,6 +39,10 @@ function ExtractionBlockFormBody({
       continueOnFailure: data.continueOnFailure,
       nextLoopOnFailure: data.nextLoopOnFailure,
       disableCache: data.disableCache,
+      exportEnabled: data.exportEnabled,
+      exportDataSchema: data.exportDataSchema,
+      exportFileName: data.exportFileName,
+      exportRecords: data.exportRecords,
     }),
     [
       data.dataExtractionGoal,
@@ -50,6 +54,10 @@ function ExtractionBlockFormBody({
       data.continueOnFailure,
       data.nextLoopOnFailure,
       data.disableCache,
+      data.exportEnabled,
+      data.exportDataSchema,
+      data.exportFileName,
+      data.exportRecords,
     ],
   );
   const { commit } = useDebouncedSidebarSave({

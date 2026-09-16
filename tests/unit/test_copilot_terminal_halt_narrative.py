@@ -17,11 +17,6 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.output_policy import (
-    CopilotOutputKind,
-    OutputPolicyReason,
-    evaluate_output_policy,
-)
 
 _ANTI_RERUN_GUARD_TEXT = (
     "The prior PER_TOOL_BUDGET run for run wr_538488327000571062 advanced the live browser at "
@@ -71,15 +66,6 @@ class TestInternalMachineryLeakPredicate:
     )
     def test_product_language_is_clean(self, text: str) -> None:
         assert contains_internal_machinery_leak(text) is False
-
-    def test_output_policy_hard_blocks_guard_text(self) -> None:
-        verdict = evaluate_output_policy(
-            request_policy=None,
-            response_type="REPLY",
-            user_response=_ANTI_RERUN_GUARD_TEXT,
-            output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        )
-        assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
 
 
 class TestRecordedFailureReply:

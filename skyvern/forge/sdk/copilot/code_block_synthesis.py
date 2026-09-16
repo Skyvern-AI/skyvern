@@ -16,6 +16,7 @@ import keyword
 import re
 import textwrap
 import tokenize
+import unicodedata
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
@@ -283,8 +284,12 @@ def credential_scout_gap(
     return ScoutGap(missing_fields=missing_fields, missing_submit=missing_submit)
 
 
-_ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
-_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
+_ENTRY_TARGET_TOOLS = frozenset(
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key"}
+)
+_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
+    {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}
+)
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
     r"\b(?:accept|agree|allow|consent|cookies?|decline|reject|refuse|dismiss|got it|no thanks)\b|^(?:ok|okay)$",
     re.I,
@@ -318,8 +323,9 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
 _REQUIRED_STATE_TIMEOUT_MS = 120_000
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
-# plus the injected `page`). A parameter key colliding with one of these is silently dropped
-# at bind time, so the synthesized fill would stringify the builtin instead of the user value.
+# plus the injected `page`). A parameter key colliding with one of these is shadowed by the
+# builtin at bind time (block.py's late safe globals let a persisted parameter keep its value,
+# but a new block must not rely on that), so the synthesized fill would stringify the builtin.
 # "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
 # injects a bound credential's fields under those bare names, so a plain parameter named
 # `password` would resolve to the credential's secret value instead of the user input.
@@ -332,6 +338,10 @@ _RESERVED_PARAM_NAMES = frozenset(
         "totp_identifier",
         "otp",
         "solve_captcha",
+        "search_web",
+        "clear_browser_data",
+        "attach_authorized_file",
+        "set_dialog_policy",
         DOWNLOAD_CLAIM_HELPER_NAME,
         "print",
         "len",
@@ -351,6 +361,8 @@ _RESERVED_PARAM_NAMES = frozenset(
         "max",
         "min",
         "sum",
+        "round",
+        "abs",
         "sorted",
         "sleep",
         "asyncio",
@@ -433,11 +445,13 @@ class SynthesizedCodeBlock:
 
 
 def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
+    normalized_key = unicodedata.normalize("NFKC", parameter_key)
     return (
         parameter_key.isidentifier()
-        and not keyword.iskeyword(parameter_key)
-        and not parameter_key.startswith("__")
-        and parameter_key not in _RESERVED_PARAM_NAMES
+        and normalized_key.isidentifier()
+        and not keyword.iskeyword(normalized_key)
+        and not normalized_key.startswith("__")
+        and normalized_key not in _RESERVED_PARAM_NAMES
     )
 
 
@@ -1909,6 +1923,9 @@ def synthesize_code_block(
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
     emit_read_return: bool = True,
+    # Recordings can bind a `secret` credential, whose single value field is not a login field;
+    # copilot's own gating sets stay untouched by passing the wider set only from that caller.
+    allowed_credential_fields: AbstractSet[str] = _CREDENTIAL_FIELDS,
     _segment_pass: bool = False,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
@@ -2609,7 +2626,7 @@ def synthesize_code_block(
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
             credential_field = str(interaction.get("credential_field") or "").strip()
-            if not credential_id or credential_field not in _CREDENTIAL_FIELDS:
+            if not credential_id or credential_field not in allowed_credential_fields:
                 notes.append("dropped a credential fill with no usable credential reference")
                 diagnostics.dropped_interactions.append(
                     {
@@ -2651,6 +2668,26 @@ def synthesize_code_block(
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
+        elif tool_name == "upload_file":
+            selector = str(interaction.get("selector") or "").strip()
+            if not selector:
+                notes.append("dropped a file upload with no durable selector")
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_selector"}
+                )
+                continue
+            parameter_name = str(interaction.get("parameter_name") or "upload_file")
+            param_key = _unique_key(_safe_param_base(parameter_name), used_param_keys)
+            parameters.append({"key": param_key, "workflow_parameter_type": "file_url"})
+            lines.append(f"{action_indent}await attach_authorized_file(page, {param_key}, {_py_str(selector)})")
+            record_emission(
+                trajectory_index,
+                tool_name,
+                "attach_authorized_file",
+                locator,
+                line_start=line_start,
+            )
+            append_step(f"Upload a file to {_step_target(interaction)}", "upload_file", line_start)
         elif tool_name == "hover" and not strict_selectors:
             # Non-strict only: recording trajectories carry deliberate hovers; the
             # strict-imposition envelope keeps treating hover as unsupported.
@@ -2757,8 +2794,8 @@ def synthesize_code_block(
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
-        # The worker-owned claim helper is the one terminal shape both engines execute: the sandboxed
-        # runner cannot broker page.expect_download. The helper clicks once and confirms the fired
+        # The worker-owned claim helper is the terminal shape both engines execute for one known
+        # affordance. The helper clicks once and confirms the fired
         # download; the bytes land wherever this run's download binding already sends them, and the
         # execution layer registers them from there.
         download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
@@ -2822,6 +2859,7 @@ def synthesize_code_block(
                 parameter_binding_snapshot=parameter_binding_snapshot,
                 file_match_transform=file_match_transform if segment_download_target is not None else None,
                 emit_read_return=emit_read_return,
+                allowed_credential_fields=allowed_credential_fields,
                 _segment_pass=True,
             )
             if segment is None or not segment.diagnostics.emitted_interaction_count:

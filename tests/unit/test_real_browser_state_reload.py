@@ -34,6 +34,16 @@ def _make_page(reload_side_effect=None) -> MagicMock:
     return page
 
 
+def test_state_remembers_route_policy_url_from_initial_context_creation() -> None:
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=MagicMock(),
+        browser_context_route_policy_url="https://accounts.example.test/login",
+    )
+
+    assert state.browser_context_route_policy_url == "https://accounts.example.test/login"
+
+
 @pytest.mark.asyncio
 async def test_reload_page_default_raises_on_timeout(browser_state: RealBrowserState) -> None:
     """Default reload_page (no degradation) raises FailedToReloadPage on timeout — existing behavior."""
@@ -196,9 +206,8 @@ async def test_scrape_with_type_normal_no_reload_call() -> None:
 
 
 def _reconnect_state(binding: DownloadBinding) -> RealBrowserState:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = MagicMock()
+    state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()
@@ -230,9 +239,8 @@ async def test_reconnect_keeps_run_dir_binding() -> None:
 
 
 def _reconnect_state_capturing_check(binding: DownloadBinding, captured: dict[str, object]) -> RealBrowserState:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = MagicMock()
+    state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()
@@ -265,12 +273,69 @@ async def test_reconnect_threads_run_dir_binding_into_check_and_fix_state() -> N
     assert captured.get("download_binding") == DownloadBinding.RUN_DIR
 
 
+@pytest.mark.asyncio
+async def test_reconnect_threads_persistent_session_into_context_setup() -> None:
+    captured: dict[str, object] = {}
+    state = _reconnect_state_capturing_check(DownloadBinding.SESSION_DIR, captured)
+    state.browser_artifacts.remote_browser_session_id = "vendor-session-1"
+
+    await state.reconnect(workflow_run_id="wr-1", organization_id="org-1", browser_session_id="pbs-1")
+
+    assert captured.get("browser_session_id") == "pbs-1"
+    assert captured.get("reconcile_persistent_init_scripts") is True
+
+
+@pytest.mark.asyncio
+async def test_reconnect_threads_sessionless_init_scripts_into_context_setup() -> None:
+    captured: dict[str, object] = {}
+    state = _reconnect_state_capturing_check(DownloadBinding.RUN_DIR, captured)
+    registration = object()
+    state.add_sessionless_init_script_registration(registration)
+
+    await state.reconnect(workflow_run_id="wr-1", browser_address="ws://remote-browser")
+
+    assert captured.get("sessionless_init_script_registrations") == (registration,)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_threads_task_route_policy_without_initial_navigation() -> None:
+    captured: dict[str, object] = {}
+    state = _reconnect_state_capturing_check(DownloadBinding.SESSION_DIR, captured)
+
+    await state.reconnect(
+        task_id="task-1",
+        workflow_run_id=None,
+        workflow_permanent_id="wpid-1",
+        browser_context_route_policy_url="https://accounts.example.test/login",
+        organization_id="org-1",
+        browser_session_id="pbs-1",
+    )
+
+    assert captured.get("task_id") == "task-1"
+    assert captured.get("browser_context_route_policy_url") == "https://accounts.example.test/login"
+    assert captured.get("url") is None
+
+
+@pytest.mark.asyncio
+async def test_close_current_context_retires_sessionless_init_scripts() -> None:
+    context = MagicMock()
+    context.close = AsyncMock()
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    state._close_all_other_pages = AsyncMock()
+    state.add_sessionless_init_script_registration(object())
+
+    assert state.sessionless_init_script_registrations
+
+    assert await state.close_current_open_page() is True
+
+    assert state.sessionless_init_script_registrations == ()
+
+
 def _recreation_state(
     binding: DownloadBinding, captured: dict[str, object]
 ) -> tuple[RealBrowserState, Callable[..., Awaitable[tuple[object, BrowserArtifacts, object]]]]:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = None  # force the check_and_fix_state recreation branch
+    # No browser context forces the check_and_fix_state recreation branch.
+    state = RealBrowserState(pw=AsyncMock(), browser_context=None)
     state.engine_selection = None
     state.browser_artifacts = BrowserArtifacts(download_binding=binding)
     state.set_working_page = AsyncMock()
@@ -281,6 +346,37 @@ def _recreation_state(
         return MagicMock(pages=[MagicMock()]), BrowserArtifacts(), None
 
     return state, _fake_create
+
+
+@pytest.mark.asyncio
+async def test_persistent_context_creation_remembers_policy_url_and_requests_script_replay() -> None:
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.RUN_DIR, captured)
+
+    with patch("skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context", fake_create):
+        await state.check_and_fix_state(
+            url="https://accounts.example.test/login",
+            organization_id="org-1",
+            browser_session_id="pbs-1",
+        )
+
+    assert state.browser_context_route_policy_url == "https://accounts.example.test/login"
+    assert captured["_browser_context_route_policy_url"] == "https://accounts.example.test/login"
+    assert captured["_reconcile_persistent_init_scripts"] is True
+
+
+@pytest.mark.asyncio
+async def test_persistent_context_recreation_reuses_stored_route_policy_url() -> None:
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.RUN_DIR, captured)
+    state.browser_context_route_policy_url = "https://accounts.example.test/login"
+
+    with patch("skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context", fake_create):
+        await state.check_and_fix_state(organization_id="org-1", browser_session_id="pbs-1")
+
+    assert captured["url"] is None
+    assert captured["_browser_context_route_policy_url"] == "https://accounts.example.test/login"
+    assert captured["_reconcile_persistent_init_scripts"] is True
 
 
 @pytest.mark.asyncio
@@ -342,13 +438,31 @@ async def test_check_and_fix_state_explicit_binding_overrides_prior_artifacts() 
 
 
 @pytest.mark.asyncio
+async def test_check_and_fix_state_marks_only_explicit_reconnect_for_init_script_restoration() -> None:
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.SESSION_DIR, captured)
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=fake_create,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(
+            workflow_run_id="wr-1",
+            reconcile_persistent_init_scripts=True,
+        )
+
+    assert captured.get("_reconcile_persistent_init_scripts") is True
+
+
+@pytest.mark.asyncio
 async def test_check_and_fix_state_recreation_stamps_forwarded_binding_on_assigned_artifacts() -> None:
     """Outer contract: on recreation, check_and_fix_state forwards the derived binding and the factory
     stamps it on the fresh artifacts, so the state ends up SESSION_DIR — with no later override that
     could mislabel a genuine provider change."""
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = None
+    state = RealBrowserState(pw=AsyncMock(), browser_context=None)
     state.engine_selection = None
     state.browser_artifacts = BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR)
     state.set_working_page = AsyncMock()

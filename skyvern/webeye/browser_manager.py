@@ -8,7 +8,7 @@ import structlog
 
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.webeye.browser_artifacts import VideoArtifact
+from skyvern.webeye.browser_artifacts import RecordingPrefixSnapshot, VideoArtifact
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -98,6 +98,12 @@ class BrowserManager(Protocol):
         workflow_run_id: str = "",
         finalize: bool = True,
     ) -> list[VideoArtifact]: ...
+
+    def snapshot_recording_prefixes(
+        self,
+        browser_state: BrowserState,
+        task_id: str = "",
+    ) -> list[RecordingPrefixSnapshot] | None: ...
 
     async def get_har_data(
         self,

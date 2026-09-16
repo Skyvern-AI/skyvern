@@ -30,8 +30,11 @@ function DebuggerPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunQuery();
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -68,7 +71,8 @@ function DebuggerPostRunParameters() {
   if (
     workflowRunIsLoading ||
     workflowRunTimelineIsLoading ||
-    workflowIsLoading
+    workflowIsLoading ||
+    runIsWithheld
   ) {
     return <div>Loading workflow inputs...</div>;
   }

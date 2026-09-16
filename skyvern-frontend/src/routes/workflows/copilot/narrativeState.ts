@@ -5,11 +5,13 @@
 
 import { buildRevealOffsets } from "./actionReveal";
 import {
+  BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
   ProposalDisposition,
   RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
@@ -22,6 +24,56 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+export interface BudgetExpiryState {
+  budgetExpired: true;
+  source: "deadline" | "max_turns";
+  reportProduced: boolean | null;
+  stagedDraftId: string | null;
+  drainFingerprint: string | null;
+}
+
+function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    value.budgetExpired !== true ||
+    (value.source !== "deadline" && value.source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: value.source,
+    reportProduced:
+      typeof value.reportProduced === "boolean" ? value.reportProduced : null,
+    stagedDraftId:
+      typeof value.stagedDraftId === "string" ? value.stagedDraftId : null,
+    drainFingerprint:
+      typeof value.drainFingerprint === "string"
+        ? value.drainFingerprint
+        : null,
+  };
+}
+
+function budgetExpiryFromOutcome(
+  outcome: BudgetExpiryOutcome | null | undefined,
+): BudgetExpiryState | null {
+  if (
+    outcome?.budget_expired !== true ||
+    (outcome.budget_expiry_source !== "deadline" &&
+      outcome.budget_expiry_source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: outcome.budget_expiry_source,
+    reportProduced: outcome.budget_expiry_report_produced ?? null,
+    stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
+    drainFingerprint: outcome.drain_fingerprint ?? null,
+  };
+}
 
 // A block's recorded actions, fetched from the run timeline while the test run
 // is live (polled from the first frame that carries the run id) and again at
@@ -46,15 +98,6 @@ export interface CopilotBlockActionsEvent {
   receivedAtMs: number;
 }
 
-// Client-synthesized event marking that the drafting silence (no frames
-// while the LLM writes code) has lasted long enough to assume Draft has
-// started. Idempotent in the reducer so a re-armed timer or StrictMode
-// double-fire is a no-op.
-export interface CopilotPhaseHintEvent {
-  type: "client_phase_hint";
-  hintedAtMs: number;
-}
-
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -69,8 +112,8 @@ export type NarrativeEvent =
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | CopilotBlockActionsEvent
-  | CopilotPhaseHintEvent;
+  | WorkflowCopilotCodegenProgressUpdate
+  | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out) under one chip and
@@ -150,32 +193,39 @@ export function humanizeJudgeText(text: string): string {
   return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
 }
 
+export function terminalNarrativeText(turn: TurnNarrativeState): string {
+  if (turn.budgetExpiry?.reportProduced === false) {
+    const limit =
+      turn.budgetExpiry.source === "deadline" ? "time" : "model-call";
+    const status = `This turn reached its ${limit} limit without producing a report.`;
+    return turn.budgetExpiry.stagedDraftId
+      ? `${status} A draft was staged during this session.`
+      : status;
+  }
+  if (turn.budgetExpiry) {
+    const drainReply = turn.terminalMessage?.trim() || "";
+    if (drainReply) return drainReply;
+  }
+  return turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+}
+
 type BuildTestConnectFailureState =
   | "already_closed"
   | "provisioning_unavailable"
-  | "cdp_connect_failed";
+  | "cdp_connect_failed"
+  | "occupied"
+  | "billing_credit_admission_refusal";
 
-function isBuildTestConnectFailureState(
+export function isBuildTestConnectFailureState(
   value: unknown,
 ): value is BuildTestConnectFailureState {
   return (
     value === "already_closed" ||
     value === "provisioning_unavailable" ||
-    value === "cdp_connect_failed"
+    value === "cdp_connect_failed" ||
+    value === "occupied" ||
+    value === "billing_credit_admission_refusal"
   );
-}
-
-export interface TerminalEnvelopeFacts {
-  runVerdict: BlockOutcome | null;
-  runDisplayReason: string | null;
-  connectFailure?: {
-    state: BuildTestConnectFailureState;
-    retryAction: "test_end_to_end";
-    workflowRunId: string | null;
-    workflowRunBlockId: string | null;
-    taskId: string | null;
-    browserSessionId: string | null;
-  } | null;
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
@@ -203,6 +253,10 @@ export interface TurnFacts {
   runCompleted: boolean | null;
   terminalCause: string | null;
   blocksRunThisTurn: number | null;
+  // The failed run's own recorded reason, scrubbed at source. Survives a reload
+  // even when no block carries an outcome reason of its own. Optional: turns
+  // persisted before it was published carry no such key.
+  recordedFailure?: string | null;
   ranCleanOnCurrentSource: boolean;
 }
 
@@ -223,51 +277,6 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
-}
-
-// Envelope dicts are backend model_dump output, so keys stay snake_case.
-// The backend anchors run_verdict from final outcomes only, so "evaluating"
-// is not a wire value here and parses to null like any unknown.
-export function parseTerminalEnvelope(
-  raw: unknown,
-): TerminalEnvelopeFacts | null {
-  if (!raw || typeof raw !== "object") return null;
-  const obj = raw as Record<string, unknown>;
-  const v = obj.run_verdict;
-  const rawConnectFailure = obj.connect_failure;
-  const connectFailure = (() => {
-    if (!rawConnectFailure || typeof rawConnectFailure !== "object")
-      return null;
-    const failure = rawConnectFailure as Record<string, unknown>;
-    const state = failure.state;
-    if (
-      !isBuildTestConnectFailureState(state) ||
-      failure.retry_action !== "test_end_to_end"
-    ) {
-      return null;
-    }
-    const text = (key: string) =>
-      typeof failure[key] === "string" ? (failure[key] as string) : null;
-    return {
-      state,
-      retryAction: "test_end_to_end" as const,
-      workflowRunId: text("workflow_run_id"),
-      workflowRunBlockId: text("workflow_run_block_id"),
-      taskId: text("task_id"),
-      browserSessionId: text("browser_session_id"),
-    };
-  })();
-  return {
-    runVerdict:
-      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
-        ? v
-        : null,
-    runDisplayReason:
-      typeof obj.run_display_reason === "string"
-        ? obj.run_display_reason
-        : null,
-    connectFailure,
-  };
 }
 
 export interface BlockState {
@@ -294,6 +303,18 @@ export interface BlockState {
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
   recordedActionsAt?: number;
+}
+
+export function hasObservedBlockEvidence(block: BlockState): boolean {
+  return (
+    block.workflowRunBlockId.length > 0 ||
+    block.activity.length > 0 ||
+    (block.recordedActions?.length ?? 0) > 0 ||
+    block.recordedActionsAt !== undefined ||
+    block.startedAt !== null ||
+    block.endedAt !== null ||
+    block.outcome !== undefined
+  );
 }
 
 export interface ActivityEntry {
@@ -357,10 +378,6 @@ export interface TurnNarrativeState {
   // Typed terminal response kind for the turn (TurnOutcome.response_kind).
   // Null on legacy rows and frames from an older backend.
   responseKind: TurnResponseKind | null;
-  // Run-outcome facts from the backend-finalized terminal envelope carried
-  // in the narrative payload. Authoritative once runVerdict is set; null on
-  // rows persisted before the envelope existed.
-  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -384,15 +401,13 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
-  // Client-only phase-progress state (never persisted): epoch ms of the most
-  // recent tool_call/tool_result/narration, and when the 8s drafting-gap
-  // heuristic fired. Grafted across the terminal payload swap by turnId so a
-  // cancel-mid-silence doesn't visually un-check the Draft phase.
-  lastActivityAtMs: number | null;
-  draftingSignaledAt: number | null;
-  // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
-  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap.
-  authoringCount: number;
+  // Live-only drafting progress from codegen_progress, never persisted. Holds
+  // only what the row renders: the frames' cumulative character count changes
+  // on every frame and would re-render the chat for nothing.
+  codegenProgress: {
+    blockLabels: string[];
+    startedAt: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -415,13 +430,15 @@ export interface TurnNarrativeState {
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
+  budgetExpiry: BudgetExpiryState | null;
 }
 
 export interface GoogleConnectionNotice {
   provider: "google";
-  connectionId: string;
+  connectionId: string | null;
   displayName: string | null;
-  condition: "missing" | "unusable";
+  condition: "missing" | "unusable" | "unbound";
+  choices?: ConnectedAccountChoice[];
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -430,7 +447,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   responseType: null,
   proposalDisposition: null,
   responseKind: null,
-  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -443,9 +459,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
-  lastActivityAtMs: null,
-  draftingSignaledAt: null,
-  authoringCount: 0,
+  codegenProgress: null,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
@@ -454,12 +468,16 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   googleConnectionNotices: [],
   review: null,
   turnFacts: null,
+  budgetExpiry: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
 // the rendered card from becoming a wall of text).
 const MAX_ACTIVITY_ENTRIES = 30;
 const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
+// Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
+// run-block id every iteration, so the block list is unbounded without this.
+const MAX_BLOCK_ATTEMPTS = 200;
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -582,28 +600,37 @@ export function parseGoogleConnectionNotices(
 ): GoogleConnectionNotice[] {
   if (!Array.isArray(value)) return [];
   const notices: GoogleConnectionNotice[] = [];
-  const seen = new Set<string>();
+  const seen = new Set<string | null>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
     if (
       row.provider !== "google" ||
-      typeof row.connectionId !== "string" ||
-      row.connectionId.length === 0 ||
-      (row.condition !== "missing" && row.condition !== "unusable") ||
-      seen.has(row.connectionId)
+      (row.condition === "unbound"
+        ? row.connectionId !== null
+        : typeof row.connectionId !== "string" ||
+          row.connectionId.length === 0) ||
+      (row.condition !== "missing" &&
+        row.condition !== "unusable" &&
+        row.condition !== "unbound")
     ) {
       continue;
     }
-    seen.add(row.connectionId);
+    const connectionId =
+      row.condition === "unbound" ? null : (row.connectionId as string);
+    if (seen.has(connectionId)) continue;
+    seen.add(connectionId);
     notices.push({
       provider: "google",
-      connectionId: row.connectionId,
+      connectionId,
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
+      ...(row.condition === "unbound"
+        ? { choices: parseConnectedAccountChoices(row.choices) }
+        : {}),
     });
   }
   return notices;
@@ -611,8 +638,7 @@ export function parseGoogleConnectionNotices(
 
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
-// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
-// activity lands in the Test phase bucket, not Draft — see copilotPhases.ts).
+// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member.
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
@@ -622,6 +648,7 @@ export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
   "run_blocks_and_collect_debug",
+  "test_workflow_from_blank_browser",
 ]);
 
 // Tool names we never surface in the user-facing activity log. Internal
@@ -658,6 +685,9 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   edit_block: "Editing block",
   add_block: "Adding block",
   delete_block: "Deleting block",
+  request_credential: "Requesting a credential",
+  ask_user: "Asking you",
+  set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
@@ -1083,29 +1113,9 @@ export function applyNarrativeEvent(
 
     case "workflow_draft": {
       // Bubble shows the summary fields; canvas mid-turn rendering of
-      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. Seed
-      // ``blocks`` from block_labels so each drafted block renders its own
-      // card even on draft-only turns (where no block_progress fires).
-      // Existing entries from prior block_progress events take precedence;
-      // new labels join as ``drafted`` until block_progress upgrades them.
-      const labelToExisting = new Map(prev.blocks.map((b) => [b.label, b]));
-      const nextBlocks: BlockState[] = event.block_labels.map((label) => {
-        const existing = labelToExisting.get(label);
-        if (existing) return existing;
-        return {
-          workflowRunBlockId: "",
-          label,
-          blockType: "task",
-          state: "drafted",
-          lastSeenIteration: 0,
-          activity: [],
-          startedAt: null,
-          endedAt: null,
-        };
-      });
-      // Preserve any prior block whose label was dropped from the draft (rare
-      // — happens if the agent renames a block mid-turn). Drop those that no
-      // longer exist; they no longer participate in the proposal.
+      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. A draft is a
+      // workflow snapshot, not evidence that any block was authored or run,
+      // so it never creates, reorders, or removes narrative block attempts.
       // The write's patch arrives here rather than on the tool_result, because a write and its
       // test share one tool call and that result lands only after the run. Attach it to the
       // call's own entry so the row shows the code as soon as it is written.
@@ -1114,9 +1124,9 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          ? { blocks: prev.blocks, designActivity: prev.designActivity }
           : attachCodeDiffsToActivity(
-              nextBlocks,
+              prev.blocks,
               prev.designActivity,
               diffTarget,
               draftDiffs,
@@ -1131,6 +1141,38 @@ export function applyNarrativeEvent(
         },
         blocks: withDiffs.blocks,
         designActivity: withDiffs.designActivity,
+        codegenProgress: null,
+      };
+    }
+
+    case "codegen_progress": {
+      // `blocks_drafted` is cumulative only WITHIN one authoring call: the
+      // producer keys its state by output_index and opens each call with an
+      // empty frame. One generation can carry several authoring calls, so union
+      // rather than replace — otherwise a second call's opening frame erases
+      // the blocks the first one drafted. The tool_call that ends the
+      // generation is what clears the row, so this cannot accumulate past it.
+      const drafting = prev.codegenProgress;
+      const drafted = drafting?.blockLabels ?? [];
+      const merged = drafted.concat(
+        event.blocks_drafted.filter((label) => !drafted.includes(label)),
+      );
+      // Frames stay throttled but still arrive every couple of seconds naming
+      // nothing new, and their character count — which nothing renders — moves
+      // on every one. Returning prev unchanged is what keeps a fast stream from
+      // re-rendering the chat between labels. The first frame of a generation
+      // still has to land: it is what opens the row, and it carries no labels.
+      if (drafting !== null && merged.length === drafted.length) {
+        return prev;
+      }
+      return {
+        ...prev,
+        codegenProgress: {
+          blockLabels: merged,
+          // First frame of the generation wins, so the row's clock times the
+          // whole draft rather than restarting on each label or each call.
+          startedAt: drafting?.startedAt ?? event.timestamp ?? null,
+        },
       };
     }
 
@@ -1138,20 +1180,9 @@ export function applyNarrativeEvent(
       const incomingState = mapBlockStatus(event.status);
       // Key on workflow_run_block_id, not block_label, so loop iterations
       // (e.g. a for_loop body) render as distinct rows.
-      let existing = prev.blocks.findIndex(
+      const existing = prev.blocks.findIndex(
         (b) => b.workflowRunBlockId === event.workflow_run_block_id,
       );
-      // A drafted placeholder seeded by workflow_draft has no run-block id
-      // yet; upgrade it in place on its first block_progress rather than
-      // spawning a duplicate row.
-      if (existing < 0) {
-        existing = prev.blocks.findIndex(
-          (b) =>
-            b.workflowRunBlockId === "" &&
-            b.state === "drafted" &&
-            b.label === event.block_label,
-        );
-      }
       const eventTs = event.timestamp ?? null;
       const previousBlock = existing >= 0 ? prev.blocks[existing]! : null;
       const startedAt =
@@ -1190,7 +1221,10 @@ export function applyNarrativeEvent(
         nextBlocks[existing] = baseEntry;
         return { ...prev, blocks: nextBlocks };
       }
-      return { ...prev, blocks: [...prev.blocks, baseEntry] };
+      return {
+        ...prev,
+        blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
+      };
     }
 
     case "run_outcome": {
@@ -1262,13 +1296,12 @@ export function applyNarrativeEvent(
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
-      const authoringCount =
-        prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
+      // The model has finished streaming arguments: the call the drafting
+      // frames described is executing, and its own row reports it from here.
       if (!entry) {
         return {
           ...prev,
-          lastActivityAtMs: nowMs,
-          authoringCount,
+          codegenProgress: null,
         };
       }
       const { blocks, designActivity } = appendActivity(
@@ -1280,14 +1313,13 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
-        authoringCount,
+        codegenProgress: null,
       };
     }
 
     case "tool_result": {
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev, lastActivityAtMs: nowMs };
+      if (!entry) return { ...prev };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1297,7 +1329,6 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
     }
 
@@ -1312,23 +1343,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
-    }
-
-    case "client_phase_hint": {
-      // No-op once drafting is already signaled or the turn has moved past
-      // pure exploration — idempotent by construction so a re-armed timer or
-      // a StrictMode double-fire never overwrites an earlier timestamp.
-      if (
-        prev.draftingSignaledAt !== null ||
-        prev.draft !== null ||
-        prev.designEnded ||
-        prev.blocks.some((b) => b.state !== "drafted")
-      ) {
-        return prev;
-      }
-      return { ...prev, draftingSignaledAt: event.hintedAtMs };
     }
 
     case "response": {
@@ -1373,18 +1388,6 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
-          // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads never
-          // carry these client-only fields). authoringCount is grafted too so a
-          // turn whose only authoring entry aged out of the capped activity
-          // list still completes Explore at the swap. lastRunOutcome remains
-          // sourced from the hydrated terminal payload.
-          draftingSignaledAt:
-            hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
-          authoringCount:
-            hydrated.turnId === prev.turnId
-              ? prev.authoringCount
-              : hydrated.authoringCount,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1512,6 +1515,7 @@ function parseTurnFacts(raw: unknown): TurnFacts | null {
       typeof value.runCompleted === "boolean" ? value.runCompleted : null,
     terminalCause: text("terminalCause"),
     blocksRunThisTurn: count("blocksRunThisTurn"),
+    recordedFailure: text("recordedFailure"),
     ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
   };
 }
@@ -1615,59 +1619,61 @@ export function hydrateNarrativeFromPayload(
       : null;
 
   const blocksRaw = Array.isArray(payload.blocks) ? payload.blocks : [];
-  const blocks: BlockState[] = blocksRaw.map((b) => {
-    const obj = b as Record<string, unknown>;
-    const outcome = ((): BlockOutcome | undefined => {
-      const o = obj.outcome;
-      if (
-        o === "evaluating" ||
-        o === "demonstrated" ||
-        o === "not_demonstrated" ||
-        o === "not_evaluated"
-      )
-        return o;
-      return undefined;
-    })();
-    const outcomeRole: RunOutcomeRole | undefined =
-      outcome === undefined
-        ? undefined
-        : obj.outcomeRole === "recorded" ||
-            obj.outcomeRole === "adjudicated" ||
-            obj.outcomeRole === "interim_build_test"
-          ? obj.outcomeRole
-          : "adjudicated";
-    return {
-      workflowRunBlockId:
-        typeof obj.workflowRunBlockId === "string"
-          ? obj.workflowRunBlockId
-          : "",
-      label: typeof obj.label === "string" ? obj.label : "",
-      blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
-      outcome,
-      outcomeRole,
-      outcomeReason:
-        typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
-      state: ((): BlockState["state"] => {
-        const s = obj.state;
+  const blocks: BlockState[] = blocksRaw
+    .map((b) => {
+      const obj = b as Record<string, unknown>;
+      const outcome = ((): BlockOutcome | undefined => {
+        const o = obj.outcome;
         if (
-          s === "queued" ||
-          s === "drafted" ||
-          s === "running" ||
-          s === "completed" ||
-          s === "failed" ||
-          s === "stopped" ||
-          s === "skipped"
+          o === "evaluating" ||
+          o === "demonstrated" ||
+          o === "not_demonstrated" ||
+          o === "not_evaluated"
         )
-          return s;
-        return "queued";
-      })(),
-      lastSeenIteration:
-        typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
-      activity: normalizeActivityEntries(obj.activity),
-      startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
-      endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
-    };
-  });
+          return o;
+        return undefined;
+      })();
+      const outcomeRole: RunOutcomeRole | undefined =
+        outcome === undefined
+          ? undefined
+          : obj.outcomeRole === "recorded" ||
+              obj.outcomeRole === "adjudicated" ||
+              obj.outcomeRole === "interim_build_test"
+            ? obj.outcomeRole
+            : "adjudicated";
+      return {
+        workflowRunBlockId:
+          typeof obj.workflowRunBlockId === "string"
+            ? obj.workflowRunBlockId
+            : "",
+        label: typeof obj.label === "string" ? obj.label : "",
+        blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
+        outcome,
+        outcomeRole,
+        outcomeReason:
+          typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        state: ((): BlockState["state"] => {
+          const s = obj.state;
+          if (
+            s === "queued" ||
+            s === "drafted" ||
+            s === "running" ||
+            s === "completed" ||
+            s === "failed" ||
+            s === "stopped" ||
+            s === "skipped"
+          )
+            return s;
+          return "queued";
+        })(),
+        lastSeenIteration:
+          typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
+        activity: normalizeActivityEntries(obj.activity),
+        startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
+        endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
+      };
+    })
+    .filter(hasObservedBlockEvidence);
 
   const terminal = ((): TurnNarrativeState["terminal"] => {
     const t = payload.terminal;
@@ -1685,7 +1691,11 @@ export function hydrateNarrativeFromPayload(
   const turnFacts = parseTurnFacts(payload.turnFacts);
   // A deadline cuts a running block off; that is a stop, so it must not be swept
   // to failed and then read back as the turn having failed.
-  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
+  const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
+  const halted =
+    cancelled ||
+    turnFacts?.terminalCause === "deadline_expired" ||
+    budgetExpiry !== null;
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
@@ -1725,7 +1735,6 @@ export function hydrateNarrativeFromPayload(
     cancelled,
     proposalDisposition,
     responseKind: parseResponseKind(payload.responseKind),
-    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
@@ -1758,27 +1767,8 @@ export function hydrateNarrativeFromPayload(
     ),
     review: parseReviewProjection(payload.review),
     turnFacts,
+    budgetExpiry,
   };
-}
-
-// The chip reflects what the turn ACTUALLY did: its blocks, its response type,
-// and the backend's evidence-derived response kind.
-export function effectiveMode(turn: TurnNarrativeState): string {
-  if (turn.responseType === "ASK_QUESTION") {
-    return "clarify";
-  }
-  const blockCount = turn.draft?.blockCount ?? turn.blocks.length;
-  if (blockCount > 0) {
-    const priorBlocks = turn.priorBlockCount ?? 0;
-    return priorBlocks > 0 ? "edit" : "build";
-  }
-  if (turn.responseKind === "answer") {
-    return "docs_answer";
-  }
-  if (turn.responseKind === "diagnose" || turn.responseKind === "refuse") {
-    return turn.responseKind;
-  }
-  return "clarify";
 }
 
 // History rows persisted before narrative_payload carried responseKind still
@@ -1788,10 +1778,10 @@ export function effectiveMode(turn: TurnNarrativeState): string {
 export function hydrateHistoryNarrative(
   payload: Record<string, unknown> | null | undefined,
   turnOutcome:
-    | {
+    | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
-      }
+      })
     | null
     | undefined,
 ): TurnNarrativeState | undefined {
@@ -1814,6 +1804,7 @@ export function hydrateHistoryNarrative(
     connectedAccountChoices: hasTurnOutcomeChoices
       ? choices
       : hydrated.connectedAccountChoices,
+    budgetExpiry: hydrated.budgetExpiry ?? budgetExpiryFromOutcome(turnOutcome),
   };
 }
 
@@ -1830,17 +1821,6 @@ export function formatElapsed(
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export interface TurnSummary {
-  headline: string;
-  stats: string[];
-  accent: "ok" | "fail" | "qa" | "warn";
-  glyph: string;
-  isFail: boolean;
-  isStopped: boolean;
-  isQA: boolean;
-  isStoppedWithDraft: boolean;
-}
-
 export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
   const latest = new Map<string, BlockState>();
   for (const block of blocks) {
@@ -1849,53 +1829,27 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
   return Array.from(latest.values());
 }
 
-// Legacy prose heuristic, consulted only when the turn has no typed
-// adjudication (responseKind null).
-function asksUserForInput(turn: TurnNarrativeState): boolean {
-  if (turn.responseType === "ASK_QUESTION") {
-    return true;
-  }
-  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
-    .toLowerCase()
-    .trim();
-  return (
-    text.includes("please provide") ||
-    text.includes("please share") ||
-    text.includes("could you provide") ||
-    text.includes("can you provide") ||
-    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
-  );
-}
-
-interface AdjudicatedParts {
-  headline: string;
-  accent: TurnSummary["accent"];
-  glyph: string;
-}
-
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
 }
 
-export function notConfirmedOutcome(
-  turn: Pick<
-    TurnNarrativeState,
-    "terminalEnvelope" | "lastRunOutcome" | "blocks"
-  >,
-): NotConfirmedOutcome | null {
-  // The backend-finalized envelope is authoritative once it carries a run
-  // verdict; the pointer/block inference below only covers rows persisted
-  // before the envelope existed (or envelopes from run-less turns).
-  const envelope = turn.terminalEnvelope;
-  if (envelope !== null && envelope.runVerdict !== null) {
-    return envelope.runVerdict === "not_demonstrated"
-      ? {
-          verdict: "not_demonstrated",
-          displayReason: envelope.runDisplayReason,
-        }
-      : null;
+function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    if (
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole)
+    ) {
+      return block;
+    }
   }
+  return null;
+}
+
+export function notConfirmedOutcome(
+  turn: Pick<TurnNarrativeState, "lastRunOutcome" | "turnFacts" | "blocks">,
+): NotConfirmedOutcome | null {
   if (turn.lastRunOutcome !== null) {
     return turn.lastRunOutcome.verdict === "not_demonstrated" &&
       !isInterimOutcome(turn.lastRunOutcome.role)
@@ -1905,251 +1859,33 @@ export function notConfirmedOutcome(
         }
       : null;
   }
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
-    ) {
-      return {
+  // lastRunOutcome is live-only; a reloaded turn carries the same anchored verdict here.
+  const evaluationState = turn.turnFacts?.evaluationState;
+  if (evaluationState != null) {
+    if (evaluationState !== "not_demonstrated") return null;
+    return {
+      verdict: "not_demonstrated",
+      displayReason:
+        turn.turnFacts?.recordedFailure ??
+        notDemonstratedBlock(turn.blocks)?.outcomeReason ??
+        null,
+    };
+  }
+  const block = notDemonstratedBlock(turn.blocks);
+  return block === null
+    ? null
+    : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
       };
-    }
-  }
-  return null;
-}
-
-// Headline parts for non-build terminal response kinds. Build rows always use
-// lifecycle and run facts rather than a separate verification stamp.
-function adjudicatedSummaryParts(
-  turn: TurnNarrativeState,
-  flags: {
-    needsUntestedProposalReview: boolean;
-    needsTestedProposalReview: boolean;
-    hasEdited: boolean;
-    hasDrafts: boolean;
-  },
-): AdjudicatedParts | null {
-  if (turn.responseKind === null) return null;
-  // Disposition-first (rule A): a pending draft review outranks why the turn
-  // ended, regardless of responseKind (including non-build/clarify turns).
-  if (flags.needsUntestedProposalReview) {
-    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
-  }
-  if (flags.needsTestedProposalReview) {
-    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
-  }
-  if (turn.responseKind !== "build") {
-    if (turn.responseKind === "refuse") {
-      return { headline: "Declined", accent: "qa", glyph: "✦" };
-    }
-    if (turn.responseKind === "answer" || turn.responseKind === "diagnose") {
-      return { headline: "Answered", accent: "qa", glyph: "✦" };
-    }
-    if (
-      turn.responseType !== "ASK_QUESTION" &&
-      notConfirmedOutcome(turn)?.verdict === "not_demonstrated"
-    ) {
-      return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
-    }
-    return {
-      headline: "Needs your input",
-      accent: "qa",
-      glyph: "✦",
-    };
-  }
-  if (flags.needsUntestedProposalReview) {
-    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
-  }
-  if (flags.needsTestedProposalReview) {
-    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
-  }
-  if (turn.responseType === "ASK_QUESTION") {
-    return {
-      headline: "Needs your input",
-      accent: "qa",
-      glyph: "✦",
-    };
-  }
-  return null;
 }
 
 // A deadline exit stamps terminal="error" for budget reasons; that is a halt,
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    (turn.turnFacts?.terminalCause === "deadline_expired" ||
+      turn.budgetExpiry !== null) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
   );
-}
-
-export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
-  const rollupBlocks = latestBlocksByLabel(turn.blocks);
-  // A cancelled turn's terminal is "error" purely because the user stopped it,
-  // so that arm must not brand their own stop a failure.
-  const anyBlockFailed = rollupBlocks.some((b) => b.state === "failed");
-  const facts = turn.turnFacts;
-  const deadlineHalt = isDeadlineHalt(turn);
-  const isFail =
-    !turn.cancelled &&
-    !deadlineHalt &&
-    (turn.terminal === "error" || anyBlockFailed);
-  // A stop halts the turn without failing it — a user cancel, or a budget halt
-  // that cancels a block mid-run. It suppresses a success verdict exactly like
-  // a failure, but never wears failure's treatment. `turn.cancelled` is load
-  // bearing on its own: a stop during the thinking phase, or on a QA turn,
-  // touches no block at all and would otherwise read as a clean success.
-  const isStopped =
-    turn.cancelled ||
-    deadlineHalt ||
-    rollupBlocks.some((b) => b.state === "stopped");
-  const mode = effectiveMode(turn);
-  const needsInput = asksUserForInput(turn);
-  const isQA =
-    mode === "docs_answer" ||
-    mode === "diagnose" ||
-    mode === "clarify" ||
-    mode === "refuse";
-  const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
-  const cleanFullCurrentSourceCoverage = ranCleanOnCurrentSource(facts);
-  const needsUntestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_untested";
-  // The tested framing is a claim like any other, so it reads the published verdict
-  // rather than the disposition alone.
-  const needsTestedProposalReview =
-    hasDrafts &&
-    turn.proposalDisposition === "review_tested" &&
-    cleanFullCurrentSourceCoverage;
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const authoredBlockCount = facts?.factsAvailable
-    ? facts.authoredBlockCount
-    : null;
-  const matchingSourceBlockCount = facts?.factsAvailable
-    ? facts.matchingSourceBlockCount
-    : null;
-  const coverageKnown =
-    authoredBlockCount !== null &&
-    authoredBlockCount > 0 &&
-    matchingSourceBlockCount !== null;
-  const hasReviewableDraft =
-    hasDrafts &&
-    (turn.proposalDisposition === "review_untested" ||
-      turn.proposalDisposition === "review_tested" ||
-      (turn.cancelled && turn.proposalDisposition !== "no_proposal"));
-  const isStoppedWithDraft = hasReviewableDraft && (isFail || isStopped);
-
-  // Fail/cancel precedence is absolute: a verdict never upgrades a halt.
-  const adjudicated =
-    isStoppedWithDraft || isFail || isStopped
-      ? null
-      : adjudicatedSummaryParts(turn, {
-          needsUntestedProposalReview,
-          needsTestedProposalReview,
-          hasEdited,
-          hasDrafts,
-        });
-
-  const headline = adjudicated
-    ? adjudicated.headline
-    : isStoppedWithDraft
-      ? "Stopped with a draft"
-      : isFail
-        ? "Run halted"
-        : isStopped
-          ? "Stopped"
-          : needsUntestedProposalReview
-            ? "Draft needs review"
-            : needsTestedProposalReview
-              ? "Workflow ready for review"
-              : needsInput
-                ? "Needs your input"
-                : isQA
-                  ? mode === "refuse"
-                    ? "Declined"
-                    : mode === "clarify"
-                      ? "Needs your input"
-                      : "Answered"
-                  : cleanFullCurrentSourceCoverage
-                    ? "Every block ran clean on the current draft"
-                    : hasEdited
-                      ? "Applied edits"
-                      : hasDrafts
-                        ? "Built the workflow"
-                        : "Completed the run";
-
-  const stats: string[] = [];
-  const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
-  if (turnElapsed) stats.push(turnElapsed);
-  if (!isQA) {
-    const ok = rollupBlocks.filter((b) => isBlockOk(b)).length;
-    const failed = rollupBlocks.filter((b) => b.state === "failed").length;
-    const stopped = rollupBlocks.filter((b) => b.state === "stopped").length;
-    const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (coverageKnown) {
-      stats.push(
-        `${authoredBlockCount} block${authoredBlockCount === 1 ? "" : "s"} authored`,
-      );
-      stats.push(
-        `${matchingSourceBlockCount}/${authoredBlockCount} ran on current source`,
-      );
-      if (facts?.runCompleted === true) {
-        stats.push("run completed");
-      } else if (facts?.runCompleted === false) {
-        stats.push("run did not complete");
-      }
-      if (facts?.evaluationState === "not_evaluated") {
-        stats.push("outcome not evaluated");
-      } else if (facts?.evaluationState === "not_demonstrated") {
-        stats.push("outcome not confirmed");
-      }
-      if (facts?.terminalCause === "deadline_expired") {
-        stats.push("time limit reached");
-      }
-    } else {
-      if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-      if (newBlocks) stats.push(`${newBlocks} new`);
-    }
-    if (failed) stats.push(`${failed} failed`);
-    if (stopped) stats.push(`${stopped} stopped`);
-  }
-
-  const accent = adjudicated
-    ? adjudicated.accent
-    : isStoppedWithDraft
-      ? "qa"
-      : isFail
-        ? "fail"
-        : isStopped ||
-            needsUntestedProposalReview ||
-            needsTestedProposalReview ||
-            isQA ||
-            (hasDrafts && !cleanFullCurrentSourceCoverage)
-          ? "qa"
-          : "ok";
-  return {
-    headline,
-    stats,
-    accent,
-    glyph: adjudicated
-      ? adjudicated.glyph
-      : isStoppedWithDraft ||
-          needsUntestedProposalReview ||
-          needsTestedProposalReview ||
-          // A draft still awaiting review never wears a success tick, whether or not
-          // facts back its tested framing.
-          (hasDrafts && turn.proposalDisposition === "review_tested")
-        ? "!"
-        : isFail
-          ? "✕"
-          : isStopped
-            ? "■"
-            : isQA
-              ? "✦"
-              : "✓",
-    isFail,
-    isStopped,
-    isQA,
-    isStoppedWithDraft,
-  };
 }

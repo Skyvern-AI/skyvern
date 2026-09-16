@@ -240,7 +240,7 @@ function QuestionnaireDetailsStep({
   }
 
   return (
-    <OnboardingStepShell stepIndex={2} stepCount={3} chip="optional">
+    <OnboardingStepShell stepIndex={2} stepCount={2} chip="final">
       <DialogHeader className="pr-12">
         <DialogTitle className="text-xl font-semibold">
           Tell us about your setup
@@ -250,7 +250,7 @@ function QuestionnaireDetailsStep({
           never limit what you can build.
         </DialogDescription>
       </DialogHeader>
-      <div className="grid gap-4 py-1 pr-1">
+      <div className="grid min-h-0 gap-4 overflow-y-auto overscroll-contain pb-6 pr-1 pt-1">
         <QuestionnaireSelect
           id={`${fieldPrefix}-role`}
           label="What best describes your role?"
@@ -287,17 +287,17 @@ function QuestionnaireDetailsStep({
           disabled={pending}
           onValueChange={(value) => setSelection("referral_source", value)}
         />
+        {displayedError ? (
+          <Alert variant="destructive">
+            <AlertDescription>{displayedError}</AlertDescription>
+          </Alert>
+        ) : null}
+        {!answers ? (
+          <p id={incompleteHintId} className="text-sm text-muted-foreground">
+            Answer every question to complete and continue.
+          </p>
+        ) : null}
       </div>
-      {displayedError ? (
-        <Alert variant="destructive">
-          <AlertDescription>{displayedError}</AlertDescription>
-        </Alert>
-      ) : null}
-      {!answers ? (
-        <p id={incompleteHintId} className="text-sm text-muted-foreground">
-          Answer every question to complete and continue.
-        </p>
-      ) : null}
       <DialogFooter className="sticky bottom-0 z-10 -mx-6 -mb-6 flex-col gap-2 border-t border-border bg-background px-6 pb-[max(1rem,env(safe-area-inset-bottom))] pt-4 sm:flex-row sm:justify-between sm:gap-0 sm:space-x-0">
         <Button
           type="button"

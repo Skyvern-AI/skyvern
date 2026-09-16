@@ -17,7 +17,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_MODAL_OVERLAYS,
     _MAX_NAVIGATION_TARGETS,
     _MAX_PAGE_OBSTRUCTIONS,
-    _MAX_RESULT_CONTAINERS,
     _MAX_RESULT_SAMPLE_ROWS,
     _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
@@ -31,17 +30,20 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _RENDERED_STYLE_SNAPSHOT_ATTR,
     _RESULT_CONTAINER_HINTS,
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+    MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
 )
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 # Keep stripped-body evaluate results under the shared MCP response cap while
 # preserving as much below-fold page structure as possible.
 COMPOSITION_STRIPPED_HTML_MAX_CHARS = 135000
 COMPOSITION_STRIPPED_HTML_EXPRESSION = (
-    "(() => {"
-    "  const b = document.body; if (!b) return '';"
-    "  const c = b.cloneNode(true);"
+    "(() => {" + OTP_INPUT_PRIVACY_JS + "  const b = document.body; if (!b) return '';"
+    "  const inert = document.implementation.createHTMLDocument('');"
+    "  const c = inert.importNode(b, true);"
+    "  const aligned = otpMaskHtmlCopy(b, c);"
     "  const sourceNodes = [b, ...b.querySelectorAll('*')];"
     "  const cloneNodes = [c, ...c.querySelectorAll('*')];"
     "  const cloneBySource = new Map(sourceNodes.map((source, index) => [source, cloneNodes[index]]));"
@@ -119,7 +121,7 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
     "    }"
     "  };"
     "  const computedVisibility = new Map();"
-    "  for (let i = 0; i < sourceNodes.length; i++) {"
+    "  for (let i = 0; aligned && i < sourceNodes.length; i++) {"
     "    const source = sourceNodes[i]; const clone = cloneNodes[i];"
     "    let style; try { style = window.getComputedStyle(source); } catch (e) { continue; }"
     "    const parentVisibility = computedVisibility.get(source.parentElement) || '';"
@@ -500,7 +502,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
-    f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
+    f"const MAX_RESULT_CONTAINERS={int(MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
     f"const MAX_SELECTOR_CHARS={int(_MAX_SELECTOR_CHARS)};"
     f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
@@ -526,7 +528,14 @@ const lower = (v) => String(v == null ? '' : v).toLowerCase();
 // Cap fields in-page so a giant element can't bloat the JSON past the size bound; Python re-bounds.
 const FIELD_CAP = 2048;
 const cap = (s) => (s.length > FIELD_CAP ? s.slice(0, FIELD_CAP) : s);
-const attr = (el, k) => { const v = el && el.getAttribute ? el.getAttribute(k) : null; return typeof v === 'string' ? cap(v.trim()) : ''; };
+const attr = (el, k) => {
+  const value = el && el.getAttribute ? el.getAttribute(k) : null;
+  if (typeof value !== 'string') return '';
+  const safe = (k === 'value' || k === 'placeholder') && isOtpInputValueSecret(el)
+    ? otpSafeInputAttribute(el, k, value)
+    : value;
+  return cap(safe.trim());
+};
 const nodeText = (el) => { if (!el) return ''; return cap(String(el.textContent || '').replace(/\s+/g, ' ').trim()); };
   const readsAsOneLeaf = (el) => {
     if (!el || !el.children || !el.children.length) return true;
@@ -876,7 +885,9 @@ const isFilled = (el) => {
 // Live DOM property state, which diverges from the markup attribute once the agent interacts.
 const observedValue = (el) => {
   try {
-    return typeof el.value === 'string' ? cap(el.value.trim()) : '';
+    if (typeof el.value !== 'string') return '';
+    const value = isOtpInputValueSecret(el) ? otpSafeInputAttribute(el, 'value', el.value) : el.value;
+    return cap(value.trim());
   } catch (e) {
     return '';
   }
@@ -1107,11 +1118,11 @@ for (const form of document.querySelectorAll('form')) {
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
-    // Observed state needs both a real <input> tag here and the reported attribute type at the
+    // Unmasked observed state needs both a real <input> tag here and the reported attribute type at the
     // Python and replay re-gates; the pair is deliberately an AND so a page that declares
     // type="date" on a textarea mirroring a password acquires no observed value.
     const observedType = tag === 'input' ? lower(node.type) : '';
-    if (OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
+    if (isOtpInputValueSecret(node) || OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
     if (OBSERVED_CHECKED_TYPES.has(observedType)) field.observed_checked = observedChecked(node);
     if (tag === 'select') {
       field.option_count = node.querySelectorAll('option').length;
@@ -1343,6 +1354,64 @@ for (const target of REQUESTED_TARGETS) {
     keyValueRelations.push(found.relation);
     metricCardNodes.add(found.owner);
     break;
+  }
+}
+// A value the same call's screenshot pass read addresses a tile its label cannot: the label repeats
+// across hidden siblings, while exactly one visible leaf carries that magnitude.
+const witnessedLabelNear = (valueLeaf) => {
+  const wanted = new Set(REQUESTED_TARGETS.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean));
+  if (!wanted.size) return { text: '', owner: null };
+  let branch = valueLeaf;
+  let ancestor = valueLeaf.parentElement;
+  while (ancestor && ancestor.tagName !== 'BODY' && ancestor.tagName !== 'HTML') {
+    for (const leaf of Array.from(ancestor.querySelectorAll('*'))) {
+      if (!isLeafEl(leaf) || withinEl(leaf, branch) || !elementVisible(leaf) || insidePageChrome(leaf)) continue;
+      const text = nodeText(leaf);
+      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor };
+    }
+    branch = ancestor;
+    ancestor = ancestor.parentElement;
+  }
+  return { text: '', owner: null };
+};
+const witnessedValueRelation = (valueLeaf) => {
+  const carrier = valueLeaf.parentElement;
+  if (!carrier) return null;
+  const kids = Array.from(carrier.children || []);
+  const childIndex = kids.indexOf(valueLeaf);
+  if (childIndex < 0) return null;
+  const sel = selectorFor(carrier);
+  if (!sel || sel.length > MAX_SELECTOR_CHARS) return null;
+  const matches = selectorMatchCount(sel);
+  if (!matches) return null;
+  let pos = -1;
+  try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
+  if (pos < 0) return null;
+  const near = witnessedLabelNear(valueLeaf);
+  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+};
+const witnessedWanted = new Set(WITNESSED_VALUES);
+if (witnessedWanted.size) {
+  const witnessedLeaves = new Map();
+  for (const node of all) {
+    if (!isLeafEl(node)) continue;
+    const text = nodeText(node);
+    if (!witnessedWanted.has(text)) continue;
+    if (!elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
+    const seen = witnessedLeaves.get(text);
+    if (seen) seen.push(node);
+    else witnessedLeaves.set(text, [node]);
+  }
+  for (const value of WITNESSED_VALUES) {
+    if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; break; }
+    const leaves = witnessedLeaves.get(value);
+    if (!leaves || leaves.length !== 1) continue;
+    const found = witnessedValueRelation(leaves[0]);
+    if (!found) continue;
+    countFoldedKey(found.relation.key_text);
+    countWalkedValue(found.relation.value_text);
+    keyValueRelations.push(found.relation);
+    metricCardNodes.add(found.owner);
   }
 }
 for (const node of all) {
@@ -1676,15 +1745,42 @@ return boundedStructuredEvidence(structuredEvidence);
 """
 
 
-def composition_structured_evidence_expression(requested_targets: tuple[str, ...] = ()) -> str:
-    """The capture expression, told which labels the turn asked for.
+def composition_structured_evidence_expression(
+    requested_targets: tuple[str, ...] = (),
+    witnessed_values: tuple[str, ...] = (),
+) -> str:
+    """The capture expression, told which labels the turn asked for and which values were just seen.
 
-    Capture that does not know the request can only guess which of a page's relations matters, and a
-    tile whose shape it fails to recognise is replaced by whatever generic pair sits nearby.
+    Capture that does not know the request can only guess which relations matter, and a witnessed
+    value addresses a tile by the magnitude a screenshot read off it rather than by its shape.
     """
     targets = [target.strip() for target in requested_targets if isinstance(target, str) and target.strip()]
-    header = f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
-    return "(() => {" + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
+    values = [value.strip() for value in witnessed_values if isinstance(value, str) and value.strip()]
+    header = (
+        f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
+        f"const WITNESSED_VALUES={json.dumps(values[:_MAX_KEY_VALUE_RELATIONS])};"
+    )
+    return "(() => {" + OTP_INPUT_PRIVACY_JS + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
 
 
 COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = composition_structured_evidence_expression()
+
+
+def value_witness_read_expression(container_selector: str, match_count: int, position: int, child_index: int) -> str:
+    """The page read that returns a witnessed relation's value, folding whitespace the way nodeText does.
+
+    A positional index only names the observed element while the selector still matches the same
+    number of nodes, so a page that grew or shed one reads nothing rather than the wrong element.
+    """
+    return (
+        "(() => { const nodes = document.querySelectorAll("
+        + json.dumps(container_selector)
+        + "); if (nodes.length !== "
+        + str(int(match_count))
+        + ") return null; const carrier = nodes["
+        + str(int(position))
+        + "]; if (!carrier) return null; const leaf = carrier.children["
+        + str(int(child_index))
+        + "]; if (!leaf) return null; "
+        + "return String(leaf.textContent || '').replace(/\\s+/g, ' ').trim(); })()"
+    )

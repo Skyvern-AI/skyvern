@@ -28,6 +28,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagSource
 from skyvern.schemas.run_enums import RunType
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 ORG_ID = "o_test"
 
@@ -302,6 +303,7 @@ def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     app_mock = MagicMock()
     app_mock.DATABASE.workflow_runs = workflow_runs_mock
+    app_mock.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
 
     test_app = FastAPI()

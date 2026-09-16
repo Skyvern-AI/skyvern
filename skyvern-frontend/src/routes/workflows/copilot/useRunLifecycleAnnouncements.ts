@@ -1,8 +1,9 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
-import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
+import { statusIsAFailureType } from "@/routes/tasks/types";
 import { formatElapsedSeconds, isRecord } from "@/util/utils";
 
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
@@ -122,20 +123,12 @@ export function useRunLifecycleAnnouncements({
   turnOwnedRunIds: { current: Set<string> };
   announce: (message: RunLifecycleMessage) => void;
 }): void {
-  // enabled: false (not just an omitted workflowRunId) stops useWorkflowRunQuery
-  // from falling back to the route's own :workflowRunId and polling a run this
-  // chat renders no line for.
-  const { data } = useWorkflowRunQuery({
-    workflowRunId,
-    enabled: workflowRunId !== undefined,
-  });
+  const { data } = useWorkflowRunQuery({ workflowRunId });
   const seen = useRef(new Map<string, SeenEntry>());
   const [searchParams] = useSearchParams();
   const isBlockRun = searchParams.get("bl") !== null;
 
   useEffect(() => {
-    // Disabling the query above doesn't clear data left over from a prior
-    // enabled fetch, so still gate announcing on our own current input.
     if (!workflowRunId || !data) {
       return;
     }
@@ -153,7 +146,7 @@ export function useRunLifecycleAnnouncements({
       entry.terminal = true;
       return;
     }
-    const finalized = statusIsFinalized({ status: data.status });
+    const finalized = runIsLogicallyFinal(data);
     // A not-yet-claimed run seen mid-turn may still turn out to be the turn's
     // own (its run_outcome hasn't landed yet), so hold its lines until the turn
     // ends instead of leaking a start line the turn would also narrate. Record

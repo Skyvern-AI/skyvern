@@ -2,14 +2,44 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 import pytest
 
+import skyvern.forge.sdk.artifact.manager as manager_module
+import skyvern.forge.sdk.artifact.storage.azure as azure_module
+import skyvern.forge.sdk.artifact.storage.base as base_module
+import skyvern.forge.sdk.artifact.storage.gcs as gcs_module
+import skyvern.forge.sdk.artifact.storage.local as local_module
+import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+from skyvern.config import settings
+from skyvern.forge.sdk.api.files import parse_uri_to_path
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.loop_download_filter import (
+    DOWNLOADED_FILE_SIGS_KEY,
+    filter_downloaded_files_for_current_iteration,
+    to_downloaded_file_signature,
+)
+from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models.block import PrintPageBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.runtime_completion import CompletionCriterion, grade_completion_contract
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
+from tests.unit.forge.sdk.artifact.storage.test_azure_storage import AzureStorageForTests
+from tests.unit.forge.sdk.artifact.storage.test_gcs_storage import GcsStorageForTests
 
 
 def _is_amazonaws_s3_url(url: str) -> bool:
@@ -44,6 +74,7 @@ async def test_create_download_artifact_is_idempotent_per_run_and_uri():
     )
     find_existing = AsyncMock(return_value=existing)
     mock_db_create = AsyncMock()
+    mock_refresh = AsyncMock()
 
     with (
         patch(
@@ -53,6 +84,10 @@ async def test_create_download_artifact_is_idempotent_per_run_and_uri():
         patch(
             "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
             mock_db_create,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.refresh_download_artifact_content",
+            mock_refresh,
         ),
     ):
         artifact_id = await manager.create_download_artifact(
@@ -65,6 +100,7 @@ async def test_create_download_artifact_is_idempotent_per_run_and_uri():
 
     assert artifact_id == "a_existing"
     mock_db_create.assert_not_awaited()
+    mock_refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -118,7 +154,7 @@ async def test_create_download_artifact_inserts_row_without_uploading():
 
 
 @pytest.mark.asyncio
-async def test_save_downloaded_files_registers_artifact_per_file(tmp_path):
+async def test_save_downloaded_files_registers_artifact_per_file(tmp_path, monkeypatch):
     """After uploading each file to S3, save_downloaded_files should create an
     Artifact row so later retrieval can build short /v1/artifacts URLs."""
     download_dir = tmp_path / "downloads"
@@ -141,6 +177,9 @@ async def test_save_downloaded_files_registers_artifact_per_file(tmp_path):
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
     ):
         app_module.ARTIFACT_MANAGER = mock_artifact_manager
+        app_module.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+        app_module.DATABASE.workflow_run_attempts = FakeWorkflowRunAttemptsRepository()
+        monkeypatch.setattr(base_module, "app", app_module)
         await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
 
     assert mock_create_download.await_count == 2
@@ -156,6 +195,50 @@ async def test_save_downloaded_files_registers_artifact_per_file(tmp_path):
     for call in mock_create_download.await_args_list:
         assert call.kwargs["organization_id"] == "o_1"
         assert call.kwargs["run_id"] == "wr_1"
+
+
+@pytest.mark.asyncio
+async def test_local_retry_snapshot_uri_survives_fragment_and_query_characters(tmp_path, monkeypatch):
+    # A raw file:// URI turns "#" and "?" into a fragment and a query, so the snapshot path read back
+    # from the artifact row no longer exists and the saved download drops out of the listing.
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "report #1?.pdf").write_bytes(b"attempt two bytes")
+    rows: list[Artifact] = []
+
+    async def register(**kwargs):
+        rows.append(
+            _make_artifact(
+                f"a_{len(rows)}",
+                kwargs["uri"],
+                checksum=kwargs["checksum"],
+                file_size=kwargs["file_size"],
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        )
+
+    fake_app = SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
+        DATABASE=SimpleNamespace(
+            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
+        ),
+    )
+    monkeypatch.setattr(local_module, "app", fake_app)
+    monkeypatch.setattr(local_module, "get_download_dir", lambda *args, **kwargs: str(download_dir))
+    started_at = datetime.now(UTC) - timedelta(minutes=1)
+    monkeypatch.setattr(base_module, "resolve_download_attempt", AsyncMock(return_value=("wr_1", 2, started_at)))
+
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+
+    assert len(rows) == 1
+    snapshot = Path(parse_uri_to_path(rows[0].uri))
+    assert snapshot.name == "report #1?.pdf"
+    assert snapshot.parent.name == "2"
+    assert snapshot.read_bytes() == b"attempt two bytes"
+    listed = await storage.get_downloaded_files("o_1", "wr_1")
+    assert [(file.filename, file.artifact_id) for file in listed] == [("report #1?.pdf", "a_0")]
 
 
 def _make_artifact(
@@ -384,6 +467,11 @@ async def test_content_endpoint_download_returns_attachment_with_filename():
     assert media_type == "application/octet-stream"
     assert disposition.startswith("attachment;")
     assert 'filename="invoice.pdf"' in disposition
+    local_snapshot = _make_artifact(
+        "a_local", "file:///tmp/artifacts/downloads/local/o_1/wr_1/attempts/2/report%20%231.pdf"
+    )
+    _, local_disposition = _artifact_response_config(local_snapshot)
+    assert 'filename="report #1.pdf"' in local_disposition
 
 
 def test_content_endpoint_non_download_stays_inline():
@@ -702,12 +790,15 @@ async def test_create_download_artifact_refreshes_checksum_for_changed_bytes():
     mock_db_create.assert_not_awaited()
     mock_refresh.assert_awaited_once()
     assert mock_refresh.await_args.kwargs["checksum"] == "fresh"
+    assert mock_refresh.await_args.kwargs["file_size"] == 10
 
 
 @pytest.mark.asyncio
-async def test_create_download_artifact_keeps_row_untouched_for_identical_bytes():
-    """A byte-identical re-save (a loop iteration re-uploading the same file) must not touch the
-    row, or every iteration's URL would read as a new download."""
+async def test_create_download_artifact_does_not_touch_row_for_identical_bytes(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.DATABASE.workflow_run_attempts",
+        FakeWorkflowRunAttemptsRepository([SimpleNamespace(attempt_number=2, started_at=None)]),
+    )
     manager = ArtifactManager()
 
     existing = Artifact(
@@ -787,3 +878,497 @@ async def test_create_download_artifact_propagates_refresh_failure():
                 checksum="fresh",
                 file_size=10,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["s3", "azure", "gcs", "local"])
+@pytest.mark.parametrize("child_save", [False, True])
+@pytest.mark.parametrize("retry_bytes", [b"attempt one", b"different attempt two bytes"])
+@pytest.mark.parametrize("signed_artifact_urls", [True, False])
+async def test_retry_downloads_preserve_attempt_objects_and_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    child_save: bool,
+    retry_bytes: bytes,
+    signed_artifact_urls: bool,
+):
+    monkeypatch.setattr(
+        settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON if signed_artifact_urls else None
+    )
+    storage = {
+        "s3": lambda: S3Storage(),
+        "azure": lambda: AzureStorageForTests("uploads"),
+        "gcs": lambda: GcsStorageForTests("uploads"),
+        "local": lambda: LocalStorage(str(tmp_path / "artifacts")),
+    }[backend]()
+    storage.async_client = MagicMock()
+    if backend in ("s3", "gcs"):
+        monkeypatch.setattr(storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    if backend == "gcs":
+        monkeypatch.setattr(storage, "_get_tags_for_org", AsyncMock(return_value=None))
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    file_path = download_dir / "report.pdf"
+    original_bytes = b"attempt one"
+    file_path.write_bytes(original_bytes)
+    first_start = datetime.now(UTC) - timedelta(minutes=2)
+    second_start = first_start + timedelta(minutes=1)
+    write_time = first_start + timedelta(seconds=1)
+    attempts = FakeWorkflowRunAttemptsRepository([SimpleNamespace(attempt_number=1, started_at=first_start)])
+    rows: dict[str, Artifact] = {}
+    objects: dict[str, bytes] = {}
+    object_info: dict[str, dict] = {}
+
+    async def upload(*, uri: str, file_path: str, metadata: dict[str, str], **kwargs):
+        objects[uri] = Path(file_path).read_bytes()
+        object_info[uri] = {"Metadata": metadata, "ContentLength": len(objects[uri]), "LastModified": write_time}
+
+    async def list_files(*, uri: str):
+        return [urlparse(key).path.lstrip("/") for key in objects if key.startswith(uri + "/")]
+
+    async def get_object_info(uri: str):
+        return object_info[uri]
+
+    async def sign_urls(uris: list[str]):
+        return [f"https://storage.example{urlparse(uri).path}?signature=test" for uri in uris]
+
+    async def find(*, uri: str, **kwargs):
+        return next((row for row in rows.values() if row.uri == uri), None)
+
+    async def create(**kwargs):
+        row = Artifact(**kwargs, created_at=write_time, modified_at=write_time)
+        rows[row.artifact_id] = row
+        return row
+
+    async def refresh(*, artifact_id: str, checksum: str | None, file_size: int | None, **kwargs):
+        row = rows[artifact_id]
+        row.checksum, row.file_size, row.modified_at = checksum, file_size, write_time
+
+    async def list_rows(**kwargs):
+        return list(rows.values())
+
+    current_context = SkyvernContext(workflow_run_id="wr_child_1" if child_save else "wr_1")
+
+    async def get_attempts(workflow_run_id):
+        if workflow_run_id != "wr_1":
+            return [SimpleNamespace(attempt_number=1, started_at=write_time)]
+        return attempts.attempts
+
+    manager = ArtifactManager()
+    fake_app = SimpleNamespace(
+        ARTIFACT_MANAGER=manager,
+        WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+        DATABASE=SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            artifacts=SimpleNamespace(
+                find_download_artifact=find,
+                create_artifact=create,
+                refresh_download_artifact_content=refresh,
+                list_artifacts_for_run_by_type=list_rows,
+            ),
+        ),
+    )
+    backend_module = {"s3": s3_module, "azure": azure_module, "gcs": gcs_module, "local": local_module}[backend]
+    for module in (manager_module, base_module, backend_module):
+        monkeypatch.setattr(module, "app", fake_app)
+    monkeypatch.setattr(backend_module, "get_download_dir", lambda **kwargs: str(download_dir))
+    monkeypatch.setattr(manager_module.skyvern_context, "current", lambda: current_context)
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", upload)
+    monkeypatch.setattr(storage.async_client, "list_files", list_files)
+    monkeypatch.setattr(storage.async_client, "get_object_info", get_object_info)
+    signing_method = {
+        "s3": "create_presigned_urls",
+        "azure": "create_sas_urls",
+        "gcs": "create_signed_urls",
+        "local": "unused",
+    }[backend]
+    monkeypatch.setattr(storage.async_client, signing_method, sign_urls)
+    monkeypatch.setattr(
+        manager,
+        "resolve_share_url",
+        AsyncMock(
+            side_effect=lambda artifact, **kwargs: f"https://api.example/v1/artifacts/{artifact.artifact_id}/content"
+        ),
+    )
+    monkeypatch.setattr(manager, "resolve_artifact_url_expiry_seconds", AsyncMock(return_value=3600))
+
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+    first = next(iter(rows.values())).model_copy(deep=True)
+    assert first.uri.endswith("/o_1/wr_1/report.pdf")
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+    assert list(rows) == [first.artifact_id]
+    first_files = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+    first_signature = to_downloaded_file_signature(first_files[0])
+
+    current_context.workflow_run_id = "wr_child_2" if child_save else "wr_1"
+    attempts.attempts.append(SimpleNamespace(attempt_number=2, started_at=second_start))
+    write_time = second_start + timedelta(seconds=1)
+    file_path.write_bytes(retry_bytes)
+    os.utime(file_path, (write_time.timestamp(), write_time.timestamp()))
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+
+    current_context.workflow_run_id = "wr_1"
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1", attempt_number=2)
+    if backend == "local":
+        objects = {row.uri: await storage.retrieve_artifact(row) for row in rows.values()}
+    assert len(objects) == 2
+    assert len(rows) == 2
+    second = next(row for row in rows.values() if row.artifact_id != first.artifact_id)
+    assert second.uri == first.uri.removesuffix("report.pdf") + "attempts/2/report.pdf"
+    assert objects[first.uri] == original_bytes
+    assert rows[first.artifact_id] == first
+    assert first.checksum == hashlib.sha256(original_bytes).hexdigest()
+    assert objects[second.uri] == retry_bytes
+    assert second.checksum == hashlib.sha256(retry_bytes).hexdigest()
+    assert second.file_size == len(retry_bytes)
+
+    service = WorkflowService()
+    all_files = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+    current_files = service._filter_downloaded_files_to_attempt(
+        all_files, attempt_rows=attempts.attempts, attempt_number=2, artifact_ids={second.artifact_id}
+    )
+    historical_files = service._filter_downloaded_files_to_attempt(
+        all_files, attempt_rows=attempts.attempts, attempt_number=1, artifact_ids={first.artifact_id}
+    )
+    assert [file.artifact_id for file in current_files] == [second.artifact_id]
+    assert [file.artifact_id for file in historical_files] == [first.artifact_id]
+    assert to_downloaded_file_signature(historical_files[0]) == first_signature
+    if backend == "local":
+        assert first_files[0].url == first.uri
+        assert Path(urlparse(first_files[0].url).path).read_bytes() == original_bytes
+        assert first_files[0].file_size == first.file_size
+        assert first_files[0].modified_at == first.modified_at
+        assert historical_files[0].url == first.uri
+        assert historical_files[0].checksum == first.checksum
+        assert current_files[0].url == second.uri
+        assert current_files[0].checksum == second.checksum
+    assert (
+        filter_downloaded_files_for_current_iteration(
+            all_files,
+            {DOWNLOADED_FILE_SIGS_KEY: [first_signature]},
+            aliases=storage.get_downloaded_file_signature_aliases,
+        )
+        == current_files
+    )
+    second_signature = to_downloaded_file_signature(current_files[0])
+    assert second_signature != first_signature
+    assert grade_completion_contract(
+        (CompletionCriterion("download", "registered_download"),), registered_download_count=len(current_files)
+    ).satisfied
+    assert not grade_completion_contract(
+        (CompletionCriterion("downloads", "registered_download", min_count=2),),
+        registered_download_count=len(current_files),
+    ).satisfied
+
+    second_snapshot = second.model_copy(deep=True)
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+    assert len(rows) == 2
+    assert rows[second.artifact_id] == second_snapshot
+    assert (
+        await manager.create_download_artifact(
+            organization_id="o_1",
+            run_id="wr_1",
+            workflow_run_id="wr_1",
+            uri=second.uri,
+            filename="report.pdf",
+            checksum=second.checksum,
+            file_size=second.file_size,
+        )
+        == second.artifact_id
+    )
+    repeated = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+    assert (
+        to_downloaded_file_signature(next(file for file in repeated if file.artifact_id == second.artifact_id))
+        == second_signature
+    )
+
+    if backend == "local":
+        fake_app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts["wr_1"] = SimpleNamespace(attempt_number=1)
+        historical_read = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+        assert {file.url for file in historical_read} == {first.uri, second.uri}
+        file_path.unlink()
+        assert await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1") == historical_read
+
+        file_path.write_bytes(b"unsaved replacement")
+        unsaved_path = download_dir / "unsaved.pdf"
+        unsaved_path.write_bytes(b"unsaved download")
+        mixed_files = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+        assert {file.url for file in mixed_files} == {
+            first.uri,
+            second.uri,
+            f"file://{file_path}",
+            f"file://{unsaved_path}",
+        }
+        for live_path in (file_path, unsaved_path):
+            live_file = next(file for file in mixed_files if file.url == f"file://{live_path}")
+            assert live_file.artifact_id is None
+            assert live_file.checksum == hashlib.sha256(live_path.read_bytes()).hexdigest()
+            assert live_file.file_size == live_path.stat().st_size
+            assert live_file.modified_at == datetime.fromtimestamp(live_path.stat().st_mtime, tz=UTC)
+
+        monkeypatch.setattr(
+            fake_app.DATABASE.artifacts,
+            "list_artifacts_for_run_by_type",
+            AsyncMock(side_effect=RuntimeError("artifact repository unavailable")),
+        )
+        unattributed_files = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
+        assert {file.url for file in unattributed_files} == {f"file://{file_path}", f"file://{unsaved_path}"}
+        assert all(file.artifact_id is None for file in unattributed_files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["s3", "azure", "gcs", "local"])
+@pytest.mark.parametrize("failure", ["lookup_error", "unstarted_attempt"])
+async def test_save_downloaded_files_fails_open_when_the_attempt_cannot_be_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, failure: str
+):
+    """A database blip while resolving the attempt, or an attempt row with no start time, must
+    save every downloaded file rather than none; the read path already fails open the same way."""
+    storage = {
+        "s3": lambda: S3Storage(),
+        "azure": lambda: AzureStorageForTests("uploads"),
+        "gcs": lambda: GcsStorageForTests("uploads"),
+        "local": lambda: LocalStorage(str(tmp_path / "artifacts")),
+    }[backend]()
+    storage.async_client = MagicMock()
+    if backend in ("s3", "gcs"):
+        monkeypatch.setattr(storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    if backend == "gcs":
+        monkeypatch.setattr(storage, "_get_tags_for_org", AsyncMock(return_value=None))
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "report.pdf").write_bytes(b"attempt two bytes")
+    now = datetime.now(UTC)
+    rows: dict[str, Artifact] = {}
+    objects: dict[str, bytes] = {}
+
+    async def upload(*, uri: str, file_path: str, metadata: dict[str, str], **kwargs):
+        objects[uri] = Path(file_path).read_bytes()
+
+    async def find(*, uri: str, **kwargs):
+        return next((row for row in rows.values() if row.uri == uri), None)
+
+    async def create(**kwargs):
+        row = Artifact(**kwargs, created_at=now, modified_at=now)
+        rows[row.artifact_id] = row
+        return row
+
+    async def list_rows(**kwargs):
+        return list(rows.values())
+
+    get_workflow_run = (
+        AsyncMock(side_effect=RuntimeError("database unavailable"))
+        if failure == "lookup_error"
+        else AsyncMock(return_value=SimpleNamespace(parent_workflow_run_id=None))
+    )
+    attempts = [
+        SimpleNamespace(attempt_number=1, started_at=now - timedelta(minutes=5)),
+        SimpleNamespace(attempt_number=2, started_at=None),
+    ]
+    fake_app = SimpleNamespace(
+        ARTIFACT_MANAGER=ArtifactManager(),
+        WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+        DATABASE=SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=attempts)),
+            workflow_runs=SimpleNamespace(get_workflow_run=get_workflow_run),
+            artifacts=SimpleNamespace(
+                find_download_artifact=find,
+                create_artifact=create,
+                refresh_download_artifact_content=AsyncMock(),
+                list_artifacts_for_run_by_type=list_rows,
+            ),
+        ),
+    )
+    backend_module = {"s3": s3_module, "azure": azure_module, "gcs": gcs_module, "local": local_module}[backend]
+    for module in (manager_module, base_module, backend_module):
+        monkeypatch.setattr(module, "app", fake_app)
+    monkeypatch.setattr(backend_module, "get_download_dir", lambda **kwargs: str(download_dir))
+    monkeypatch.setattr(manager_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(base_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(storage.async_client, "upload_file_from_path", upload)
+    monkeypatch.setattr(storage.async_client, "list_files", AsyncMock(return_value=[]))
+
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1", attempt_number=2)
+
+    saved_uris = [row.uri for row in rows.values()]
+    assert len(saved_uris) == 1
+    assert saved_uris[0].endswith("/o_1/wr_1/attempts/2/report.pdf")
+    if backend != "local":
+        assert list(objects) == saved_uris
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", ["wr_root", "wr_nested", "tsk_v2_root", "tsk_v2_child"])
+@pytest.mark.parametrize("with_context", [True, False])
+async def test_download_attempt_resolves_parent_owner(monkeypatch, run_id, with_context):
+    started_at = datetime.now(UTC)
+    parents = {"wr_root": None, "wr_nested": "wr_root"}
+
+    async def get_workflow_run(workflow_run_id, *, organization_id):
+        assert organization_id == "o_1"
+        return SimpleNamespace(parent_workflow_run_id=parents[workflow_run_id])
+
+    get_attempts = AsyncMock(return_value=[SimpleNamespace(attempt_number=2, started_at=started_at)])
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(get_workflow_run=get_workflow_run),
+            workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+            tasks=SimpleNamespace(
+                get_run=AsyncMock(
+                    return_value=SimpleNamespace(
+                        parent_workflow_run_id="wr_nested" if run_id == "tsk_v2_child" else None
+                    )
+                )
+            ),
+            observer=SimpleNamespace(get_task_v2=AsyncMock(return_value=SimpleNamespace(workflow_run_id="wr_root"))),
+        ),
+        WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+    )
+    monkeypatch.setattr(base_module, "app", fake_app)
+    context = SkyvernContext(workflow_run_id="wr_nested") if with_context else None
+    monkeypatch.setattr(base_module.skyvern_context, "current", lambda: context)
+    owner, number, start = await base_module.resolve_download_attempt("o_1", run_id)
+    assert (owner, number, start) == ("wr_root", 2, started_at)
+    get_attempts.assert_awaited_once_with("wr_root")
+    if with_context or run_id in {"wr_nested", "tsk_v2_child"}:
+        assert await base_module.resolve_download_attempt("o_1", run_id, attempt_number=1) == ("wr_root", 2, started_at)
+    else:
+        assert await base_module.resolve_download_attempt("o_1", run_id, attempt_number=1) == ("wr_root", 1, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attempt_number, stale_retry_file, metadata_timeout",
+    [
+        (1, False, False),
+        (2, False, False),
+        (2, True, False),
+        pytest.param(1, False, True, id="no-policy-metadata-timeout"),
+    ],
+)
+async def test_print_page_excludes_live_http_download_after_snapshot_registration(
+    tmp_path, monkeypatch, attempt_number, stale_retry_file, metadata_timeout
+):
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    http_file = download_dir / ("printed.pdf" if stale_retry_file else "http-report.pdf")
+    http_file.write_bytes(b"printed PDF" if stale_retry_file else b"HTTP response")
+    context = SkyvernContext(workflow_run_id="wr_1", run_id="wr_1")
+    rows: list[Artifact] = []
+
+    async def register(**kwargs):
+        rows.append(
+            _make_artifact(
+                f"a_{len(rows)}",
+                kwargs["uri"],
+                checksum=kwargs["checksum"],
+                file_size=kwargs["file_size"],
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        )
+
+    fake_app = SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
+        DATABASE=SimpleNamespace(
+            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
+        ),
+    )
+    for module in (local_module, block_module):
+        monkeypatch.setattr(module, "app", fake_app)
+        monkeypatch.setattr(module, "get_download_dir", lambda *args, **kwargs: str(download_dir))
+    started_at = datetime.now(UTC) - timedelta(minutes=1)
+    resolve_attempt = AsyncMock(return_value=("wr_1", 1, started_at - timedelta(minutes=1)))
+    monkeypatch.setattr(base_module, "resolve_download_attempt", resolve_attempt)
+    if stale_retry_file:
+        list_artifacts = fake_app.DATABASE.artifacts.list_artifacts_for_run_by_type
+        list_artifacts.side_effect = RuntimeError("repository unavailable")
+        with pytest.raises(RuntimeError, match="repository unavailable"):
+            await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1")
+        list_artifacts.side_effect = lambda **kwargs: list(rows)
+        stale_timestamp = (started_at - timedelta(seconds=1)).timestamp()
+        os.utime(http_file, (stale_timestamp, stale_timestamp))
+        assert rows == []
+        assert [file.url for file in await storage.get_downloaded_files("o_1", "wr_1")] == [f"file://{http_file}"]
+    resolve_attempt.return_value = ("wr_1", attempt_number, None if metadata_timeout else started_at)
+    if metadata_timeout:
+
+        async def resolve_listing_attempt(*args, **kwargs):
+            if rows:
+                raise TimeoutError("attempt metadata unavailable")
+            return "wr_1", 1, None
+
+        monkeypatch.setattr(base_module, "resolve_download_attempt", resolve_listing_attempt)
+    monkeypatch.setattr(block_module.skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(
+        PrintPageBlock, "get_workflow_run_context", lambda *args: SimpleNamespace(organization_id="o_1")
+    )
+    monkeypatch.setattr(PrintPageBlock, "render_templatable_field", lambda self, field, value, ctx: value)
+    monkeypatch.setattr(
+        PrintPageBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=SimpleNamespace(pdf=AsyncMock(return_value=b"printed PDF")))
+            )
+        ),
+    )
+    monkeypatch.setattr(PrintPageBlock, "_upload_pdf_artifact", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(PrintPageBlock, "record_output_parameter_value", AsyncMock())
+    monkeypatch.setattr(
+        PrintPageBlock, "build_block_result", AsyncMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+    )
+    block = PrintPageBlock(
+        label="print",
+        custom_filename="printed.pdf",
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="print_output",
+            output_parameter_id="op_1",
+            workflow_id="wf_1",
+            created_at=datetime.now(UTC),
+            modified_at=datetime.now(UTC),
+        ),
+    )
+
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="wrb_1", organization_id="o_1")
+
+    assert result.success is True
+    assert [file["filename"] for file in result.output_parameter_value["downloaded_files"]] == ["printed.pdf"]
+    assert context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY] == (
+        []
+        if stale_retry_file
+        else [("http-report.pdf", hashlib.sha256(b"HTTP response").hexdigest(), f"file://{http_file}")]
+    )
+    printed = next(row for row in rows if row.uri.endswith("/printed.pdf"))
+    assert result.output_parameter_value["downloaded_file_urls"] == [printed.uri]
+    assert Path(urlparse(printed.uri).path).read_bytes() == b"printed PDF"
+    if stale_retry_file:
+        assert printed.uri.endswith("/attempts/2/printed.pdf")
+        assert result.output_parameter_value["downloaded_files"][0]["url"] == printed.uri
+
+
+def test_local_snapshot_aliases_consume_primary_before_live_baseline_and_preserve_duplicates(tmp_path, monkeypatch):
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    download_dir = tmp_path / "downloads"
+    monkeypatch.setattr(local_module, "get_download_dir", lambda **kwargs: str(download_dir / kwargs["run_id"]))
+    first = FileInfo(
+        url=f"file://{storage.artifact_path}/{local_module.DOWNLOAD_FILE_PREFIX}/{settings.ENV}/o_1/wr_1/report.pdf",
+        filename="report.pdf",
+        checksum="same-bytes",
+    )
+    retry = first.model_copy(update={"url": first.url.removesuffix("report.pdf") + "attempts/2/report.pdf"})
+    live = first.model_copy(update={"url": f"file://{download_dir}/wr_1/report.pdf"})
+    baseline = {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(first), to_downloaded_file_signature(live)]}
+
+    assert filter_downloaded_files_for_current_iteration(
+        [first, retry, first], baseline, aliases=storage.get_downloaded_file_signature_aliases
+    ) == [first]
+    assert filter_downloaded_files_for_current_iteration(
+        [retry, retry],
+        {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(live)]},
+        aliases=storage.get_downloaded_file_signature_aliases,
+    ) == [retry]

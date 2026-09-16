@@ -1,16 +1,20 @@
 """Shared pytest fixtures and setup for unit tests."""
 
 # -- begin speed up unit tests
+import asyncio
+import contextlib
 import itertools
 import logging
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, TypeVar
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -19,19 +23,43 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.webeye.utils import page as page_module
+from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+
+class FakeWorkflowRunAttemptsRepository:
+    """Small in-memory repository for tests that need durable attempt resolution."""
+
+    def __init__(self, attempts: list[Any] | None = None) -> None:
+        self.attempts = list(attempts or [])
+        self.requested_workflow_run_ids: list[str] = []
+
+    async def get_attempts(self, workflow_run_id: str) -> list[Any]:
+        self.requested_workflow_run_ids.append(workflow_run_id)
+        return list(self.attempts)
+
+    async def refresh_attempt_finished_at(self, workflow_run_id: str, attempt_number: int, *, finished_at: Any) -> Any:
+        for attempt in self.attempts:
+            if attempt.workflow_run_id == workflow_run_id and attempt.attempt_number == attempt_number:
+                if getattr(attempt, "retry_decision", None) is not None:
+                    attempt.finished_at = finished_at
+                return attempt
+        return None
 
 
 @pytest.fixture
@@ -82,12 +110,14 @@ def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
         mask_secrets: bool = True,
         secrets: dict[str, str] | None = None,
         runtime_otp_values: set[str] | None = None,
+        attempt_number: int = 1,
     ) -> WorkflowContextManager:
         manager = WorkflowContextManager()
         manager.workflow_run_contexts[workflow_run_id] = SimpleNamespace(
             mask_secrets=mask_secrets,
             secrets=dict(secrets or {}),
             runtime_otp_values=set(runtime_otp_values or set()),
+            attempt_number=attempt_number,
         )
         return manager
 
@@ -135,6 +165,21 @@ def reset_collapse_xp_assignment_memo():
         handler_module = sys.modules.get("skyvern.webeye.actions.handler")
         if handler_module is not None:
             handler_module._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_copilot_driver_ledgers() -> Iterator[None]:
+    # A holder count leaked by one test makes a later test's turn-exit release silently skip its evict.
+    def _clear() -> None:
+        runtime = sys.modules.get("skyvern.forge.sdk.copilot.runtime")
+        if runtime is not None:
+            runtime._ATTACHED_TURNS_PER_SESSION.clear()
+            runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
+            runtime._DRIVER_RELEASE_EPOCHS.clear()
 
     _clear()
     yield
@@ -323,6 +368,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.input_sequentially = AsyncMock()
     el.input_clear = AsyncMock()
     el.input_fill = AsyncMock()
+    el.is_content_editable = AsyncMock(return_value=False)
     el.refresh_locator_if_stale = AsyncMock()
     el.apply_secret_visual_mask = AsyncMock()
     el.scroll_into_view = AsyncMock()
@@ -496,3 +542,235 @@ def fake_api_request_context() -> Callable[[], object]:
         return _FakeAPIRequestContext()
 
     return _build
+
+
+class FakeSearchPage:
+    """Temporary tab a `search_web` call opens on the run's browser context."""
+
+    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
+        self._html = html
+        self._page_title = page_title
+        self._goto_error = goto_error
+        self.http_status = http_status
+        self.closed = False
+        self.requested_url: str | None = None
+
+    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+        self.requested_url = url
+        if self._goto_error is not None:
+            raise self._goto_error
+        return SimpleNamespace(status=self.http_status)
+
+    async def title(self) -> str:
+        return self._page_title
+
+    async def content(self) -> str:
+        return self._html
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeSearchBrowserContext:
+    def __init__(
+        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
+    ) -> None:
+        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+
+    async def new_page(self) -> FakeSearchPage:
+        return self.page
+
+
+class FakeCdpSession:
+    def __init__(
+        self,
+        storage_reachable: bool = True,
+        origins_refusing_clear: tuple[str, ...] = (),
+        origins_failing_unexpectedly: tuple[str, ...] = (),
+        refuses_clear: bool = False,
+        refusal_error: type[BaseException] = PlaywrightError,
+        storage_key: str | None = None,
+    ) -> None:
+        self.sent: list[tuple[str, dict | None]] = []
+        self.detached = False
+        self.storage_key = storage_key
+        self.storage_reachable = storage_reachable
+        self.origins_refusing_clear = origins_refusing_clear
+        self.origins_failing_unexpectedly = origins_failing_unexpectedly
+        self.refuses_clear = refuses_clear
+        self.refusal_error = refusal_error
+
+    async def send(self, method: str, params: dict | None = None) -> dict:
+        self.sent.append((method, params))
+        if method == "Runtime.evaluate":
+            # Answers for whatever document this session is attached to, as the real one does.
+            return {"result": {"value": "reachable" if self.storage_reachable else "unreachable"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-of-this-session"}}}
+        if method == "Storage.getStorageKeyForFrame":
+            if self.storage_key is None:
+                raise self.refusal_error(
+                    "Protocol error (Storage.getStorageKeyForFrame): Frame corresponds to an opaque origin"
+                )
+            return {"storageKey": self.storage_key}
+        if method == "DOMStorage.clear":
+            origin = (params or {}).get("storageId", {}).get("securityOrigin")
+            if origin in self.origins_failing_unexpectedly:
+                raise ValueError("not a browser-driver error")
+            if self.refuses_clear or origin in self.origins_refusing_clear:
+                raise self.refusal_error("Protocol error (DOMStorage.clear): Frame not found for the given storage id")
+        return {}
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class FakeClearingBrowserContext:
+    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out.
+
+    `pages` is what the clear enumerates origins from, so a test that expects storage to be cleared has
+    to put its page in it, the way a live context holds its open tabs.
+    """
+
+    def __init__(self, clear_cookies_error: Exception | None = None) -> None:
+        self.clear_cookies_calls = 0
+        self.clear_cookies_error = clear_cookies_error
+        self.cdp_sessions: list[tuple[object, FakeCdpSession]] = []
+        self.pages: list[object] = []
+        # Documents whose session reports no reachable storage, the way a sandboxed frame's does.
+        self.frames_without_storage: list[object] = []
+        # Origins whose DOMStorage.clear fails, whichever session carries it.
+        self.origins_refusing_clear: list[str] = []
+        # Frames sharing their parent's renderer: Playwright refuses them a session of their own.
+        self.frames_without_own_session: list[object] = []
+        # Origins whose clear fails with something that is not a browser-driver error at all.
+        self.origins_failing_unexpectedly: list[str] = []
+        # Frames whose own clear fails, however the origin is spelled -- a sandboxed frame does this
+        # while an ordinary frame at the same origin clears fine.
+        self.frames_refusing_clear: list[object] = []
+        # Raise this engine's refusal instead of the Playwright family's, as a raw-CDP run would.
+        self.refusal_error: type[BaseException] = PlaywrightError
+        # Storage key the browser reports for a tab whose URL names no origin, as it does for a
+        # window opened on about:blank. A tab absent from this list has an opaque origin and none.
+        self.inherited_storage_keys: list[tuple[object, str]] = []
+
+    async def clear_cookies(self) -> None:
+        self.clear_cookies_calls += 1
+        if self.clear_cookies_error is not None:
+            raise self.clear_cookies_error
+
+    async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        if page in self.frames_without_own_session:
+            raise PlaywrightError("This frame does not have a separate CDP session")
+        session = FakeCdpSession(
+            storage_reachable=page not in self.frames_without_storage,
+            origins_refusing_clear=tuple(self.origins_refusing_clear),
+            origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
+            refuses_clear=page in self.frames_refusing_clear,
+            refusal_error=self.refusal_error,
+            storage_key=next((key for held, key in self.inherited_storage_keys if held is page), None),
+        )
+        self.cdp_sessions.append((page, session))
+        return session
+
+
+def read_unit_data_fixture(name: str) -> str:
+    return (Path(__file__).parent / "data" / name).read_text()
+
+
+class ScopeRecordingAgentFunction(AgentFunction):
+    """Records the captcha-solver lifecycle scope's enter/exit and — when ``record_arms`` — the extension
+    resolver, the completion-confirmation probe, and each solver arm, proving the ladder resolves and confirms
+    inside the open scope. ``record_arms=False`` silences those; ``confirm`` overrides the anchor arm's
+    completion verdict (``None`` hands the ladder's own default back, like the OSS base)."""
+
+    def __init__(self, *, auto_solve: bool = False, record_arms: bool = True, confirm: bool | None = None) -> None:
+        self.events: list[str] = []
+        self._auto_solve = auto_solve
+        self._record_arms = record_arms
+        self._confirm = confirm
+
+    def captcha_solver_lifecycle_scope(self, page: object) -> AbstractAsyncContextManager[None]:
+        events = self.events
+
+        @asynccontextmanager
+        async def _scope() -> AsyncIterator[None]:
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        return _scope()
+
+    def resolve_captcha_solver_extension_timeout(self, page: object, default_timeout: float) -> float:
+        if self._record_arms:
+            self.events.append("resolve")
+        return default_timeout
+
+    async def is_captcha_solver_completion_confirmed(self, page: object, default_result: bool) -> bool:
+        if self._record_arms:
+            self.events.append("confirm")
+        return default_result if self._confirm is None else self._confirm
+
+    async def auto_solve_captchas(self, page: object) -> bool:
+        if self._record_arms:
+            self.events.append("solve")
+        return self._auto_solve
+
+    async def solve_recaptcha_token(self, page: object, **kwargs: object) -> bool:
+        if self._record_arms:
+            self.events.append("token")
+        return False
+
+
+_T = TypeVar("_T")
+
+
+def stalling_async_mock(entered: asyncio.Event) -> AsyncMock:
+    """An awaitable that marks ``entered`` and then never returns, so only cancellation can release it."""
+
+    async def _stall(*args: object, **kwargs: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    return AsyncMock(side_effect=_stall)
+
+
+async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tuple[asyncio.Task[_T], float]:
+    """Run ``coro`` as a task and fail the test if it is still pending after ``wait_seconds``, so a hang fails
+    instead of passing as a slow TimeoutError. Returns the finished task and the elapsed seconds."""
+    task = asyncio.ensure_future(coro)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait({task}, timeout=wait_seconds)
+    elapsed = loop.time() - started
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        pytest.fail(f"task still running after {wait_seconds}s")
+    return task, elapsed
+
+
+def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
+    """A ``take_fullpage_screenshot`` stand-in that drives the real ``take_scrolling_screenshot`` with a stalled
+    stitched-capture helper, so a caller test exercises the primitive's own deadline."""
+    fake_frame = SimpleNamespace(
+        get_scroll_x_y=AsyncMock(return_value=(0, 0)),
+        safe_scroll_to_x_y=AsyncMock(return_value=None),
+    )
+
+    async def _capture() -> bytes:
+        with (
+            patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame)),
+            patch.object(page_module, "_scrolling_screenshots_helper", stalling_async_mock(entered)),
+        ):
+            return await page_module.SkyvernFrame.take_scrolling_screenshot(
+                page=MagicMock(name="page"),
+                mode=ScreenshotMode.LITE,
+                scrolling_number=1,
+                timeout=timeout_ms,
+            )
+
+    return AsyncMock(side_effect=_capture)

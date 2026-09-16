@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    BrowserRecordingModel,
     CredentialParameterModel,
     FolderModel,
     OnePasswordCredentialParameterModel,
@@ -47,7 +48,7 @@ from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
 )
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
@@ -203,6 +204,7 @@ class WorkflowsRepository(BaseRepository):
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
             .filter(WorkflowModel.workflow_id != workflow_id)
             .filter(WorkflowModel.deleted_at.is_(None))
+            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR))
             .filter(
                 WorkflowModel.version
                 > select(WorkflowModel.version).filter_by(workflow_id=workflow_id).scalar_subquery()
@@ -250,6 +252,7 @@ class WorkflowsRepository(BaseRepository):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
+        browser_type: str | None = None,
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
@@ -294,6 +297,7 @@ class WorkflowsRepository(BaseRepository):
                 is_saved_task=is_saved_task,
                 status=status,
                 run_with=run_with,
+                browser_type=browser_type,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
@@ -402,13 +406,14 @@ class WorkflowsRepository(BaseRepository):
 
     @db_operation("is_workflow_copilot_authored")
     async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
-        """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
+        """Any saved version stamped by copilot marks the lineage. Test snapshots do not. The latest row is not a
         durable signal: user saves re-stamp created_by/edited_by. Deleted versions still count —
         provenance is historical."""
         copilot_version_exists = (
             select(WorkflowModel.workflow_id)
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
             .filter(or_(WorkflowModel.created_by == "copilot", WorkflowModel.edited_by == "copilot"))
+            .filter(or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR))
             .limit(1)
         )
         async with self.Session() as session:
@@ -449,7 +454,12 @@ class WorkflowsRepository(BaseRepository):
     ) -> Workflow | None:
         get_workflow_query = select(WorkflowModel).filter_by(workflow_permanent_id=workflow_permanent_id)
         if filter_deleted:
-            get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
+            # History/version allocation opts out with filter_deleted=False; ordinary
+            # saved-workflow resolution must not select an in-flight test snapshot.
+            get_workflow_query = get_workflow_query.filter(
+                WorkflowModel.deleted_at.is_(None),
+                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
+            )
         if organization_id:
             get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
         if version:
@@ -514,6 +524,25 @@ class WorkflowsRepository(BaseRepository):
                 )
             return None
 
+    @db_operation("get_workflow_permanent_id_created_at")
+    async def get_workflow_permanent_id_created_at(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> datetime | None:
+        """Return the earliest version timestamp for a workflow permanent ID.
+
+        Deleted versions remain part of the permanent ID's history, so this query
+        intentionally does not apply the usual soft-delete filter.
+        """
+        async with self.Session() as session:
+            return await session.scalar(
+                select(func.min(WorkflowModel.created_at)).where(
+                    WorkflowModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowModel.organization_id == organization_id,
+                )
+            )
+
     @db_operation("get_workflow_versions_by_permanent_id")
     async def get_workflow_versions_by_permanent_id(
         self,
@@ -526,7 +555,10 @@ class WorkflowsRepository(BaseRepository):
         """
         get_workflows_query = select(WorkflowModel).filter_by(workflow_permanent_id=workflow_permanent_id)
         if filter_deleted:
-            get_workflows_query = get_workflows_query.filter(WorkflowModel.deleted_at.is_(None))
+            get_workflows_query = get_workflows_query.filter(
+                WorkflowModel.deleted_at.is_(None),
+                or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
+            )
         if organization_id:
             get_workflows_query = get_workflows_query.filter_by(organization_id=organization_id)
         get_workflows_query = get_workflows_query.order_by(WorkflowModel.version.desc())
@@ -570,6 +602,9 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
                 .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
                 .group_by(
                     WorkflowModel.workflow_permanent_id,
                 )
@@ -674,6 +709,9 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
                 .group_by(
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
@@ -1024,6 +1062,9 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.version > expected_version)
                 .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
                 .exists()
             )
             update_workflow_query = (
@@ -1109,6 +1150,9 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.version > expected_version)
                 .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
                 .exists()
             )
             update_workflow_query = (
@@ -1410,6 +1454,15 @@ class WorkflowsRepository(BaseRepository):
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
             await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            recording_delete_query = update(BrowserRecordingModel).where(
+                BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
+                BrowserRecordingModel.deleted_at.is_(None),
+            )
+            if organization_id is not None:
+                recording_delete_query = recording_delete_query.where(
+                    BrowserRecordingModel.organization_id == organization_id
+                )
+            await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
             return schedule_ids
 

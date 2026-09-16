@@ -17,6 +17,8 @@ from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_m
 from skyvern.forge.sdk.copilot.tools.workflow_update import _update_workflow
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 
+pytestmark = pytest.mark.usefixtures("no_saved_workflow")
+
 _SUBMISSION_REF = "call_code_safety_repair_1"
 _SOURCE_SECRET = "source-secret-must-not-survive"
 

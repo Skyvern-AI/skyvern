@@ -88,7 +88,11 @@ function WorkflowsTree() {
   const navigate = useNavigate();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [search, setSearch] = useState("");
+  const searchParam = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(searchParam);
+  useEffect(() => {
+    setSearch(searchParam);
+  }, [searchParam]);
   const [debouncedSearch] = useDebounce(search, 250);
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
@@ -905,6 +909,13 @@ function WorkflowsTree() {
               value={search}
               onChange={(value) => {
                 setSearch(value);
+                const params = new URLSearchParams(searchParams);
+                if (value === "") {
+                  params.delete("search");
+                } else {
+                  params.set("search", value);
+                }
+                setSearchParams(params, { replace: true });
               }}
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"

@@ -640,6 +640,19 @@ class UnrecognizedWorkflowParameters(SkyvernHTTPException):
         super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
 
 
+class WorkflowRetryAttemptLookupError(Exception):
+    pass
+
+
+class WorkflowAttemptDispatchSuperseded(Exception):
+    """The dispatch sweep released this dispatch's stale claim and started the attempt elsewhere."""
+
+    def __init__(self, workflow_run_id: str, attempt_number: int) -> None:
+        super().__init__(f"Workflow run {workflow_run_id} attempt {attempt_number} is owned by a newer dispatch")
+        self.workflow_run_id = workflow_run_id
+        self.attempt_number = attempt_number
+
+
 class WorkflowRunParameterPersistenceError(SkyvernException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(
@@ -751,9 +764,13 @@ class WorkflowParameterNotFound(SkyvernHTTPException):
 
 
 class FailedToNavigateToUrl(SkyvernException):
-    def __init__(self, url: str, error_message: str) -> None:
+    def __init__(self, url: str, error_message: str, nav_error_code: str | None = None) -> None:
         self.url = url
         self.error_message = error_message
+        # The driver's own error code, read where the driver raised it. Downstream layers flatten
+        # this exception into a sentence, and a sentence cannot say who wrote it; carrying the code
+        # as a field is what lets a consumer attribute the failure without parsing prose.
+        self.nav_error_code = nav_error_code
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
@@ -765,6 +782,36 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
     def __init__(self, url: str, reason: str) -> None:
         self.reason = reason
         super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
+
+
+# Leads the error_message below, and so the run's failure_reason. A consumer that only ever sees
+# that string matches on this instead of restating the prose, since the egress-attributable browser
+# error code stays in the message and would otherwise classify the failure as ours.
+NO_ADDRESS_RECORD_NAV_ERROR_MARKER = "has no DNS address record"
+
+# Shaped like a driver code on purpose: the scrub/restore/preservation pipeline in
+# nav_attribution.py and block.py pattern-matches `net::ERR_[A-Z0-9_]+`, and this rides that same
+# path rather than needing its own case in every one of those gates. It is not a real Chromium
+# error, so no driver or page text can ever produce it; only UnresolvableNavigationHost sets it.
+NO_ADDRESS_RECORD_NAV_ERROR_CODE = "net::ERR_SKYVERN_UNRESOLVABLE_HOST"
+
+
+class UnresolvableNavigationHost(FailedToNavigateToUrl):
+    """The navigation target's host has no DNS address record, so no egress of ours can reach it.
+
+    A browser behind a proxy hands the hostname to the proxy (HTTP CONNECT, SOCKS remote DNS), so a
+    target whose record is gone surfaces as the proxy failing to open a tunnel rather than as
+    ERR_NAME_NOT_RESOLVED. The distinct type is what keeps that borrowed error code from being read
+    as our own egress failing; it subclasses FailedToNavigateToUrl so the failure stays terminal.
+    """
+
+    def __init__(self, url: str, host: str, error_message: str) -> None:
+        self.host = host
+        super().__init__(
+            url=url,
+            error_message=f"{host} {NO_ADDRESS_RECORD_NAV_ERROR_MARKER}: {error_message}",
+            nav_error_code=NO_ADDRESS_RECORD_NAV_ERROR_CODE,
+        )
 
 
 class FailedToReloadPage(SkyvernException):
@@ -953,6 +1000,16 @@ class SkyvernActionFailed(SkyvernException):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class StaleFrameSelectionError(RuntimeError):
+    """The selected iframe belongs to a different page than the one now resolved."""
+
+    def __init__(self, name: str, url: str) -> None:
+        super().__init__(
+            f"Stale frame selection: the selected iframe (name={name[:80]!r}, url={url!r}) belongs to a "
+            "different page than the one now in focus."
+        )
 
 
 class ScrapingFailedBlankPage(ScrapingFailed):
@@ -1616,7 +1673,24 @@ class BrowserSessionOwnershipConflict(SkyvernHTTPException):
 
 class BrowserSessionNotRenewable(SkyvernException):
     def __init__(self, reason: str, browser_session_id: str) -> None:
+        self.reason = reason
+        self.browser_session_id = browser_session_id
         super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
+
+
+class BrowserSessionNotExtendable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        self.reason = reason
+        self.browser_session_id = browser_session_id
+        super().__init__(f"Browser session {browser_session_id} cannot be extended: {reason}")
+
+
+class BrowserSessionExtensionUnconfirmed(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        self.browser_session_id = browser_session_id
+        super().__init__(
+            f"Browser session {browser_session_id} was signalled to extend, but its new budget could not be confirmed."
+        )
 
 
 class MissingBrowserAddressError(SkyvernException):
@@ -1701,6 +1775,16 @@ class ElementOutOfCurrentViewport(SkyvernException):
 class ScriptNotFound(SkyvernHTTPException):
     def __init__(self, script_id: str) -> None:
         super().__init__(f"Script {script_id} not found")
+
+
+class MultiFieldTotpGroupChanged(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("The verification widget changed during code entry; the step must be re-planned.")
+
+
+class MultiFieldTotpGroupGone(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("The verification widget changed after a preceding action; the step must be re-planned.")
 
 
 class NoTOTPSecretFound(SkyvernException):

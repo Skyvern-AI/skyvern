@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 
 from ._common import ErrorCode, make_error
+
+if TYPE_CHECKING:
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
 
 DEFAULT_ACTION_TIMEOUT_MS = 30000
 DEFAULT_DIRECT_ACTION_TIMEOUT_MS = 5000
@@ -108,15 +111,13 @@ async def _click_point_is_covered(locator: Any) -> bool:
         return False
 
 
-async def classify_element_state(page: Any, selector: str, *, pointer_intercepted: bool = False) -> ElementState:
-    # Frame-aware actions resolve against SkyvernPage._locator_scope (working iframe if set);
-    # the probe must query the same root or an iframe failure misclassifies as not_found.
-    probe_root = getattr(page, "_locator_scope", None)
-    if probe_root is None:
-        probe_root = page.page
-
+async def classify_element_state(
+    page: SkyvernPage, selector: str, *, pointer_intercepted: bool = False
+) -> ElementState:
     async def _probe() -> ElementState:
-        locator = probe_root.locator(selector)
+        # Frame-aware actions resolve against the working iframe when one is set; the probe must
+        # query the same scope or an iframe failure misclassifies as not_found.
+        locator = page.locator_scope.locator(selector)
         if await locator.count() == 0:
             return "not_found"
         first = locator.first
@@ -135,6 +136,8 @@ async def classify_element_state(page: Any, selector: str, *, pointer_intercepte
     try:
         return await asyncio.wait_for(_probe(), timeout=ELEMENT_STATE_PROBE_TIMEOUT_MS / 1000)
     except Exception:
+        # This runs while an action failure is already being reported, so a stale-scope refusal
+        # degrades the reason to "unknown" instead of replacing a handled failure with a crash.
         return "unknown"
 
 
@@ -164,7 +167,7 @@ def element_state_error(state: ElementState, exc: Exception, *, selector: str, t
     detail = _redacted_exception_detail(exc)
     if detail:
         details["exception_detail"] = detail
-    return make_error(code, message, hint, details=details)
+    return make_error(code, message, hint, details=details, exc=exc)
 
 
 async def make_direct_action_error(page: Any, selector: str, exc: Exception, *, timeout_ms: int) -> dict[str, Any]:

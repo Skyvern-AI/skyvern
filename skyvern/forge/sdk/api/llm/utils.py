@@ -1,12 +1,16 @@
+import asyncio
 import base64
 import copy
+import io
 import json
 import re
 from typing import Any
 
+import filetype
 import json_repair
 import litellm
 import structlog
+from PIL import Image
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm import commentjson
@@ -19,6 +23,11 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 
 LOG = structlog.get_logger()
 
+_PASS_THROUGH_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+# A file under the upload cap can still decode to hundreds of megapixels, which RGBA conversion
+# would expand to gigabytes in the worker process.
+_MAX_DECODED_IMAGE_PIXELS = 25_000_000
+
 
 def is_image_message(message: dict[str, Any]) -> bool:
     """Check if message contains an image."""
@@ -27,6 +36,35 @@ def is_image_message(message: dict[str, Any]) -> bool:
         and isinstance(message.get("content"), list)
         and any(item.get("type") == "image_url" for item in message["content"])
     )
+
+
+async def normalize_llm_image(image: bytes) -> tuple[str, bytes]:
+    media_type = filetype.guess_mime(image) or "image/png"
+    if media_type in _PASS_THROUGH_IMAGE_MEDIA_TYPES:
+        return media_type, image
+    return await asyncio.to_thread(_reencode_llm_image_as_png, image, media_type)
+
+
+def _reencode_llm_image_as_png(image: bytes, media_type: str) -> tuple[str, bytes]:
+    # Converting would drop extra frames, clip high-bit-depth samples, or expand a heavily compressed
+    # image to gigabytes in the worker. Those are refused here rather than sent in a format the
+    # provider will not decode, which would fail later and less clearly.
+    refusal = ""
+    try:
+        with Image.open(io.BytesIO(image)) as decoded:
+            if getattr(decoded, "n_frames", 1) > 1:
+                refusal = "it has more than one frame"
+            elif decoded.mode.startswith("I") or decoded.mode == "F":
+                refusal = "it stores more than 8 bits per channel"
+            elif decoded.width * decoded.height > _MAX_DECODED_IMAGE_PIXELS:
+                refusal = f"it decodes to more than {_MAX_DECODED_IMAGE_PIXELS} pixels"
+            else:
+                buffer = io.BytesIO()
+                decoded.convert("RGBA").save(buffer, format="PNG")
+                return "image/png", buffer.getvalue()
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        raise ValueError(f"This {media_type} image could not be decoded to send to the model") from error
+    raise ValueError(f"This {media_type} image cannot be sent to the model because {refusal}")
 
 
 async def llm_messages_builder(
@@ -44,13 +82,14 @@ async def llm_messages_builder(
 
     if screenshots:
         for screenshot in screenshots:
-            encoded_image = base64.b64encode(screenshot).decode("utf-8")
+            media_type, image_bytes = await normalize_llm_image(screenshot)
+            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
             if message_pattern == "anthropic":
                 message = {
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/png",
+                        "media_type": media_type,
                         "data": encoded_image,
                     },
                 }
@@ -58,7 +97,7 @@ async def llm_messages_builder(
                 message = {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{encoded_image}",
+                        "url": f"data:{media_type};base64,{encoded_image}",
                     },
                 }
             messages.append(message)
@@ -92,14 +131,15 @@ async def llm_messages_builder_with_history(
 
     if screenshots:
         for screenshot in screenshots:
-            encoded_image = base64.b64encode(screenshot).decode("utf-8")
+            media_type, image_bytes = await normalize_llm_image(screenshot)
+            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
             message: dict[str, Any]
             if message_pattern == "anthropic":
                 message = {
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/png",
+                        "media_type": media_type,
                         "data": encoded_image,
                     },
                 }
@@ -107,7 +147,7 @@ async def llm_messages_builder_with_history(
                 message = {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{encoded_image}",
+                        "url": f"data:{media_type};base64,{encoded_image}",
                     },
                 }
             current_user_messages.append(message)

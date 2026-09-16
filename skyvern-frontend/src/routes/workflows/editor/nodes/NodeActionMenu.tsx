@@ -43,14 +43,14 @@ function NodeActionMenu({
   const isRecording = recordingStore.isRecording;
   const deleteGated = isRecording || isCanvasLocked;
   const deleteGateReason = isRecording
-    ? "Stop recording to delete blocks"
+    ? "Finish recording the task to delete blocks"
     : isCanvasLocked
       ? "Unlock canvas to delete blocks"
       : null;
   const duplicateGated =
     isRecording || isCanvasLocked || Boolean(duplicateDisabledReason);
   const duplicateGateReason = isRecording
-    ? "Stop recording to duplicate blocks"
+    ? "Finish recording the task to duplicate blocks"
     : isCanvasLocked
       ? "Unlock canvas to duplicate blocks"
       : duplicateDisabledReason;

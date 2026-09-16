@@ -43,7 +43,21 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
         workflow_copilot_chat_id: "chat-1" as string | null,
         chat_history: [] as unknown[],
         proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
+        proposed_workflow_metadata: null as {
+          owner_turn_id: string;
+          revision: number;
+          canonical_fingerprint: string;
+          disposition: "review_untested";
+          workflow_run_id: string | null;
+        } | null,
+        proposed_workflow_run: null as {
+          workflow_run_id: string;
+          status: string | null;
+          available: boolean;
+          failure_reason: string | null;
+          outputs: Array<{ output_parameter_id: string; value: unknown }>;
+        } | null,
+        auto_accept: false as boolean,
       },
     };
     const get = vi.fn().mockImplementation(() => Promise.resolve(history));
@@ -135,7 +149,12 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import { toast } from "@/components/ui/use-toast";
+
+import {
+  ACCEPT_SETTLE_CEILING_MS,
+  WorkflowCopilotChat,
+} from "./WorkflowCopilotChat";
 
 async function renderChat(props: { docked?: boolean } = {}) {
   // docked renders via a portal; without a target it intentionally renders null.
@@ -146,9 +165,7 @@ async function renderChat(props: { docked?: boolean } = {}) {
       portalTarget={portalTarget}
     />,
   );
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -294,6 +311,8 @@ beforeEach(() => {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
     proposed_workflow: null,
+    proposed_workflow_metadata: null,
+    proposed_workflow_run: null,
     auto_accept: false,
   };
 });
@@ -310,6 +329,142 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]!.body.keep_pending_proposal).toBe(false);
+  });
+
+  it("interrupted_draft resyncs a stale typed Accept without applying it locally", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      title: "Newer draft",
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-2",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 409 } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
+    );
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("retains and resyncs a typed proposal when atomic Accept fails", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("does not locally accept a typed proposal when its chat cannot be resolved", async () => {
+    historyResponse.data.workflow_copilot_chat_id = null;
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    await renderChat();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("interrupted_draft reload shows an actionable candidate and its exact run result", async () => {
+    // A hard kill can leave only the submitted user row. MessageItem does not
+    // render footers on user bubbles, so the durable candidate needs a
+    // standalone review gate until an assistant-owned row exists.
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "build the candidate",
+        created_at: "2026-09-08T12:00:00Z",
+      },
+    ];
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      title: "Recovered draft",
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-interrupted",
+      revision: 3,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-exact",
+    };
+    historyResponse.data.proposed_workflow_run = {
+      workflow_run_id: "wr-exact",
+      status: "completed",
+      available: true,
+      failure_reason: null,
+      outputs: [{ output_parameter_id: "op-metric", value: { metric: "42" } }],
+    };
+
+    await renderChat();
+
+    expect(await screen.findByText("Associated test: completed")).toBeTruthy();
+    expect(screen.getByText(/op-metric:.*42/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
 
   it("restores an actionable gate via the chip after a bypassed proposal (old code: buttons vanish forever)", async () => {
@@ -336,7 +491,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(streamCalls[1]!.body.keep_pending_proposal).toBe(true);
     // Mid-flight: the gate's own actions are not accessible while loading.
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
-    expect(screen.getByText("1 proposal pending · Review")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /1 proposal pending/ }),
+    ).toBeTruthy();
 
     // Turn 2 ends with no new proposal; resync picks the row back up.
     await act(async () => {
@@ -352,7 +509,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
     // The gate's owning turn is still not the last message, so the chip
     // (and its jump-back affordance) stays up even once actions re-enable.
-    const chip = screen.getByText("1 proposal pending · Review");
+    const chip = screen.getByRole("button", { name: /1 proposal pending/ });
     await act(async () => {
       fireEvent.click(chip);
     });
@@ -367,6 +524,518 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
       ),
     );
+  });
+
+  it("shows auto-accept in the composer and Turn off mid-turn makes that turn's verified fix wait for review", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    const chip = await screen.findByRole("button", {
+      name: /Auto-accepting/,
+    });
+
+    // The turn starts while auto-accept is still on.
+    await submit("fix the selector");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    // A failed write leaves the server auto-accepting, so the chip must not claim otherwise.
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+
+    let finishTurnOff: (value: unknown) => void = () => {};
+    cancelPost.mockImplementationOnce(
+      () => new Promise((resolve) => (finishTurnOff = resolve)),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/disable-auto-accept",
+      { workflow_copilot_chat_id: "chat-1" },
+    );
+    historyResponse.data.auto_accept = false;
+
+    // The server committed the write and finished the turn before the browser saw the POST resolve.
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Fixed and verified.", {
+          proposal_disposition: "auto_applicable",
+          workflow_applied: false,
+          narrative_payload: proposalNarrativePayload({
+            proposalDisposition: "auto_applicable",
+          }),
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    // The gate offers no actions while Turn off is pending; the draft must still be waiting when it finishes.
+    await act(async () => {
+      finishTurnOff({});
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it.each([
+    { rowKept: false, chipAfterAccept: "hidden" },
+    // Apply writes auto-accept best-effort after creating the version, so the row can keep it on.
+    { rowKept: true, chipAfterAccept: "shown" },
+  ])(
+    "after a plain Accept the chip follows the chat row (row kept auto_accept=$rowKept: $chipAfterAccept)",
+    async ({ rowKept }) => {
+      await renderChat();
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull();
+
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+        streamCalls[0]!.resolve();
+      });
+      historyResponse.data.auto_accept = true;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      });
+      expect(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      ).toBeTruthy();
+
+      // Auto-accept never covers an untested draft, so this one still gets a gate.
+      await submit("add a step");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+      await act(async () => {
+        streamCalls[1]!.onMessage(
+          proposalResponse("Untested draft.", {
+            turn_id: "turn-2",
+            narrative_payload: proposalNarrativePayload({
+              turnId: "turn-2",
+              turnIndex: 1,
+            }),
+          }),
+        );
+        streamCalls[1]!.resolve();
+      });
+      historyResponse.data.auto_accept = rowKept;
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      });
+
+      expect(cancelPost).toHaveBeenLastCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.objectContaining({ auto_accept: false }),
+      );
+      await waitFor(() =>
+        expect(
+          Boolean(screen.queryByRole("button", { name: /Auto-accepting/ })),
+        ).toBe(rowKept),
+      );
+    },
+  );
+
+  it("sends Turn off only after every in-flight Always accept settles, so auto-accept ends off", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    // The chat row takes each request's auto_accept when that request completes, as the routes do.
+    const finishApplies: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/apply-proposed-workflow") {
+        return new Promise((resolve) => {
+          finishApplies.push((value) => {
+            historyResponse.data.auto_accept = true;
+            resolve(value);
+          });
+        });
+      }
+      if (path === "/workflow/copilot/disable-auto-accept") {
+        historyResponse.data.auto_accept = false;
+      }
+      return Promise.resolve({});
+    });
+    const requestedPaths = () => cancelPost.mock.calls.map(([path]) => path);
+
+    // A double click starts two applies; the second can come back first.
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Always accept" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    expect(finishApplies).toHaveLength(2);
+    await act(async () => {
+      finishApplies[1]!({});
+    });
+    expect(requestedPaths()).not.toContain(
+      "/workflow/copilot/disable-auto-accept",
+    );
+
+    await act(async () => {
+      finishApplies[0]!({});
+    });
+    await waitFor(() =>
+      expect(requestedPaths()).toContain(
+        "/workflow/copilot/disable-auto-accept",
+      ),
+    );
+    expect(
+      requestedPaths().lastIndexOf("/workflow/copilot/apply-proposed-workflow"),
+    ).toBeLessThan(
+      requestedPaths().indexOf("/workflow/copilot/disable-auto-accept"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+    expect(historyResponse.data.auto_accept).toBe(false);
+  });
+
+  it("offers no Accept while Turn off is pending, so no Accept can start after it", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByRole("button", { name: "Always accept" }),
+    ).toBeTruthy();
+    let finishTurnOff: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => (finishTurnOff = resolve))
+        : Promise.resolve({}),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    // Neither writes auto_accept, so the user keeps them while Turn off runs.
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
+
+    await act(async () => {
+      finishTurnOff({});
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("gives the gate its Accept back when an Accept never settles, instead of waiting forever", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    // An apply that never answers: without a ceiling the chat's gate would stay without Accept.
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise(() => {})
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Always accept" }),
+      );
+    });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACCEPT_SETTLE_CEILING_MS + 1_000);
+    });
+    vi.useRealTimers();
+
+    expect(
+      await screen.findByRole("button", { name: "Always accept" }),
+    ).toBeTruthy();
+    // The disable never went out, so the chip still reports the row's state.
+    expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
+      "/workflow/copilot/disable-auto-accept",
+    );
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ variant: "destructive" }),
+    );
+  });
+
+  it("does not leak an Always accept into a New chat opened before it lands", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let finishApply: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((resolve) => (finishApply = resolve))
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+    });
+
+    // New chat clears the chat and its auto-accept while that apply is still in flight.
+    historyResponse.data.auto_accept = false;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    });
+    await act(async () => {
+      finishApply({ data: { workflow_id: "wf_proposed" } });
+    });
+
+    // The apply landed for a chat the user already left: it must not arm the blank chat.
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+
+    // And it stays off once the blank chat's own turn assigns it a chat id to read back.
+    await submit("start over");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(
+        proposalResponse("Renamed the blocks.", {
+          turn_id: "turn-2",
+        }),
+      );
+      streamCalls[1]!.resolve();
+    });
+
+    expect(await screen.findByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+  });
+
+  it("ignores a read that started before a plain Accept turned auto-accept off", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByRole("button", { name: /Auto-accepting/ }),
+    ).toBeTruthy();
+
+    // A conflicted Accept leaves a row read in flight, taken while the row still said true.
+    let finishStaleRead: (value: unknown) => void = () => {};
+    historyGet.mockImplementationOnce(
+      () => new Promise((resolve) => (finishStaleRead = resolve)),
+    );
+    cancelPost.mockRejectedValueOnce({ response: { status: 409 } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    // The retry succeeds: a plain Accept writes auto_accept=false on the row.
+    historyResponse.data.auto_accept = false;
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+
+    await act(async () => {
+      finishStaleRead({ data: { ...historyResponse.data, auto_accept: true } });
+    });
+
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
+  });
+
+  it("keeps Accept withheld until every Turn off for the chat settles, not just the first", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    const heldDisables: Array<(value: unknown) => void> = [];
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((resolve) => heldDisables.push(resolve))
+        : Promise.resolve({}),
+    );
+
+    // Two clicks in one tick, before React re-renders: both start, as a double click does.
+    const chip = await screen.findByRole("button", {
+      name: /Auto-accepting/,
+    });
+    await act(async () => {
+      fireEvent.click(chip);
+      fireEvent.click(chip);
+    });
+    expect(heldDisables).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    // The first settles while the second is still in flight: the gate must stay withheld.
+    await act(async () => {
+      heldDisables[0]!({});
+    });
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+
+    await act(async () => {
+      heldDisables[1]!({});
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy(),
+    );
+  });
+
+  it("gives the gate its Accept back when Turn off fails", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    let failTurnOff: (reason: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/disable-auto-accept"
+        ? new Promise((_resolve, reject) => (failTurnOff = reject))
+        : Promise.resolve({}),
+    );
+
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Auto-accepting/ }),
+      );
+    });
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+
+    await act(async () => {
+      failTurnOff({ response: { status: 500 } });
+    });
+
+    // The request failed, so auto-accept is still on and the gate must be usable again.
+    expect(
+      await screen.findByRole("button", { name: "Always accept" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+  });
+
+  it("keeps Turn off behind the fallback accept's row write", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      // A v1 proposal carries no metadata, so a failed apply falls back to the client-side apply,
+      // and that path writes the row itself instead of letting the apply route do it.
+      streamCalls[0]!.onMessage(legacyProposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let finishRowWrite: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/clear-proposed-workflow") {
+        return new Promise((resolve) => (finishRowWrite = resolve));
+      }
+      if (path === "/workflow/copilot/apply-proposed-workflow") {
+        return Promise.reject({ response: { status: 500 } });
+      }
+      return Promise.resolve({});
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Always accept" }),
+      );
+    });
+
+    // That write ends with auto_accept=true, so a Turn off sent first is silently overwritten.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
+      "/workflow/copilot/disable-auto-accept",
+    );
+
+    await act(async () => {
+      finishRowWrite({ data: {} });
+    });
+    await waitFor(() =>
+      expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
+        "/workflow/copilot/disable-auto-accept",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+  });
+
+  it("ignores a read-back that started before Turn off finished", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
+      streamCalls[0]!.resolve();
+    });
+    let finishStaleRead: (value: unknown) => void = () => {};
+    historyGet.mockImplementationOnce(
+      () => new Promise((resolve) => (finishStaleRead = resolve)),
+    );
+    // A plain Accept reads the row back; that read captures auto_accept=true before Turn off lands.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+
+    await act(async () => {
+      finishStaleRead({ data: { ...historyResponse.data, auto_accept: true } });
+    });
+
+    expect(screen.queryByRole("button", { name: /Auto-accepting/ })).toBeNull();
   });
 
   it("shows the Untested pill on hydration of an old payload lacking proposalDisposition", async () => {
@@ -411,7 +1080,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.queryByText("Removed")).toBeNull();
     // No narrative turn id to derive an owning turn from — the chip would be
     // a dead no-op affordance here, not a working jump-back.
-    expect(screen.queryByText("1 proposal pending · Review")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /1 proposal pending/ }),
+    ).toBeNull();
   });
 
   it("clears a stale pending gate when a later turn is auto-applied (stale Accept can't reapply over the newer canvas)", async () => {
@@ -451,7 +1122,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
     );
-    expect(screen.queryByText("1 proposal pending · Review")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /1 proposal pending/ }),
+    ).toBeNull();
   });
 
   it("shows the gate live on a narrative-less turn, not only after a reload (SKY-14099)", async () => {

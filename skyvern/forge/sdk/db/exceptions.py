@@ -17,6 +17,15 @@ def is_connection_failure(dbapi_error: BaseException) -> bool:
     return sqlstate is None or sqlstate.startswith(_CONNECTION_SQLSTATE_PREFIXES)
 
 
+class DatabaseConnectionUnavailableError(Exception):
+    """A read could not reach the database after bounded reconnection attempts."""
+
+    def __init__(self, operation: str, attempts: int) -> None:
+        super().__init__(f"{operation} could not reach the database after {attempts} connection attempts")
+        self.operation = operation
+        self.attempts = attempts
+
+
 class NotFoundError(Exception):
     pass
 
@@ -25,6 +34,10 @@ class DuplicateCopilotTurnError(Exception):
     def __init__(self, turn_id: str) -> None:
         super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")
         self.turn_id = turn_id
+
+
+class CopilotProposalConflictError(Exception):
+    """The candidate changed after the caller read its owner/revision token."""
 
 
 class ScheduleLimitExceededError(Exception):

@@ -3,10 +3,13 @@ CDP input channel for interactive browser control via Chrome DevTools Protocol.
 """
 
 import asyncio
+import base64
+import binascii
 import dataclasses
 import json
 import time
 import typing as t
+from pathlib import PurePath
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
@@ -46,6 +49,7 @@ _INPUT_KIND_LABELS = frozenset(
         "wheelEvent",
         "insertText",
         "copySelectedText",
+        "fileUpload",
         "navigateEvent",
         "goBackEvent",
         "goForwardEvent",
@@ -84,6 +88,7 @@ _NAVIGATION_RESET_TIMEOUT_MS = 5_000
 _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
 _PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent", "insertText"})
 _MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
+_MAX_FILE_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 def _input_kind_label(kind: object) -> str:
@@ -547,6 +552,42 @@ async def _dispatch_history_event(
         await cdp_session.send("Page.navigateToHistoryEntry", {"entryId": entry_id})
 
 
+async def _dispatch_file_upload_event(page: object, msg: dict, websocket: WebSocket) -> None:
+    file_name = msg.get("fileName")
+    mime_type = msg.get("mimeType")
+    encoded = msg.get("content")
+    if (
+        not isinstance(file_name, str)
+        or not file_name
+        or len(file_name) > 255
+        or PurePath(file_name).name != file_name
+        or "/" in file_name
+        or "\\" in file_name
+        or not isinstance(mime_type, str)
+        or not mime_type
+        or len(mime_type) > 255
+        or not isinstance(encoded, str)
+        or len(encoded) > ((_MAX_FILE_UPLOAD_BYTES + 2) // 3) * 4
+    ):
+        await websocket.send_json({"kind": "file-upload-error", "reason": "invalid_file"})
+        return
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        await websocket.send_json({"kind": "file-upload-error", "reason": "invalid_file"})
+        return
+    if len(content) > _MAX_FILE_UPLOAD_BYTES:
+        await websocket.send_json({"kind": "file-upload-error", "reason": "file_too_large"})
+        return
+
+    locator = page.locator('input[type="file"]')  # type: ignore[attr-defined]
+    if await locator.count() != 1:
+        await websocket.send_json({"kind": "file-upload-error", "reason": "expected_one_file_input"})
+        return
+    await locator.set_input_files({"name": file_name, "mimeType": mime_type, "buffer": content})
+    await websocket.send_json({"kind": "file-upload-complete"})
+
+
 async def _dispatch_event(
     cdp_session: CDPSession,
     page: object,
@@ -556,6 +597,10 @@ async def _dispatch_event(
     log_id_value: str,
     websocket: WebSocket,
 ) -> None:
+    if kind == "fileUpload":
+        await _dispatch_file_upload_event(page, msg, websocket)
+        return
+
     if kind == "navigateEvent":
         await _dispatch_navigate_event(page, msg, log_id_key, log_id_value, websocket)
         return

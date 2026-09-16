@@ -151,12 +151,17 @@ class FakeStorage:
     def __init__(self) -> None:
         self.deleted: list[str] = []
         self.fail_with: Exception | None = None
+        # URIs whose object is already gone. Deleting one succeeds without deleting
+        # anything, as S3, GCS, Azure and local storage all do for an absent key.
+        self.absent: set[str] = set()
 
     async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
         if not uri.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{organization_id}/"):
             raise PermissionError(f"No permission to access storage URI: {uri}")
         if self.fail_with:
             raise self.fail_with
+        if uri in self.absent:
+            return
         self.deleted.append(uri)
 
 
@@ -194,6 +199,23 @@ def _client() -> TestClient:
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
     return TestClient(test_app)
+
+
+@pytest.mark.asyncio
+async def test_a_file_past_its_expiry_no_longer_dereferences(
+    repo: FakeUploadedFilesRepository,
+    service_app: object,
+) -> None:
+    """The purge runs hourly, so an expired row still names live bytes until it runs; a workflow that
+    saved the id must not keep reading them in that window."""
+    now = datetime.now(timezone.utc)
+    expired = repo.seed(VICTIM_ORG_ID, expires_at=now - timedelta(minutes=1), filename="expired.csv")
+    live = repo.seed(VICTIM_ORG_ID, expires_at=now + timedelta(days=1), filename="live.csv")
+
+    assert await uploaded_file_service.resolve_file_reference(file_id=expired, organization_id=VICTIM_ORG_ID) is None
+    assert await uploaded_file_service.resolve_file_reference(file_id=live, organization_id=VICTIM_ORG_ID) == _uri(
+        VICTIM_ORG_ID, "live.csv"
+    )
 
 
 class TestDeleteEndpoint:
@@ -389,6 +411,25 @@ class TestExpirySweep:
 
         assert result == {"examined": 1, "deleted": 0, "failed": 1}
         assert repo.live_ids() == {file_id}
+
+    @pytest.mark.asyncio
+    async def test_a_row_whose_object_is_already_gone_is_still_retired(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+    ) -> None:
+        """The scrubber stamps expires_at on rows whose objects a retention cap already deleted.
+
+        Every row it hands over is in exactly this state, so a sweep that required the object
+        to still exist would leave all of them live and the file ids resolving to dead URIs.
+        """
+        past = datetime.now(timezone.utc) - timedelta(days=1)
+        file_id = repo.seed(VICTIM_ORG_ID, expires_at=past, filename="lifecycle-expired.csv")
+        storage.absent.add(_uri(VICTIM_ORG_ID, "lifecycle-expired.csv"))
+
+        result = await uploaded_file_service.purge_expired_files()
+
+        assert result == {"examined": 1, "deleted": 1, "failed": 0}
+        assert storage.deleted == []
+        assert file_id not in repo.live_ids()
 
 
 class TestRunAttachment:

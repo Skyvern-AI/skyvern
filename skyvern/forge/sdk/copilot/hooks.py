@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from agents.agent import Agent, AgentBase
-from agents.items import TResponseInputItem
+from agents.items import ModelResponse, TResponseInputItem
 from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.credential_pause import arm_credential_pause_gate
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
     outcome_fully_verified,
@@ -35,7 +36,18 @@ LOG = structlog.get_logger()
 # entry as a short preview. This is a hooks-side concern (what to record),
 # not a registry of the tools themselves.
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
-    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
+    {
+        "run_blocks_and_collect_debug",
+        "get_run_results",
+        "update_and_run_blocks",
+        "edit_block_and_run",
+        "test_workflow_from_blank_browser",
+    }
+)
+# The tools that dispatch a build test. Counted per model response so the acquisition seam can tell
+# a stale run of an earlier turn from a sibling call the same response is running right now.
+_BUILD_TEST_DISPATCH_TOOLS: frozenset[str] = frozenset(
+    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
 )
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
@@ -58,7 +70,12 @@ def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
 
 
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
-    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}:
+    if tool_name not in {
+        "run_blocks_and_collect_debug",
+        "update_and_run_blocks",
+        "edit_block_and_run",
+        "test_workflow_from_blank_browser",
+    }:
         return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
@@ -94,6 +111,24 @@ class CopilotRunHooks(RunHooksBase):
                 **_copilot_log_fields(self._ctx),
             )
 
+    async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
+        try:
+            called = [getattr(item, "name", None) for item in response.output]
+            # Counted before the credential gate: a gate that raises would otherwise leave the
+            # previous response's count standing, and the acquisition seam reads it as this one's.
+            self._ctx.build_test_tool_calls_in_model_response = sum(
+                1 for name in called if name in _BUILD_TEST_DISPATCH_TOOLS
+            )
+            if "request_credential" in called:
+                arm_credential_pause_gate(self._ctx)
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_llm_end response accounting failed",
+                **_copilot_log_fields(self._ctx),
+            )
+
     async def on_agent_start(self, context: AgentHookContext, agent: AgentBase) -> None:
         try:
             self._ctx.enforcement_pass_count += 1
@@ -103,6 +138,16 @@ class CopilotRunHooks(RunHooksBase):
                 **_copilot_log_fields(self._ctx),
             )
 
+    async def on_tool_start(
+        self,
+        context: RunContextWrapper,
+        agent: AgentBase,
+        tool: Tool,
+    ) -> None:
+        # Retry safety depends on this monotonic fact, so record it before the
+        # tool executes and outside the best-effort activity-summary path.
+        self._ctx.tool_calls_this_turn += 1
+
     async def on_tool_end(
         self,
         context: RunContextWrapper,
@@ -110,6 +155,8 @@ class CopilotRunHooks(RunHooksBase):
         tool: Tool,
         result: Any,
     ) -> None:
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
         # Activity recording is observability -- a malformed tool result or an
         # unserializable block output must not propagate into the agent loop
         # and kill the whole run.

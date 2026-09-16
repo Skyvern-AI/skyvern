@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
 import yaml
+from typing_extensions import TypedDict
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
@@ -33,7 +36,9 @@ from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     _elapsed_run_seconds,
     _requested_output_labels_by_path,
+    proxy_hop_failure_reason,
 )
+from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     effective_browser_session_id,
@@ -48,6 +53,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -263,7 +269,9 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
-BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"})
+BLOCK_RUNNING_TOOLS = frozenset(
+    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
+)
 
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks", "edit_block_and_run"})
 
@@ -604,12 +612,72 @@ async def _discovery_navigate(
         nav_args["timeout"] = int(timeout_seconds * 1000)
         cap = timeout_seconds + 5
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_navigate", nav_args),
             timeout=cap,
         )
     except TimeoutError:
         return {"ok": False, "error": f"skyvern_navigate timed out after {timeout_seconds:g}s"}
+    return await attribute_navigation_failure(ctx, result)
+
+
+async def browser_session_hop_proxy(
+    ctx: AgentContext, session_id: str | None = None
+) -> tuple[bool, ProxyLocationInput]:
+    """Whether a browser session made this hop, and the proxy it was given.
+
+    The session's answer governs even when it is None. The browser layer reuses an attached session's
+    existing state instead of applying the workflow's declared proxy, so falling back to that
+    declaration would name a location the hop never used.
+    """
+    session_id = session_id or effective_browser_session_id(ctx)
+    if not session_id:
+        return False, None
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, ctx.organization_id)
+    except Exception:
+        LOG.warning(
+            "Could not read the browser session's proxy for failure attribution",
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        return True, None
+    return True, session.proxy_location if session is not None else None
+
+
+async def attribute_navigation_failure(ctx: AgentContext, result: dict[str, Any]) -> dict[str, Any]:
+    """Name Skyvern's proxy hop in a failed navigation before anything downstream renders it.
+
+    Scouting has no run row to read codes from, so the code comes off the call that failed and the
+    proxy off the browser state that made the hop. The failure text is rendered, never inspected --
+    an MCP error string is as reproducible as any other prose.
+    """
+    if result.get("ok") or not isinstance(result.get("error"), str):
+        return result
+    # Only the code this call reported. The browser state's code is cleared by a successful
+    # state-managed navigation, which an MCP hop never performs, so reading it here would let an
+    # earlier failure's code attach to a later call that reported none of its own.
+    #
+    # Asked before the state is resolved: every other failure then leaves this seam without paying
+    # for a session lookup, and a lookup that fails cannot replace a failure it was only labelling.
+    if not proxy_owns_nav_codes([result.get("nav_error_code")]):
+        return result
+    if not effective_browser_session_id(ctx):
+        return result
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+    except Exception:  # noqa: BLE001 - an unreadable session costs the proxy name, not the failure.
+        LOG.warning("Could not resolve the browser state to name the proxy hop", exc_info=True)
+        browser_state = None
+    # With no state the proxy is unknown, and proxy_hop_failure_reason drops the parenthetical
+    # rather than naming one the hop may not have used.
+    attributed = proxy_hop_failure_reason(
+        ctx,
+        result["error"],
+        browser_state.built_with_proxy_location if browser_state is not None else None,
+        session_made_hop=True,
+    )
+    return {**result, "error": attributed}
 
 
 async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
@@ -750,6 +818,53 @@ async def _composition_get_html(
     return "", str(error) if error else None, False, True
 
 
+class RequestedOutputRead(TypedDict):
+    """A requested output and the exact label/value the model sees on the current page."""
+
+    output_path: str
+    value_text: str
+    label: str
+
+
+_MAX_REQUESTED_OUTPUT_READS = 8
+
+
+@dataclass(frozen=True)
+class AdmittedOutputRead:
+    output_path: str
+    value_text: str
+    label: str
+
+
+def admitted_requested_output_reads(
+    reads: Sequence[RequestedOutputRead],
+) -> tuple[tuple[AdmittedOutputRead, ...], list[dict[str, str]]]:
+    """Admit the designations this turn may act on, and say why the rest were refused.
+
+    Capture and the designation verifier read the same admission, so a turn cannot seed a target the
+    verifier would have rejected or probe one capture already addressed.
+    """
+    admitted: list[AdmittedOutputRead] = []
+    rejected: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
+        rejected.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
+    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
+        raw_path = str(read.get("output_path") or "").strip()
+        value_text = str(read.get("value_text") or "").strip()
+        label = str(read.get("label") or "").strip()
+        if not raw_path or not value_text:
+            rejected.append({"output_path": raw_path, "reason": "malformed"})
+            continue
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
+        if output_path in seen_paths:
+            rejected.append({"output_path": output_path, "reason": "duplicate-output-path"})
+            continue
+        seen_paths.add(output_path)
+        admitted.append(AdmittedOutputRead(output_path=output_path, value_text=value_text, label=label))
+    return tuple(admitted), rejected
+
+
 def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
     """The labels this turn asked for, so capture resolves them rather than guessing which relations matter."""
     if not isinstance(copilot_ctx, AgentContext):
@@ -779,6 +894,8 @@ async def _composition_get_structured_evidence_result(
     inspected_url: str,
     current_url: str,
     timeout_seconds: float | None = None,
+    requested_targets: tuple[str, ...] | None = None,
+    witnessed_values: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Capture composition evidence and preserve why the observation failed.
 
@@ -794,7 +911,12 @@ async def _composition_get_structured_evidence_result(
             evaluate = _call_internal_browser_tool(
                 server,
                 "skyvern_evaluate",
-                {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
+                {
+                    "expression": composition_structured_evidence_expression(
+                        _requested_capture_targets(copilot_ctx) if requested_targets is None else requested_targets,
+                        witnessed_values,
+                    )
+                },
             )
             if timeout_seconds is None:
                 result, outcome = await evaluate

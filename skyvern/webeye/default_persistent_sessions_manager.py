@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from math import floor
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import structlog
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.cli.core.session_manager import active_copilot_session_ids
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionNotExtendable,
+    BrowserSessionNotFound,
+    BrowserSessionNotRenewable,
+    MissingBrowserAddressError,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
@@ -28,11 +36,28 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_final_status,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_timeouts import (
+    DEFAULT_TIMEOUT,
+    EXTENSION_MIN_REMAINING_SECONDS,
+    MAX_EXTENDED_TIMEOUT,
+    MAX_LIFETIME_REACHED_MESSAGE,
+    MAX_TIMEOUT,
+    creation_timeout_minutes,
+)
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
-from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE, PersistentSessionsManager
+from skyvern.webeye.persistent_sessions_manager import (
+    PBS_TASK_RUNNABLE_TYPE,
+    BrowserOperation,
+    BrowserOperationRejected,
+    BrowserRetirement,
+    BrowserRetirementReason,
+    BrowserSessionExtension,
+    PersistentSessionsManager,
+)
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.session_cookies import persist_session_cookies
 
@@ -86,6 +111,12 @@ class BrowserSession:
     browser_state: BrowserState
     organization_id: str | None = None
     cdp_port: int | None = None
+    retirement: BrowserRetirement = field(default_factory=BrowserRetirement)
+    active_browser_operations: set[asyncio.Task[Any]] = field(default_factory=set)
+
+    @property
+    def retirement_started(self) -> asyncio.Event:
+        return self.retirement.started
 
 
 async def validate_session_for_renewal(
@@ -158,6 +189,52 @@ def _renewal_extension_minutes(new_timeout_datetime: datetime, current_timeout_d
     return max(0, floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60))
 
 
+async def extend_session(
+    database: AgentDB, session_id: str, organization_id: str, additional_minutes: int
+) -> BrowserSessionExtension:
+    """Grant a live session more lifetime by moving its timeout, clamped to the maximum extended lifetime."""
+    browser_session = await database.browser_sessions.get_persistent_browser_session(
+        session_id=session_id,
+        organization_id=organization_id,
+    )
+    if browser_session is None:
+        raise BrowserSessionNotFound(session_id)
+    if browser_session.completed_at is not None or is_final_status(browser_session.status):
+        raise BrowserSessionNotExtendable("browser session has already ended", session_id)
+
+    current_timeout_minutes = browser_session.timeout_minutes or DEFAULT_TIMEOUT
+    headroom_minutes = MAX_EXTENDED_TIMEOUT - current_timeout_minutes
+    if headroom_minutes <= 0:
+        raise BrowserSessionNotExtendable(MAX_LIFETIME_REACHED_MESSAGE, session_id)
+    if browser_session.started_at is not None:
+        started_at_utc = (
+            browser_session.started_at.replace(tzinfo=timezone.utc)
+            if browser_session.started_at.tzinfo is None
+            else browser_session.started_at
+        )
+        remaining_seconds = current_timeout_minutes * 60 - (datetime.now(timezone.utc) - started_at_utc).total_seconds()
+        if remaining_seconds < EXTENSION_MIN_REMAINING_SECONDS:
+            raise BrowserSessionNotExtendable("browser session has expired", session_id)
+
+    granted_minutes = min(additional_minutes, headroom_minutes)
+    updated = await database.browser_sessions.update_persistent_browser_session(
+        session_id,
+        organization_id=organization_id,
+        timeout_minutes=current_timeout_minutes + granted_minutes,
+    )
+    LOG.info(
+        "Extended browser session",
+        requested_minutes=additional_minutes,
+        granted_minutes=granted_minutes,
+        timeout_minutes=current_timeout_minutes + granted_minutes,
+        session_id=session_id,
+        organization_id=organization_id,
+        lifecycle_event="browser_session_timeout_extended",
+        browser_session_id=session_id,
+    )
+    return BrowserSessionExtension(session=updated, granted_minutes=granted_minutes)
+
+
 async def renew_session(
     database: AgentDB, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
 ) -> PersistentBrowserSession:
@@ -178,9 +255,11 @@ async def renew_session(
     if minutes_left >= settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES:
         new_timeout_datetime = right_now + timedelta(minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES)
         minutes_diff = _renewal_extension_minutes(new_timeout_datetime, current_timeout_datetime)
+        # Automatic renewal stays within the creation cap; only the extend endpoint goes past it.
+        new_timeout_minutes = min(current_timeout_minutes + minutes_diff, max(MAX_TIMEOUT, current_timeout_minutes))
+        minutes_diff = new_timeout_minutes - current_timeout_minutes
         if minutes_diff == 0:
             return browser_session
-        new_timeout_minutes = current_timeout_minutes + minutes_diff
 
         browser_session = await database.browser_sessions.update_persistent_browser_session(
             session_id,
@@ -258,11 +337,64 @@ async def update_status(
 class DefaultPersistentSessionsManager(PersistentSessionsManager):
     """Default (OSS) implementation of PersistentSessionsManager protocol."""
 
+    @asynccontextmanager
+    async def browser_operation(
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+    ) -> AsyncIterator[BrowserOperation | BrowserOperationRejected]:
+        operation_task = asyncio.current_task()
+        if operation_task is None:
+            raise RuntimeError("A browser operation requires an asyncio task")
+        current = self._browser_sessions.get(session_id)
+        if current is None:
+            yield BrowserOperationRejected(BrowserRetirementReason.session_ending)
+            return
+        if current.browser_state is not browser_state:
+            yield BrowserOperationRejected(BrowserRetirementReason.replacement)
+            return
+        if current.retirement.started.is_set():
+            yield BrowserOperationRejected(current.retirement.reason or BrowserRetirementReason.session_ending)
+            return
+        current.active_browser_operations.add(operation_task)
+        try:
+            yield BrowserOperation(current.browser_state, current.retirement)
+        finally:
+            current.active_browser_operations.discard(operation_task)
+
+    def _retire_browser_session(
+        self,
+        session_id: str,
+        *,
+        expected: BrowserSession | None = None,
+        reason: BrowserRetirementReason = BrowserRetirementReason.replacement,
+    ) -> BrowserSession | None:
+        current = self._browser_sessions.get(session_id)
+        if current is None or (expected is not None and current is not expected):
+            return None
+        current.retirement.begin(reason)
+        self._browser_sessions.pop(session_id, None)
+        for operation_task in tuple(current.active_browser_operations):
+            current.retirement.cancel(operation_task)
+        return current
+
     instance: DefaultPersistentSessionsManager | None = None
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
+    _close_cleanup_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
     _reaper_task: asyncio.Task[None] | None = None
     database: AgentDB
+
+    @classmethod
+    def _retain_background_task(cls, task: asyncio.Task[None]) -> None:
+        cls._background_tasks.add(task)
+
+        def _finish(finished: asyncio.Task[None]) -> None:
+            cls._background_tasks.discard(finished)
+            if not finished.cancelled():
+                finished.exception()
+
+        task.add_done_callback(_finish)
 
     def __new__(cls, database: AgentDB) -> DefaultPersistentSessionsManager:
         if cls.instance is None:
@@ -384,6 +516,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        url: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
@@ -412,6 +548,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:
+        current = self._browser_sessions.get(session_id)
+        if current is not None and current.browser_state is browser_state:
+            current.organization_id = organization_id
+            return
+        if current is not None:
+            self._retire_browser_session(session_id, expected=current)
         browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
 
@@ -422,13 +564,22 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected: BrowserState | None = None,
         *,
         detach_remote_driver: bool = False,
-    ) -> None:
+        only_if_unleased: bool = False,
+    ) -> bool:
         cached = self._browser_sessions.get(session_id)
         if cached is None:
-            return
+            return False
         if expected is not None and cached.browser_state is not expected:
-            return
-        self._browser_sessions.pop(session_id, None)
+            return False
+        if only_if_unleased and cached.active_browser_operations:
+            return False
+        cached = self._retire_browser_session(
+            session_id,
+            expected=cached,
+            reason=BrowserRetirementReason.session_ending,
+        )
+        if cached is None:
+            return False
         try:
             if detach_remote_driver:
                 await cached.browser_state.detach_remote_driver()
@@ -445,6 +596,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 session_id=session_id,
                 exc_info=True,
             )
+        return True
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
@@ -482,7 +634,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
-            timeout_minutes=timeout_minutes,
+            timeout_minutes=creation_timeout_minutes(timeout_minutes),
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             extensions=extensions,
@@ -570,11 +722,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 await _discard_browser_state(browser_state, discarded_cdp_port)
                 return
 
-            self._browser_sessions[session_id] = BrowserSession(
+            launched_session = BrowserSession(
                 browser_state=browser_state,
                 organization_id=organization_id,
                 cdp_port=cdp_port,
             )
+            self._browser_sessions[session_id] = launched_session
             cdp_port = None
 
             result = await self.update_status(
@@ -586,7 +739,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 upstream_cdp_url=browser_address,
             )
             if result is None:
-                discarded_session = self._browser_sessions.pop(session_id, None)
+                discarded_session = self._retire_browser_session(
+                    session_id,
+                    expected=launched_session,
+                    reason=BrowserRetirementReason.session_ending,
+                )
                 await _discard_browser_state(
                     browser_state,
                     discarded_session.cdp_port if discarded_session is not None else None,
@@ -656,11 +813,20 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     raise
             # Session doesn't exist, has started, is completed, or is stuck — close it
             if session is None or session.completed_at is None:
-                await self.close_session(organization_id, session_id)
+                await self.close_session(organization_id, session_id, reason=BrowserSessionCloseReason.expired)
             raise
+
+    async def extend_session(
+        self, session_id: str, organization_id: str, additional_minutes: int
+    ) -> BrowserSessionExtension:
+        return await extend_session(self.database, session_id, organization_id, additional_minutes)
 
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
         """These sessions run on browsers this process owns, which can always be given longer."""
+        return None
+
+    async def remaining_lifetime_seconds(self, session_id: str, organization_id: str) -> float | None:
+        """This manager enforces no lifetime cap of its own, so there is no deadline the run cannot renew past."""
         return None
 
     async def update_status(
@@ -768,6 +934,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             return False
         if not browser_session:
             return False
+        browser_session = self._retire_browser_session(
+            browser_session_id,
+            expected=browser_session,
+            reason=BrowserRetirementReason.session_ending,
+        )
+        if browser_session is None:
+            return False
 
         LOG.info(
             "Closing browser session",
@@ -781,9 +954,18 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # the dir; the later close() persist runs after this export, too late to land in the
             # archive. export_profile=False intentionally skips both the cookie snapshot and the
             # profile upload.
-            await persist_session_cookies(
-                browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
-            )
+            try:
+                await persist_session_cookies(
+                    browser_session.browser_state.browser_context,
+                    browser_artifacts.browser_session_dir,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to persist browser-session cookies during close",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
             if export_profile is None:
                 # close_session: re-read the row to honor an update-while-alive opt-in toggle. Fail
                 # open on a missing/errored re-read so a transient blip never drops an opted-in /
@@ -870,13 +1052,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                             video_path=video_artifact.video_path,
                         )
 
-        self._browser_sessions.pop(browser_session_id, None)
         if browser_session.cdp_port is not None:
             _release_cdp_port(browser_session.cdp_port)
         return True
 
-    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
-        """Close a specific browser session."""
+    async def _close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
         released = await self._release_local_browser_session(organization_id, browser_session_id)
         if not released:
             LOG.info(
@@ -885,15 +1071,52 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 session_id=browser_session_id,
             )
 
+        try:
+            await self.database.browser_sessions.record_persistent_browser_session_close_reason(
+                browser_session_id, organization_id, reason.value
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record the close reason; the row will close on its terminal default",
+                organization_id=organization_id,
+                session_id=browser_session_id,
+                exc_info=True,
+            )
         await self.database.browser_sessions.close_persistent_browser_session(browser_session_id, organization_id)
         if settings.BROWSER_STREAMING_MODE == "cdp":
             await self.database.browser_sessions.archive_browser_session_address(browser_session_id, organization_id)
+
+    async def close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
+        """Close a session while retaining cleanup ownership if its caller is cancelled."""
+        cleanup_key = (organization_id, browser_session_id)
+        cleanup_task = self._close_cleanup_tasks.get(cleanup_key)
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(self._close_session(organization_id, browser_session_id, reason=reason))
+            self._close_cleanup_tasks[cleanup_key] = cleanup_task
+            self._retain_background_task(cleanup_task)
+
+            def _release(finished: asyncio.Task[None]) -> None:
+                if self._close_cleanup_tasks.get(cleanup_key) is finished:
+                    self._close_cleanup_tasks.pop(cleanup_key, None)
+
+            cleanup_task.add_done_callback(_release)
+        await asyncio.shield(cleanup_task)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""
         browser_sessions = await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
         for browser_session in browser_sessions:
-            await self.close_session(organization_id, browser_session.persistent_browser_session_id)
+            await self.close_session(
+                organization_id,
+                browser_session.persistent_browser_session_id,
+                reason=BrowserSessionCloseReason.shutdown,
+            )
 
     async def cleanup_stale_sessions(self) -> None:
         """Close sessions left active by a previous process."""
@@ -1022,7 +1245,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=db_session.organization_id,
             )
             try:
-                await self.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
+                await self.close_session(
+                    db_session.organization_id,
+                    db_session.persistent_browser_session_id,
+                    reason=BrowserSessionCloseReason.expired,
+                )
             except Exception:
                 LOG.exception(
                     "Failed to reap expired persistent browser session",
@@ -1113,5 +1340,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if cls.instance:
             active_sessions = await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
             for db_session in active_sessions:
-                await cls.instance.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
+                await cls.instance.close_session(
+                    db_session.organization_id,
+                    db_session.persistent_browser_session_id,
+                    reason=BrowserSessionCloseReason.shutdown,
+                )
         LOG.info("PersistentSessionsManager is closed")

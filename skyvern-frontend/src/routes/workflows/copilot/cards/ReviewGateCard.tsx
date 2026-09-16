@@ -4,7 +4,11 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 import { humanizeBlockLabel } from "../blockLabel";
 import { everyTestBlockExecuted, hasFailedTestBlock } from "../copilotPhases";
-import { TurnNarrativeState, ranCleanOnCurrentSource } from "../narrativeState";
+import {
+  isBuildTestConnectFailureState,
+  TurnNarrativeState,
+  ranCleanOnCurrentSource,
+} from "../narrativeState";
 import { getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -78,6 +82,9 @@ interface ReviewGateCardProps {
   verdict: ReviewGateVerdict;
   settled?: ReviewGateSettled;
   actionsEnabled: boolean;
+  // False only while this chat's Turn off is in flight: an Accept started then could write auto_accept
+  // back on after it. Review and Reject write no auto_accept and stay available.
+  acceptsEnabled?: boolean;
   onAccept: () => void;
   onAlwaysAccept: () => void;
   onReject: () => void;
@@ -123,6 +130,7 @@ export function ReviewGateCard({
   verdict,
   settled = null,
   actionsEnabled,
+  acceptsEnabled = true,
   onAccept,
   onAlwaysAccept,
   onReject,
@@ -132,6 +140,8 @@ export function ReviewGateCard({
   flash = false,
 }: ReviewGateCardProps) {
   const draft = turn?.draft ?? null;
+  const billingCreditRefusal =
+    turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
   const rejected = settled === "rejected";
   const accepted = settled === "accepted";
   const itemClassName = rejected
@@ -230,6 +240,18 @@ export function ReviewGateCard({
       ) : null}
       {pending && actionsEnabled ? (
         <div className="flex flex-wrap gap-2 border-t border-border/55 bg-slate-elevation1/55 px-3 py-2">
+          {billingCreditRefusal ? (
+            <p className="basis-full text-[11px] leading-snug text-muted-foreground">
+              No browser or run started because credits are exhausted.{" "}
+              <a
+                href="/billing"
+                className="font-medium text-sky-700 underline underline-offset-2 dark:text-sky-300"
+              >
+                Go to Billing
+              </a>
+              .
+            </p>
+          ) : null}
           <button
             type="button"
             onClick={onReview}
@@ -237,20 +259,24 @@ export function ReviewGateCard({
           >
             Review
           </button>
-          <button
-            type="button"
-            onClick={onAccept}
-            className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
-          >
-            Accept
-          </button>
-          <button
-            type="button"
-            onClick={onAlwaysAccept}
-            className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
-          >
-            Always accept
-          </button>
+          {acceptsEnabled ? (
+            <>
+              <button
+                type="button"
+                onClick={onAccept}
+                className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
+              >
+                Accept
+              </button>
+              <button
+                type="button"
+                onClick={onAlwaysAccept}
+                className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
+              >
+                Always accept
+              </button>
+            </>
+          ) : null}
           <button
             type="button"
             onClick={onReject}
@@ -258,18 +284,18 @@ export function ReviewGateCard({
           >
             Reject
           </button>
-          {onTestEndToEnd ? (
+          {onTestEndToEnd && !billingCreditRefusal ? (
             <button
               type="button"
               onClick={onTestEndToEnd}
               className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
             >
-              {turn?.terminalEnvelope?.connectFailure
+              {isBuildTestConnectFailureState(turn?.turnFacts?.terminalCause)
                 ? "Retry in a fresh session"
                 : "Test end-to-end"}
             </button>
           ) : null}
-          {onTestEndToEnd ? (
+          {onTestEndToEnd && !billingCreditRefusal ? (
             <p className="basis-full text-[11px] leading-snug text-muted-foreground">
               {verdict === "untested" &&
               turn &&

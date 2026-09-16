@@ -52,6 +52,17 @@ describe("useIsGeneratingCode", () => {
     blockScriptsQueryModule.useBlockScriptsQuery,
   );
 
+  // Stands in for the hook's own withholding: a caller that states a cleared run
+  // gets no payload, while omitting the options object resolves to the route's run.
+  function serveRunOnlyToTheRoute() {
+    useWorkflowRunQueryMock.mockImplementation(
+      (options) =>
+        mockQueryResult(
+          options ? undefined : workflowRun("running"),
+        ) as ReturnType<typeof workflowRunQueryModule.useWorkflowRunQuery>,
+    );
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
     useWorkflowQueryMock.mockReturnValue(
@@ -138,6 +149,31 @@ describe("useIsGeneratingCode", () => {
         cacheKey: "k",
         cacheKeyValue: "v",
         workflowPermanentId: "wf-1",
+      }),
+    );
+    expect(hook.result.current).toBe(false);
+  });
+
+  it("defers to the route's run when no run id is given", () => {
+    serveRunOnlyToTheRoute();
+    const hook = renderHook(() =>
+      useIsGeneratingCode({
+        cacheKey: "k",
+        cacheKeyValue: "v",
+        workflowPermanentId: "wf-1",
+      }),
+    );
+    expect(hook.result.current).toBe(true);
+  });
+
+  it("asks for no run when the caller's run id is cleared", () => {
+    serveRunOnlyToTheRoute();
+    const hook = renderHook(() =>
+      useIsGeneratingCode({
+        cacheKey: "k",
+        cacheKeyValue: "v",
+        workflowPermanentId: "wf-1",
+        workflowRunId: undefined,
       }),
     );
     expect(hook.result.current).toBe(false);

@@ -30,6 +30,8 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
     RecordingPage,
+    _action_from_fields,
+    _recorded_action_fields,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import (
     CONTROL_ENDPOINT_PROBE_INTERVAL_SECONDS,
@@ -625,3 +627,18 @@ async def test_probing_stops_at_the_cap() -> None:
             recording._page_call_still_pending(pending)
 
     assert scheduled.call_count == MAX_CONTROL_ENDPOINT_PROBES
+
+
+def test_an_in_memory_upload_payload_records_its_filename_as_a_typed_upload_action() -> None:
+    """A {name, mimeType, buffer} payload must still validate as UploadFileAction, minus the bytes."""
+    payload = {"name": "resume.pdf", "mimeType": "application/pdf", "buffer": b"secret bytes"}
+    fields = _recorded_action_fields(ActionType.UPLOAD_FILE, "locator.set_input_files", "#file", (payload,), {})
+
+    assert fields["file_url"] == "resume.pdf"
+    action = _action_from_fields(
+        ActionType.UPLOAD_FILE,
+        {"action_type": ActionType.UPLOAD_FILE, "status": ActionStatus.completed, "action_order": 0, **fields},
+        warning="unused",
+    )
+    assert type(action).__name__ == "UploadFileAction"
+    assert b"secret bytes" not in repr(action).encode()

@@ -124,8 +124,8 @@ class CustomSMTPAuthenticationFailed(BaseWorkflowException):
 
 
 class NoValidEmailRecipient(BaseWorkflowException):
-    def __init__(self, recipients: list[str]) -> None:
-        super().__init__(f"No valid email recipient found. Recipients: {recipients}")
+    def __init__(self) -> None:
+        super().__init__("No email recipient found: the Recipients field resolved to no addresses.")
 
 
 class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
@@ -192,6 +192,18 @@ class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
         )
 
 
+class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, original: BaseException) -> None:
+        self.block_label = block_label
+        self.original = original
+        self.line = getattr(original, "lineno", None)
+        line_suffix = f" on line {self.line}" if self.line is not None else ""
+        super().__init__(
+            f"Invalid Jinja2 in code block '{block_label}'{line_suffix}: {original}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
     def __init__(self, block_label: str, wait_sec: int, max_sec: int) -> None:
         super().__init__(
@@ -202,7 +214,9 @@ class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
 
 
 class FailedToFormatJinjaStyleParameter(SkyvernException):
-    def __init__(self, template: str, msg: str) -> None:
+    def __init__(self, template: str, msg: str, *, available_keys: list[str] | None = None) -> None:
+        self.template = template
+        self.available_keys = available_keys or []
         super().__init__(
             f"Failed to format Jinja style parameter '{template}'. "
             f"Reason: {msg}. "

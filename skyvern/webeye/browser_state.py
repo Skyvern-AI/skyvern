@@ -22,6 +22,7 @@ BLANK_PAGE_URLS = {"about:blank", ":"}
 
 class BrowserState(Protocol):
     browser_context: BrowserContext | None
+    browser_context_route_policy_url: str | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
     pw: Playwright
@@ -31,12 +32,16 @@ class BrowserState(Protocol):
     # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
     # response). The Task V3 loop reads it to classify a dead/removed starting URL.
     last_navigation_status: int | None
+    # The proxy this browser was actually built with. A consumer reading a flattened failure
+    # sentence cannot tell which hop it went through; this carries that fact from where it is known.
+    built_with_proxy_location: ProxyLocationInput
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
     async def check_and_fix_state(
         self,
         url: str | None = None,
+        browser_context_route_policy_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -47,6 +52,7 @@ class BrowserState(Protocol):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> None: ...
 
     def is_connected(self) -> bool: ...
@@ -56,13 +62,17 @@ class BrowserState(Protocol):
     async def reconnect(
         self,
         proxy_location: ProxyLocationInput = None,
+        task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
+        browser_context_route_policy_url: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
+        stale_context_is_unusable: bool = False,
     ) -> None: ...
 
     async def get_working_page(self) -> Page | None: ...
@@ -71,7 +81,7 @@ class BrowserState(Protocol):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None: ...
 
-    async def set_active_page(self, page: Page) -> None: ...
+    async def set_active_page(self, page: Page, *, prune_excess_pages: bool = True) -> None: ...
 
     async def navigate_to_url(
         self,
@@ -94,6 +104,7 @@ class BrowserState(Protocol):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> Page: ...
 
     async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]: ...

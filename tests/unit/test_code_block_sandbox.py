@@ -7,22 +7,43 @@ Verifies that the CodeBlock safety layer:
 """
 
 import asyncio
+import inspect
 import json
-from datetime import datetime, timezone
+import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
-from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
-from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected, MissingJinjaVariables
+from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    ALWAYS_DENIED_BUILTINS,
+    SANDBOX_ONLY_BUILTINS,
+    is_safe_script_code,
+    safe_builtins,
+)
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    InsecureCodeDetected,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
     BranchEvaluationContext,
     CodeBlock,
+    _bind_code_block_set_dialog_policy,
+)
+from skyvern.forge.sdk.workflow.models.credential_release import (
+    CodeBlockCredentialReleaseError,
+    CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
@@ -32,7 +53,10 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.workflows import BlockStatus
+from skyvern.webeye import dialog_handler
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.skycdp.errors import CdpError
+from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
@@ -63,6 +87,12 @@ class TestIsSafeCodeRejectsDunderAccess:
         with pytest.raises(InsecureCodeDetected, match="private"):
             CodeBlock.is_safe_code("page._session._nonce")
 
+    def test_recording_page_raw_unwrap_seam_is_private(self) -> None:
+        # The RecordingPage raw-page unwrap is a private platform seam; authored code must not be able to
+        # name it to reach the unrecorded Playwright page behind the recording/credential guards.
+        with pytest.raises(InsecureCodeDetected, match="private"):
+            CodeBlock.is_safe_code("page._underlying_page")
+
     def test_dunder_class(self) -> None:
         with pytest.raises(InsecureCodeDetected, match="private"):
             CodeBlock.is_safe_code("x.__class__")
@@ -82,6 +112,54 @@ class TestIsSafeCodeRejectsDunderAccess:
     def test_dunder_builtins(self) -> None:
         with pytest.raises(InsecureCodeDetected, match="private"):
             CodeBlock.is_safe_code("x.__builtins__")
+
+
+_MATCH_CLASS_POSITIONAL_BYPASS_CODE = (
+    'M = type("M", (type,), {"__instancecheck__": lambda s, o: True})\n'
+    'R = M("R", (), {"__match_args__": ("__globals__",)})\n'
+    "match sleep:\n    case R(g):\n        result = g\n"
+)
+_MATCH_CLASS_CHECKERS = (CodeBlock.is_safe_code, is_safe_script_code)
+
+
+@pytest.mark.parametrize(
+    ("checker", "error"),
+    [(CodeBlock.is_safe_code, "private"), (is_safe_script_code, "globals")],
+    ids=["codeblock", "script"],
+)
+def test_match_class_private_keyword_attribute_is_rejected(checker, error: str) -> None:
+    with pytest.raises(InsecureCodeDetected, match=error):
+        checker("match obj:\n    case type(__globals__=g):\n        result = g\n")
+
+
+@pytest.mark.parametrize("checker", _MATCH_CLASS_CHECKERS, ids=["codeblock", "script"])
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [
+        ("match obj:\n    case Session(_nonce=n):\n        result = n\n", "private"),
+        ("match obj:\n    case Thing(popen=p):\n        result = p\n", "popen"),
+        (_MATCH_CLASS_POSITIONAL_BYPASS_CODE, "positional"),
+        ("match obj:\n    case Thing(x, y):\n        result = x\n", "positional"),
+        ("match obj:\n    case Thing(x, attr=y):\n        result = x\n", "positional"),
+    ],
+    ids=["private-keyword", "blocked-keyword", "dynamic-positional", "positional", "mixed-positional"],
+)
+def test_match_class_attribute_bypasses_are_rejected(checker, code: str, error: str) -> None:
+    with pytest.raises(InsecureCodeDetected, match=error):
+        checker(code)
+
+
+@pytest.mark.parametrize("checker", _MATCH_CLASS_CHECKERS, ids=["codeblock", "script"])
+@pytest.mark.parametrize(
+    "code",
+    [
+        "match point:\n    case Point(x=0, y=0):\n        result = 1\n",
+        "match obj:\n    case Thing():\n        result = 1\n",
+    ],
+    ids=["keyword", "bare"],
+)
+def test_safe_match_class_patterns_are_accepted(checker, code: str) -> None:
+    checker(code)
 
 
 class TestIsSafeCodeRejectsBareDunderIdentifiers:
@@ -390,15 +468,16 @@ class TestIsSafeCodeAcceptsLegitimateCode:
 
     def test_exposes_safe_iteration_and_regex_aliases(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
+        sandbox_builtins = safe_vars["__builtins__"]
 
-        assert safe_vars["enumerate"] is enumerate
-        assert safe_vars["isinstance"] is isinstance
-        assert safe_vars["any"] is any
-        assert safe_vars["all"] is all
-        assert safe_vars["max"] is max
-        assert safe_vars["min"] is min
-        assert safe_vars["sum"] is sum
-        assert safe_vars["sorted"] is sorted
+        assert sandbox_builtins["enumerate"] is enumerate
+        assert sandbox_builtins["isinstance"] is isinstance
+        assert sandbox_builtins["any"] is any
+        assert sandbox_builtins["all"] is all
+        assert sandbox_builtins["max"] is max
+        assert sandbox_builtins["min"] is min
+        assert sandbox_builtins["sum"] is sum
+        assert sandbox_builtins["sorted"] is sorted
         assert safe_vars["re"].I == safe_vars["re"].IGNORECASE
 
     def test_try_except(self) -> None:
@@ -444,15 +523,17 @@ class TestBuildSafeVars:
 
     def test_float_in_safe_vars(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        assert "float" in safe_vars
-        assert safe_vars["float"] is float
+        assert "float" not in safe_vars
+        assert safe_vars["__builtins__"]["float"] is float
 
-    def test_builtins_mapping_is_minimal(self) -> None:
-        safe_vars = CodeBlock.build_safe_vars()
-        assert set(safe_vars["__builtins__"]) == {"__build_class__", "__name__"}
+    def test_builtins_mapping_is_the_declared_policy(self) -> None:
+        sandbox_builtins = set(CodeBlock.build_safe_vars()["__builtins__"])
+        assert sandbox_builtins == set(safe_builtins()) | {"__build_class__", "__name__"}
+        assert sandbox_builtins.isdisjoint(ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS)
+        assert "__import__" not in sandbox_builtins
 
     def test_expected_builtins_present(self) -> None:
-        safe_vars = CodeBlock.build_safe_vars()
+        sandbox_builtins = CodeBlock.build_safe_vars()["__builtins__"]
         expected = {
             "len",
             "range",
@@ -471,9 +552,14 @@ class TestBuildSafeVars:
             "min",
             "sum",
             "sorted",
+            "zip",
+            "map",
+            "filter",
+            "ValueError",
+            "KeyError",
         }
         for name in expected:
-            assert name in safe_vars, f"{name} missing from safe_vars"
+            assert name in sandbox_builtins, f"{name} missing from __builtins__"
 
     def test_json_is_restricted_namespace(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
@@ -506,7 +592,13 @@ class TestBuildSafeVars:
 
     def test_exception_available(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        assert safe_vars["Exception"] is Exception
+        assert safe_vars["__builtins__"]["Exception"] is Exception
+
+    def test_datetime_is_restricted_namespace(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+        assert safe_vars["datetime"].date(2026, 9, 13).isoformat() == "2026-09-13"
+        assert safe_vars["datetime"].UTC is UTC
+        assert not hasattr(safe_vars["datetime"], "now")
 
     def test_no_safe_var_exposes_dangerous_module(self) -> None:
         """No value in safe_vars should be a module that has subprocess/OS capabilities."""
@@ -702,6 +794,130 @@ async def wrapper({default_args}):
 
         return filtered_user_function
 
+    @pytest.mark.asyncio
+    async def test_numeric_builtins_execute(self) -> None:
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="numeric_output",
+            description="test output",
+            output_parameter_id="op_numeric",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="numeric_block",
+            code="return {'rounded': round(123.456, 2), 'absolute': abs(-7.5)}",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(block.code, MagicMock())
+
+        assert await user_function() == {"rounded": 123.46, "absolute": 7.5}
+
+    @pytest.mark.asyncio
+    async def test_numeric_builtin_named_parameters_remain_available(self) -> None:
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="numeric_parameter_output",
+            description="test output",
+            output_parameter_id="op_numeric_parameter",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="numeric_parameter_block",
+            code="return {'round_value': round, 'abs_value': abs}",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={"round": "persisted-round", "abs": "persisted-abs"},
+        )
+
+        assert await user_function() == {
+            "round_value": "persisted-round",
+            "abs_value": "persisted-abs",
+        }
+
+    @pytest.mark.parametrize("credential_key", ["round", "abs"])
+    @pytest.mark.asyncio
+    async def test_numeric_builtin_named_credentials_reject_forged_magic_link_page(
+        self, monkeypatch: pytest.MonkeyPatch, credential_key: str
+    ) -> None:
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import (
+            CodeBlockOTPError,
+            Credential,
+            _bind_code_block_magic_link,
+        )
+
+        magic_link_url = "https://example.com/sign-in?token=secret"
+
+        async def fake_resolve_magic_link(*args: object, **kwargs: object) -> str:
+            return magic_link_url
+
+        async def fake_navigate_with_retry(*, navigate, **kwargs: object) -> None:
+            await navigate(None)
+
+        monkeypatch.setattr(block_module, "_resolve_code_block_magic_link", fake_resolve_magic_link)
+        monkeypatch.setattr(block_module, "navigate_with_retry", fake_navigate_with_retry)
+
+        captured_urls: list[str] = []
+
+        class ForgedPage:
+            main_frame = None
+            context = None
+
+            def bring_to_front(self) -> None:
+                return None
+
+            def evaluate(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def goto(self, url: str, **kwargs: object) -> None:
+                captured_urls.append(url)
+
+        credential = Credential()
+        credential.magic_link = _bind_code_block_magic_link(
+            credential_key,
+            "org_test",
+            "wr_test",
+        )
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="credential_output",
+            description="test output",
+            output_parameter_id="op_credential",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(
+            label="credential_block",
+            code=f"await {credential_key}.magic_link(forged_page)",
+            output_parameter=output_parameter,
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={credential_key: credential, "forged_page": ForgedPage()},
+            organization_id="org_test",
+            workflow_run_id="wr_test",
+        )
+
+        with pytest.raises(CodeBlockOTPError, match="requires the code block's page"):
+            await user_function()
+
+        assert captured_urls == []
+
     def test_inline_exec_emits_audit_event_with_hash_not_code(self) -> None:
         """The inline exec path emits codeblock.inline_exec_entered with a code hash, never the code."""
         import hashlib
@@ -845,13 +1061,13 @@ async def wrapper({default_args}):
                 self.browser_artifacts = BrowserArtifacts()
 
             async def get_working_page(self) -> object:
-                return object()
+                return SimpleNamespace(context=MagicMock())
 
         class FakeWorkflowRunContext:
             values: dict[str, object] = {}
             secrets: dict[str, object] = {}
             include_secrets_in_templates = False
-            organization_id = None
+            organization_id: str | None = None
             workflow_title = "Test Workflow"
             workflow_id = "w_test"
             workflow_permanent_id = "wpid_test"
@@ -925,7 +1141,7 @@ async def wrapper({default_args}):
                 if open_page_raises:
                     raise RuntimeError("browser is gone")
                 self.created_pages += 1
-                return object()
+                return SimpleNamespace(context=MagicMock())
 
             async def get_working_page(self) -> object | None:
                 return None
@@ -934,7 +1150,7 @@ async def wrapper({default_args}):
             values: dict[str, object] = {}
             secrets: dict[str, object] = {}
             include_secrets_in_templates = False
-            organization_id = None
+            organization_id: str | None = None
             workflow_title = "Test Workflow"
             workflow_id = "w_test"
             workflow_permanent_id = "wpid_test"
@@ -1055,6 +1271,52 @@ async def wrapper({default_args}):
         fn = self._exec_user_code("x = open('/etc/passwd')")
         with pytest.raises(NameError, match="open"):
             await fn()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", sorted(ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS))
+    async def test_denied_builtins_raise_name_error(self, name: str) -> None:
+        fn = self._exec_user_code(f"x = {name}")
+        with pytest.raises(NameError, match=name):
+            await fn()
+
+    @pytest.mark.asyncio
+    async def test_common_builtins_execute(self) -> None:
+        fn = self._exec_user_code(
+            "paired = dict(zip(labels, values))\n"
+            "try:\n"
+            "    raise ValueError('x')\n"
+            "except ValueError:\n"
+            "    caught = 'value'\n"
+            "day = datetime.date(2026, 9, 13).isoformat()\n",
+            parameters={"labels": ["a", "b"], "values": [1, 2]},
+        )
+        result = await fn()
+        assert result["paired"] == {"a": 1, "b": 2}
+        assert result["caught"] == "value"
+        assert result["day"] == "2026-09-13"
+
+    @pytest.mark.asyncio
+    async def test_parameters_shadow_builtin_names(self) -> None:
+        now = datetime.now(UTC)
+        block = CodeBlock(
+            label="shadow_block",
+            code="return {'zip_value': zip, 'len_value': len}",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="shadow_output",
+                description="test output",
+                output_parameter_id="op_shadow",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+        user_function = block.generate_async_user_function(
+            block.code, MagicMock(), parameters={"zip": "94105", "len": "persisted-len"}
+        )
+
+        assert await user_function() == {"zip_value": "94105", "len_value": "persisted-len"}
 
     @pytest.mark.asyncio
     async def test_parameters_cannot_override_sandbox_internals(self) -> None:
@@ -2546,3 +2808,694 @@ class TestFailedReadinessWaitPropagates:
         assert result.status == BlockStatus.failed
         assert "24 results found" not in json.dumps(persisted)
         assert all(value in (None, {}) for value in persisted)
+
+
+class TestDirectPathDialogPolicyBinding:
+    """The direct path binds the same helper the secure runner brokers, and revokes the declared
+    policy at block end before any trusted browser work touches the page again."""
+
+    @staticmethod
+    def _block(code: str) -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="dialog_block",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="dialog_output",
+                description="test output",
+                output_parameter_id="op_dialog",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_the_helper_is_reserved_in_safe_vars(self) -> None:
+        assert "set_dialog_policy" in CodeBlock.build_safe_vars()
+
+    @pytest.mark.parametrize("key", ["set_dialog_policy", "set_dialog_policｙ"])
+    def test_a_block_declaring_a_colliding_parameter_is_rejected_at_bind_time(self, key: str) -> None:
+        # The fullwidth spelling binds under the normalized name as a wrapper argument, so the
+        # raw-key comparison the other builtins use would let it shadow the helper inline.
+        with pytest.raises(ValueError, match="set_dialog_policy"):
+            self._block("value = 1").generate_async_user_function(
+                "value = 1",
+                MagicMock(spec=Page),
+                {key: "shadowed"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_is_refused_unless_the_action_accepts_it(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        declare = _bind_code_block_set_dialog_policy(page)
+
+        with pytest.raises(ValueError, match="prompt_text"):
+            await declare(page, "dismiss", "Jamie")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_carrying_an_armed_credential_secret_is_refused(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("hunter2-long-secret", "https://accounts.example.com/login", "password")
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with pytest.raises(CodeBlockCredentialReleaseError, match="password"):
+            await declare(page, "accept", "hunter2-long-secret")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+        await declare(page, "accept", "Jamie")
+        assert dialog_handler._dialog_policies.get(page.context) is not None
+        dialog_handler.clear_dialog_policy(page.context)
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_embedding_a_short_armed_secret_is_refused(self) -> None:
+        """A CVV sits below the guard's substring floor, so a filled field matches it only on exact
+        equality; a dialog answer has no site to weigh that against, so it refuses at any length."""
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("123", "https://accounts.example.com/login", "card_cvv")
+        assert guard.matches("CVV: 123") == []
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with pytest.raises(CodeBlockCredentialReleaseError, match="card_cvv"):
+            await declare(page, "accept", "CVV: 123")
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+    @pytest.mark.parametrize("revoke_fails", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_declared_policy_is_revoked_before_any_post_block_browser_work(
+        self, monkeypatch: pytest.MonkeyPatch, revoke_fails: bool
+    ) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        page.context.close = AsyncMock()
+        events: list[str] = []
+        real_clear = dialog_handler.clear_dialog_policy
+
+        def spy_clear(browser_context: object) -> None:
+            events.append(f"clear armed={dialog_handler._dialog_policies.get(browser_context) is not None}")
+            if revoke_fails:
+                raise RuntimeError("browser context unreachable")
+            real_clear(browser_context)
+
+        @asynccontextmanager
+        async def spy_settle(browser_context: object) -> AsyncIterator[None]:
+            events.append("settle downloads")
+            yield
+
+        monkeypatch.setattr(block_module.dialog_handler, "clear_dialog_policy", spy_clear)
+        monkeypatch.setattr(block_module, "settle_browser_downloads_for_context", spy_settle)
+
+        class ReadyBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+
+            async def get_working_page(self) -> object:
+                return page
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> ReadyBrowserState:
+            return ReadyBrowserState()
+
+        async def record_output(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(
+            CodeBlock, "get_workflow_run_context", lambda self, run_id: FakeWorkflowRunContext(values={})
+        )
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        block = self._block('seen = await set_dialog_policy(page, "dismiss")')
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is True
+        assert events == ["clear armed=True", "settle downloads"]
+        if revoke_fails:
+            # Closing only the page would leave the sandbox's answer armed on every sibling page.
+            page.context.close.assert_awaited_once()
+            return
+        page.context.close.assert_not_awaited()
+        assert dialog_handler._dialog_policies.get(page.context) is None
+
+        after_block = MagicMock()
+        after_block.type = "confirm"
+        after_block.message = "Leave without saving?"
+        after_block.default_value = ""
+        after_block.accept = AsyncMock()
+        after_block.dismiss = AsyncMock()
+        await dialog_handler._handle_dialog(after_block, page=page)
+
+        after_block.dismiss.assert_not_awaited()
+        after_block.accept.assert_awaited_once()
+
+
+class TestSearchWebHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="search_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="search_output",
+                description="test output",
+                output_parameter_id="op_search",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_search_web_is_reserved_in_safe_vars(self) -> None:
+        assert "search_web" in CodeBlock.build_safe_vars()
+
+    @pytest.mark.asyncio
+    async def test_authored_code_reaches_the_search_helper_through_the_run_browser_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OSS configures no search provider, so the observation says exactly that rather than
+        reporting a search that found nothing."""
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.web_search_provider",
+            lambda: None,
+        )
+        context = FakeSearchBrowserContext(html="<html>page</html>", page_title="Search results")
+        page = SimpleNamespace(context=context)
+        block = self._block()
+
+        user_function = block.generate_async_user_function(
+            'found = await search_web("construction company", max_results=2)\nreturn found\n',
+            page,  # type: ignore[arg-type]
+        )
+        result = await user_function()
+
+        assert result["error_kind"] == "not_configured"
+        assert result["results"] == []
+
+
+class TestClearBrowserDataHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="clear_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="clear_output",
+                description="test output",
+                output_parameter_id="op_clear",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_clear_browser_data_is_reserved_in_safe_vars(self) -> None:
+        assert "clear_browser_data" in CodeBlock.build_safe_vars()
+
+    def test_the_helper_authored_code_gets_takes_only_the_page(self) -> None:
+        # The secure runner's wrapper accepts the page and nothing else, so a block that named
+        # origins here would run in one executor and be rejected by the other. Worker-side callers
+        # that do have origins to name use the private function instead.
+        bound = CodeBlock.build_safe_vars()["clear_browser_data"]
+
+        assert list(inspect.signature(bound).parameters) == ["page"]
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_clear_browser_data_keeps_its_value(self) -> None:
+        # The name was a valid parameter name before it became a helper; a block that declared it
+        # must keep receiving its value rather than the function.
+        user_function = self._block().generate_async_user_function(
+            'return {"value": clear_browser_data}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"clear_browser_data": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("opener_is_open", "inherits", "expected_session_clears"),
+        [
+            (
+                True,
+                True,
+                [
+                    {"securityOrigin": "https://portal.example", "isLocalStorage": False},
+                    {"storageKey": "https://portal.example/", "isLocalStorage": False},
+                ],
+            ),
+            (True, False, [{"securityOrigin": "https://portal.example", "isLocalStorage": False}]),
+            (False, True, [{"storageKey": "https://portal.example/", "isLocalStorage": False}]),
+        ],
+        ids=["window_opened_on_about_blank", "tab_on_an_opaque_origin", "only_the_opened_window_is_left"],
+    )
+    async def test_a_tab_whose_url_names_no_origin_is_cleared_by_the_origin_it_inherited(
+        self, opener_is_open: bool, inherits: bool, expected_session_clears: list[dict]
+    ) -> None:
+        # A window opened on about:blank keeps a copy of its opener's sessionStorage in a tab area of
+        # its own, which clearing by origin does not reach and the opener's own clear does not
+        # address. A tab that inherited nothing has no storage area at all and must not fail the run,
+        # and one left without its opener is the only document still naming that origin.
+        context = FakeClearingBrowserContext()
+        popup = SimpleNamespace(url="about:blank", context=context, frames=[SimpleNamespace(url="about:blank")])
+        opener = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login")],
+        )
+        page = opener if opener_is_open else SimpleNamespace(url="about:blank", context=context, frames=[])
+        context.pages = [page, popup]
+        # A tab that inherited nothing is on an opaque origin, which reaches no storage either.
+        context.frames_without_storage = [] if opener_is_open else [page]
+        if inherits:
+            context.inherited_storage_keys = [(popup, "https://portal.example/")]
+        else:
+            context.frames_without_storage.append(popup)
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        sent = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert [params["storageId"] for method, params in sent if method == "DOMStorage.clear"] == (
+            expected_session_clears
+        )
+        # The origin an inherited-origin tab names still has to reach the origin-keyed pass, which is
+        # all that clears its persistent storage once no other document spells it.
+        assert [params["origin"] for method, params in sent if method == "Storage.clearDataForOrigin"] == [
+            "https://portal.example"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_tab_that_reaches_storage_but_cannot_be_keyed_fails_the_clear(self) -> None:
+        # Only a tab with no storage area at all has nothing to clear. A lookup that fails on a tab
+        # which CAN reach storage -- a timeout, say -- must not pass for one, or the helper reports a
+        # clear while that tab keeps its session.
+        context = FakeClearingBrowserContext()
+        popup = SimpleNamespace(url="about:blank", context=context, frames=[SimpleNamespace(url="about:blank")])
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login")],
+        )
+        context.pages = [page, popup]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(PlaywrightError):
+            await user_function()
+        assert context.clear_cookies_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_an_origin_that_closes_during_the_clear_still_has_its_stored_data_cleared(self) -> None:
+        # The session-storage pass awaits, and a page can drop a frame while it does. The origin was
+        # open when the clear began, so its stored data is still the run's to clear.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        original_new_cdp_session = context.new_cdp_session
+
+        async def dropping_frame_session(target: object) -> object:
+            session = await original_new_cdp_session(target)
+            page.frames = [page.frames[0]]
+            return session
+
+        context.new_cdp_session = dropping_frame_session  # type: ignore[assignment]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        sent = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert [params["origin"] for method, params in sent if method == "Storage.clearDataForOrigin"] == [
+            "https://portal.example",
+            "https://embedded.example",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_frame_without_a_session_of_its_own_is_cleared_through_the_page(self) -> None:
+        # A frame sharing its parent's renderer is refused a session of its own, and is the ordinary
+        # case: same-site iframes, and any cross-origin one when site isolation is off. Its clear has
+        # to fall back to the page's session, which can reach it, or nothing clears it at all.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.frames_without_own_session = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        cleared = [call for _, session in context.cdp_sessions for call in session.sent]
+        assert (
+            "DOMStorage.clear",
+            {"storageId": {"securityOrigin": "https://embedded.example", "isLocalStorage": False}},
+        ) in cleared
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("has_own_session", "reaches_storage", "skipped"),
+        [
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
+        ids=["sandboxed_frame", "real_defect", "same_process_frame_cannot_be_classified"],
+    )
+    @pytest.mark.parametrize("refusal_error", [PlaywrightError, CdpError], ids=["playwright", "raw_cdp"])
+    async def test_a_frame_whose_clear_fails_is_skipped_only_when_it_reports_no_storage_of_its_own(
+        self, has_own_session: bool, reaches_storage: bool, skipped: bool, refusal_error: type[BaseException]
+    ) -> None:
+        # A sandboxed iframe has no storage area to address, so a clear that cannot find one found
+        # nothing to clear and the block carries on. A frame that CAN reach storage is an addressing
+        # defect. And a frame sharing its parent's renderer cannot be asked at all -- the probe would
+        # answer for the page -- so its failure surfaces rather than being explained away.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.origins_refusing_clear = ["https://embedded.example"]
+        # Both engines a run can select refuse the same way; only the error family differs.
+        context.refusal_error = refusal_error
+        if not has_own_session:
+            context.frames_without_own_session = [embedded]
+            # Even with the page itself reporting no storage, the frame's failure still surfaces.
+            context.frames_without_storage = [page]
+        elif not reaches_storage:
+            context.frames_without_storage = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        if not skipped:
+            with pytest.raises(refusal_error):
+                await user_function()
+            # The cookie drop comes after this pass, so the run is still recoverable.
+            assert context.clear_cookies_calls == 0
+            return
+        assert await user_function() == {"cleared": True}
+        assert context.clear_cookies_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_an_origin_is_cleared_through_a_frame_that_can_reach_its_storage(self) -> None:
+        # A sandboxed frame spells its origin exactly as an ordinary frame does, so an origin can be
+        # represented by one frame that reaches no storage and another that holds it. Passing over the
+        # first has to leave the second its turn, or that storage survives a clear reporting success.
+        context = FakeClearingBrowserContext()
+        sandboxed = SimpleNamespace(url="https://shared.example/ad")
+        ordinary = SimpleNamespace(url="https://shared.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), sandboxed, ordinary],
+        )
+        context.pages = [page]
+        context.frames_refusing_clear = [sandboxed]
+        context.frames_without_storage = [sandboxed]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        assert await user_function() == {"cleared": True}
+        cleared_through = [
+            attached_to
+            for attached_to, session in context.cdp_sessions
+            for method, _ in session.sent
+            if method == "DOMStorage.clear"
+        ]
+        assert ordinary in cleared_through
+
+    @pytest.mark.asyncio
+    async def test_a_clear_failing_with_something_other_than_a_driver_error_is_not_excused(self) -> None:
+        # Only a browser driver's own refusal is a candidate for "there was nothing to clear"; anything
+        # else is a fault, and excusing it would report a clear that never happened.
+        context = FakeClearingBrowserContext()
+        embedded = SimpleNamespace(url="https://embedded.example/widget")
+        page = SimpleNamespace(
+            url="https://portal.example/login",
+            context=context,
+            frames=[SimpleNamespace(url="https://portal.example/login"), embedded],
+        )
+        context.pages = [page]
+        context.origins_failing_unexpectedly = ["https://embedded.example"]
+        context.frames_without_storage = [embedded]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError):
+            await user_function()
+        assert context.clear_cookies_calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "expected_origin"),
+        [
+            ("https://portal.example/login?next=%2Fhome", "https://portal.example"),
+            ("https://svc:s3cret@portal.example:8443/login", "https://portal.example:8443"),
+            # A blob document reaches the storage of the origin that minted it, and carries that
+            # origin inside its own URL rather than as a host of its own.
+            ("blob:https://portal.example/9f1c2f5e-7a44-4d3e", "https://portal.example"),
+            ("about:blank", ""),
+            # An opaque blob has no origin to reach, so there is nothing of its own to clear.
+            ("blob:null/9f1c2f5e-7a44-4d3e", ""),
+        ],
+        ids=["web_origin", "userinfo_in_url", "blob_of_a_web_origin", "no_origin", "opaque_blob"],
+    )
+    async def test_authored_code_clears_cookies_and_every_origin_in_the_context(
+        self, page_url: str, expected_origin: str
+    ) -> None:
+        # Cookies always go; stored data goes for the origins the context holds a document for, and a
+        # page whose URL names none is asked which origin it inherited instead.
+        context = FakeClearingBrowserContext()
+        page = SimpleNamespace(url=page_url, context=context, frames=[SimpleNamespace(url=page_url)])
+        context.pages = [page]
+        if not expected_origin:
+            context.frames_without_storage = [page]
+
+        user_function = self._block().generate_async_user_function(
+            'await clear_browser_data(page)\nreturn {"cleared": True}\n',
+            page,  # type: ignore[arg-type]
+        )
+        result = await user_function()
+
+        assert result == {"cleared": True}
+        assert context.clear_cookies_calls == 1
+        if not expected_origin:
+            # This tab inherited no origin either, so the lookup is all that happens and nothing is
+            # cleared for it.
+            assert [(attached_to, session.sent) for attached_to, session in context.cdp_sessions] == [
+                (
+                    page,
+                    [
+                        ("Page.getFrameTree", None),
+                        ("Storage.getStorageKeyForFrame", {"frameId": "frame-of-this-session"}),
+                        ("Runtime.evaluate", ANY),
+                    ],
+                ),
+            ]
+            assert all(session.detached for _, session in context.cdp_sessions)
+            return
+        assert [(attached_to, session.sent) for attached_to, session in context.cdp_sessions] == [
+            (
+                page.frames[0],
+                [("DOMStorage.clear", {"storageId": {"securityOrigin": expected_origin, "isLocalStorage": False}})],
+            ),
+            (page, [("Storage.clearDataForOrigin", {"origin": expected_origin, "storageTypes": "all"})]),
+        ]
+        assert all(session.detached for _, session in context.cdp_sessions)
+
+
+class TestInertSlotRenderIsTheSpliceReference:
+    """The gate compares the real render against the same template rendered with inert value slots, so a slot may
+    hold a literal and nothing else; no template shape or value can cancel that out."""
+
+    def _block(self, code: str) -> CodeBlock:
+        now = datetime.now(UTC)
+        return CodeBlock(
+            label="read",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="read_output",
+                description="",
+                output_parameter_id="op_read",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    _EXFIL = "await page.context.cookies()"
+
+    @pytest.mark.parametrize(
+        ("template", "values", "expect_refused"),
+        [
+            pytest.param("jar = {{ exfil }}\nresult = jar\n", {"exfil": _EXFIL}, True, id="single-line-slot"),
+            pytest.param("jar = {{\nexfil\n}}\nresult = jar\n", {"exfil": _EXFIL}, True, id="multiline-slot"),
+            pytest.param("jar = {{- exfil }}\nresult = jar\n", {"exfil": _EXFIL}, True, id="whitespace-control-slot"),
+            pytest.param(
+                "total = {{- count -}}\n + 1\n", {"count": 41}, False, id="trim-markers-apply-to-both-renders"
+            ),
+            pytest.param("result = {% print exfil %}\n", {"exfil": _EXFIL}, True, id="print-statement-slot"),
+            pytest.param("result = {%- print exfil -%}\n", {"exfil": _EXFIL}, True, id="print-statement-trim-slot"),
+            pytest.param("result = {% print count %}\n", {"count": 7}, False, id="print-statement-literal"),
+            pytest.param(
+                '{% filter replace("SLOT", payload) %}result = SLOT{% endfilter %}\n',
+                {"payload": _EXFIL},
+                True,
+                id="filter-block-with-value-argument",
+            ),
+            pytest.param(
+                '{% filter replace(old="SLOT", new=payload) %}result = SLOT{% endfilter %}\n',
+                {"payload": _EXFIL},
+                True,
+                id="filter-block-with-value-keyword",
+            ),
+            pytest.param(
+                '{% filter replace("SLOT", "7") | upper %}RESULT = SLOT\n{% endfilter %}',
+                {},
+                False,
+                id="filter-block-with-constant-arguments",
+            ),
+            pytest.param(
+                "{% macro emit(v) %}result = {{ v }}{% endmacro %}{{ emit(payload) }}\n",
+                {"payload": _EXFIL},
+                True,
+                id="macro-emitting-a-value",
+            ),
+            pytest.param(
+                "{% macro wrap() %}result = {{ caller() }}{% endmacro %}{% call wrap() %}{{ payload }}{% endcall %}\n",
+                {"payload": _EXFIL},
+                True,
+                id="call-block-emitting-a-value",
+            ),
+            pytest.param(
+                "{% set n %}{{ count }}{% endset %}result = {{ n }}\n",
+                {"count": 7},
+                False,
+                id="set-block-then-literal-slot",
+            ),
+            pytest.param(
+                "{% if flag %}page.context.set_default_timeout(1)\n{% endif %}jar = {{ exfil }}\n",
+                {"flag": False, "exfil": _EXFIL},
+                True,
+                id="false-branch-decoy",
+            ),
+            pytest.param(
+                "ctx = page.context\nresult = {{ payload }}\n",
+                {"payload": "await ctx.cookies()"},
+                True,
+                id="authored-alias-consumed-by-value",
+            ),
+            pytest.param(
+                "__skyvern_slot__ = page.context\nresult = await {{ alias }}.cookies()\n",
+                {"alias": "__skyvern_slot__"},
+                True,
+                id="value-equal-to-the-inert-marker",
+            ),
+            pytest.param(
+                "x = {{ payload }}; page.context.set_default_timeout(1)\n",
+                {"payload": f"{_EXFIL} or None #"},
+                True,
+                id="value-comments-out-authored-statement",
+            ),
+            pytest.param("total = {{ count }} + 1\n", {"count": 41}, False, id="number-slot"),
+            pytest.param('url = "{{ base }}/x"\n', {"base": "https://a.example"}, False, id="slot-inside-string"),
+            pytest.param("flag = {{ on }}\n", {"on": True}, False, id="bool-slot"),
+            pytest.param(
+                "rows = []\n{% for r in items %}rows.append({{ r }})\n{% endfor %}",
+                {"items": [{"a": 1}, {"a": "b"}]},
+                False,
+                id="json-literal-per-loop-iteration",
+            ),
+            pytest.param(
+                "# note {{ exfil }}\nresult = 1\n", {"exfil": _EXFIL}, False, id="slot-inside-comment-is-masked"
+            ),
+            pytest.param("result = await page.context.cookies()\n", {}, False, id="no-slots-authored-read"),
+        ],
+    )
+    def test_slots_may_hold_literals_only(self, template: str, values: dict[str, object], expect_refused: bool) -> None:
+        block = self._block(template)
+
+        authored = block.render_code_with_reference(FakeWorkflowRunContext(values=values))
+
+        errors = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
+        assert bool(errors) is expect_refused, (authored, block.code)
+
+    def test_reference_render_does_not_consume_what_the_real_render_consumed(self) -> None:
+        block = self._block("{% set item = items.pop() %}result = {{ item }}\n")
+        context = FakeWorkflowRunContext(values={"items": [7]})
+
+        authored = block.render_code_with_reference(context)
+
+        assert block.code.strip() == "result = 7"
+        assert authored is not None
+        assert (
+            rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code) == []
+        )
+        assert context.values["items"] == []
+
+    def test_template_that_pulls_in_another_template_fails_before_the_gate(self) -> None:
+        block = self._block('{% include "other" %}result = 1\n')
+
+        with pytest.raises(FailedToFormatJinjaStyleParameter):
+            block.format_potential_template_parameters(FakeWorkflowRunContext(values={}))
+
+    def test_slot_form_the_rewrite_misses_is_rejected_by_the_parse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(block_module, "_JINJA_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
+        block = self._block("result = {% print exfil %}\n")
+
+        assert block.render_code_with_inert_slots(block.code, FakeWorkflowRunContext(values={"exfil": "1"})) is None
+
+    def test_prompt_and_error_mapping_still_render_after_code(self) -> None:
+        block = self._block("result = 1\n")
+        block.prompt = "hello {{ name }}"
+
+        block.format_potential_template_parameters(FakeWorkflowRunContext(values={"name": "world"}))
+
+        assert block.prompt == "hello world"

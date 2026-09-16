@@ -6,10 +6,12 @@ OSS-synced: only example.* / authenticationtest.com fixtures with fake secret va
 from __future__ import annotations
 
 import base64
+import html
 import json
 from collections.abc import Callable, Iterator
 from typing import Any
 from unittest.mock import MagicMock
+from urllib.parse import quote
 
 import pytest
 
@@ -20,7 +22,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.secret_scrub import (
     MIN_PERSISTED_REDACTION_LENGTH,
     REDACTED_SECRET_PLACEHOLDER,
@@ -410,6 +412,55 @@ class TestPersistenceSeam:
         register_secret_scrub_value(_agent_ctx("pbs_b"), _FAKE_OTP)
 
         assert set(all_registered_secret_values()) == {_FAKE_PASSWORD, _FAKE_OTP}
+
+    def test_registering_a_value_also_registers_its_encoded_forms(self) -> None:
+        """A page echoes a credential URL-encoded in a query string and HTML-escaped in markup."""
+        ctx = _agent_ctx()
+        username, password = "demo.user@pathfold.test", "Sp1r!t&Level<2026>"
+        register_secret_scrub_value(ctx, username)
+        register_secret_scrub_value(ctx, password)
+        page = {
+            "current_url": f"http://pathfold.test/app?user={quote(username, safe='')}",
+            "outer_html": f'<input value="{html.escape(password)}">',
+            "json_literal": json.dumps(password),
+        }
+
+        scrubbed = json.dumps(secret_scrub.scrub_secrets_from_structure(ctx, page))
+
+        for form in (username, quote(username, safe=""), password, html.escape(password), json.dumps(password)[1:-1]):
+            assert form not in scrubbed
+        assert REDACTED_SECRET_PLACEHOLDER in scrubbed
+
+    def test_browser_style_url_encoding_is_a_registered_form(self) -> None:
+        """encodeURIComponent leaves `!*'()` literal where Python's quote does not."""
+        ctx = _agent_ctx()
+        password = "Sp1r!t&Level<2026>"
+        register_secret_scrub_value(ctx, password)
+        browser_encoded = "Sp1r!t%26Level%3C2026%3E"
+
+        assert browser_encoded in registered_scrub_values(ctx)
+        assert scrub_secrets_from_text(ctx, f"?next={browser_encoded}") == f"?next={REDACTED_SECRET_PLACEHOLDER}"
+
+
+class TestOriginRunBinding:
+    def test_binding_a_complete_registry_marks_the_run_bound(self) -> None:
+        ctx = _agent_ctx()
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=True
+        )
+
+        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is True
+        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == {"wr_1"}
+        assert _FAKE_PASSWORD in registered_scrub_values(ctx)
+
+    def test_an_incomplete_registry_binds_nothing(self) -> None:
+        ctx = _agent_ctx()
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=False
+        )
+
+        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is False
+        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == set()
 
     def test_importing_this_module_stays_cheap(self) -> None:
         """This module sits on the logging and span-exception paths.

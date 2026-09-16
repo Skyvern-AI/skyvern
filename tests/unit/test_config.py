@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime
 
 import pytest
 
@@ -113,3 +114,28 @@ def test_api_limit_concurrency_rejects_negative(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(ValueError):
         Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("2026-09-15T00:00:00Z", datetime(2026, 9, 15, tzinfo=UTC)),
+        ("2026-09-15 00:00:00", datetime(2026, 9, 15)),
+        ("2026-09-15", datetime(2026, 9, 15)),
+        # This setting is the settings-side kill path for the new-workflow v3 default, and blanking
+        # an already-set env var is how it gets turned off. A boot-time ValidationError would
+        # CrashLoopBackOff every arm-resolving process during the incident the operator is ending.
+        ("", None),
+        ("0", None),
+        ("none", None),
+        ("null", None),
+        ("off", None),
+        ("disabled", None),
+    ],
+)
+def test_task_v3_default_engine_workflow_cutoff_env_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str, expected: datetime | None
+) -> None:
+    monkeypatch.setenv("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", raw_value)
+
+    assert Settings(_env_file=None).TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF == expected

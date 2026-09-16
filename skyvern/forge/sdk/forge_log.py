@@ -667,6 +667,10 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     context = skyvern_context.current()
     if context:
         log_entry = dict(event_dict)
+        if workflow_run_id := log_entry.get("workflow_run_id"):
+            attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
+            if attempt_number is not None:
+                log_entry["workflow_run_attempt_number"] = attempt_number
         context.log.append(log_entry)
 
     return event_dict

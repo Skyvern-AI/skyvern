@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
 def _credential_parameter(
@@ -900,8 +901,10 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
         mock_analytics.capture = MagicMock()
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -938,8 +941,10 @@ async def test_clean_up_workflow_preserves_body_success_without_retrying_finally
         mock_analytics.capture = MagicMock()
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -981,8 +986,10 @@ async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> N
         mock_analytics.capture = MagicMock()
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(
@@ -1019,8 +1026,10 @@ async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raise
         mock_analytics.capture = MagicMock()
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock(side_effect=RuntimeError("upload drain failed"))
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(

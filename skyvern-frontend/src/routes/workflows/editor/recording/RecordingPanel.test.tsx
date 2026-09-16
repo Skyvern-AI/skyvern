@@ -119,6 +119,18 @@ describe("RecordingPanel", () => {
     cleanup();
   });
 
+  it("explains what Record task captures and what Skyvern creates", () => {
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+
+    expect(screen.getByText("Recording task")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+  });
+
   it("keeps Done disabled and never calls process_recording while the browser session id has not resolved", () => {
     render(<RecordingPanel browserSessionId={null} />);
 
@@ -227,6 +239,7 @@ describe("RecordingPanel", () => {
           url: "https://example.com/login",
         }),
       ],
+      sessionRevision: 1,
     });
 
     render(<RecordingPanel browserSessionId="pbs_123" />);
@@ -241,6 +254,11 @@ describe("RecordingPanel", () => {
 
     expect(screen.queryByRole("button", { name: /add password/i })).toBeNull();
     expect(screen.queryByTestId("mock-create-credential")).toBeNull();
+    // The committed step carries the credential, which is what makes the backend
+    // emit a login block instead of a bare action block.
+    expect(
+      useRecordingStore.getState().getFinalDraftSteps()?.[0]?.credential_id,
+    ).toBe("new-cred-1");
   });
 
   it.each([

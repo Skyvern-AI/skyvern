@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import InvalidWorkflowTaskURLState, MissingStarterUrl
+from skyvern.exceptions import FailedToNavigateToUrl, InvalidWorkflowTaskURLState, MissingStarterUrl
 from skyvern.forge.agent import ForgeAgent, resolve_inherited_workflow_task_page
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -93,7 +93,8 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
     database.organizations = organizations_db
     database.observer = observer_db
 
-    task = SimpleNamespace(task_id="tsk_test", status=TaskStatus.failed)
+    # workflow_run_id is on the real Task; the block failure handler keys its secret lookup on it.
+    task = SimpleNamespace(task_id="tsk_test", status=TaskStatus.failed, workflow_run_id="wr_test")
     step = SimpleNamespace(step_id="stp_test")
 
     agent = MagicMock()
@@ -121,6 +122,7 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
             "tasks_db": tasks_db,
             "agent": agent,
             "browser_state": browser_state,
+            "browser_manager": browser_manager,
         }
 
 
@@ -169,6 +171,56 @@ async def test_execute_fails_early_when_first_block_has_no_url(blank_url: str) -
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_message", "expect_level"),
+    [
+        ("Page.goto: net::ERR_CERT_DATE_INVALID at https://vendor.example.com/", "warning"),
+        ("Page.goto: net::ERR_CONNECTION_REFUSED at https://vendor.example.com/", "warning"),
+        ("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://vendor.example.com/", "exception"),
+        ("Page.goto: net::ERR_NAME_NOT_RESOLVED at https://vendor.example.com/", "exception"),
+        ("Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://vendor.example.com/", "exception"),
+    ],
+    ids=["expired_cert", "connection_refused", "tunnel", "dns", "untrusted_ca"],
+)
+async def test_first_task_navigation_failure_log_level_splits_site_from_egress(
+    error_message: str, expect_level: str
+) -> None:
+    """A site that will not load is the customer's problem and is already on the run via
+    failure_reason, so it logs at warning. Our own egress failing -- proxy tunnel, SOCKS, DNS, or a
+    TLS interceptor we do not trust -- must keep an error-level record, because that is a
+    proxy-pool signal nothing else pages on. Dropping the egress guard makes the last three
+    cases warn."""
+
+    block = TaskBlock(
+        label="open_vendor_url",
+        output_parameter=_output_parameter(),
+        title="Open vendor URL",
+        url="https://vendor.example.com/",
+    )
+
+    with _mock_block_execute_deps(working_page_url="https://vendor.example.com/") as deps:
+        deps["browser_manager"].get_or_create_for_workflow_run = AsyncMock(
+            side_effect=FailedToNavigateToUrl(url="https://vendor.example.com/", error_message=error_message)
+        )
+        with patch("skyvern.forge.sdk.workflow.models.block.LOG") as log_mock:
+            with pytest.raises(FailedToNavigateToUrl):
+                await block.execute(
+                    workflow_run_id="wr_missing_starter_url_test",
+                    workflow_run_block_id="wrb_test",
+                    organization_id="o_test",
+                )
+
+    def _logged(level: str) -> bool:
+        return any(
+            call.args and "Failed to get browser state for first task" in str(call.args[0])
+            for call in getattr(log_mock, level).call_args_list
+        )
+
+    assert _logged(expect_level), f"expected {expect_level} for {error_message}"
+    assert not _logged("exception" if expect_level == "warning" else "warning")
+
+
 def _workflow_run_for_create_task() -> SimpleNamespace:
     return SimpleNamespace(
         workflow_run_id="wr_missing_starter_url_test",
@@ -205,7 +257,7 @@ async def test_create_task_rejects_about_blank_url_inherited_from_later_block() 
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager
@@ -259,7 +311,7 @@ async def test_create_task_uses_latest_non_blank_page_for_inherited_marker_url()
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager

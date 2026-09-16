@@ -14,6 +14,8 @@ type ResolveBrowserPaneViewArgs = {
   // A block-scoped run (?bl=) shares the live debug session; the live browser
   // stays the surface even after it finalizes (the block-iterate loop).
   blockRunInDebugSession: boolean;
+  // The Copilot introduced the run focus and still owns its automatic view.
+  systemFocused: boolean;
   running: boolean;
   hasRecording: boolean;
   failed: boolean;
@@ -56,6 +58,7 @@ export function resolveBrowserPaneView({
   scrubbing,
   inspectingRun,
   blockRunInDebugSession,
+  systemFocused,
   running,
   hasRecording,
   failed,
@@ -78,6 +81,9 @@ export function resolveBrowserPaneView({
   }
   if (scrubbing) {
     return "screenshots";
+  }
+  if (systemFocused) {
+    return "live";
   }
   if (blockRunInDebugSession) {
     return "live";

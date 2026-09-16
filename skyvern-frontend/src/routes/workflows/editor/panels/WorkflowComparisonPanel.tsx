@@ -158,6 +158,7 @@ function getWorkflowElements(version: WorkflowVersion) {
       ? JSON.stringify(version.cdp_connect_headers)
       : null,
     runWith: version.run_with ?? "agent",
+    browserType: version.browser_type ?? null,
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
@@ -169,6 +170,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     workflowSystemPrompt:
       version.workflow_definition?.workflow_system_prompt ?? null,
     errorCodeMapping: version.workflow_definition?.error_code_mapping ?? null,
+    retryPolicy: version.workflow_definition?.retry_policy ?? null,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor

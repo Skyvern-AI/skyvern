@@ -188,7 +188,7 @@ A Schedule runs an agent automatically on a recurring basis. You define a cron e
 
 <CodeGroup>
 ```python Python
-result = await client.agent.create_workflow_schedule(
+result = await client.schedules.create(
     workflow_permanent_id="wpid_abc123",
     cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
     timezone="America/New_York",
@@ -243,7 +243,7 @@ flowchart LR
     B -- "restore" --> A
 ```
 
-**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 24 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
+**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 6 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
 
 ```python
 browser = await skyvern.launch_cloud_browser()

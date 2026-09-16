@@ -20,20 +20,29 @@ from skyvern.browser_extension.auth import compute_broker_proof, verify_client_p
 from skyvern.browser_extension.broker_protocol import (
     BROKER_GENERATION,
     BROKER_PROTOCOL_VERSION,
+    CLIENT_CLOSE_GRACE_SECONDS,
+    CLIENT_OUTPUT_RECOVERY_BYTES,
+    CLIENT_OUTPUT_STALL_SECONDS,
     CONTROL_FRAME_LIMIT,
     MAX_AUTHENTICATED_CLIENTS,
     MAX_CLIENT_INBOUND_BYTES,
     MAX_CLIENT_OUTPUT_BYTES,
     MAX_GLOBAL_INBOUND_BYTES,
     MAX_GLOBAL_OUTPUT_BYTES,
+    MAX_GLOBAL_OUTSTANDING_REQUESTS,
+    MAX_GLOBAL_QUEUED_REQUESTS,
     MAX_GLOBAL_REQUESTS,
+    MAX_OUTSTANDING_REQUESTS_PER_CLIENT,
     MAX_PENDING_CONNECTIONS,
-    MAX_QUEUED_FRAMES_PER_CLIENT,
+    MAX_QUEUED_REQUESTS_PER_CLIENT,
+    MAX_QUEUED_REQUESTS_PER_TAB,
     MAX_REQUESTS_PER_CLIENT,
     MAX_REQUESTS_PER_TAB,
     OPERATION_FRAME_LIMIT,
     PREAUTH_FRAME_LIMIT,
     READ_TIMEOUT_SECONDS,
+    SHEDDABLE_EVENT_METHODS,
+    TAB_REQUEST_QUEUE_WAIT_SECONDS,
     encode_frame,
     error_frame,
     event_frame,
@@ -58,6 +67,7 @@ from skyvern.browser_extension.broker_state import (
     ensure_run_directory,
     process_identity_matches,
     publish_broker_state,
+    read_broker_state,
     read_extension_secret,
     remove_control_socket,
     reset_lease_journal,
@@ -68,9 +78,11 @@ from skyvern.browser_extension.broker_state import (
 )
 from skyvern.browser_extension.errors import (
     BrowserExtensionBrokerError,
+    BrowserExtensionError,
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.package_extension import EXTENSION_DIR, compute_extension_source_hash
 from skyvern.browser_extension.protocol import ALLOWED_OPS, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.workstation_grant import (
@@ -92,18 +104,36 @@ CONTROL_INBOUND_TIMEOUT_SECONDS = 45.0
 EXTENSION_RESET_TIMEOUT_SECONDS = 5.0
 MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
+TAB_REQUEST_EXACT_TIMEOUT_TOLERANCE_SECONDS = 0.25
 _LEASED_OPS = frozenset(
     {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "tabs.activate", "tabs.remove"}
 )
 _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"
 _APPROVAL_SOURCE_GRANT = "grant"
+_BUILD_HASH_SHORT_LENGTH = 12
+_OWNERSHIP_STATE_READ_ATTEMPTS = 3
+_OWNERSHIP_STATE_READ_RETRY_SECONDS = 0.05
+
+
+def _default_time_source() -> float:
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _local_extension_build_hash() -> str:
+    # Recomputed per status call (not cached): an editable-install daemon can outlive
+    # edits to its own extension source, and status is not a hot path.
+    return compute_extension_source_hash(EXTENSION_DIR)
 
 
 class Relay(Protocol):
     bound_port: int
     scoped_tabs: list[dict[str, Any]]
     extension_protocol_version: int | None
+    extension_build_hash: str | None
     extension_connection_generation: int
 
     @property
@@ -172,17 +202,24 @@ class _ClientConnection:
     operator: bool = False
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     request_ids: set[str] = field(default_factory=set)
+    queued_request_ids: set[str] = field(default_factory=set)
+    outstanding_request_ids: set[str] = field(default_factory=set)
     request_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     inbound_bytes: int = 0
     queued_output_bytes: int = 0
     queued_output_frames: int = 0
-    output_queue: asyncio.Queue[tuple[bytes, asyncio.Future[None] | None]] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=MAX_QUEUED_FRAMES_PER_CLIENT)
-    )
+    output_queue: asyncio.Queue[tuple[bytes, asyncio.Future[None] | None]] = field(default_factory=asyncio.Queue)
+    output_in_flight_bytes: int = 0
     sender_task: asyncio.Task[None] | None = None
     keepalive_task: asyncio.Task[None] | None = None
     last_inbound: float = field(default_factory=time.monotonic)
+    pressure_since: float | None = None
+    # A connection created by the server is initialized with its injected clock at
+    # authentication time. Zero also keeps direct test construction in the same clock domain.
+    last_output_progress: float = 0.0
+    shed_event_count: int = 0
     closed: bool = False
+    close_started: bool = False
     ownership_released: bool = False
 
 
@@ -203,6 +240,16 @@ class _TabLease:
         }
 
 
+@dataclass(slots=True)
+class _QueuedTabRequest:
+    connection: _ClientConnection
+    future: asyncio.Future[None]
+    error: BrowserExtensionError | None = None
+    notified: bool = False
+    slot_reserved: bool = False
+    admitted: bool = False
+
+
 class BrowserExtensionBrokerServer:
     """Multi-client broker: shared daemon, per-client tab leases (SKY-13757 spec-v3 milestone 2)."""
 
@@ -213,6 +260,7 @@ class BrowserExtensionBrokerServer:
         base_dir: Path | None = None,
         relay_factory: RelayFactory | None = None,
         pairing_opener: Callable[[str], bool] | None = None,
+        time_source: Callable[[], float] | None = None,
     ) -> None:
         self.port = port
         self.paths = broker_paths(port, base_dir=base_dir)
@@ -225,6 +273,7 @@ class BrowserExtensionBrokerServer:
         self._daemon_lock: OwnerFileLock | None = None
         self._credentials: dict[str, _Credential] = {}
         self._clients: dict[str, _ClientConnection] = {}
+        self._connections: dict[int, _ClientConnection] = {}
         self._client_lock = asyncio.Lock()
         self._leases: dict[int, _TabLease] = {}
         self._create_lock = asyncio.Lock()
@@ -246,10 +295,16 @@ class BrowserExtensionBrokerServer:
         self._global_inbound_bytes = 0
         self._global_output_bytes = 0
         self._global_requests = 0
+        self._global_queued_requests = 0
+        self._global_outstanding_requests = 0
         self._tab_request_counts: dict[int, int] = {}
         self._tab_idle_events: dict[int, asyncio.Event] = {}
+        self._tab_request_queues: dict[int, deque[_QueuedTabRequest]] = {}
         self._shutdown_event = asyncio.Event()
         self._stopping = False
+        self.time_source: Callable[[], float] = time_source or _default_time_source
+        self.client_close_grace_seconds = CLIENT_CLOSE_GRACE_SECONDS
+        self._output_watchdog_task: asyncio.Task[None] | None = None
         self._boot_id = secrets.token_hex(16)
         self._process_start = current_process_start_marker()
         self._forwarded_tasks: set[asyncio.Task[dict[str, Any]]] = set()
@@ -294,7 +349,6 @@ class BrowserExtensionBrokerServer:
                     count=stale_leases,
                     archive=str(self.paths.leases_stale),
                 )
-            remove_control_socket(self.paths)
             relay = self._make_relay(extension_secret)
             self._relay = relay
             try:
@@ -323,6 +377,7 @@ class BrowserExtensionBrokerServer:
             validate_run_directory(self.paths, expected_identity=self._run_identity)
             publish_broker_state(self.paths, self._state(lifecycle="ready", clean_shutdown=False))
             await self._control_server.start_serving()
+            self._output_watchdog_task = asyncio.create_task(self._output_stall_watchdog())
             clear_startup_failure(self.paths)
             LOG.info("browser_extension_broker_started", port=self.port, generation=BROKER_GENERATION)
         except BaseException:
@@ -341,6 +396,15 @@ class BrowserExtensionBrokerServer:
         if self._stopping:
             return
         self._stopping = True
+        self._fail_all_queued_tab_requests(
+            BrowserExtensionBrokerError("BROKER_STOPPING", "Browser-extension broker is stopping")
+        )
+        output_watchdog_task = self._output_watchdog_task
+        self._output_watchdog_task = None
+        if output_watchdog_task is not None:
+            output_watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await output_watchdog_task
         reset_recovery_task = self._reset_recovery_task
         if reset_recovery_task is not None and not reset_recovery_task.done():
             reset_recovery_task.cancel()
@@ -352,11 +416,16 @@ class BrowserExtensionBrokerServer:
             control_server.close()
             await control_server.wait_closed()
 
-        clients = list(self._clients.values())
-        for client in clients:
-            if client.sender_task is not None:
-                with suppress(Exception):
-                    await self._send(client, event_frame("broker.draining", {}))
+        connections = {id(connection): connection for connection in self._connections.values()}
+        connections.update((id(connection), connection) for connection in self._clients.values())
+        clients: tuple[_ClientConnection, ...] = tuple(connections.values())
+        draining_tasks = [
+            asyncio.wait_for(self._send(client, event_frame("broker.draining", {})), 2.0)
+            for client in clients
+            if client.sender_task is not None and not client.closed
+        ]
+        if draining_tasks:
+            await asyncio.gather(*draining_tasks, return_exceptions=True)
 
         for task in tuple(self._cleanup_tasks):
             task.cancel()
@@ -374,17 +443,16 @@ class BrowserExtensionBrokerServer:
         if relay is not None and not await relay.wait_pending_requests(30.0):
             clean_shutdown = False
 
-        for client in clients:
-            await self._close_connection(client)
+        if clients:
+            await asyncio.gather(
+                *(self._connection_closed(client) for client in clients),
+                return_exceptions=True,
+            )
         self._relay = None
         if relay is not None:
             await relay.stop()
 
-        with suppress(BrowserExtensionBrokerError, OSError):
-            validate_run_directory(self.paths, expected_identity=self._run_identity)
-            publish_broker_state(self.paths, self._state(lifecycle="stopped", clean_shutdown=clean_shutdown))
-        with suppress(BrowserExtensionBrokerError, OSError):
-            remove_control_socket(self.paths)
+        self._cleanup_published_state(clean_shutdown=clean_shutdown)
         if self._daemon_lock is not None:
             self._daemon_lock.release()
             self._daemon_lock = None
@@ -409,21 +477,88 @@ class BrowserExtensionBrokerServer:
         )
 
     async def _cleanup_partial_start(self) -> None:
+        output_watchdog_task = self._output_watchdog_task
+        self._output_watchdog_task = None
+        if output_watchdog_task is not None:
+            output_watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await output_watchdog_task
         server = self._control_server
         self._control_server = None
         if server is not None:
             server.close()
             await server.wait_closed()
+        connections = {id(connection): connection for connection in self._connections.values()}
+        connections.update((id(connection), connection) for connection in self._clients.values())
+        if connections:
+            await asyncio.gather(
+                *(self._connection_closed(connection) for connection in connections.values()),
+                return_exceptions=True,
+            )
         relay = self._relay
         self._relay = None
         if relay is not None:
             with suppress(Exception):
                 await relay.stop()
-        with suppress(BrowserExtensionBrokerError, OSError):
-            remove_control_socket(self.paths)
+        self._cleanup_published_state(clean_shutdown=False)
         if self._daemon_lock is not None:
             self._daemon_lock.release()
             self._daemon_lock = None
+
+    def _cleanup_published_state(self, *, clean_shutdown: bool) -> None:
+        if not self._owns_published_state():
+            return
+        try:
+            validate_run_directory(self.paths, expected_identity=self._run_identity)
+            publish_broker_state(self.paths, self._state(lifecycle="stopped", clean_shutdown=clean_shutdown))
+        except (BrowserExtensionBrokerError, OSError):
+            LOG.warning("browser_extension_broker_state_cleanup_failed", port=self.port, exc_info=True)
+        else:
+            with suppress(BrowserExtensionBrokerError, OSError):
+                remove_control_socket(self.paths)
+
+    def _owns_published_state(self) -> bool:
+        daemon_lock = self._daemon_lock
+        if daemon_lock is None or daemon_lock.fd is None:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="lifecycle_lock_not_held",
+            )
+            return False
+        state: BrokerState | None = None
+        for attempt in range(_OWNERSHIP_STATE_READ_ATTEMPTS):
+            try:
+                state = read_broker_state(self.paths)
+            except (BrowserExtensionBrokerError, OSError):
+                if attempt + 1 == _OWNERSHIP_STATE_READ_ATTEMPTS:
+                    LOG.warning(
+                        "browser_extension_broker_artifact_ownership_lost",
+                        port=self.port,
+                        reason="state_unreadable",
+                        exc_info=True,
+                    )
+                    return False
+                time.sleep(_OWNERSHIP_STATE_READ_RETRY_SECONDS)
+            else:
+                break
+        if state is None:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="state_missing",
+            )
+            return False
+        if state.pid != os.getpid() or state.bootId != self._boot_id:
+            LOG.warning(
+                "browser_extension_broker_artifact_ownership_lost",
+                port=self.port,
+                reason="state_owner_mismatch",
+                state_pid=state.pid,
+                state_boot_id=state.bootId,
+            )
+            return False
+        return True
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if (
@@ -431,9 +566,7 @@ class BrowserExtensionBrokerServer:
             or not self._consume_connection_token()
             or not self._verify_peer_uid(writer)
         ):
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
+            await self._close_writer(writer)
             return
         self._pending_connections += 1
         handshake_pending = True
@@ -443,7 +576,7 @@ class BrowserExtensionBrokerServer:
             self._pending_connections -= 1
             handshake_pending = False
             await self._read_requests(connection)
-        except (EOFError, ConnectionError, BrokenPipeError, asyncio.CancelledError):
+        except (EOFError, ConnectionError, OSError, asyncio.TimeoutError, asyncio.CancelledError):
             pass
         except BrowserExtensionBrokerError as exc:
             LOG.info("browser_extension_broker_connection_rejected", code=exc.code)
@@ -455,9 +588,7 @@ class BrowserExtensionBrokerServer:
             if connection is not None:
                 await self._connection_closed(connection)
             else:
-                writer.close()
-                with suppress(Exception):
-                    await writer.wait_closed()
+                await self._close_writer(writer)
 
     async def _authenticate(
         self,
@@ -600,6 +731,7 @@ class BrowserExtensionBrokerServer:
                 reader=reader,
                 writer=writer,
                 operator=operator,
+                last_output_progress=self.time_source(),
             )
             result: dict[str, Any] = {
                 "clientId": credential.client_id,
@@ -623,6 +755,7 @@ class BrowserExtensionBrokerServer:
                 if connection.sender_task is not None:
                     connection.sender_task.cancel()
                 raise
+            self._connections[id(connection)] = connection
             if not operator:
                 if op == "client.enroll":
                     self._evict_stale_credentials_locked()
@@ -658,6 +791,31 @@ class BrowserExtensionBrokerServer:
             await self._connection_closed(connection)
             raise
         return connection
+
+    @staticmethod
+    def _is_queueable_tab_request(op: str, args: dict[str, Any]) -> bool:
+        if op != "extension.request":
+            return False
+        extension_args = args.get("args")
+        return isinstance(extension_args, dict) and "tabId" in extension_args
+
+    def _release_active_request(self, connection: _ClientConnection, request_id: str) -> None:
+        if request_id not in connection.request_ids:
+            return
+        connection.request_ids.discard(request_id)
+        self._global_requests = max(0, self._global_requests - 1)
+
+    def _release_queued_request(self, connection: _ClientConnection, request_id: str) -> None:
+        if request_id not in connection.queued_request_ids:
+            return
+        connection.queued_request_ids.discard(request_id)
+        self._global_queued_requests = max(0, self._global_queued_requests - 1)
+
+    def _release_outstanding_request(self, connection: _ClientConnection, request_id: str) -> None:
+        if request_id not in connection.outstanding_request_ids:
+            return
+        connection.outstanding_request_ids.discard(request_id)
+        self._global_outstanding_requests = max(0, self._global_outstanding_requests - 1)
 
     async def _read_requests(self, connection: _ClientConnection) -> None:
         while not connection.closed and not self._stopping:
@@ -698,11 +856,12 @@ class BrowserExtensionBrokerServer:
                 request_id, op, _args = parse_request(frame)
                 if op != "extension.request" and size > CONTROL_FRAME_LIMIT:
                     raise BrowserExtensionBrokerError("FRAME_TOO_LARGE", "Control frame exceeds the allowed size")
-                if request_id in connection.request_ids:
+                if request_id in connection.outstanding_request_ids:
                     raise BrowserExtensionBrokerError("DUPLICATE_REQUEST", "Duplicate broker request id")
+                queueable = self._is_queueable_tab_request(op, _args)
                 if (
-                    len(connection.request_ids) >= MAX_REQUESTS_PER_CLIENT
-                    or self._global_requests >= MAX_GLOBAL_REQUESTS
+                    len(connection.outstanding_request_ids) >= MAX_OUTSTANDING_REQUESTS_PER_CLIENT
+                    or self._global_outstanding_requests >= MAX_GLOBAL_OUTSTANDING_REQUESTS
                 ):
                     await self._send_error(
                         connection,
@@ -710,16 +869,68 @@ class BrowserExtensionBrokerServer:
                         BrowserExtensionBrokerError("RESOURCE_LIMIT", "Too many broker requests are in flight"),
                     )
                     continue
-                connection.request_ids.add(request_id)
-                self._global_requests += 1
+                if queueable:
+                    if (
+                        len(connection.queued_request_ids) >= MAX_QUEUED_REQUESTS_PER_CLIENT
+                        or self._global_queued_requests >= MAX_GLOBAL_QUEUED_REQUESTS
+                    ):
+                        await self._send_error(
+                            connection,
+                            request_id,
+                            BrowserExtensionBrokerError(
+                                "RESOURCE_LIMIT",
+                                "Too many broker requests are queued",
+                            ),
+                        )
+                        continue
+                else:
+                    if (
+                        len(connection.request_ids) >= MAX_REQUESTS_PER_CLIENT
+                        or self._global_requests >= MAX_GLOBAL_REQUESTS
+                    ):
+                        await self._send_error(
+                            connection,
+                            request_id,
+                            BrowserExtensionBrokerError("RESOURCE_LIMIT", "Too many broker requests are in flight"),
+                        )
+                        continue
+                connection.outstanding_request_ids.add(request_id)
+                self._global_outstanding_requests += 1
+                if queueable:
+                    connection.queued_request_ids.add(request_id)
+                    self._global_queued_requests += 1
+                else:
+                    connection.request_ids.add(request_id)
+                    self._global_requests += 1
+                request_started_at = self.time_source()
                 try:
-                    task = asyncio.create_task(self._handle_charged_request(connection, request_id, frame, size))
+                    task = asyncio.create_task(
+                        self._handle_charged_request(
+                            connection,
+                            request_id,
+                            frame,
+                            size,
+                            request_started_at=request_started_at,
+                        )
+                    )
                 except BaseException:
-                    self._global_requests = max(0, self._global_requests - 1)
-                    connection.request_ids.discard(request_id)
+                    if queueable:
+                        self._release_queued_request(connection, request_id)
+                    else:
+                        self._release_active_request(connection, request_id)
+                    self._release_outstanding_request(connection, request_id)
                     raise
                 connection.request_tasks.add(task)
-                task.add_done_callback(connection.request_tasks.discard)
+
+                def request_done(done: asyncio.Task[None], request_id: str = request_id) -> None:
+                    connection.request_tasks.discard(done)
+                    if not done.cancelled():
+                        return
+                    self._release_active_request(connection, request_id)
+                    self._release_queued_request(connection, request_id)
+                    self._release_outstanding_request(connection, request_id)
+
+                task.add_done_callback(request_done)
                 release_inline = False
             finally:
                 if release_inline:
@@ -731,20 +942,44 @@ class BrowserExtensionBrokerServer:
         request_id: str,
         frame: dict[str, Any],
         size: int,
+        *,
+        request_started_at: float | None = None,
     ) -> None:
         terminal_accounting = False
         terminal_response = False
         handler_done = False
-        released = False
+        inbound_released = False
+        accounting_released = False
+        active = request_id in connection.request_ids
+
+        def release_accounting() -> None:
+            nonlocal accounting_released
+            if accounting_released:
+                return
+            accounting_released = True
+            if active:
+                self._release_active_request(connection, request_id)
+            else:
+                self._release_queued_request(connection, request_id)
+            self._release_outstanding_request(connection, request_id)
 
         def release_if_terminal() -> None:
-            nonlocal released
-            if released or not handler_done or (terminal_accounting and not terminal_response):
+            nonlocal inbound_released
+            if inbound_released or not handler_done or (terminal_accounting and not terminal_response):
                 return
-            released = True
-            connection.request_ids.discard(request_id)
-            self._global_requests = max(0, self._global_requests - 1)
+            release_accounting()
+            inbound_released = True
             self._release_inbound(connection, size)
+
+        def on_admitted() -> None:
+            nonlocal active
+            if active or request_id not in connection.queued_request_ids:
+                active = True
+                return
+            self._release_queued_request(connection, request_id)
+            connection.request_ids.add(request_id)
+            self._global_requests += 1
+            active = True
 
         def on_registered() -> None:
             nonlocal terminal_accounting
@@ -753,10 +988,18 @@ class BrowserExtensionBrokerServer:
         def on_terminal() -> None:
             nonlocal terminal_response
             terminal_response = True
+            release_accounting()
             release_if_terminal()
 
         try:
-            await self._handle_request(connection, frame, on_registered=on_registered, on_terminal=on_terminal)
+            await self._handle_request(
+                connection,
+                frame,
+                on_admitted=on_admitted,
+                on_registered=on_registered,
+                on_terminal=on_terminal,
+                request_started_at=request_started_at,
+            )
         finally:
             handler_done = True
             release_if_terminal()
@@ -766,8 +1009,10 @@ class BrowserExtensionBrokerServer:
         connection: _ClientConnection,
         frame: dict[str, Any],
         *,
+        on_admitted: Callable[[], None],
         on_registered: Callable[[], None],
         on_terminal: Callable[[], None],
+        request_started_at: float | None,
     ) -> None:
         request_id = "unknown"
         try:
@@ -777,8 +1022,10 @@ class BrowserExtensionBrokerServer:
                     connection,
                     op,
                     args,
+                    on_admitted=on_admitted,
                     on_registered=on_registered,
                     on_terminal=on_terminal,
+                    request_started_at=request_started_at,
                 )
             else:
                 result = await self._dispatch(connection, op, args)
@@ -816,8 +1063,10 @@ class BrowserExtensionBrokerServer:
         op: str,
         args: dict[str, Any],
         *,
+        on_admitted: Callable[[], None] | None = None,
         on_registered: Callable[[], None] | None = None,
         on_terminal: Callable[[], None] | None = None,
+        request_started_at: float | None = None,
     ) -> dict[str, Any]:
         if not await self._is_current(connection):
             raise BrowserExtensionBrokerError("STALE_CONNECTION", "Broker connection was replaced")
@@ -849,21 +1098,41 @@ class BrowserExtensionBrokerServer:
                     tab_id for tab_id, lease in self._leases.items() if lease.client_id == connection.client_id
                 )
             approved = connection.operator or self._client_approved(connection)
+            extension_ready = (
+                approved
+                and relay.connected
+                and relay.extension_protocol_version == PROTOCOL_VERSION
+                and not self._extension_reset_quarantined
+            )
+            local_build_hash = _local_extension_build_hash()
+            remote_build_hash = relay.extension_build_hash
+            if not extension_ready:
+                # No completed hello to compare yet - not an upgrade signal, just no data.
+                extension_build = "unknown"
+            elif remote_build_hash is None:
+                # A connected, current-protocol extension that reports no hash predates
+                # build_hash.json entirely - exactly the same-version-different-bytes skew
+                # this check exists to catch, so it gets the same actionable "stale" label.
+                extension_build = "stale"
+            elif remote_build_hash == local_build_hash:
+                extension_build = "current"
+            else:
+                extension_build = "stale"
             return {
                 "protocol": BROKER_PROTOCOL_VERSION,
                 "generation": BROKER_GENERATION,
                 "buildFingerprint": BROKER_BUILD_FINGERPRINT,
                 "lifecycle": "draining" if self._stopping else "ready",
-                "extensionConnected": (
-                    approved
-                    and relay.connected
-                    and relay.extension_protocol_version == PROTOCOL_VERSION
-                    and not self._extension_reset_quarantined
-                ),
+                "extensionConnected": extension_ready,
                 "approved": approved,
                 "clientCount": len(self._clients),
                 "tabIds": tab_ids,
                 "quarantines": [],
+                "extensionBuild": extension_build,
+                "extensionBuildHash": local_build_hash[:_BUILD_HASH_SHORT_LENGTH],
+                "extensionReportedBuildHash": (
+                    remote_build_hash[:_BUILD_HASH_SHORT_LENGTH] if remote_build_hash is not None else None
+                ),
             }
         if op == "workstation.grant":
             if args:
@@ -975,18 +1244,17 @@ class BrowserExtensionBrokerServer:
                     on_registered=on_registered,
                     on_terminal=on_terminal,
                 )
+            tab_reserved = False
             if extension_op in _LEASED_OPS:
                 if tab_id is None:
                     raise BrowserExtensionBrokerError("LEASE_REQUIRED", f"{extension_op} requires a leased tabId")
                 await self._claim_tab_lease(connection, tab_id)
-            if tab_id is not None and not self._reserve_tab_request(tab_id):
-                raise BrowserExtensionBrokerError("RESOURCE_LIMIT", "Too many requests are in flight for this tab")
             registered = False
             tab_released = False
 
             def release_tab() -> None:
                 nonlocal tab_released
-                if tab_id is None or tab_released:
+                if tab_id is None or not tab_reserved or tab_released:
                     return
                 tab_released = True
                 self._release_tab_request(tab_id)
@@ -1003,11 +1271,23 @@ class BrowserExtensionBrokerServer:
                     on_terminal()
 
             try:
+                if tab_id is not None:
+                    remaining_timeout = await self._wait_for_tab_request_slot(
+                        connection,
+                        tab_id,
+                        float(timeout),
+                        request_started_at=request_started_at,
+                    )
+                    tab_reserved = True
+                    if on_admitted is not None:
+                        on_admitted()
+                else:
+                    remaining_timeout = float(timeout)
                 forwarded = asyncio.create_task(
                     relay.request(
                         extension_op,
                         extension_args,
-                        float(timeout),
+                        remaining_timeout,
                         retain_until_terminal=True,
                         on_registered=forwarded_registered,
                         on_terminal=forwarded_terminal,
@@ -1017,7 +1297,7 @@ class BrowserExtensionBrokerServer:
                 forwarded.add_done_callback(self._forwarded_tasks.discard)
                 return await asyncio.shield(forwarded)
             finally:
-                if not registered:
+                if tab_reserved and not registered:
                     release_tab()
         if op == "pairing.begin":
             return await self._pairing_begin(connection, relay)
@@ -1427,24 +1707,74 @@ class BrowserExtensionBrokerServer:
                 await self._send_event(connection, "extension.disconnected", {})
 
     async def _connection_closed(self, connection: _ClientConnection) -> None:
-        connection.closed = True
+        try:
+            await self._close_connection(connection)
+        finally:
+            async with self._client_lock:
+                self._release_client_locked(connection)
+
+    async def _close_connection(self, connection: _ClientConnection) -> None:
+        if connection.close_started:
+            return
+        connection.close_started = True
+        self._mark_connection_closed(connection)
+        writer_close_started = False
+        self._fail_queued_tab_requests(
+            connection=connection,
+            error=BrowserExtensionNotConnectedError("Broker client disconnected while the request was queued"),
+        )
         sender_task = connection.sender_task
-        if sender_task is not None:
-            sender_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await sender_task
-        keepalive_task = connection.keepalive_task
-        if keepalive_task is not None and keepalive_task is not asyncio.current_task():
-            keepalive_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await keepalive_task
-        for task in tuple(connection.request_tasks):
-            task.cancel()
-        connection.writer.close()
-        with suppress(Exception):
-            await connection.writer.wait_closed()
-        async with self._client_lock:
-            self._release_client_locked(connection)
+        try:
+            if sender_task is not None and sender_task is not asyncio.current_task():
+                sender_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await sender_task
+            keepalive_task = connection.keepalive_task
+            if keepalive_task is not None and keepalive_task is not asyncio.current_task():
+                keepalive_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await keepalive_task
+            for task in tuple(connection.request_tasks):
+                if task is not asyncio.current_task():
+                    task.cancel()
+            request_tasks = tuple(task for task in connection.request_tasks if task is not asyncio.current_task())
+            if request_tasks:
+                await asyncio.wait(request_tasks, timeout=self.client_close_grace_seconds)
+            for request_id in tuple(connection.queued_request_ids):
+                self._release_queued_request(connection, request_id)
+                self._release_outstanding_request(connection, request_id)
+            writer_close_started = True
+            await self._close_writer(connection.writer)
+        finally:
+            for request_id in tuple(connection.queued_request_ids):
+                self._release_queued_request(connection, request_id)
+                self._release_outstanding_request(connection, request_id)
+            if not writer_close_started:
+                with suppress(Exception):
+                    connection.writer.close()
+                transport = getattr(connection.writer, "transport", None)
+                if transport is not None:
+                    with suppress(Exception):
+                        transport.abort()
+            self._discard_output_queue(connection)
+            self._connections.pop(id(connection), None)
+
+    async def _close_writer(self, writer: asyncio.StreamWriter) -> None:
+        close_failed = False
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), self.client_close_grace_seconds)
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            close_failed = True
+        except BaseException:
+            close_failed = True
+            raise
+        finally:
+            if close_failed:
+                transport = getattr(writer, "transport", None)
+                if transport is not None:
+                    with suppress(Exception):
+                        transport.abort()
 
     def _release_client_locked(self, connection: _ClientConnection) -> None:
         if connection.operator:
@@ -1482,6 +1812,10 @@ class BrowserExtensionBrokerServer:
         )
 
     def _schedule_lease_drain(self, lease: _TabLease, *, cleanup: bool = True) -> None:
+        self._fail_queued_tab_requests(
+            tab_id=lease.tab_id,
+            error=BrowserExtensionBrokerError("LEASE_HELD", f"Tab {lease.tab_id} is being released"),
+        )
         existing = self._lease_drain_tasks.get(lease.tab_id)
         if existing is not None and not existing.done():
             return
@@ -1733,10 +2067,17 @@ class BrowserExtensionBrokerServer:
         return lease
 
     async def _free_lease(self, tab_id: int) -> None:
+        self._fail_queued_tab_requests(
+            tab_id=tab_id,
+            error=BrowserExtensionBrokerError("LEASE_REQUIRED", f"Tab {tab_id} is no longer leased"),
+        )
         if self._leases.pop(tab_id, None) is not None:
             await self._persist_leases()
 
     def _free_all_leases(self, reason: str) -> None:
+        self._fail_all_queued_tab_requests(
+            BrowserExtensionNotConnectedError("The browser extension disconnected while the request was queued")
+        )
         if not self._leases:
             return
         count = len(self._leases)
@@ -1932,24 +2273,6 @@ class BrowserExtensionBrokerServer:
             fallback="cycle_only",
         )
 
-    async def _close_connection(self, connection: _ClientConnection) -> None:
-        if connection.closed:
-            return
-        connection.closed = True
-        sender_task = connection.sender_task
-        if sender_task is not None:
-            sender_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await sender_task
-        keepalive_task = connection.keepalive_task
-        if keepalive_task is not None and keepalive_task is not asyncio.current_task():
-            keepalive_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await keepalive_task
-        connection.writer.close()
-        with suppress(Exception):
-            await connection.writer.wait_closed()
-
     async def _is_current(self, connection: _ClientConnection) -> bool:
         if connection.operator:
             return not connection.closed
@@ -1960,28 +2283,26 @@ class BrowserExtensionBrokerServer:
     async def _send_event(self, connection: _ClientConnection, event: str, params: dict[str, Any]) -> None:
         if connection.closed:
             return
-        encoded = encode_frame(event_frame(event, params))
-        if not self._reserve_output(connection, len(encoded)):
-            connection.closed = True
-            connection.writer.close()
-            if connection.sender_task is not None:
-                connection.sender_task.cancel()
+        if connection.pressure_since is not None and self._is_sheddable_event(event, params):
+            connection.shed_event_count += 1
             return
-        try:
-            connection.output_queue.put_nowait((encoded, None))
-        except asyncio.QueueFull:
+        encoded = encode_frame(event_frame(event, params))
+        if not await self._reserve_output(connection, len(encoded)):
+            await self._connection_closed(connection)
+            return
+        if connection.closed:
             self._release_output(connection, len(encoded))
-            connection.closed = True
-            connection.writer.close()
-            if connection.sender_task is not None:
-                connection.sender_task.cancel()
+            return
+        connection.output_queue.put_nowait((encoded, None))
 
     async def _event_writer(self, connection: _ClientConnection) -> None:
         try:
             while not connection.closed:
                 encoded, completion = await connection.output_queue.get()
+                connection.output_in_flight_bytes = len(encoded)
                 try:
                     await self._write_encoded(connection, encoded)
+                    connection.last_output_progress = self.time_source()
                     if completion is not None and not completion.done():
                         completion.set_result(None)
                 except BaseException as exc:
@@ -1989,30 +2310,54 @@ class BrowserExtensionBrokerServer:
                         completion.set_exception(exc)
                     raise
                 finally:
-                    self._release_output(connection, len(encoded))
+                    if connection.output_in_flight_bytes == len(encoded):
+                        connection.output_in_flight_bytes = 0
+                        self._release_output(connection, len(encoded))
         except asyncio.CancelledError:
             pass
         except Exception:
-            connection.closed = True
-            connection.writer.close()
+            self._mark_connection_closed(connection)
+            await self._close_writer(connection.writer)
         finally:
-            while not connection.output_queue.empty():
-                encoded, completion = connection.output_queue.get_nowait()
-                self._release_output(connection, len(encoded))
-                if completion is not None and not completion.done():
-                    completion.set_exception(BrowserExtensionNotConnectedError("Broker client disconnected"))
+            self._discard_output_queue(connection)
 
     async def _control_keepalive(self, connection: _ClientConnection) -> None:
         try:
             while not connection.closed:
                 await asyncio.sleep(CONTROL_PING_INTERVAL_SECONDS)
                 if time.monotonic() - connection.last_inbound >= CONTROL_INBOUND_TIMEOUT_SECONDS:
-                    connection.closed = True
-                    connection.writer.close()
+                    self._mark_connection_closed(connection)
+                    await self._close_writer(connection.writer)
                     return
                 await self._send(connection, {"v": BROKER_PROTOCOL_VERSION, "type": "ping"})
         except (asyncio.CancelledError, BrowserExtensionNotConnectedError):
             pass
+
+    async def _output_stall_watchdog(self) -> None:
+        try:
+            while not self._stopping:
+                await asyncio.sleep(1.0)
+                await self._check_output_stalls()
+        except asyncio.CancelledError:
+            pass
+
+    async def _check_output_stalls(self) -> None:
+        connections = {id(connection): connection for connection in self._connections.values()}
+        connections.update((id(connection), connection) for connection in self._clients.values())
+        now = self.time_source()
+        for connection in tuple(connections.values()):
+            pressure_since = connection.pressure_since
+            if connection.closed or pressure_since is None:
+                continue
+            if now - max(pressure_since, connection.last_output_progress) < CLIENT_OUTPUT_STALL_SECONDS:
+                continue
+            LOG.warning(
+                "browser_extension_client_output_stalled",
+                client_id=connection.client_id,
+                queued_output_bytes=connection.queued_output_bytes,
+                shed_event_count=connection.shed_event_count,
+            )
+            await self._connection_closed(connection)
 
     async def _send_error(
         self,
@@ -2026,16 +2371,14 @@ class BrowserExtensionBrokerServer:
         if connection.closed or connection.sender_task is None:
             raise BrowserExtensionNotConnectedError("Broker client disconnected")
         encoded = encode_frame(frame)
-        if not self._reserve_output(connection, len(encoded)):
-            await self._close_connection(connection)
+        if not await self._reserve_output(connection, len(encoded)):
+            await self._connection_closed(connection)
             return
-        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        try:
-            connection.output_queue.put_nowait((encoded, completion))
-        except asyncio.QueueFull:
+        if connection.closed:
             self._release_output(connection, len(encoded))
-            await self._close_connection(connection)
-            return
+            raise BrowserExtensionNotConnectedError("Broker client disconnected")
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        connection.output_queue.put_nowait((encoded, completion))
         await completion
 
     async def _write_encoded(self, connection: _ClientConnection, encoded: bytes) -> None:
@@ -2045,30 +2388,289 @@ class BrowserExtensionBrokerServer:
             try:
                 connection.writer.write(encoded)
                 await connection.writer.drain()
-            except (ConnectionError, BrokenPipeError, RuntimeError) as exc:
-                connection.closed = True
+            except (ConnectionError, OSError, asyncio.TimeoutError, RuntimeError) as exc:
+                self._mark_connection_closed(connection)
                 raise BrowserExtensionNotConnectedError("Broker client disconnected") from exc
 
-    def _reserve_output(self, connection: _ClientConnection, size: int) -> bool:
-        if (
-            connection.queued_output_frames >= MAX_QUEUED_FRAMES_PER_CLIENT
-            or connection.queued_output_bytes + size > MAX_CLIENT_OUTPUT_BYTES
-            or self._global_output_bytes + size > MAX_GLOBAL_OUTPUT_BYTES
-        ):
-            return False
+    async def _reserve_output(self, connection: _ClientConnection, size: int) -> bool:
+        while self._global_output_bytes + size > MAX_GLOBAL_OUTPUT_BYTES:
+            victim = self._select_output_victim(connection)
+            if victim is None:
+                return False
+            LOG.warning(
+                "browser_extension_client_output_global_cap",
+                client_id=connection.client_id,
+                reason="global_cap",
+                attempted_frame_bytes=size,
+                queued_output_frames=connection.queued_output_frames,
+                queued_output_bytes=connection.queued_output_bytes,
+                global_output_bytes=self._global_output_bytes,
+                victim_client_id=victim.client_id,
+                victim_queued_output_bytes=victim.queued_output_bytes,
+            )
+            if victim is connection:
+                return False
+            await self._connection_closed(victim)
         connection.queued_output_frames += 1
         connection.queued_output_bytes += size
         self._global_output_bytes += size
+        if connection.pressure_since is None and connection.queued_output_bytes > MAX_CLIENT_OUTPUT_BYTES:
+            connection.pressure_since = self.time_source()
+            LOG.warning(
+                "browser_extension_client_output_pressure",
+                client_id=connection.client_id,
+                queued_output_bytes=connection.queued_output_bytes,
+            )
         return True
+
+    def _select_output_victim(self, sender: _ClientConnection) -> _ClientConnection | None:
+        connections = {id(connection): connection for connection in self._connections.values()}
+        connections.update((id(connection), connection) for connection in self._clients.values())
+        connections[id(sender)] = sender
+        candidates = [
+            connection
+            for connection in connections.values()
+            if not connection.close_started and connection.queued_output_bytes > 0
+        ]
+        if not candidates:
+            return sender if not sender.closed else None
+        non_operator_candidates = [connection for connection in candidates if not connection.operator]
+        if non_operator_candidates:
+            candidates = non_operator_candidates
+        return max(
+            candidates,
+            key=lambda connection: (
+                connection.queued_output_bytes,
+                connection.pressure_since is not None,
+                -connection.pressure_since if connection.pressure_since is not None else float("-inf"),
+            ),
+        )
 
     def _release_output(self, connection: _ClientConnection, size: int) -> None:
         connection.queued_output_frames = max(0, connection.queued_output_frames - 1)
         connection.queued_output_bytes = max(0, connection.queued_output_bytes - size)
         self._global_output_bytes = max(0, self._global_output_bytes - size)
+        if (
+            not connection.closed
+            and connection.pressure_since is not None
+            and connection.queued_output_bytes <= CLIENT_OUTPUT_RECOVERY_BYTES
+        ):
+            shed_event_count = connection.shed_event_count
+            connection.pressure_since = None
+            connection.shed_event_count = 0
+            LOG.info(
+                "browser_extension_client_output_recovered",
+                client_id=connection.client_id,
+                queued_output_bytes=connection.queued_output_bytes,
+                shed_event_count=shed_event_count,
+            )
+
+    @staticmethod
+    def _is_sheddable_event(event: str, params: dict[str, Any]) -> bool:
+        if event != "extension.event" or params.get("event") != "debugger.event":
+            return False
+        debugger_params = params.get("params")
+        if not isinstance(debugger_params, dict):
+            return False
+        method = debugger_params.get("method")
+        return isinstance(method, str) and method in SHEDDABLE_EVENT_METHODS
+
+    def _discard_output_queue(self, connection: _ClientConnection) -> None:
+        while True:
+            try:
+                encoded, completion = connection.output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._release_output(connection, len(encoded))
+            if completion is not None and not completion.done():
+                completion.set_exception(BrowserExtensionNotConnectedError("Broker client disconnected"))
+        if connection.output_in_flight_bytes:
+            size = connection.output_in_flight_bytes
+            connection.output_in_flight_bytes = 0
+            self._release_output(connection, size)
+
+    def _mark_connection_closed(self, connection: _ClientConnection) -> None:
+        connection.closed = True
+        self._discard_output_queue(connection)
 
     def _release_inbound(self, connection: _ClientConnection, size: int) -> None:
         connection.inbound_bytes = max(0, connection.inbound_bytes - size)
         self._global_inbound_bytes = max(0, self._global_inbound_bytes - size)
+
+    async def _wait_for_tab_request_slot(
+        self,
+        connection: _ClientConnection,
+        tab_id: int,
+        timeout: float = 30.0,
+        *,
+        request_started_at: float | None = None,
+    ) -> float:
+        if self._stopping:
+            raise BrowserExtensionBrokerError("BROKER_STOPPING", "Browser-extension broker is stopping")
+
+        started_at = self.time_source() if request_started_at is None else request_started_at
+        request_deadline = started_at + timeout
+        queue_deadline = started_at + TAB_REQUEST_QUEUE_WAIT_SECONDS
+        queue = self._tab_request_queues.get(tab_id)
+        if not queue and self._reserve_tab_request(tab_id):
+            remaining = request_deadline - self.time_source()
+            if remaining < 0.05:
+                self._release_tab_request(tab_id)
+                raise BrowserExtensionBrokerError("COMMAND_TIMEOUT", "Request expired while queued")
+            return (
+                timeout
+                if math.isclose(remaining, timeout, abs_tol=TAB_REQUEST_EXACT_TIMEOUT_TOLERANCE_SECONDS)
+                else remaining
+            )
+
+        queue = self._tab_request_queues.setdefault(tab_id, deque())
+        if len(queue) >= MAX_QUEUED_REQUESTS_PER_TAB:
+            LOG.info(
+                "browser_extension_tab_request_queue_full",
+                tab_id=tab_id,
+                queued=len(queue),
+            )
+            raise BrowserExtensionBrokerError(
+                "RESOURCE_LIMIT",
+                "Too many requests are queued for this tab",
+            )
+
+        waiter = _QueuedTabRequest(connection=connection, future=asyncio.get_running_loop().create_future())
+        queue.append(waiter)
+        try:
+            wait_deadline = min(request_deadline, queue_deadline)
+            remaining = wait_deadline - self.time_source()
+            if remaining <= 0:
+                if request_deadline <= queue_deadline:
+                    raise BrowserExtensionBrokerError("COMMAND_TIMEOUT", "Request expired while queued")
+                raise BrowserExtensionBrokerError(
+                    "RESOURCE_LIMIT",
+                    "A tab request queue slot did not become available in time",
+                )
+            try:
+                await asyncio.wait_for(asyncio.shield(waiter.future), remaining)
+            except TimeoutError as exc:
+                if request_deadline <= queue_deadline:
+                    raise BrowserExtensionBrokerError("COMMAND_TIMEOUT", "Request expired while queued") from exc
+                raise BrowserExtensionBrokerError(
+                    "RESOURCE_LIMIT",
+                    "A tab request queue slot did not become available in time",
+                ) from exc
+
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise asyncio.CancelledError
+            if waiter.error is not None:
+                raise waiter.error
+            if self._stopping:
+                raise BrowserExtensionBrokerError("BROKER_STOPPING", "Browser-extension broker is stopping")
+            if connection.closed:
+                raise BrowserExtensionNotConnectedError("Broker client disconnected while the request was queued")
+            lease = self._leases.get(tab_id)
+            if lease is None:
+                raise BrowserExtensionBrokerError("LEASE_REQUIRED", f"Tab {tab_id} is no longer leased")
+            if lease.draining:
+                raise BrowserExtensionBrokerError("LEASE_HELD", f"Tab {tab_id} is being released")
+            if lease.client_id != connection.client_id:
+                raise BrowserExtensionBrokerError("LEASE_HELD", f"Tab {tab_id} is leased to another agent")
+            remaining = request_deadline - self.time_source()
+            if remaining < 0.05:
+                raise BrowserExtensionBrokerError("COMMAND_TIMEOUT", "Request expired while queued")
+            if not waiter.slot_reserved:
+                raise BrowserExtensionBrokerError(
+                    "RESOURCE_LIMIT",
+                    "A tab request queue slot was not reserved",
+                )
+            waiter.admitted = True
+            waiter.slot_reserved = False
+            return remaining
+        finally:
+            self._remove_tab_request_waiter(tab_id, waiter)
+            if not waiter.future.done():
+                waiter.future.cancel()
+
+    def _remove_tab_request_waiter(self, tab_id: int, waiter: _QueuedTabRequest) -> None:
+        queue = self._tab_request_queues.get(tab_id)
+        if queue is not None:
+            with suppress(ValueError):
+                queue.remove(waiter)
+            if not queue:
+                self._tab_request_queues.pop(tab_id, None)
+        if waiter.slot_reserved and not waiter.admitted:
+            waiter.slot_reserved = False
+            self._decrement_tab_request_slot(tab_id)
+        self._wake_next_tab_request(tab_id)
+        if tab_id not in self._tab_request_queues:
+            self._set_tab_idle_if_idle(tab_id)
+
+    def _set_tab_idle_if_idle(self, tab_id: int) -> None:
+        if tab_id in self._tab_request_counts:
+            return
+        idle_event = self._tab_idle_events.pop(tab_id, None)
+        if idle_event is not None:
+            idle_event.set()
+
+    def _decrement_tab_request_slot(self, tab_id: int) -> None:
+        count = self._tab_request_counts.get(tab_id, 0)
+        if count <= 1:
+            self._tab_request_counts.pop(tab_id, None)
+        else:
+            self._tab_request_counts[tab_id] = count - 1
+
+    def _wake_next_tab_request(self, tab_id: int) -> None:
+        queue = self._tab_request_queues.get(tab_id)
+        if queue is None:
+            self._set_tab_idle_if_idle(tab_id)
+            return
+        for waiter in tuple(queue):
+            if waiter.admitted:
+                with suppress(ValueError):
+                    queue.remove(waiter)
+                continue
+            if waiter.error is not None or waiter.future.cancelled() or (waiter.future.done() and not waiter.notified):
+                with suppress(ValueError):
+                    queue.remove(waiter)
+                if waiter.slot_reserved:
+                    waiter.slot_reserved = False
+                    self._decrement_tab_request_slot(tab_id)
+                continue
+            if waiter.slot_reserved or waiter.notified:
+                continue
+            if not self._reserve_tab_request(tab_id):
+                break
+            waiter.notified = True
+            waiter.slot_reserved = True
+            if not waiter.future.done():
+                waiter.future.set_result(None)
+        if queue is not None and not queue:
+            self._tab_request_queues.pop(tab_id, None)
+        self._set_tab_idle_if_idle(tab_id)
+
+    def _fail_queued_tab_requests(
+        self,
+        *,
+        error: BrowserExtensionError,
+        tab_id: int | None = None,
+        connection: _ClientConnection | None = None,
+    ) -> None:
+        tab_ids: tuple[int, ...]
+        if tab_id is not None:
+            tab_ids = (tab_id,)
+        else:
+            tab_ids = tuple(self._tab_request_queues)
+        for queued_tab_id in tab_ids:
+            queue = self._tab_request_queues.get(queued_tab_id)
+            if queue is None:
+                continue
+            for waiter in queue:
+                if connection is not None and waiter.connection is not connection:
+                    continue
+                waiter.error = error
+                if not waiter.future.done():
+                    waiter.future.set_result(None)
+
+    def _fail_all_queued_tab_requests(self, error: BrowserExtensionError) -> None:
+        self._fail_queued_tab_requests(error=error)
 
     def _reserve_tab_request(self, tab_id: int) -> bool:
         count = self._tab_request_counts.get(tab_id, 0)
@@ -2078,14 +2680,9 @@ class BrowserExtensionBrokerServer:
         return True
 
     def _release_tab_request(self, tab_id: int) -> None:
-        count = self._tab_request_counts.get(tab_id, 0)
-        if count <= 1:
-            self._tab_request_counts.pop(tab_id, None)
-            idle_event = self._tab_idle_events.pop(tab_id, None)
-            if idle_event is not None:
-                idle_event.set()
-        else:
-            self._tab_request_counts[tab_id] = count - 1
+        self._decrement_tab_request_slot(tab_id)
+        self._wake_next_tab_request(tab_id)
+        self._set_tab_idle_if_idle(tab_id)
 
     def _verify_peer_uid(self, writer: asyncio.StreamWriter) -> bool:
         transport_socket = writer.get_extra_info("socket")

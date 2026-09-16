@@ -64,14 +64,22 @@ function compactLocalDateTime(time: string): string {
 }
 
 function basicTimeFormat(time: string): string {
+  time = normalizeUtcTimestamp(time);
+
   const date = new Date(time);
+
+  // Render in UTC to match the "UTC" label; this is the hover companion to
+  // basicLocalTimeFormat, which shows the same instant in the local time zone.
   const dateString = date.toLocaleDateString("en-US", {
     weekday: "short",
     year: "numeric",
     month: "short",
     day: "numeric",
+    timeZone: "UTC",
   });
-  const timeString = date.toLocaleTimeString("en-US");
+  const timeString = date.toLocaleTimeString("en-US", {
+    timeZone: "UTC",
+  });
   return `${dateString} at ${timeString} UTC`;
 }
 

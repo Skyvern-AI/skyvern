@@ -13,7 +13,38 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.schemas.steps import AgentStepOutput
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from skyvern.webeye.actions.actions import Action, ActionType
+from skyvern.webeye.actions.responses import ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
+
+_EXPECTED_500 = "An HTTP request made during the download action returned HTTP 500, and no file was received."
+
+
+def _download_intent_action() -> Action:
+    return Action(action_type=ActionType.CLICK, element_id="download-link", download=True)
+
+
+def _failed_download_result(status: int) -> ActionSuccess:
+    result = ActionSuccess()
+    result.download_triggered = False
+    result.download_failure_status = status
+    return result
+
+
+def _step_output(pairs: list) -> AgentStepOutput:
+    return AgentStepOutput(action_results=[], actions_and_results=pairs)
+
+
+def _echo_persisted_reason(base_task):
+    """Mirror real update_task: return the persisted row so the caller reads back the failure_reason that
+    was actually stored (post enrichment/redaction), not the stale local string it passed in."""
+
+    def _update_task(task, status, failure_reason=None, **kwargs):
+        return base_task.model_copy(update={"status": status, "failure_reason": failure_reason})
+
+    return _update_task
 
 
 @pytest.fixture
@@ -63,7 +94,7 @@ async def test_fail_task_with_error_code_mapping_detects_errors(agent, mock_brow
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -105,7 +136,7 @@ async def test_fail_task_without_error_code_mapping(agent, mock_browser_state):
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -141,7 +172,7 @@ async def test_fail_task_without_browser_state(agent):
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -181,7 +212,7 @@ async def test_fail_task_without_step(agent, mock_browser_state):
 
     with patch.object(agent, "update_step", new_callable=AsyncMock) as mock_update_step:
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -211,7 +242,7 @@ async def test_fail_task_preserves_completed_step_and_fails_task(agent, mock_bro
 
     with patch.object(agent, "update_step", new_callable=AsyncMock) as mock_update_step:
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             result = await agent.fail_task(task, step, "Post-step billing failed", mock_browser_state)
 
@@ -237,7 +268,7 @@ async def test_fail_task_error_detection_fails_gracefully(agent, mock_browser_st
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -280,7 +311,7 @@ async def test_fail_task_multiple_errors_detected(agent, mock_browser_state):
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -318,7 +349,7 @@ async def test_fail_task_no_errors_detected(agent, mock_browser_state):
 
     with patch.object(agent, "update_step", new_callable=AsyncMock):
         with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
-            mock_update_task.return_value = task
+            mock_update_task.side_effect = _echo_persisted_reason(task)
 
             with patch(
                 "skyvern.forge.agent.detect_user_defined_errors_for_task",
@@ -394,3 +425,186 @@ async def test_fail_task_with_task_already_timed_out(agent, mock_browser_state):
             result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
             assert result is False
+
+
+@pytest.mark.asyncio
+async def test_fail_task_redacts_a_registered_secret_from_the_failure_reason(agent, mock_browser_state):
+    """fail_task persists failure_reason and then webhooks the task itself, and this exit is
+    reachable on v3 as well as v1 -- a run that dies by exception rather than by a model verdict
+    lands here. Redaction happens once at the top, so the detector sees the redacted string too."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.side_effect = _echo_persisted_reason(task)
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = []
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, "the portal rejected the key sk4829137765", mock_browser_state)
+
+    persisted = mock_update_task.await_args.kwargs["failure_reason"]
+    assert "sk4829137765" not in persisted
+    assert REDACTED_SECRET_PLACEHOLDER in persisted
+    # Redacted at the top, so the detector is handed the scrubbed string rather than the raw one.
+    assert "sk4829137765" not in mock_detect.await_args.kwargs["failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_fail_task_redacts_a_registered_secret_from_detector_written_errors(agent, mock_browser_state):
+    """The detector reads the page as well as the failure reason, so redacting its input is not
+    enough -- a secret typed into the form can come back in its reasoning, and task.errors ships
+    over the same webhook."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.side_effect = _echo_persisted_reason(task)
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = [
+                    UserDefinedError(
+                        error_code="payment_failed",
+                        reasoning="the page showed sk4829137765 after submit",
+                        confidence_float=1.0,
+                    )
+                ]
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, "could not continue", mock_browser_state)
+
+                    (persisted,) = mock_app.DATABASE.tasks.update_task.call_args[1]["errors"]
+
+    assert "sk4829137765" not in persisted["reasoning"]
+    assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_fail_task_leaves_the_failure_reason_alone_when_no_secrets_are_registered(agent, mock_browser_state):
+    """Secret values are available only through the gate; with the gate off the scrub must not run
+    at all, so a run that never opted in gets its text back unchanged."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+    raw = "the portal rejected the key sk4829137765"
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.side_effect = _echo_persisted_reason(task)
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = []
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, raw, mock_browser_state)
+
+    assert mock_update_task.await_args.kwargs["failure_reason"] == raw
+
+
+@pytest.mark.asyncio
+async def test_detector_receives_the_enriched_failure_reason_persisted_by_update_task(agent, mock_browser_state):
+    """The download 5xx enrichment is stamped inside update_task at the persistence seam, so the string
+    fail_task computed locally is stale by the time the row is written. The detector must be handed the
+    post-update persisted reason -- the one carrying the HTTP 5xx/no-file sentence -- so its judgment sees
+    the same evidence that ships to the customer. Drives real fail_task -> real update_task -> real
+    _enrich_failure_reason_with_download_status, mocking only DB/browser/LLM/telemetry boundaries."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        task_id="task-dl",
+        workflow_run_id="wr-dl",
+        error_code_mapping={"download_failed": "The document could not be downloaded"},
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-1",
+        status=StepStatus.completed,
+        order=0,
+        output=_step_output([(_download_intent_action(), [_failed_download_result(500)])]),
+    )
+    reason = "The task failed while attempting to retrieve the document."
+
+    def _claim(task_id, organization_id, **updates):
+        persisted = task.model_copy(
+            update={"status": updates.get("status"), "failure_reason": updates.get("failure_reason")}
+        )
+        return persisted, False
+
+    claim = AsyncMock(side_effect=_claim)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch("skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock) as mock_detect:
+            mock_detect.return_value = []
+            with (
+                patch("skyvern.forge.agent.app") as mock_app,
+                patch("skyvern.forge.agent.save_task_logs", new_callable=AsyncMock),
+            ):
+                mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+                mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+                mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+                mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[step])
+                mock_app.DATABASE.tasks.update_task_and_claim_finish = claim
+                mock_app.DATABASE.tasks.update_task = AsyncMock()
+                mock_app.DATABASE.observer.get_workflow_run_block_engine_by_task_id = AsyncMock(return_value=None)
+                mock_app.AGENT_FUNCTION.record_run_duration = AsyncMock()
+                mock_app.AGENT_FUNCTION.on_task_completed = AsyncMock()
+
+                result = await agent.fail_task(task, step, reason, mock_browser_state)
+
+    assert result is True
+    persisted_reason = claim.await_args.kwargs["failure_reason"]
+    assert persisted_reason == f"{reason} {_EXPECTED_500}"
+    detector_reason = mock_detect.await_args.kwargs["failure_reason"]
+    assert _EXPECTED_500 in detector_reason
+    assert detector_reason == persisted_reason
+
+
+@pytest.mark.asyncio
+async def test_reason_none_stays_none_even_when_updated_task_carries_a_stale_reason(agent, mock_browser_state):
+    """When the caller's reason is None the detector must receive None, even though update_task returns a
+    persisted Task whose failure_reason column still holds an older value. fail_task keys the detector
+    input off the original reason, not the returned row -- so a None reason never picks up a stale string."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"download_failed": "The document could not be downloaded"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=0, output=None)
+    stale = make_task(now, organization, failure_reason="a stale failure reason from a previous write")
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = stale
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = []
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    result = await agent.fail_task(task, step, None, mock_browser_state)
+
+    assert result is True
+    assert mock_detect.await_args.kwargs["failure_reason"] is None

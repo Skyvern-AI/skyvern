@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError
+from skyvern.browser_extension.protocol import ERROR_CODES
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
-from skyvern.cli.core.session_manager import is_stateless_http_mode
+from skyvern.cli.core.session_manager import BrowserSessionConnectionError, is_stateless_http_mode
 from skyvern.cli.core.session_ops import (
     coerce_proxy_location,
     do_session_arm_generate_browser_profile,
@@ -67,6 +69,16 @@ def _broker_extension_not_connected_hint() -> str:
     )
 
 
+def _extension_build_mismatch_warning(status: dict[str, Any] | None) -> str | None:
+    if status is None or status.get("extensionBuild") != "stale":
+        return None
+    reported = BrowserExtensionRuntime.describe_reported_build_hash(status)
+    return (
+        f"Skyvern browser extension build is stale (extension {reported} vs "
+        f"broker {status.get('extensionBuildHash')}). Reload the unpacked extension in chrome://extensions."
+    )
+
+
 def _browser_extension_start_hint(error: Exception) -> str:
     if isinstance(error, BrowserExtensionBrokerError):
         if error.code in {"INVALID_READINESS", "STARTUP_TIMEOUT"}:
@@ -80,6 +92,59 @@ def _browser_extension_start_hint(error: Exception) -> str:
                 "to a free port and use the same port in the Skyvern Agent popup."
             )
     return "Failed to start or connect to the Skyvern browser extension"
+
+
+# Keep this explicit and sorted. It covers the CDP domains used by the adapter and
+# accepted by the extension protocol without treating arbitrary dotted text as a method.
+_SESSION_DIAGNOSTIC_CDP_DOMAINS = (
+    "Accessibility",
+    "Animation",
+    "Browser",
+    "CSS",
+    "Console",
+    "Debugger",
+    "DOM",
+    "DOMDebugger",
+    "DOMSnapshot",
+    "DOMStorage",
+    "Emulation",
+    "Fetch",
+    "IO",
+    "Input",
+    "Inspector",
+    "Log",
+    "Network",
+    "Overlay",
+    "Page",
+    "Performance",
+    "Profiler",
+    "Runtime",
+    "Security",
+    "Storage",
+    "Target",
+)
+_SESSION_DIAGNOSTIC_METHOD_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.])((?:{'|'.join(_SESSION_DIAGNOSTIC_CDP_DOMAINS)})\.[a-z][A-Za-z]+)(?![A-Za-z0-9_.])"
+)
+# ERROR_CODES is the extension protocol's complete allowlist. RESOURCE_LIMIT is emitted by the
+# broker while admitting extension requests, before the extension can return an error code.
+_SESSION_DIAGNOSTIC_ERROR_CODES = frozenset((*ERROR_CODES, "RESOURCE_LIMIT"))
+_SESSION_DIAGNOSTIC_CODE_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])({'|'.join(re.escape(code) for code in sorted(_SESSION_DIAGNOSTIC_ERROR_CODES, key=len, reverse=True))})"
+    r"(?![A-Za-z0-9_])"
+)
+
+
+def _session_create_diagnostic(error: Exception) -> str:
+    detail = error.raw_detail if isinstance(error, BrowserSessionConnectionError) else str(error)
+    diagnostic_parts = [type(error).__name__]
+    method_match = _SESSION_DIAGNOSTIC_METHOD_RE.search(detail)
+    if method_match is not None:
+        diagnostic_parts.append(method_match.group(1))
+    code_match = _SESSION_DIAGNOSTIC_CODE_RE.search(detail)
+    if code_match is not None:
+        diagnostic_parts.append(code_match.group(1))
+    return ": ".join(diagnostic_parts)
 
 
 def _session_api_key_hash() -> str | None:
@@ -230,7 +295,19 @@ async def skyvern_browser_session_create(
             try:
                 _browser, ctx = await resolve_browser(extension_runtime=runtime)
                 timer.mark("sdk")
-            except Exception:
+            except Exception as e:
+                if runtime.extension_connected:
+                    return make_result(
+                        "skyvern_browser_session_create",
+                        ok=False,
+                        timing_ms=timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.SDK_ERROR,
+                            _session_create_diagnostic(e),
+                            "The extension is connected, but browser setup failed. Retry session creation. If it fails "
+                            "again, reload the Skyvern Agent extension and include this diagnostic when reporting the issue.",
+                        ),
+                    )
                 guidance = (
                     _broker_extension_not_connected_guidance(pairing_opened=False)
                     if broker_mode
@@ -246,6 +323,11 @@ async def skyvern_browser_session_create(
                         _broker_extension_not_connected_hint() if broker_mode else "",
                     ),
                 )
+        try:
+            build_status = await runtime.broker_build_status()
+        except Exception:
+            build_status = None
+        build_warning = _extension_build_mismatch_warning(build_status)
         return make_result(
             "skyvern_browser_session_create",
             browser_context=ctx,
@@ -254,6 +336,7 @@ async def skyvern_browser_session_create(
                 "session": "implicit",
                 "note": "Extension sessions are implicit; call browser tools without a session_id.",
             },
+            warnings=[build_warning] if build_warning else None,
             timing_ms=timer.timing_ms,
         )
 

@@ -132,6 +132,7 @@ export type OnboardingStateResponse = {
   launch_date_at_signup: string | null;
   recovery_guidance_assignment: RecoveryGuidanceAssignment | null;
   questionnaire_prompt_result?: QuestionnairePromptResultV1 | null;
+  organization_id?: string | null;
 };
 
 export type ConfirmedWriteCode =

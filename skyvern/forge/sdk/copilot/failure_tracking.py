@@ -154,6 +154,17 @@ def selector_identity_from_failure(text: str) -> str:
     return f"{_CSS_SELECTOR_KIND if kind == 'selector' else kind}:{value}" if kind else ""
 
 
+def selector_identity_from_literal(attr: str, selector: str, name: str = "") -> str:
+    """Identity for a selector read from source as a literal, spelled as ``selector_identities_in_text`` would."""
+    if attr == "get_by_role":
+        role = _normalize_signature_text(selector)
+        role_name = _normalize_signature_text(name)
+        return f"role:{role}:{role_name}" if role_name else f"role:{role}"
+    if attr == "locator":
+        return f"{_CSS_SELECTOR_KIND}:{_normalize_signature_text(selector)}"
+    return ""
+
+
 def selector_identities_in_text(text: str) -> set[str]:
     """Every locator identity in ``text``, normalized to match ``selector_identity_from_failure``."""
     identities: set[str] = set()

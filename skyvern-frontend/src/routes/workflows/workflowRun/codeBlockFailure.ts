@@ -121,8 +121,14 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block ran out of memory",
     guidance:
-      "Process the data in smaller batches rather than holding it all at once.",
+      "Process data in smaller batches, or return only the fields the next block needs.",
     recovery: "fix",
+  },
+  parameter_reassembly_memory_limit_exceeded: {
+    ...INFRASTRUCTURE,
+    title: "The code sandbox ran out of memory while receiving inputs",
+    guidance:
+      "Retry the run. If it keeps happening, have an earlier block pass in less data to this block.",
   },
   busy: {
     kind: "infrastructure",
@@ -146,6 +152,19 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
   child_exited: INFRASTRUCTURE,
   child_no_request: INFRASTRUCTURE,
   child_malformed_request: INFRASTRUCTURE,
+  parameter_transfer_failed: {
+    ...INFRASTRUCTURE,
+    title: "The block's inputs could not be transferred",
+    guidance:
+      "The block's inputs could not be transferred to the sandbox safely. This is a Skyvern-side transport fault, not your code — retry, and reach out if it keeps happening.",
+  },
+  parameter_limit_exceeded: {
+    kind: "limit",
+    title: "The block's inputs are too large to transfer",
+    guidance:
+      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Have an earlier block pass in less data.",
+    recovery: "fix",
+  },
   unspecified: {
     kind: "user-code",
     title: "The code block failed",
@@ -265,6 +284,41 @@ export function failingCodeLineFromActions(
   return failingAction ? actionCodeLine(failingAction) : null;
 }
 
+// unsupported_page_operation is one error code for four different guards, so the code alone
+// cannot pick a remedy. codeblock/workflow.py puts the runner-authored class name on the failure
+// output for exactly this; the names come from SAFE_DENIED_OPERATION_EXCEPTION_CLASSES, which
+// allowlists them as carrying no page or parameter data.
+const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
+  "codeblock.page_operation_broker.PageOperationLimitExceeded": {
+    kind: "limit",
+    title: "The block used too many browser operations",
+    guidance:
+      "This block issued more browser operations in a single run than the per-run limit allows. Split the work across several runs, or narrow what each run processes.",
+    recovery: "fix",
+  },
+  "codeblock.page_operation_broker.BlockedEgressError": {
+    kind: "browser",
+    title: "The block navigated to a blocked destination",
+    guidance:
+      "Navigation is limited to reachable external web addresses. Check the URL this block navigates to \u2014 internal, unroutable, and non-web destinations are refused.",
+    recovery: "fix",
+  },
+};
+
+function denialTemplate(
+  output: WorkflowRunBlock["output"],
+): { template: CodeBlockFailureTemplate; code: string } | null {
+  if (!isRecord(output)) {
+    return null;
+  }
+  const exceptionClass = output.runner_exception_class;
+  if (typeof exceptionClass !== "string") {
+    return null;
+  }
+  const template = DENIAL_TEMPLATES[exceptionClass];
+  return template ? { template, code: exceptionClass } : null;
+}
+
 function templateFor(
   errorCodes: Array<string>,
   reason: string,
@@ -305,6 +359,13 @@ function templateFor(
         recovery: "retry",
       },
     };
+  }
+
+  // Before the code lookup: a named guard is more specific than the code it reports under, and
+  // the code lookup below returns early, so anything after it is unreachable for runner rows.
+  const denial = denialTemplate(output);
+  if (denial) {
+    return { code: runnerCode ?? denial.code, template: denial.template };
   }
 
   if (
@@ -427,4 +488,10 @@ export function findRunCodeBlockFailure(
   return failure === null
     ? null
     : { ...failure, workflowRunBlockId: culprit.workflow_run_block_id };
+}
+
+export function formatCodeBlockErrorCode(code: string): string {
+  return Object.prototype.hasOwnProperty.call(FAILURE_TEMPLATES, code)
+    ? FAILURE_TEMPLATES[code]!.title
+    : code;
 }

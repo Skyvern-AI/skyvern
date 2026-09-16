@@ -59,6 +59,8 @@ def _sentence_containing(prompt: str, needle: str) -> str:
 
 def _code_only_ctx() -> SimpleNamespace:
     return SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[],
@@ -122,6 +124,14 @@ async def test_code_schema_is_the_discoverable_home_for_runtime_helpers(monkeypa
     assert "<key>.username" in guidance
     assert "<key>.password" in guidance
 
+    model_result = _copilot_to_call_tool_result(rendered, "get_block_schema")
+    model_payload = json.loads(model_result.content[0].text)
+    model_guidance = "\n".join(model_payload["data"]["code_only_guidance"])
+    assert "await clear_browser_data(page)" in model_guidance
+    clear_helper = model_payload["data"]["clear_browser_data_helper_contract"]
+    assert clear_helper["shadowed_by_parameter"] == "clear_browser_data"
+    assert clear_helper["on_parameter_collision"]
+
 
 @pytest.mark.asyncio
 async def test_workflow_knowledge_marks_code_only_policy_as_authoritative() -> None:
@@ -138,7 +148,7 @@ async def test_workflow_knowledge_marks_code_only_policy_as_authoritative() -> N
 def test_code_only_policy_is_short_and_contains_no_settled_block_conversion_steering() -> None:
     rendered = _code_only_browser_authoring_prompt()
 
-    assert "before authoring the first `code` block" in rendered
+    assert "Before authoring the first `code` block" in rendered
     assert "call `get_block_schema` with `block_type: code`" in rendered
     assert "solve_captcha" not in rendered
     assert "<key>.username" not in rendered
@@ -158,6 +168,12 @@ def test_rendered_prompt_keeps_security_ask_telemetry_and_workflow_wide_edit_sco
     assert "CUSTOM SECURITY RULE" in new_workflow_prompt
     assert '"ask_subject"' in new_workflow_prompt
     assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in new_workflow_prompt
+
+
+def test_rendered_prompt_scopes_verbatim_code_to_scouting_tool_output() -> None:
+    prompt = _render_production_prompt()
+
+    assert "scouting tool offers a SYNTHESIZED CODE BLOCK" in prompt
 
 
 def test_ask_carve_out_gates_money_and_destruction_and_never_a_site_sent_message() -> None:

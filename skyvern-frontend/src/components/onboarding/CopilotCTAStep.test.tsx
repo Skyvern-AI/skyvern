@@ -122,25 +122,6 @@ describe("CopilotCTAStep", () => {
     );
   });
 
-  it("hands the prompt off to /build when the studio preview is off", async () => {
-    studioState.enabled = false;
-    mockPost.mockResolvedValue({
-      data: { workflow_permanent_id: "wpid_x" },
-    });
-    setup();
-
-    fireEvent.change(screen.getByRole("textbox"), {
-      target: { value: "fill out my form" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Create with AI" }));
-
-    await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_x/build", {
-        state: { copilotMessage: "fill out my form" },
-      }),
-    );
-  });
-
   it("reports busy to the parent while the handoff is in flight", async () => {
     mockPost.mockReturnValue(new Promise(() => {}));
     const onBusyChange = vi.fn();

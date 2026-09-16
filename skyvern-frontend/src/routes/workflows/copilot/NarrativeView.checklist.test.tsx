@@ -510,24 +510,47 @@ describe("NarrativeView — activity log", () => {
     ).toBeGreaterThan(0);
   });
 
-  it("a drafted block never renders under a run row", () => {
+  it("an evidence-free drafted block never renders", () => {
     const turn = repairLoopTurn();
     turn.blocks = [
       runningBlock({
         workflowRunBlockId: "",
         label: "block_2",
         state: "drafted",
+        startedAt: null,
       }),
     ];
     render(<NarrativeView turn={turn} />);
-    const card = screen.getByText("Block 2");
-    const runRow = screen.getByText("Testing workflow");
-    expect(
-      runRow.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(screen.queryByText("Block 2")).toBeNull();
+    expect(screen.getByText("Testing workflow")).toBeTruthy();
   });
 
-  it("an empty drafted block cannot hide or open ahead of live work", () => {
+  it("filters evidence-free blocks from the fallback projection", () => {
+    const turn: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-fallback",
+      blocks: [
+        runningBlock({
+          workflowRunBlockId: "",
+          label: "snapshot_only",
+          state: "drafted",
+          startedAt: null,
+        }),
+        runningBlock({
+          workflowRunBlockId: "wrb_observed",
+          label: "observed_attempt",
+          state: "completed",
+        }),
+      ],
+    };
+
+    render(<NarrativeView turn={turn} />);
+
+    expect(screen.queryByText("Snapshot Only")).toBeNull();
+    expect(screen.getByText("Observed Attempt")).toBeTruthy();
+  });
+
+  it("an empty drafted block cannot render or steal focus from live work", () => {
     const turn: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
       turnId: "turn-1",
@@ -565,14 +588,10 @@ describe("NarrativeView — activity log", () => {
       name: /Searching the catalogue/,
       expanded: true,
     });
-    const draftRow = screen.getByRole("button", {
-      name: /Add First Result/,
-    });
-
     expect(liveRow).toBeTruthy();
-    expect(draftRow.getAttribute("aria-expanded")).toBeNull();
-    fireEvent.click(draftRow);
-    expect(draftRow.getAttribute("aria-expanded")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Add First Result/ }),
+    ).toBeNull();
     expect(container.querySelectorAll(".border-l")).toHaveLength(1);
 
     // The newest row still owns focus during a real between-call gap, but a
@@ -595,9 +614,7 @@ describe("NarrativeView — activity log", () => {
       />,
     );
     expect(
-      screen
-        .getByRole("button", { name: /Add First Result/ })
-        .getAttribute("aria-expanded"),
+      screen.queryByRole("button", { name: /Add First Result/ }),
     ).toBeNull();
     expect(container.querySelectorAll(".border-l")).toHaveLength(0);
   });

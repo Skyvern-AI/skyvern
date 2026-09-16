@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useRecordingStore,
-  type MessageInExfiltratedConsoleEvent,
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
 
@@ -63,29 +62,6 @@ async function openSocket() {
   }
   act(() => socket.emitOpen());
   return socket;
-}
-
-function consoleClick(timestamp: number): MessageInExfiltratedConsoleEvent {
-  return {
-    kind: "exfiltrated-event",
-    event_name: "user_interaction",
-    source: "console",
-    timestamp: timestamp / 1000,
-    params: {
-      type: "click",
-      url: "https://example.test",
-      timestamp,
-      target: { tagName: "BUTTON", text: ["Submit"] },
-      mousePosition: { xa: 640, ya: 360, xp: 0.5, yp: 0.5 },
-      activeElement: { tagName: "BUTTON" },
-      window: {
-        width: 1280,
-        height: 720,
-        scrollX: 0,
-        scrollY: 0,
-      },
-    },
-  };
 }
 
 describe("useRecordingMessageChannel", () => {
@@ -154,7 +130,79 @@ describe("useRecordingMessageChannel", () => {
       socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
     ).toEqual([
       expect.objectContaining({ kind: "begin-exfiltration" }),
-      { kind: "end-exfiltration" },
+      { kind: "end-exfiltration", discard: true },
+    ]);
+  });
+
+  it("preserves finalized actions when Done ends exfiltration", async () => {
+    useRecordingStore.setState({
+      isRecording: true,
+      finishRequested: false,
+    });
+    const { rerender } = renderHook(
+      ({ exfiltrate }) =>
+        useRecordingMessageChannel({
+          browserSessionId: "pbs-1",
+          enabled: true,
+          exfiltrate,
+          workflowPermanentId: "workflow-1",
+          clipboard: "none",
+        }),
+      { initialProps: { exfiltrate: true } },
+    );
+    const socket = await openSocket();
+    socket.send.mockClear();
+
+    act(() => useRecordingStore.setState({ finishRequested: true }));
+    rerender({ exfiltrate: false });
+
+    expect(
+      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
+    ).toContainEqual(
+      expect.objectContaining({ kind: "end-exfiltration", discard: false }),
+    );
+  });
+
+  it("purges finalized actions when Discard follows Done", async () => {
+    useRecordingStore.setState({
+      isRecording: true,
+      finishRequested: false,
+      interpretationSessionId: "interpretation-1",
+    });
+    const { rerender, unmount } = renderHook(
+      ({ exfiltrate }) =>
+        useRecordingMessageChannel({
+          browserSessionId: "pbs-1",
+          enabled: true,
+          exfiltrate,
+          workflowPermanentId: "workflow-1",
+          clipboard: "none",
+        }),
+      { initialProps: { exfiltrate: true } },
+    );
+    const socket = await openSocket();
+    socket.send.mockClear();
+
+    act(() => useRecordingStore.setState({ finishRequested: true }));
+    rerender({ exfiltrate: false });
+    act(() => useRecordingStore.getState().reset());
+    unmount();
+
+    expect(
+      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
+    ).toEqual([
+      {
+        kind: "end-exfiltration",
+        discard: false,
+        interpretation_session_id: "interpretation-1",
+        workflow_permanent_id: "workflow-1",
+      },
+      {
+        kind: "end-exfiltration",
+        discard: true,
+        interpretation_session_id: "interpretation-1",
+        workflow_permanent_id: "workflow-1",
+      },
     ]);
   });
 
@@ -372,36 +420,6 @@ describe("useRecordingMessageChannel", () => {
       socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
     ).toContainEqual({ kind: "recording-rearm-capture" });
     expect(useRecordingStore.getState().pendingEvents).toContainEqual(event);
-  });
-
-  it("stores the current frame for an inbound console click", async () => {
-    const getFrameDataUrl = vi.fn(() => "data:image/jpeg;base64,frame");
-    vi.stubGlobal("requestIdleCallback", (callback: IdleRequestCallback) => {
-      callback({ didTimeout: false, timeRemaining: () => 50 });
-      return 1;
-    });
-    useRecordingStore.setState({ isRecording: true });
-    renderHook(() =>
-      useRecordingMessageChannel({
-        browserSessionId: "pbs-1",
-        enabled: true,
-        exfiltrate: true,
-        workflowPermanentId: null,
-        getFrameDataUrl,
-        clipboard: "none",
-      }),
-    );
-    const socket = await openSocket();
-
-    act(() => socket.emitMessage(consoleClick(1_700_000_000_000)));
-
-    expect(getFrameDataUrl).toHaveBeenCalled();
-    expect(useRecordingStore.getState().screenshots).toContainEqual({
-      timestampMs: 1_700_000_000_000,
-      dataUrl: "data:image/jpeg;base64,frame",
-      xp: 0.5,
-      yp: 0.5,
-    });
   });
 
   it("applies inbound interpretation updates to the recording store", async () => {

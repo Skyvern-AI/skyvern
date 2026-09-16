@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { isForbiddenError } from "@/api/forbidden";
 import { DebugSessionViewerStateApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
@@ -7,13 +8,20 @@ import { useEffect, useRef } from "react";
 const ACTIVE_RUN_SESSION_REFETCH_INTERVAL_MS = 1000;
 
 type ActiveRunSessionRefetchState = {
+  status?: "pending" | "error" | "success";
   data?: DebugSessionViewerStateApiResponse;
+  error?: unknown;
 };
 
 function getActiveRunSessionRefetchInterval(
   queryState: ActiveRunSessionRefetchState,
   isTurnActive: boolean,
 ): number | false {
+  // A forbidden viewer-state (expired session or another org's workflow) never
+  // becomes allowed on its own, so stop polling instead of hammering it 1/s.
+  if (queryState.status === "error" && isForbiddenError(queryState.error)) {
+    return false;
+  }
   return isTurnActive || Boolean(queryState.data?.active_run_session_id)
     ? ACTIVE_RUN_SESSION_REFETCH_INTERVAL_MS
     : false;

@@ -1,12 +1,10 @@
 import {
   CheckIcon,
   CursorArrowIcon,
-  EnterFullScreenIcon,
   PauseIcon,
   Pencil1Icon,
   PlayIcon,
   TrashIcon,
-  ZoomInIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -31,11 +29,9 @@ import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   applyDraftStepOverlays,
-  findScreenshotForStep,
   useRecordingStore,
   type RecordingActionKind,
   type RecordingDraftStep,
-  type RecordingScreenshot,
 } from "@/store/useRecordingStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { formatRecordingClock } from "@/util/recordingClock";
@@ -86,55 +82,6 @@ function formatDraftStepDisplayTitle(step: RecordingDraftStep): string {
   }
 
   return step.label;
-}
-
-function StepScreenshot({ screenshot }: { screenshot: RecordingScreenshot }) {
-  const [showFullPage, setShowFullPage] = useState(false);
-  const xp = screenshot.xp ?? 0.5;
-  const yp = screenshot.yp ?? 0.5;
-
-  return (
-    <div className="group/shot relative h-36 overflow-hidden rounded-md border bg-black">
-      <div
-        className="absolute inset-0"
-        style={
-          showFullPage
-            ? {
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "contain",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "center",
-              }
-            : {
-                // background-position p% pins image point p% to container
-                // point p%, keeping the zoomed crop in-bounds with the click
-                // point at the same relative spot as the ring below.
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "250% auto",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: `${xp * 100}% ${yp * 100}%`,
-              }
-        }
-      />
-      <button
-        type="button"
-        className="absolute bottom-2 right-2 inline-flex items-center gap-1 rounded bg-black/70 px-2 py-1 text-[10.5px] text-slate-200 opacity-0 transition-opacity group-hover/shot:opacity-100"
-        onClick={() => setShowFullPage(!showFullPage)}
-      >
-        {showFullPage ? (
-          <>
-            <ZoomInIcon className="h-3 w-3" />
-            Zoom to action
-          </>
-        ) : (
-          <>
-            <EnterFullScreenIcon className="h-3 w-3" />
-            Full page
-          </>
-        )}
-      </button>
-    </div>
-  );
 }
 
 function credentialPromptForKind(
@@ -188,7 +135,6 @@ function DraftStepCard({
   step,
   index,
   baselineMs,
-  screenshot,
   onDelete,
   onRename,
   showCredentialPrompt,
@@ -199,7 +145,6 @@ function DraftStepCard({
   step: RecordingDraftStep;
   index: number;
   baselineMs: number | null;
-  screenshot: RecordingScreenshot | null;
   onDelete: () => void;
   onRename: (value: string) => void;
   showCredentialPrompt: boolean;
@@ -322,11 +267,6 @@ function DraftStepCard({
           </button>
         </div>
       </div>
-      {screenshot && (
-        <div className="pl-8">
-          <StepScreenshot screenshot={screenshot} />
-        </div>
-      )}
       {showCredentialPrompt && (
         <div className="flex flex-wrap items-center gap-2 pl-8">
           <Button
@@ -435,7 +375,6 @@ function RecordingPanel({ browserSessionId }: Props) {
     deletedStepIds,
     stepPatches,
     dismissedCredentialStepIds,
-    screenshots,
     sessionRevision,
     optimisticSteps: rawOptimisticSteps,
     workflowPermanentId,
@@ -451,7 +390,6 @@ function RecordingPanel({ browserSessionId }: Props) {
       deletedStepIds: state.deletedStepIds,
       stepPatches: state.stepPatches,
       dismissedCredentialStepIds: state.dismissedCredentialStepIds,
-      screenshots: state.screenshots,
       sessionRevision: state.sessionRevision,
       optimisticSteps: state.optimisticSteps,
       workflowPermanentId: state.workflowPermanentId,
@@ -589,10 +527,10 @@ function RecordingPanel({ browserSessionId }: Props) {
   const showInterpretationFallbackNote =
     !interpretationEnabled && exposedEventCount > 0;
   const headerTitle = isFinishing
-    ? "Finishing recording"
+    ? "Creating workflow steps"
     : manualCapturePaused
       ? "Recording paused"
-      : "Recording browser";
+      : "Recording task";
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden rounded-xl border bg-slate-elevation2">
@@ -626,13 +564,13 @@ function RecordingPanel({ browserSessionId }: Props) {
               <>
                 Capture is paused.
                 <br />
-                Resume to continue recording browser actions.
+                Resume to continue recording the task.
               </>
             ) : (
               <>
-                Interact with the browser.
-                <br />
-                Your clicks, typing and navigation will appear here as blocks.
+                Complete the task in the browser. Skyvern captures the browser
+                view and your clicks, typing, and navigation, then turns them
+                into workflow steps.
               </>
             )}
           </div>
@@ -643,7 +581,6 @@ function RecordingPanel({ browserSessionId }: Props) {
               step={step}
               index={index}
               baselineMs={baselineMs}
-              screenshot={findScreenshotForStep(step, screenshots)}
               showCredentialPrompt={
                 Boolean(step.credential_kind) &&
                 !dismissedCredentialStepIds.includes(step.step_id)
@@ -703,8 +640,8 @@ function RecordingPanel({ browserSessionId }: Props) {
         {showInterpretationFallbackNote && (
           <div className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
             {exposedEventCount} interaction
-            {exposedEventCount === 1 ? "" : "s"} captured — blocks will be
-            generated when you finish.
+            {exposedEventCount === 1 ? "" : "s"} captured — workflow steps will
+            be generated when you choose Done.
           </div>
         )}
         <div ref={feedEndRef} />
@@ -712,8 +649,8 @@ function RecordingPanel({ browserSessionId }: Props) {
 
       {insertionPointMissing && (
         <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
-          Could not determine where to insert recorded blocks. Discard and start
-          recording from the workflow editor again.
+          Could not determine where to insert workflow steps. Discard and choose
+          Record task from the workflow editor again.
         </div>
       )}
 
@@ -722,7 +659,11 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Button
           variant="outline"
           size="icon"
-          title={manualCapturePaused ? "Resume capture" : "Pause capture"}
+          title={
+            manualCapturePaused
+              ? "Resume recording task"
+              : "Pause recording task"
+          }
           className="h-8 w-8"
           disabled={isCommitting || isFinishing}
           onClick={() =>
@@ -740,7 +681,7 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Button
           variant="outline"
           size="icon"
-          title="Discard recording"
+          title="Discard task recording"
           className="h-8 w-8 hover:border-red-500/40 hover:text-red-700 dark:hover:text-red-400"
           disabled={isCommitting}
           onClick={onDiscardClick}
@@ -758,7 +699,11 @@ function RecordingPanel({ browserSessionId }: Props) {
           onClick={onDoneClick}
         >
           <CheckIcon className="mr-1.5 h-4 w-4" />
-          {mutationIsError ? "Retry" : isFinishing ? "Processing…" : "Done"}
+          {mutationIsError
+            ? "Retry"
+            : isFinishing
+              ? "Creating workflow…"
+              : "Done"}
         </Button>
       </div>
 
@@ -766,14 +711,14 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Dialog open onOpenChange={setConfirmDiscardOpen}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Discard recording?</DialogTitle>
+              <DialogTitle>Discard task recording?</DialogTitle>
               <DialogDescription>
                 {visibleSteps.length > 0
-                  ? `You have ${visibleSteps.length} recorded block${
+                  ? `You have ${visibleSteps.length} captured workflow step${
                       visibleSteps.length === 1 ? "" : "s"
                     } that will be lost if you discard.`
-                  : "Your recorded interactions will be lost if you discard."}{" "}
-                Are you sure you want to discard the recording?
+                  : "Your captured browser interactions will be lost if you discard."}{" "}
+                Are you sure you want to discard this task recording?
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -781,10 +726,10 @@ function RecordingPanel({ browserSessionId }: Props) {
                 variant="outline"
                 onClick={() => setConfirmDiscardOpen(false)}
               >
-                Keep recording
+                Keep recording task
               </Button>
               <Button variant="destructive" onClick={discard}>
-                Discard recording
+                Discard
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -802,8 +747,13 @@ function RecordingPanel({ browserSessionId }: Props) {
               setCredentialModal(null);
             }
           }}
-          onCredentialCreated={() => {
+          onCredentialCreated={(credentialId) => {
             const store = useRecordingStore.getState();
+            // Binds the vault entry to the step so the backend emits a login block
+            // (password/totp/magic link) or a credential-bound action block.
+            store.patchDraftStep(credentialModal.stepId, {
+              credential_id: credentialId,
+            });
             if (credentialModal.url) {
               store.dismissCredentialPromptsForUrl(credentialModal.url);
             } else {

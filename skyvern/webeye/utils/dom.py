@@ -40,6 +40,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
+    read_locator_is_content_editable,
     read_locator_tag_name,
     read_resolved_anchor_href,
     read_whether_link_or_button,
@@ -541,6 +542,19 @@ class SkyvernElement:
         except Exception:
             LOG.info(
                 "Failed to check element editable, considering it's not editable",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            return False
+
+    async def is_content_editable(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        # A block inside a contenteditable host inherits editability without carrying the attribute, so
+        # only the live DOM property can answer this.
+        try:
+            return await read_locator_is_content_editable(self.get_locator(), timeout=timeout) is True
+        except Exception:
+            LOG.info(
+                "Failed to check element contenteditable, considering it's not contenteditable",
                 exc_info=True,
                 element_id=self.get_id(),
             )
@@ -1171,10 +1185,35 @@ class SkyvernElement:
         try:
             await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
         except Exception as exc:
+            if is_engine_error(exc, self._engine_selection) and is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
             if not is_engine_timeout_error(exc, self._engine_selection):
                 raise
             await self._classify_typing_timeout(exc)
             raise
+
+    async def mark_totp_box(self, page: Page, expected_digits: int) -> None:
+        """Keep the smallest filled group length and this box's privacy provenance."""
+        record_minimum = (
+            "const previous = Number(root.getAttribute('data-skyvern-otp-filled'));"
+            f"root.setAttribute('data-skyvern-otp-filled', String(Number.isInteger(previous) && previous >= 2 ? Math.min(previous, {expected_digits}) : {expected_digits}));"
+        )
+        await SkyvernFrame.evaluate(
+            frame=self.get_frame(),
+            expression="""(element) => {
+                const root = element.ownerDocument.documentElement;
+            """
+            + record_minimum
+            + """
+                element.setAttribute("data-skyvern-otp-box", "1");
+            }""",
+            arg=await self.get_element_handler(),
+        )
+        if self.get_frame() is not page:
+            await SkyvernFrame.evaluate(
+                frame=page,
+                expression="() => {const root = document.documentElement;" + record_minimum + "}",
+            )
 
     async def apply_secret_visual_mask(self) -> None:
         try:
@@ -1320,6 +1359,13 @@ class SkyvernElement:
     async def move_mouse_to(
         self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> tuple[float, float]:
+        # Resolve the element into the live viewport before reading its box, then
+        # re-read the box. Reading it first can yield a document-level off-screen
+        # coordinate (e.g. y far below the fold) that would become the humanized
+        # cursor target and drive a cross-document cursor traversal (SKY-15195).
+        # scroll_into_view is the element's established scroll/actionability contract.
+        await self.scroll_into_view(timeout=timeout)
+
         bounding_box = await self.get_locator().bounding_box(timeout=timeout)
         if not bounding_box:
             raise NoElementBoudingBox(element_id=self.get_id())
@@ -1330,8 +1376,6 @@ class SkyvernElement:
         dest_x = uniform(x + epsilon, x + width - epsilon) if width > 2 * epsilon else (x + width) / 2
         dest_y = uniform(y + epsilon, y + height - epsilon) if height > 2 * epsilon else (y + height) / 2
 
-        # TODO: a better way to check if the element is out of current viewport
-        # eg: x > window.innerWidth or y > window.innerHeight; part of the element is out of the viewport
         if dest_x < 0 or dest_y < 0:
             raise ElementOutOfCurrentViewport(element_id=self.get_id())
 
@@ -1676,7 +1720,7 @@ class DomUtil:
             return True
         return False
 
-    async def get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement:
+    async def get_skyvern_element_by_id(self, element_id: str, *, allow_xpath_fallback: bool = True) -> SkyvernElement:
         element = self.scraped_page.id_to_element_dict.get(element_id)
         if not element:
             raise MissingElementDict(element_id)
@@ -1695,6 +1739,8 @@ class DomUtil:
 
         num_elements = await locator.count()
         if num_elements < 1:
+            if not allow_xpath_fallback:
+                raise MissingElement(selector=css, element_id=element_id)
             xpath: str | None = element.get("xpath")
             if not xpath:
                 LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)

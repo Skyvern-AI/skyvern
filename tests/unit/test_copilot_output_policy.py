@@ -23,7 +23,10 @@ from skyvern.forge.sdk.copilot.author_time_block import (
     CREDENTIAL_SCOUT_BLOCK_ID,
     AuthorTimeBlock,
 )
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    contains_internal_machinery_leak,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -44,6 +47,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     NATIVE_TOOLS,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import _watchdog_error_message
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
 # Assembled at runtime so the source never contains a token-shaped literal for secret scanners to flag.
@@ -325,14 +329,6 @@ def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> No
             id="call-update-and-run-blocks-instruction",
         ),
         pytest.param(
-            "Do NOT retry this tool call; wait for the current run result.",
-            id="do-not-retry-tool-call",
-        ),
-        pytest.param(
-            "Do NOT re-invoke the tool until the user responds.",
-            id="do-not-reinvoke-tool",
-        ),
-        pytest.param(
             'I\'ll call get_run_results(workflow_run_id="wr_123") and report back.',
             id="call-get-run-results-report-back",
         ),
@@ -352,34 +348,24 @@ def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> No
             "Falling back to list_credentials since the user did not specify one.",
             id="list-credentials-fallback",
         ),
-        pytest.param(
-            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
-            "Do NOT retry block-running tools.",
-            id="late-block-running-timer-do-not-retry",
-        ),
     ],
 )
-def test_rejects_internal_tool_instruction_leak_in_user_response(user_response: str) -> None:
+def test_machine_format_machinery_leak_predicate_matches(user_response: str) -> None:
+    assert contains_internal_machinery_leak(user_response) is True
+
+
+def test_watchdog_model_facing_text_is_allowed_as_a_run_result_reply() -> None:
     verdict = evaluate_output_policy(
-        request_policy=_policy(),
+        request_policy=None,
         response_type="REPLY",
-        user_response=user_response,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
-
-
-def test_allows_benign_do_not_retry_user_guidance() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Do not retry until the account lockout clears.",
+        user_response=asyncio.run(
+            _watchdog_error_message("stagnation", SimpleNamespace(), "wr_123", None, 300, dispatch_to_worker=True)
+        ),
+        output_kind=CopilotOutputKind.WORKFLOW_RUN_RESULT,
     )
 
     assert verdict.allowed
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK not in verdict.reason_codes
+    assert verdict.reason_codes == []
 
 
 @pytest.mark.parametrize(
@@ -1036,27 +1022,6 @@ def test_extended_taxonomy_leak_skipped_on_ask_question(user_response: str) -> N
 
 
 @pytest.mark.parametrize(
-    "output_kind",
-    [
-        CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
-        CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL,
-        CopilotOutputKind.WORKFLOW_RUN_RESULT,
-    ],
-)
-def test_tool_name_leak_hard_blocks_across_output_kinds(
-    output_kind: CopilotOutputKind,
-) -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Use `update_workflow` to apply that change.",
-        output_kind=output_kind,
-    )
-
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
-
-
-@pytest.mark.parametrize(
     "user_response",
     [
         "Send me a normal instruction like 'run it', and I'll continue.",
@@ -1142,7 +1107,11 @@ def test_allows_existing_workflow_credential_id_on_unrelated_turn() -> None:
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
 
 
-def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
+@pytest.mark.parametrize(
+    "url",
+    ["https://evil.example.test/login", "https://bücher.example/login", r"https://evil.example.test\login"],
+)
+def test_rejects_existing_workflow_credential_id_on_new_origin(url: str) -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(
             resolved_credentials=[],
@@ -1150,7 +1119,7 @@ def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
             existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
             credential_input_kind="none",
         ),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+        workflow_yaml=_workflow_yaml(url=url),
     )
 
     assert not verdict.allowed
@@ -1644,6 +1613,79 @@ def test_output_policy_credential_block_asks_for_credential_confirmation(
     assert "I could not safely return" not in result.user_response
 
 
+def test_output_policy_block_turn_outcome_persists_and_logs_every_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", log)
+    reasons = [
+        OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
+        OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
+    ]
+
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        OutputPolicyVerdict(reason_codes=reasons),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.output_policy_reasons == reasons
+    log.warning.assert_any_call(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{"copilot.output_policy_reasons": [reason.value for reason in reasons]},
+    )
+
+
+def test_unblocked_turn_outcome_has_empty_output_policy_reasons() -> None:
+    outcome = TurnOutcome(response_kind=ResponseKind.ANSWER)
+
+    assert outcome.output_policy_reasons == []
+    assert outcome.model_dump(mode="json")["output_policy_reasons"] == []
+
+
+def test_turn_outcome_drops_unknown_historical_output_policy_reasons() -> None:
+    outcome = TurnOutcome.model_validate(
+        {
+            "response_kind": "clarify",
+            "reason_code": "output_policy_block",
+            "terminal_reason": "output_policy_block",
+            "output_policy_reasons": [
+                "internal_tool_instruction_leak",
+                OutputPolicyReason.RAW_SECRET_LEAK.value,
+            ],
+        }
+    )
+
+    assert outcome.response_kind is ResponseKind.CLARIFY
+    assert outcome.terminal_reason == "output_policy_block"
+    assert outcome.output_policy_reasons == [OutputPolicyReason.RAW_SECRET_LEAK]
+
+
+def test_output_policy_fallback_replacement_keeps_turn_outcome_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "challenge"
+    reasons = [OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_output_policy",
+        lambda **_kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK]),
+    )
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(reason_codes=reasons),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.output_policy_reasons == reasons
+    assert result.turn_outcome.model_dump(mode="json")["output_policy_reasons"] == [reason.value for reason in reasons]
+
+
 def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
     ctx = _ctx()
     ctx.last_workflow = SimpleNamespace(name="draft")
@@ -1657,7 +1699,7 @@ def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None
     result = agent_module._build_output_policy_blocked_result(
         ctx,
         OutputPolicyVerdict(
-            reason_codes=[OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK],
+            reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH],
         ),
         prior_global_llm_context="{}",
         prior_workflow_yaml="title: Prior",
@@ -1954,13 +1996,13 @@ workflow_definition:
     assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
 
 
-def test_inline_replace_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
+def test_inline_replace_output_policy_turn_outcome_keeps_raw_reasons_before_processing(monkeypatch) -> None:
     process_mock = MagicMock()
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
     result = _fake_run_result(
         {
             "type": "REPLACE_WORKFLOW",
-            "user_response": "Here is the workflow.",
+            "user_response": "Here is the workflow. Saw [copilot:nudge] in the trace.",
             "workflow_yaml": """
 workflow_definition:
   blocks:
@@ -1985,6 +2027,11 @@ workflow_definition:
     assert agent_result.updated_workflow is None
     assert agent_result.clear_proposed_workflow is False
     assert agent_result.proposal_disposition == "no_proposal"
+    assert agent_result.turn_outcome is not None
+    assert agent_result.turn_outcome.output_policy_reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
     process_mock.assert_not_called()
 
 
@@ -2009,7 +2056,7 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
 
 
-def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:
+def test_translate_preserves_draft_on_late_block_running_blocker() -> None:
     ctx = _ctx()
     saved_workflow = object()
     ctx.last_workflow = saved_workflow
@@ -2047,38 +2094,23 @@ def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:
     assert agent_result.updated_workflow is saved_workflow
     assert agent_result.clear_proposed_workflow is False
     assert agent_result.proposal_disposition == "review_untested"
-    assert "Do NOT retry" not in agent_result.user_response
-    assert "workflow draft is still saved" in agent_result.user_response
 
 
-def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
-    result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
+def test_output_policy_allows_informational_prose_about_a_completed_workflow() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "The workflow runs as generated code. This explanation does not mean the workflow is complete. "
+            "Earlier I said the workflow is ready; that was before the test failed."
+        ),
+        has_workflow_proposal=False,
+        workflow_attempted=False,
     )
 
-    assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-    assert "provide the missing details" not in agent_result.user_response
-    assert "couldn't identify which details were missing" in agent_result.user_response
-    assert agent_result.response_type == "ASK_QUESTION"
-    assert agent_result.updated_workflow is None
-    assert agent_result.output_policy_diagnostics == {
-        "raw_output_kind": "informational_answer",
-        "final_output_kind": "clarification_request",
-        "raw_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
-        "hard_block_reason_codes": [],
-        "soft_rewrite_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
-        "raw_would_have_failed": True,
-        "contained_failure": True,
-        "final_output_policy_allowed": True,
-    }
+    assert verdict.allowed
+    assert verdict.reason_codes == []
+    assert verdict.output_kind == CopilotOutputKind.INFORMATIONAL_ANSWER
 
 
 def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
@@ -2157,27 +2189,6 @@ def test_translate_to_agent_result_rewrites_internal_classifier_vocab_leak() -> 
     assert diagnostics["contained_failure"] is True
 
 
-def test_translate_to_agent_result_hard_blocks_extended_taxonomy_tool_name_leak() -> None:
-    leak = "Trace shows `get_run_results` was the last tool dispatched on this turn."
-    result = _fake_run_result({"type": "REPLY", "user_response": leak})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert "get_run_results" not in agent_result.user_response
-    assert "I could not safely return" in agent_result.user_response
-    diagnostics = agent_result.output_policy_diagnostics or {}
-    assert "internal_tool_instruction_leak" in diagnostics["hard_block_reason_codes"]
-    assert "internal_block_taxonomy_leak" not in diagnostics["raw_reason_codes"]
-
-
 def test_translate_to_agent_result_rewrites_self_prescriptive_phrase_leak() -> None:
     leak = "Please send 'continue debugging' next and I'll keep going."
     result = _fake_run_result({"type": "REPLY", "user_response": leak})
@@ -2199,13 +2210,32 @@ def test_translate_to_agent_result_rewrites_self_prescriptive_phrase_leak() -> N
     assert "self_prescriptive_phrase_leak" in diagnostics["raw_reason_codes"]
 
 
-def test_translate_to_agent_result_unbacked_workflow_wins_over_self_prescriptive_rewrite() -> None:
-    leak = "Here's the workflow. Send me a normal instruction like 'run it' next."
-    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> None:
+    leak = f"Use the key {_FAKE_OPENAI_KEY} to authenticate. Saw [copilot:nudge] in the trace."
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        _ctx(),
+        {"type": "REPLY", "user_response": leak},
+    )
+
+    assert not verdict.allowed
+    assert "raw_secret_leak" in diagnostics["hard_block_reason_codes"]
+    assert "internal_block_taxonomy_leak" not in diagnostics["hard_block_reason_codes"]
+    assert diagnostics["soft_rewrite_reason_codes"] == []
+    raw_reason_codes = diagnostics["raw_reason_codes"]
+    assert "raw_secret_leak" in raw_reason_codes
+    assert "internal_block_taxonomy_leak" in raw_reason_codes
+
+
+def test_translate_output_policy_block_turn_outcome_keeps_raw_soft_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", log)
+    leak = f"Use the key {_FAKE_OPENAI_KEY} to authenticate. Saw [copilot:nudge] in the trace."
 
     agent_result = asyncio.run(
         agent_module._translate_to_agent_result(
-            result,
+            _fake_run_result({"type": "REPLY", "user_response": leak}),
             _ctx(),
             global_llm_context=None,
             chat_request=_chat_request(),
@@ -2213,28 +2243,40 @@ def test_translate_to_agent_result_unbacked_workflow_wins_over_self_prescriptive
         )
     )
 
-    assert "run it" not in agent_result.user_response
-    assert "Send me a normal instruction" not in agent_result.user_response
-    diagnostics = agent_result.output_policy_diagnostics or {}
-    soft_reasons = diagnostics["soft_rewrite_reason_codes"]
-    assert "unbacked_workflow_delivery_claim" in soft_reasons
-    assert "self_prescriptive_phrase_leak" in soft_reasons
-
-
-def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> None:
-    leak = "Call get_run_results(workflow_run_id='wr_123') and do not retry. Saw [copilot:nudge] in the trace."
-    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        _ctx(),
-        {"type": "REPLY", "user_response": leak},
+    assert agent_result.turn_outcome is not None
+    assert agent_result.turn_outcome.output_policy_reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
+    log.warning.assert_any_call(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{
+            "copilot.output_policy_reasons": [
+                OutputPolicyReason.RAW_SECRET_LEAK.value,
+                OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK.value,
+            ]
+        },
     )
 
-    assert not verdict.allowed
-    assert "internal_tool_instruction_leak" in diagnostics["hard_block_reason_codes"]
-    assert "internal_block_taxonomy_leak" not in diagnostics["hard_block_reason_codes"]
-    assert diagnostics["soft_rewrite_reason_codes"] == []
-    raw_reason_codes = diagnostics["raw_reason_codes"]
-    assert "internal_tool_instruction_leak" in raw_reason_codes
-    assert "internal_block_taxonomy_leak" in raw_reason_codes
+
+def test_output_policy_guardrail_turn_outcome_recovers_every_raw_reason() -> None:
+    output_info = {
+        "allowed": False,
+        "reason_codes": [OutputPolicyReason.RAW_SECRET_LEAK.value],
+        "raw_reason_codes": [
+            OutputPolicyReason.RAW_SECRET_LEAK.value,
+            OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK.value,
+        ],
+    }
+    exc = SimpleNamespace(guardrail_result=SimpleNamespace(output=SimpleNamespace(output_info=output_info)))
+
+    reasons = agent_module._output_policy_reason_codes_from_guardrail_exception(exc)
+
+    assert reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
 
 
 def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:
@@ -2256,7 +2298,6 @@ def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:
 def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None:
     classifier_leak = "RequestPolicy blocked this turn, safe_reason_code=request_policy_clarification."
     self_prescriptive_leak = "Please send 'continue debugging' next and I'll keep going."
-    tool_name_leak = "Use `get_run_results` to fetch the prior run output."
 
     classifier_verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -2271,13 +2312,6 @@ def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None
         user_response=self_prescriptive_leak,
     )
     assert OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK in self_prescriptive_verdict.reason_codes
-
-    tool_name_verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLACE_WORKFLOW",
-        user_response=tool_name_leak,
-    )
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in tool_name_verdict.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -2333,31 +2367,6 @@ def test_yaml_block_scalar_standard_term_does_not_hard_block_ask_question() -> N
         user_response="Should this multi-line value use a literal block scalar or folded style?",
     )
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
-
-
-def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:
-    result = _fake_run_result(
-        {
-            "type": "REPLY",
-            "user_response": "I've drafted a workflow for you using `task_v2`.",
-        }
-    )
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-    assert "task_v2" not in agent_result.user_response
-    assert agent_result.output_policy_diagnostics is not None
-    assert "unbacked_workflow_delivery_claim" in agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"]
-    assert agent_result.updated_workflow is None
 
 
 def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None:
@@ -2783,10 +2792,7 @@ _AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
     "raw_secret_leak": _FINDING,
     "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
     "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
-    "unbacked_workflow_delivery_claim": _FINDING,
-    "missing_proposal_state": _FINDING,
     "persistence_state_mismatch": _FINDING,
-    "internal_tool_instruction_leak": _FINDING,
     "output_policy_context_missing": _FINDING,
     "internal_block_taxonomy_leak": _FINDING,
     "internal_classifier_vocab_leak": _FINDING,

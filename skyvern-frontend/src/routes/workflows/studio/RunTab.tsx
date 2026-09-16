@@ -1,7 +1,6 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-
-import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
 import { RunView } from "./runview/RunView";
@@ -20,9 +19,9 @@ export function RunTab() {
   const workflowPermanentId = useWorkflowPermanentId();
   const { openPane } = useStudioPanes();
   const { runId, pending } = useStudioInspectedRun();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: runId,
+  });
   // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
@@ -32,8 +31,7 @@ export function RunTab() {
   const retryPath = `/agents/${workflowPermanentId}/run`;
   const retryState =
     workflowRun &&
-    workflowRun.workflow_run_id === runId &&
-    statusIsFinalized(workflowRun) &&
+    runIsLogicallyFinal(workflowRun) &&
     workflowRun.task_v2 === null
       ? getRerunNavigationState(workflowRun)
       : undefined;
@@ -50,15 +48,19 @@ export function RunTab() {
       workflowRunId={runId}
       runIdPending={pending}
       onFix={
-        workflowDeleted
+        workflowDeleted || !runId
           ? undefined
-          : (seedMessage, failingLabel) => {
-              // One replace-navigation opens the Copilot pane and seeds the message
-              // via location.state (Workspace reads it as the copilot's
-              // initialMessage), so the pane write can't race a separate
-              // state-only navigation.
+          : (failingLabel) => {
+              // One replace-navigation opens the pane and arms the action via
+              // location.state, so the pane write can't race a state-only navigation.
               openPane("copilot", {
-                state: { copilotMessage: seedMessage },
+                state: {
+                  copilotAction: {
+                    kind: "diagnose_run",
+                    workflowRunId: runId,
+                    nonce: crypto.randomUUID(),
+                  },
+                },
                 selectedBlockLabel: failingLabel ?? null,
               });
             }

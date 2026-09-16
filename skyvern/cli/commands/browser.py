@@ -53,6 +53,7 @@ from skyvern.cli.core.browser_ops import (
     do_screenshot,
     do_state_load,
     do_state_save,
+    selector_targets_password,
 )
 from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.guards import (
@@ -66,14 +67,24 @@ from skyvern.cli.core.guards import (
     validate_button,
     validate_wait_until,
 )
+from skyvern.cli.core.js_dispatch import (
+    cancellation_pending,
+    deadline_ended_the_call,
+    record_unreported_timeout,
+    unwrap_caller_js_error,
+    without_navigation_recovery,
+)
 from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install_ngrok, offer_setup_auth
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.core.telemetry import capture_cli_tool_call
 from skyvern.cli.lazy import SkyvernTyperGroup
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.utils.env_paths import EnvIntent
+from skyvern.webeye.utils.page import SkyvernFrame
 
 browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
@@ -207,9 +218,8 @@ def _handle_tool_error(e: Exception, *, tool: str, hint: str, json_output: bool)
     """Common error handler for CLI commands: emit telemetry + output error."""
     capture_cli_tool_call(tool, ok=False, error=e)
     if isinstance(e, GuardError):
-        output_error(str(e), hint=e.hint, json_mode=json_output)
-    else:
-        output_error(str(e), hint=hint, json_mode=json_output)
+        hint = e.hint
+    output_error(str(e), hint=hint, json_mode=json_output, exc=e)
 
 
 def _clipboard_command() -> list[str] | None:
@@ -336,12 +346,15 @@ def _launch_extension_pairing(port: int) -> None:
     console.print("Approve the pairing in your browser.")
 
 
-async def _broker_client(port: int, *, auto_spawn: bool = True, operator: bool = False) -> BrokerClient:
+async def _broker_client(
+    port: int, *, auto_spawn: bool = True, operator: bool = False, connect: bool = True
+) -> BrokerClient:
     async def _ignore_event(_event: str, _params: dict) -> None:
         return None
 
     client = BrokerClient(port, _ignore_event, auto_spawn=auto_spawn, operator=operator)
-    await client.start()
+    if connect:
+        await client.start()
     return client
 
 
@@ -362,6 +375,15 @@ def _broker_status_output(port: int) -> None:
     console.print(f"broker ready on {port}")
     console.print(f"extension connected: {'yes' if status.get('extensionConnected') else 'no'}")
     console.print(f"authenticated clients: {status.get('clientCount', 0)}")
+    extension_build = status.get("extensionBuild", "unknown")
+    local_hash = status.get("extensionBuildHash")
+    remote_hash = BrowserExtensionRuntime.describe_reported_build_hash(status)
+    if extension_build == "stale":
+        console.print(f"extension_build: stale ({remote_hash} vs {local_hash})")
+    elif extension_build == "current":
+        console.print(f"extension_build: current ({local_hash})")
+    else:
+        console.print("extension_build: unknown (extension has not reported a build hash)")
 
 
 def _begin_broker_pairing(port: int, *, cancel_pending: bool) -> None:
@@ -530,7 +552,7 @@ def extension_broker_stop() -> None:
     port = BrowserExtensionRuntime.configured_port()
 
     async def _run() -> None:
-        client = await _broker_client(port, auto_spawn=False, operator=True)
+        client = await _broker_client(port, auto_spawn=False, operator=True, connect=False)
         try:
             await client.stop_broker()
         finally:
@@ -937,7 +959,7 @@ def network_requests_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_network_requests", ok=False, error=e)
-        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output, exc=e)
 
 
 @network_app.command("detail")
@@ -971,7 +993,7 @@ def network_detail_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_network_request_detail", ok=False, error=e)
-        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output, exc=e)
 
 
 @network_app.command("route")
@@ -1017,7 +1039,7 @@ def network_route_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_network_route", ok=False, error=e)
-        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output, exc=e)
 
 
 @network_app.command("unroute")
@@ -1051,7 +1073,7 @@ def network_unroute_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_network_unroute", ok=False, error=e)
-        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output, exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1094,7 @@ def navigate(
     try:
         validate_wait_until(wait_until)
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1163,7 +1185,7 @@ def evaluate(
     try:
         check_js_password(expression)
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1171,7 +1193,27 @@ def evaluate(
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
         await _apply_cli_frame_state(page)
-        result = await page.evaluate(expression)
+        # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+        _ = page.locator_scope
+        deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+        try:
+            result = await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                # Logged verbatim on timeout, and a caller's expression can carry data no log
+                # processor knows to redact; the evaluation itself runs the real expression below.
+                expression="skyvern browser evaluate caller expression",
+                evaluate_expression=without_navigation_recovery(lambda: page.evaluate(expression)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+        except Exception as exc:
+            if cancellation_pending():
+                raise asyncio.CancelledError from exc
+            original = unwrap_caller_js_error(exc)
+            if isinstance(original, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(original, deadline):
+                raise
+            record_unreported_timeout(original)
+            raise SkyvernPageAnalysisTimeout(str(original)) from original
         return {"result": result}
 
     try:
@@ -1180,9 +1222,23 @@ def evaluate(
         output(data, action="evaluate", json_mode=json_output)
     except typer.BadParameter:
         raise
+    except SkyvernPageAnalysisTimeout as e:
+        _handle_tool_error(
+            e,
+            tool="skyvern_evaluate",
+            hint=(
+                "The expression never settled within the browser action deadline, so whether it already "
+                "took effect is unknown — read the page before retrying, since a re-run would repeat "
+                "anything it did."
+            ),
+            json_output=json_output,
+        )
     except Exception as e:
         _handle_tool_error(
-            e, tool="skyvern_evaluate", hint="Check JavaScript syntax and page state.", json_output=json_output
+            unwrap_caller_js_error(e),
+            tool="skyvern_evaluate",
+            hint="Check JavaScript syntax and page state.",
+            json_output=json_output,
         )
 
 
@@ -1202,7 +1258,7 @@ def click(
         validate_button(button)
         ai_mode = _resolve_ai_target(selector, intent, operation="click")
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1256,7 +1312,7 @@ def hover(
     try:
         ai_mode = _resolve_ai_target(selector, intent, operation="hover")
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1307,7 +1363,7 @@ def type_text(
             )
         ai_mode = _resolve_ai_target(selector, intent, operation="type")
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1317,14 +1373,12 @@ def type_text(
         await _apply_cli_frame_state(page)
 
         if selector:
-            try:
-                is_password = await page.evaluate(
-                    "(s) => { const el = document.querySelector(s); return !!(el && el.type === 'password'); }",
-                    selector,
-                )
-            except Exception:
-                is_password = False
-            if is_password:
+            probe_scopes: list[Any] = [page.locator_scope]
+            if ai_mode is not None and page.page is not probe_scopes[0]:
+                # AI-assisted writes resolve the selector against the top document, so a probe
+                # confined to the selected frame would miss the input they land in.
+                probe_scopes.append(page.page)
+            if await selector_targets_password(probe_scopes, selector, timeout=timeout):
                 raise GuardError(
                     "Cannot type into password fields — credentials must not be passed through tool calls",
                     CREDENTIAL_HINT,
@@ -1377,7 +1431,7 @@ def scroll(
         if not intent and direction not in valid_directions:
             raise GuardError(f"Invalid direction: {direction}", "Use up, down, left, or right")
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1399,6 +1453,8 @@ def scroll(
         if selector:
             await page.locator(selector).evaluate(f"el => el.scrollBy({dx}, {dy})")
         else:
+            # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+            _ = page.locator_scope
             await page.evaluate(f"window.scrollBy({dx}, {dy})")
 
         return {"direction": direction, "pixels": pixels, "selector": selector}
@@ -1430,7 +1486,7 @@ def select(
     try:
         ai_mode = _resolve_ai_target(selector, intent, operation="select")
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1444,6 +1500,8 @@ def select(
         else:
             assert selector is not None
             if by_label:
+                # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                _ = page.locator_scope
                 await page.page.locator(selector).select_option(label=value, timeout=timeout)
             else:
                 await page.select_option(selector, value=value, timeout=timeout)
@@ -1485,7 +1543,7 @@ def press_key(
                     "Use intent='describe where to press' or selector='#css-selector'",
                 )
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1502,6 +1560,8 @@ def press_key(
                 locator = page.locator(selector)
             await locator.press(key)
         else:
+            # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+            _ = page.locator_scope
             await page.keyboard.press(key)
 
         return {"key": key, "selector": selector, "intent": intent}
@@ -1539,7 +1599,7 @@ def wait(
                 "Use --time, --selector, or --intent to specify what to wait for",
             )
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1569,7 +1629,7 @@ def wait(
                     break
                 if loop.time() >= deadline:
                     if last_error:
-                        raise RuntimeError(str(last_error))
+                        raise RuntimeError(str(last_error)) from last_error
                     raise TimeoutError(f"Condition not met within {timeout}ms: {intent}")
                 await page.wait_for_timeout(poll_interval)
         else:
@@ -1602,7 +1662,7 @@ def act(
     try:
         check_password_prompt(prompt)
     except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
+        output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         return
 
     async def _run() -> dict:
@@ -1726,7 +1786,9 @@ def run_task(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_run_task", ok=False, error=e)
-        output_error(str(e), hint="Check the prompt, active connection, and timeout settings.", json_mode=json_output)
+        output_error(
+            str(e), hint="Check the prompt, active connection, and timeout settings.", json_mode=json_output, exc=e
+        )
 
 
 @browser_app.command("login")
@@ -1799,7 +1861,10 @@ def login(
     except Exception as e:
         capture_cli_tool_call("skyvern_login", ok=False, error=e)
         output_error(
-            str(e), hint="Check credential inputs, active connection, and timeout settings.", json_mode=json_output
+            str(e),
+            hint="Check credential inputs, active connection, and timeout settings.",
+            json_mode=json_output,
+            exc=e,
         )
 
 
@@ -1938,7 +2003,7 @@ def serve(
             else:
                 clone_local_chrome_profile(chrome_profile_name, Path(resolved_profile_dir), full=full_profile_copy)
         except (FileNotFoundError, ValueError, PermissionError) as e:
-            output_error(str(e), json_mode=json_output)
+            output_error(str(e), json_mode=json_output, exc=e)
             raise SystemExit(1)
         if not json_output:
             copy_mode = "full" if full_profile_copy else "selective"
@@ -2057,6 +2122,7 @@ def serve(
             str(e),
             hint="Install Chrome or specify the path with --chrome-path.",
             json_mode=json_output,
+            exc=e,
         )
         raise SystemExit(1)
     except TimeoutError as e:
@@ -2064,12 +2130,13 @@ def serve(
             str(e),
             hint="Chrome may have failed to start. Check if the port is available.",
             json_mode=json_output,
+            exc=e,
         )
         raise SystemExit(1)
     except KeyboardInterrupt:
         pass  # Normal shutdown via Ctrl+C
     except Exception as e:
-        output_error(str(e), hint="Failed to launch Chrome or unified server.", json_mode=json_output)
+        output_error(str(e), hint="Failed to launch Chrome or unified server.", json_mode=json_output, exc=e)
         raise SystemExit(1)
     finally:
         # Restore signal handlers
@@ -2296,11 +2363,11 @@ def frame_switch(
     except Exception as e:
         capture_cli_tool_call("skyvern_frame_switch", ok=False, error=e)
         if isinstance(e, GuardError):
-            output_error(str(e), hint=e.hint, json_mode=json_output)
+            output_error(str(e), hint=e.hint, json_mode=json_output, exc=e)
         elif isinstance(e, ValueError):
-            output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output)
+            output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output, exc=e)
         else:
-            output_error(str(e), json_mode=json_output)
+            output_error(str(e), json_mode=json_output, exc=e)
 
 
 @frame_app.command("main")
@@ -2579,7 +2646,7 @@ def get_errors_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_get_errors", ok=False, error=e)
-        output_error(str(e), json_mode=json_output)
+        output_error(str(e), json_mode=json_output, exc=e)
 
 
 # ── HAR recording commands ───────────────────────────────────────────
@@ -2608,7 +2675,7 @@ def har_start_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_har_start", ok=False, error=e)
-        output_error(str(e), json_mode=json_output)
+        output_error(str(e), json_mode=json_output, exc=e)
 
 
 @browser_app.command("har-stop")
@@ -2634,7 +2701,7 @@ def har_stop_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_har_stop", ok=False, error=e)
-        output_error(str(e), json_mode=json_output)
+        output_error(str(e), json_mode=json_output, exc=e)
 
 
 # ── DOM Inspection commands ──────────────────────────────────────────
@@ -2784,7 +2851,7 @@ def clipboard_read_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_clipboard_read", ok=False, error=e)
-        output_error(str(e), json_mode=json_output)
+        output_error(str(e), json_mode=json_output, exc=e)
 
 
 @browser_app.command("clipboard-write")
@@ -2812,7 +2879,7 @@ def clipboard_write_cmd(
         raise
     except Exception as e:
         capture_cli_tool_call("skyvern_clipboard_write", ok=False, error=e)
-        output_error(str(e), json_mode=json_output)
+        output_error(str(e), json_mode=json_output, exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -2931,4 +2998,4 @@ def qa(
         console.print()
 
     except Exception as e:
-        output_error(str(e), hint="Check your API key, prompt, and network connection.", json_mode=json_output)
+        output_error(str(e), hint="Check your API key, prompt, and network connection.", json_mode=json_output, exc=e)

@@ -39,6 +39,15 @@ class BrowserHealth:
         self.consecutive_timeouts += 1
         self.stuck_operations.add(operation)
 
+    def record_recovery(self, operation: BrowserOperation) -> None:
+        """A second route answered the operation that just timed out, so that strike was a tight
+        deadline rather than a dead browser; strikes held by other operations stand. A failure that
+        never earned a strike (a non-timeout error) has nothing to give back."""
+        if operation not in self.stuck_operations:
+            return
+        self.consecutive_timeouts = max(0, self.consecutive_timeouts - 1)
+        self.stuck_operations.discard(operation)
+
     @property
     def is_degraded(self) -> bool:
         strikes = settings.BROWSER_DEGRADED_TIMEOUT_STRIKES

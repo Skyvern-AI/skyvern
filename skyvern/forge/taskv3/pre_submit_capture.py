@@ -16,6 +16,8 @@ from typing import Any, Protocol
 
 import structlog
 
+from skyvern.webeye.utils.page import mask_otp_values_in_html
+
 LOG = structlog.get_logger(__name__)
 
 DEFAULT_RING_SIZE = 8
@@ -196,7 +198,7 @@ class PreSubmitCaptureRing:
                 # Oversized: the DOM never crossed the browser boundary, only its size did.
                 skipped = int(serialized.get("bytes") or 0)
             else:
-                html = str(serialized["html"]).encode("utf-8")
+                html = mask_otp_values_in_html(str(serialized["html"])).encode("utf-8")
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:500]
             LOG.warning("taskv3 pre-submit DOM capture failed", tool=tool_name, exc_info=True)

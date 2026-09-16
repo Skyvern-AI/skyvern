@@ -20,6 +20,7 @@ import {
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { AgentFilterDropdown } from "@/components/AgentFilterDropdown";
 import {
@@ -153,8 +154,6 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
 function getRunNavigationPath(run: TaskRunListItem): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
-      // /runs/{wr} renders the studio run view when the preview is on and the
-      // legacy run page when it is off, so one short path serves both.
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
@@ -490,7 +489,7 @@ function RunHistory() {
             </div>
           </TableCell>
           <TableCell>
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               {isKnownStatus(run.status) ? (
                 <StatusBadge status={run.status} />
               ) : (
@@ -498,6 +497,11 @@ function RunHistory() {
                   {run.status}
                 </span>
               )}
+              <WorkflowRunAttemptChip
+                attempt={run.attempt}
+                retryPending={run.retry_pending}
+                nextAttemptAt={run.next_attempt_at}
+              />
               <RunOutcomeRiskMarker
                 outcomeRisk={
                   (runHealMap[run.run_id]?.blocks_outcome_risk?.length ?? 0) > 0

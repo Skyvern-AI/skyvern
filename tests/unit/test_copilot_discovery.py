@@ -21,13 +21,18 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
-from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
+from skyvern.forge.sdk.copilot.runtime import (
+    PendingBrowserInteractionObservation,
+    bound_call_browser_session,
+    current_call_browser_session_override,
+)
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,
     _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
 )
+from skyvern.forge.sdk.copilot.tools import _shared as shared_module
 from skyvern.forge.sdk.copilot.tools.discovery import (
     _credential_entry_url,
     _discovery_build_result,
@@ -35,6 +40,8 @@ from skyvern.forge.sdk.copilot.tools.discovery import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
+from skyvern.schemas.runs import ProxyLocation
 
 _VALID_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
@@ -55,6 +62,9 @@ class _Ctx:
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.browser_session_id = None
         self.last_run_blocks_browser_session_id = None
+        self.organization_id = "o_test"
+        self.effective_workflow_proxy_location = None
+        self.last_workflow = None
         self.request_policy = None
         self.org_credentials_for_turn = None
         self.supports_vision = True
@@ -324,6 +334,32 @@ class _CurrentPageServer:
         if tool_name == "skyvern_evaluate":
             assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
             return {"ok": True, "data": {"result": _structured_search_page()}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _ProxyRejectedNavigationServer:
+    """A dead proxy hop: skyvern_navigate fails, and the capture that follows reads Chrome's own
+    error page rather than the target."""
+
+    def __init__(self, navigation_error: str, driver_code: str | None = None) -> None:
+        self.calls: list[str] = []
+        self.navigation_error = navigation_error
+        self.driver_code = driver_code
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            # The shape mcp_to_copilot produces: the driver's code survives the flattening as a
+            # value beside the sentence, which is the only thing attribution reads.
+            failure: dict[str, Any] = {"ok": False, "error": self.navigation_error}
+            if self.driver_code:
+                failure["nav_error_code"] = self.driver_code
+            return failure
+        if tool_name == "skyvern_evaluate":
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": "<html><body></body></html>"}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -807,6 +843,7 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
         *,
         evidence: dict[str, Any],
         screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
     ) -> tuple[dict[str, Any], None]:
         assert screenshot_b64 == _VALID_PNG_B64
         assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
@@ -870,7 +907,8 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
 
     async def fake_page_info(_ctx: object, session_id: str | None = None) -> tuple[str, str]:
-        assert session_id == "pbs_run"
+        assert session_id is None
+        assert current_call_browser_session_override() == "pbs_run"
         return "https://www.example.com/search", "Search"
 
     async def fake_visual_summary(
@@ -878,6 +916,7 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
         *,
         evidence: dict[str, Any],
         screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
     ) -> tuple[dict[str, Any], None]:
         assert screenshot_b64 == _VALID_PNG_B64
         return {
@@ -900,7 +939,8 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_page_info)
     monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
 
-    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+    with bound_call_browser_session("pbs_run"):
+        result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["data"]["source_browser_session_id"] == "pbs_run"
     assert result["data"]["workflow_run_id"] == "wr_123"
@@ -1089,6 +1129,23 @@ class TestUserProvidedEntryUrl:
         _ground_user_provided_sites(policy, user_message, [])
         return SimpleNamespace(request_policy=policy)
 
+    def test_a_url_only_the_product_wrote_never_grounds_a_site(self) -> None:
+        """Grounding releases credentials, so it stays USER-only; widening it to every turn opener
+        would let a server-authored row authorize an origin the person never typed."""
+        policy = RequestPolicy()
+        _ground_user_provided_sites(
+            policy,
+            "fix it",
+            [
+                SimpleNamespace(
+                    sender=WorkflowCopilotChatSender.PRODUCT,
+                    content="Diagnose run wr_1 at https://impostor.example.com and repair the workflow.",
+                )
+            ],
+        )
+
+        assert _user_provided_entry_url(SimpleNamespace(request_policy=policy)) is None
+
     def test_the_only_site_the_user_gave_is_opened(self) -> None:
         ctx = self._ctx("go to https://us.example.com/reports and pull the numbers")
 
@@ -1154,3 +1211,49 @@ class TestCredentialEntryUrl:
 
     def test_credentials_without_a_login_page_resolve_nothing(self) -> None:
         assert _credential_entry_url(self._ctx(None), "example") is None
+
+
+_TUNNEL_NAVIGATION_ERROR = (
+    "Failed to navigate to url https://www.example.com/search. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
+_DNS_NAVIGATION_ERROR = (
+    "Failed to navigate to url https://www.example.invalid/. Error message: net::ERR_NAME_NOT_RESOLVED"
+)
+
+
+def _proxy_scout_ctx(monkeypatch: pytest.MonkeyPatch, navigation_error: str, driver_code: str | None) -> _Ctx:
+    """``navigation_error`` is the sentence the tool returned; ``driver_code`` is what the browser
+    reported for that call. Only the second one decides who owns the failure."""
+    ctx = _Ctx(_ProxyRejectedNavigationServer(navigation_error, driver_code))
+    ctx.browser_session_id = "pbs_scout"
+    browser_state = SimpleNamespace(built_with_proxy_location=ProxyLocation.RESIDENTIAL_ES)
+    monkeypatch.setattr(shared_module, "resolve_browser_state_for_context", AsyncMock(return_value=browser_state))
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_proxy_rejected_inspection_names_the_proxy_hop_in_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _proxy_scout_ctx(monkeypatch, _TUNNEL_NAVIGATION_ERROR, "net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/search")
+
+    warnings = result["data"]["inspection_warnings"]
+    assert any(
+        "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in warning
+        and "net::ERR_TUNNEL_CONNECTION_FAILED" in warning
+        for warning in warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_owned_navigation_failure_leaves_the_packet_unattributed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _proxy_scout_ctx(monkeypatch, _DNS_NAVIGATION_ERROR, "net::ERR_NAME_NOT_RESOLVED")
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.invalid/")
+
+    warnings = result["data"]["inspection_warnings"]
+    assert not any("Skyvern proxy hop failed" in warning for warning in warnings)

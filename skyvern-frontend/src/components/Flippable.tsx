@@ -18,6 +18,12 @@ interface FlippableProps {
   preserveFrontsideHeight?: boolean;
 }
 
+// The hidden face is only turned away (backfaceVisibility), so its buttons
+// would stay in the tab order and the accessibility tree without inert.
+// React 18 renders inert only as a string, not a boolean.
+const inertWhen = (inactive: boolean): Record<string, string> =>
+  inactive ? { inert: "" } : {};
+
 export function Flippable({
   facing = "front",
   children,
@@ -73,6 +79,7 @@ export function Flippable({
       >
         <div
           ref={frontRef}
+          {...inertWhen(facing !== "front")}
           style={{
             backfaceVisibility: "hidden",
             WebkitBackfaceVisibility: "hidden",
@@ -84,6 +91,7 @@ export function Flippable({
         </div>
         <div
           ref={backRef}
+          {...inertWhen(facing !== "back")}
           className="absolute inset-0 flex items-start justify-start"
           style={{
             backfaceVisibility: "hidden",
