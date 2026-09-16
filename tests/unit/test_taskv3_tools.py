@@ -24517,3 +24517,87 @@ def test_an_out_of_range_port_does_not_escape_the_origin_helper() -> None:
 
     assert _url_origin("https://site.test:99999/a") == "unparseable"
     assert _url_origin("https://site.test:8443/a") == "https://site.test:8443"
+
+
+@pytest.mark.asyncio
+async def test_the_counter_and_the_directory_do_not_each_arm_the_same_download(tmp_path: Path) -> None:
+    # The two sources observe ONE download at different moments: the interceptor counts it on one
+    # scan, its filename appears in the listing on a later one. Unioned, that is two arming events for
+    # one download, and the second has no tab-opening behind it -- the same defect the rename
+    # normalisation removed, which identity cannot dedupe because the counter carries none. The
+    # directory is therefore a fallback used only when no counter is available.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    pages.append(opener)
+
+    attempts = [3]
+    provider = _newest_open(pages)
+
+    async def _restore(page: Any, url: str) -> None:
+        return None
+
+    guard = BlankWorkingPageGuard(
+        provider, _restore, downloads_dir=str(tmp_path), download_attempts=lambda: attempts[0]
+    )
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "get_html").handler({})  # baseline
+    attempts[0] += 1  # the interceptor counts the download
+    await _tool(tools, "click").handler({"selector": "#dl"})  # arms once, opens the tab
+    await _tool(tools, "get_html").handler({})
+    assert popup.is_closed()
+
+    # The same download's file now appears in the listing. It must not arm a second time.
+    (tmp_path / "statement.pdf").write_bytes(b"x" * 500)
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    pages.append(later_tab)
+    await guard.ensure_live()
+
+    assert not later_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_does_not_arm_on_everything_when_the_counter_goes_away(tmp_path: Path) -> None:
+    # The HANDOVER, which neither source alone exercises. The interceptor is attached per browser
+    # context, so a reconnect drops it and the counter starts returning None mid-run. If the listing
+    # had been skipped while the counter was authoritative, its baseline would be stale and the first
+    # scan after the handover would see the whole run's directory as new and arm a close window.
+    pages: list[Any] = []
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, later_tab)
+    pages.append(opener)
+
+    attempts: list[int | None] = [5]
+    provider = _newest_open(pages)
+
+    async def _restore(page: Any, url: str) -> None:
+        return None
+
+    guard = BlankWorkingPageGuard(
+        provider, _restore, downloads_dir=str(tmp_path), download_attempts=lambda: attempts[0]
+    )
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "get_html").handler({})  # baseline, counter available
+    # Downloads land while the counter is the authority. The listing must still track them.
+    for name in ("statement.pdf", "invoice.pdf", "receipt.pdf"):
+        (tmp_path / name).write_bytes(b"x" * 100)
+    attempts[0] += 1
+    # Let that (legitimate) arming decay fully on a live page, so what follows isolates the handover
+    # rather than tripping the ordinary close window.
+    for _ in range(4):
+        await _tool(tools, "get_html").handler({})
+
+    attempts[0] = None  # reconnect: the interceptor is gone, the listing becomes the authority
+    await _tool(tools, "click").handler({"selector": "#link"})  # opens a blank tab
+    await guard.ensure_live()
+
+    # Nothing new has landed since the handover, so nothing may arm -- and the tab the model opened
+    # must survive.
+    assert not later_tab.is_closed()
