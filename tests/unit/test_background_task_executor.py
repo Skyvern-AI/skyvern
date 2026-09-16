@@ -4405,3 +4405,60 @@ async def test_late_owner_failure_leaves_a_recorded_retry_to_the_next_sweep(
     else:
         scheduled.assert_not_called()
         assert key not in executor._retry_resumes_needing_recovery
+
+
+def test_background_task_set_is_isolated_across_event_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fire-and-forget task scheduled by one WorkflowService under one event loop must never
+    surface in a freshly built WorkflowService bound to a different loop. When it does, draining
+    the later service gathers a future from loop A and raises
+    ``ValueError: The future belongs to a different loop`` — the shard-2 CI failure this repairs.
+    Loop A stays open with its task pending through the ownership assertion; the finally cancels
+    and awaits that task on loop A so nothing is destroyed while pending.
+    """
+    loop_a = asyncio.new_event_loop()
+    loop_b = asyncio.new_event_loop()
+    stale_future = loop_a.create_future()
+
+    async def block_until_released(**_: object) -> None:
+        await stale_future
+
+    async def schedule_pending_task() -> WorkflowService:
+        svc = WorkflowService()
+        monkeypatch.setattr(
+            WorkflowService,
+            "_record_workflow_run_metadata_best_effort",
+            staticmethod(block_until_released),
+        )
+        svc._record_workflow_run_metadata_in_background(
+            workflow_run_id="wr_loop_a",
+            organization_id="org_loop_a",
+            run_metadata={"env": "prod"},
+        )
+        return svc
+
+    svc_a = loop_a.run_until_complete(schedule_pending_task())
+    leaked = set(svc_a._background_tasks)
+
+    try:
+        assert leaked, "expected a pending fire-and-forget task on loop A"
+
+        # Loop A is still open and its task still pending. A freshly built service (as the autouse
+        # fixture builds one per test) must not observe loop A's task; when it does, draining its
+        # own set under loop B gathers loop A's future and raises the cross-loop ValueError from CI.
+        svc_b = WorkflowService()
+        assert set(svc_b._background_tasks).isdisjoint(leaked)
+
+        async def drain() -> None:
+            await asyncio.gather(*svc_b._background_tasks)
+
+        loop_b.run_until_complete(drain())
+    finally:
+
+        async def cancel_leaked() -> None:
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
+
+        loop_a.run_until_complete(cancel_leaked())
+        loop_a.close()
+        loop_b.close()
