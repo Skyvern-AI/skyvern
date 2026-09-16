@@ -58,6 +58,7 @@ from skyvern.forge.taskv3.tools import (
     apply_blank_page_guard,
     build_browser_tools,
 )
+from skyvern.schemas.workflows import BlockType
 
 LOG = structlog.get_logger()
 
@@ -405,6 +406,7 @@ async def run_task_v3_agent_loop(
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
+            refuse_input_entry=block_type == BlockType.EXTRACTION,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire

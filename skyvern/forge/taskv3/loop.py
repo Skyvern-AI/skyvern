@@ -515,6 +515,10 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
+# Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
+# this module; the extraction-block refusal and tools.py's frame-work ledger both read this one set.
+FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
 # A wrap-up turn granted by a guard that a later budget extension raised past its trip; facetable
 # so a released latch is distinguishable from one that never fired.
 FINAL_TURN_RELEASED_EVENT = "taskv3 loop final turn grant released by budget extension"
@@ -2190,6 +2194,9 @@ async def run_agent_tool_loop(
     # step-cap death into a token-cap death. None keeps the guards fixed for the whole run.
     backstops_for_cap: Callable[[int], tuple[int, int, int]] | None = None,
     semantic_commit_stats: SemanticCommitStats | None = None,
+    # Set for an extraction block: it reads, and may click to reveal what it reads, but it does not
+    # author input, so every FILL_TOOLS call is refused at dispatch.
+    refuse_input_entry: bool = False,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -2801,6 +2808,24 @@ async def run_agent_tool_loop(
                         "content": (
                             "skipped: a field in this batch failed before this verdict was reached; "
                             "re-observe, then finish with a status that reflects the failure"
+                        ),
+                    }
+                )
+                continue
+            if refuse_input_entry and tool_name in FILL_TOOLS:
+                LOG.info(EXTRACTION_ENTRY_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                # A refused call did not do what the rest of the batch was planned around, so it marks the
+                # batch failed: a later click, Enter-shaped submit, or finish in the same batch is skipped.
+                batch_had_failure = True
+                st.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "refused: an extraction block does not type, select, or upload input. Extract what the "
+                            "page shows now (clicking to reveal content is allowed), or finish with a status "
+                            "that reflects it"
                         ),
                     }
                 )

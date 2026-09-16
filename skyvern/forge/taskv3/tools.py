@@ -46,6 +46,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
+    FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
     REF_SELECTOR_RE,
@@ -12436,7 +12437,6 @@ def build_browser_tools(
 
     # Which tools leave work a reload would discard, and which leave something that may still be in
     # flight. The loop decides what counts as a submit; this only records WHERE the click landed.
-    _LEDGER_FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
     _LEDGER_SUBMIT_TOOLS = frozenset({"click", "press_key"})
 
     async def _note_frame_work(tool_name: str, realm: Any, selector: Any, result: ToolResult) -> None:
@@ -12447,7 +12447,7 @@ def build_browser_tools(
         """
         if realm is None or not isinstance(selector, str) or not selector:
             return
-        kind = "filled" if tool_name in _LEDGER_FILL_TOOLS else "submitted" if tool_name in _LEDGER_SUBMIT_TOOLS else ""
+        kind = "filled" if tool_name in FILL_TOOLS else "submitted" if tool_name in _LEDGER_SUBMIT_TOOLS else ""
         if not kind:
             return
         # A FILL is recorded whether or not the VERDICT was ok, because mutating the control and
