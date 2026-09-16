@@ -10,6 +10,7 @@ import secrets
 import shutil
 import tempfile
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -78,6 +79,25 @@ _EXPIRED_SESSION_MARKERS = (
 # A vault copy that predates the item looks exactly like an item that does not exist, so both are
 # worth one forced sync before believing the miss.
 _STALE_VAULT_MARKERS = ("not found", "no items found", "no item found")
+
+# The CLI can exit successfully after substituting this poison value for an undecryptable field.
+_DECRYPTION_FAILURE_STDERR_MARKER = "failed to decrypt"
+_DECRYPTION_FAILURE_VALUE = "[error: cannot decrypt]"
+
+# The only stderr line advisory enough to accept alongside a valid item: the CLI's generic
+# audit-event upload failure. Everything else stays fatal.
+_EVENT_POST_FAILED_ADVISORY = "Event post failed."
+
+
+def _contains_decryption_failure(value: Any) -> bool:
+    if isinstance(value, str):
+        return _DECRYPTION_FAILURE_VALUE in value
+    if isinstance(value, dict):
+        return any(_contains_decryption_failure(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_decryption_failure(child) for child in value)
+    return False
+
 
 # The fingerprint is only ever compared against others made in this process. A random per-process
 # salt prevents cross-process correlation, while a password KDF prevents a log line carrying the
@@ -619,8 +639,14 @@ class BitwardenService:
         """
         Run a CLI command with the specified additional environment variables and return the result.
         """
-        env = os.environ.copy()  # Copy the current environment
-        # Make sure node isn't returning warnings. Warnings are sent through stderr and we raise exceptions on stderr.
+        env = os.environ.copy()
+        # The CLI reads ~ten BW_* env vars (client id/secret/password/session plus the
+        # CLEANEXIT/RESPONSE/QUIET/PRETTY/RAW/NOINTERACTION output modes). An inherited output-mode var
+        # can suppress a failure, wrap the item payload, or — with BW_RAW — make `bw unlock` print the
+        # raw vault session key on stdout. Scrub the whole BW_* prefix fail-closed and re-supply only
+        # what additional_env sets below; do not narrow this back to a fixed allowlist that can drift.
+        for key in [name for name in env if name.startswith("BW_")]:
+            del env[key]
         env["NODE_NO_WARNINGS"] = "1"
         if additional_env:
             env.update(additional_env)  # Update with any additional environment variables
@@ -821,21 +847,86 @@ class BitwardenService:
 
     @staticmethod
     def _parse_fetched_item(item_result: RunCommandResult, item_id: str) -> dict:
-        """Read `bw get item` output, naming the CLI's own complaint before blaming the JSON.
-
-        Same reasoning as `_parse_listed_items`: a dead session and an item the cached vault has
-        never seen both report themselves on stderr, and both are recoverable — but only if the
-        message survives to the caller.
+        """Require exit zero and a matching, supported item with valid fields and no decryption failures.
+        The CLI reports advisory event-upload failures on stderr, so only validated items can tolerate diagnostics.
         """
-        if item_result.returncode != 0 or item_result.stderr:
-            raise BitwardenGetItemError(f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}")
+        if item_result.returncode != 0:
+            raise BitwardenGetItemError(f"Failed to get Bitwarden item. Error: {item_result.stderr}")
+        if _DECRYPTION_FAILURE_STDERR_MARKER in item_result.stderr.lower():
+            raise BitwardenGetItemError(f"Failed to decrypt Bitwarden item. Error: {item_result.stderr}")
+
+        # Decide the stderr posture before parsing: an unknown or mixed line is fatal here so the CLI's
+        # repair-relevant diagnostic (RELOGIN/RESYNC) survives instead of being masked by a later static
+        # shape error. The exact advisory line(s) are deferred and accepted only after item validation.
+        advisory_lines = [line.strip() for line in item_result.stderr.splitlines() if line.strip()]
+        if any(line != _EVENT_POST_FAILED_ADVISORY for line in advisory_lines):
+            raise BitwardenGetItemError(f"Failed to get Bitwarden item. Error: {item_result.stderr}")
 
         try:
             item = json.loads(item_result.stdout)
         except json.JSONDecodeError:
-            raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
-        if not item:
-            raise BitwardenGetItemError(f"No item found in Bitwarden for item ID: {item_id}")
+            raise BitwardenGetItemError(f"Failed to parse Bitwarden item JSON. Error: {item_result.stderr}")
+        if not isinstance(item, dict) or item.get("object") != "item":
+            raise BitwardenGetItemError("Invalid Bitwarden item envelope")
+        returned_id = item.get("id")
+        # `is_uuid` accepts an uppercase request while the CLI lowercases it and returns the canonical
+        # form, so compare by parsed UUID rather than exact string; an unparseable returned id is fatal.
+        try:
+            returned_uuid = uuid.UUID(returned_id) if isinstance(returned_id, str) else None
+            requested_uuid = uuid.UUID(item_id)
+        except ValueError:
+            raise BitwardenGetItemError("Bitwarden item identity is not a valid UUID")
+        if returned_uuid is None or returned_uuid != requested_uuid:
+            raise BitwardenGetItemError("Bitwarden item identity does not match the request")
+        item_type = item.get("type")
+        if type(item_type) is not int or item_type not in (BitwardenItemType.LOGIN, BitwardenItemType.CREDIT_CARD):
+            raise BitwardenGetItemError("Unsupported Bitwarden item type")
+        if _contains_decryption_failure(item):
+            raise BitwardenGetItemError("Bitwarden item contains a value that failed to decrypt")
+
+        if item_type == BitwardenItemType.LOGIN:
+            login = item.get("login")
+            login_fields = ("username", "password", "totp")
+            if not isinstance(login, dict) or not any(field in login for field in login_fields):
+                raise BitwardenGetItemError("Invalid Bitwarden login payload")
+            if any(login.get(field) is not None and not isinstance(login[field], str) for field in login_fields):
+                raise BitwardenGetItemError("Invalid Bitwarden login field")
+        else:
+            card = item.get("card")
+            card_fields = ("cardholderName", "number", "expMonth", "expYear", "code", "brand")
+            if not isinstance(card, dict) or any(field not in card for field in card_fields):
+                raise BitwardenGetItemError("Invalid Bitwarden card payload")
+            if any(card[field] is not None and not isinstance(card[field], str) for field in card_fields):
+                raise BitwardenGetItemError("Invalid Bitwarden card field")
+            fields = item.get("fields")
+            if fields is not None and (
+                not isinstance(fields, list)
+                or any(
+                    not isinstance(field, dict)
+                    or any(field.get(key) is not None and not isinstance(field[key], str) for key in ("name", "value"))
+                    for field in fields
+                )
+            ):
+                raise BitwardenGetItemError("Invalid Bitwarden card custom fields")
+            organization_id = item.get("organizationId")
+            collection_ids = item.get("collectionIds")
+            if organization_id is not None and not isinstance(organization_id, str):
+                raise BitwardenGetItemError("Invalid Bitwarden card organization")
+            if collection_ids is not None and (
+                not isinstance(collection_ids, list) or any(not isinstance(value, str) for value in collection_ids)
+            ):
+                raise BitwardenGetItemError("Invalid Bitwarden card collections")
+
+        # The item is valid; the only stderr that reached here is the exact advisory (possibly repeated),
+        # accepted with a bounded classification now that item validation has passed.
+        if advisory_lines:
+            LOG.warning(
+                "Bitwarden CLI reported advisory stderr while fetching an item",
+                command_kind="get_item",
+                stderr_class="event_post_failed",
+                returncode=item_result.returncode,
+                item_valid=True,
+            )
         return item
 
     @staticmethod
@@ -1015,6 +1106,8 @@ class BitwardenService:
                 command = ["bw", "get", "item", item_id, "--session", session_key]
                 item_result = await BitwardenService.run_command(command, additional_env=session.env, timeout=timeout)
                 item = BitwardenService._parse_fetched_item(item_result, item_id)
+                if item["type"] != BitwardenItemType.LOGIN:
+                    raise BitwardenGetItemError("Bitwarden item is not a login type")
 
                 login = item["login"]
                 totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
@@ -1304,11 +1397,10 @@ class BitwardenService:
         unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
         unlock_result = await BitwardenService.run_command(unlock_command, env, timeout=timeout)
 
-        # Validate the unlock result
+        # Validate the unlock result. Never interpolate unlock stdout into the error: on this path it
+        # can be the raw vault session key (e.g. under BW_RAW), so keep only stderr for repair triage.
         if unlock_result.stdout and "Your vault is now unlocked!" not in unlock_result.stdout:
-            raise BitwardenUnlockError(
-                f"Failed to unlock vault. stdout: {unlock_result.stdout} stderr: {unlock_result.stderr}"
-            )
+            raise BitwardenUnlockError(f"Failed to unlock vault. stderr: {unlock_result.stderr}")
 
         # Extract session key
         try:
