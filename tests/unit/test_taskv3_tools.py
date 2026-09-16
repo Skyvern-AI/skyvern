@@ -14850,31 +14850,45 @@ def _patch_upload_download(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_file_upload_no_upload_activity_returns_actionable_error_not_false_ok(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("input_state", ["holds_file", "unreadable", "cleared_during_settle"])
+async def test_file_upload_with_no_upload_activity_is_ok_only_when_the_input_confirms_the_file(
+    monkeypatch: pytest.MonkeyPatch, input_state: str
 ) -> None:
-    # The core fix: set_input_files can populate the control at the Playwright layer yet the site
-    # register nothing (post-navigation the change handler is not wired) — zero upload requests
-    # dispatched. file_upload must return a recoverable non-OK there, not a confident OK that makes the
-    # agent submit with no file. A submit-time-upload form lands here too as an accepted false-negative.
-    # RED against pre-fix code, which returned "uploaded 1 file" regardless of activity.
+    # A form that sends the file with the submit dispatches nothing at attach time. The input holding
+    # the file when the tool returns is its postcondition, so that is an ok; an unreadable input, or one
+    # a change handler emptied while the page settled, confirms nothing and stays an error.
     import skyvern.forge.taskv3.tools as tools_module
 
     page = _FakePage()
-    page.element.emit_upload_on_set = False  # file lands in the input, but the site never reacts
+    page.element.emit_upload_on_set = False
+    if input_state == "unreadable":
+
+        async def _unreadable(_js: str, _arg: Any = None) -> Any:
+            raise RuntimeError("Execution context was destroyed")
+
+        monkeypatch.setattr(page.element, "evaluate", _unreadable)
     _patch_upload_dwell(monkeypatch, tools_module)
+    if input_state == "cleared_during_settle":
+
+        async def _settle_clears(_page: Any) -> None:
+            page.element._files = []
+
+        monkeypatch.setattr(tools_module, "_settle_after_upload", _settle_clears)
     _patch_upload_download(monkeypatch)
 
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
 
-    assert r.status == "error", r.content
-    assert "no upload activity" in r.content
-    assert "uploaded 1 file" not in r.content
-    # The file was still attached at the Playwright layer, so the staged-download key must persist so
-    # the download-signal wrapper still suppresses the staged file.
+    if input_state == "holds_file":
+        assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
+        assert "sent no upload request" in r.content
+    elif input_state == "unreadable":
+        assert (r.status, r.error_class) == ("error", "attach_unconfirmed"), r.content
+    else:
+        assert r.status == "error", r.content
+        assert "did not attach" in r.content
+    # The staged-download key must persist so the download-signal wrapper still suppresses the file.
     assert (r.data or {}).get("staged_download") == "cv.pdf"
-    # The request listener must be removed after the call — no leaked/accumulating listeners.
     assert page._request_listeners == []
 
 
@@ -15218,9 +15232,93 @@ async def test_file_upload_ignores_non_upload_network_noise(monkeypatch: pytest.
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
 
-    assert r.status == "error", r.content
-    assert "no upload activity" in r.content
+    assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
     assert page._request_listeners == []
+
+
+_UPLOAD_TARGETS_HTML = """<!doctype html><html><body>
+<form id="apply" onsubmit="event.preventDefault(); window.__submitted = true;">
+  <div id="dropzone" style="border:1px dashed;padding:20px">Drop your resume
+    <input id="inner" type="file" style="display:none">
+  </div>
+  <input id="picker-input" type="file" style="display:none">
+  <input id="labelled-input" type="file" style="display:none">
+  <label id="choose" for="labelled-input">Choose file</label>
+  <button id="attach" type="button" onclick="document.getElementById('picker-input').click()">Attach</button>
+  <div id="inert" style="padding:10px">Nothing to click</div>
+  <button id="send">Send application</button>
+</form>
+<input id="formless-input" type="file" style="display:none">
+<button id="formless-attach" onclick="document.getElementById('formless-input').click()">Select resume</button>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "receiving_input"),
+    [
+        ("#dropzone", "#inner"),
+        ("#attach", "#picker-input"),
+        ("#choose", "#labelled-input"),
+        # A typeless button outside any form submits nothing, so it is clicked.
+        ("#formless-attach", "#formless-input"),
+    ],
+)
+async def test_file_upload_on_an_upload_control_that_is_not_the_input_lands_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selector: str, receiving_input: str
+) -> None:
+    # The model targets the visible control, since observe does not list a hidden file input. The
+    # driver refuses a non-input ("Node is not an HTMLInputElement"); v1 sets the file on the input
+    # inside the control, or clicks it and fills the picker it opens.
+    import skyvern.forge.sdk.api.files as files_module
+    import skyvern.forge.taskv3.tools as tools_module
+
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 synthetic")
+
+    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return str(cv)
+
+    monkeypatch.setattr(files_module, "download_file", _fake_download)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    async with _content_page(_UPLOAD_TARGETS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "file_upload").handler({"selector": selector, "file": "resume.pdf"})
+
+        assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
+        assert await page.eval_on_selector(receiving_input, "e => e.files.length") == 1
+        assert not await page.evaluate("() => !!window.__submitted")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "error_class"),
+    [("#inert", "no_file_input"), ("#send", "submits_form")],
+)
+async def test_file_upload_on_a_control_with_no_file_input_reports_it_without_submitting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selector: str, error_class: str
+) -> None:
+    import skyvern.forge.sdk.api.files as files_module
+    import skyvern.forge.taskv3.tools as tools_module
+
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 synthetic")
+
+    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return str(cv)
+
+    monkeypatch.setattr(files_module, "download_file", _fake_download)
+    monkeypatch.setattr(tools_module, "_FILE_CHOOSER_TIMEOUT_MS", 300)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    async with _content_page(_UPLOAD_TARGETS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "file_upload").handler({"selector": selector, "file": "resume.pdf"})
+
+        assert not await page.evaluate("() => !!window.__submitted"), r.content
+        assert r.status == "error", r.content
+        assert r.error_class == error_class, r.content
 
 
 @pytest.mark.asyncio
