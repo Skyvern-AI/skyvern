@@ -269,6 +269,7 @@ export type WorkflowCopilotStreamMessageType =
   | "design_start"
   | "design_end"
   | "workflow_draft"
+  | "codegen_progress"
   | "title_update"
   | "credential_required"
   | "question_required";
@@ -343,6 +344,19 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   // These carry the patch at write time and name the call whose row it belongs to.
   code_diffs?: unknown;
   tool_call_id?: string | null;
+}
+
+// Throttled progress while the model streams an authoring tool call's arguments.
+// Live-only and never persisted: a reload has no access to these, and the
+// workflow_draft / tool_call frames that follow supersede them.
+export interface WorkflowCopilotCodegenProgressUpdate {
+  type: "codegen_progress";
+  tool_name: string;
+  // Cumulative and ordered: every frame carries the full list seen so far.
+  blocks_drafted: string[];
+  chars_streamed: number;
+  iteration: number;
+  timestamp: string;
 }
 
 // Emitted once the backend has persisted a derived agent name, before any block
