@@ -64,6 +64,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -698,6 +699,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotCodegenProgressUpdate
   | WorkflowCopilotTitleUpdate
   | WorkflowCopilotCredentialRequiredUpdate
   | WorkflowCopilotQuestionRequired
@@ -4799,6 +4801,7 @@ export function WorkflowCopilotChat({
               }
               case "design_start":
               case "design_end":
+              case "codegen_progress":
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {

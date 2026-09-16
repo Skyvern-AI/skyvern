@@ -57,6 +57,9 @@ export interface ActivityRow {
   endedAt: string | null;
   // Epoch ms the winning narration arrived live; absent on hydrate.
   reasonAt?: number;
+  // Block labels the model has written so far in the authoring call it is
+  // still streaming. Present only on the synthetic live drafting row.
+  draftingLabels?: string[];
 }
 
 export interface ActivityLog {
@@ -534,6 +537,29 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       (row.pending || row.blocks.some((block) => block.state === "running"));
     if (row.live) liveIndex = i;
   });
+
+  // The model is still writing the authoring call's arguments: no tool call is
+  // in flight and no block is running, so nothing above claims the frontier.
+  // The frames are live-only, which is why a terminated turn never shows this
+  // and a reload — whose hydrated turn carries no progress — cannot strand it.
+  const drafting = turn.codegenProgress;
+  if (!ended && drafting !== null) {
+    rows.push({
+      id: "codegen-progress",
+      kind: "author",
+      entries: [],
+      blocks: [],
+      codeDiffs: [],
+      pending: false,
+      live: true,
+      reason: null,
+      label: null,
+      startedAt: drafting.startedAt,
+      endedAt: null,
+      draftingLabels: drafting.blockLabels,
+    });
+    liveIndex = rows.length - 1;
+  }
 
   // While the model is generating, no row has an unmatched call and no block is
   // running, so liveIndex is -1 and nothing would be open — the stretch that

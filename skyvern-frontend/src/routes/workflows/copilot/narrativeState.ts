@@ -11,6 +11,7 @@ import {
   ProposalDisposition,
   RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
@@ -111,6 +112,7 @@ export type NarrativeEvent =
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
+  | WorkflowCopilotCodegenProgressUpdate
   | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
@@ -399,6 +401,13 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
+  // Live-only drafting progress from codegen_progress, never persisted. Holds
+  // only what the row renders: the frames' cumulative character count changes
+  // on every frame and would re-render the chat for nothing.
+  codegenProgress: {
+    blockLabels: string[];
+    startedAt: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -450,6 +459,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
+  codegenProgress: null,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
@@ -1131,6 +1141,38 @@ export function applyNarrativeEvent(
         },
         blocks: withDiffs.blocks,
         designActivity: withDiffs.designActivity,
+        codegenProgress: null,
+      };
+    }
+
+    case "codegen_progress": {
+      // `blocks_drafted` is cumulative only WITHIN one authoring call: the
+      // producer keys its state by output_index and opens each call with an
+      // empty frame. One generation can carry several authoring calls, so union
+      // rather than replace — otherwise a second call's opening frame erases
+      // the blocks the first one drafted. The tool_call that ends the
+      // generation is what clears the row, so this cannot accumulate past it.
+      const drafting = prev.codegenProgress;
+      const drafted = drafting?.blockLabels ?? [];
+      const merged = drafted.concat(
+        event.blocks_drafted.filter((label) => !drafted.includes(label)),
+      );
+      // Frames stay throttled but still arrive every couple of seconds naming
+      // nothing new, and their character count — which nothing renders — moves
+      // on every one. Returning prev unchanged is what keeps a fast stream from
+      // re-rendering the chat between labels. The first frame of a generation
+      // still has to land: it is what opens the row, and it carries no labels.
+      if (drafting !== null && merged.length === drafted.length) {
+        return prev;
+      }
+      return {
+        ...prev,
+        codegenProgress: {
+          blockLabels: merged,
+          // First frame of the generation wins, so the row's clock times the
+          // whole draft rather than restarting on each label or each call.
+          startedAt: drafting?.startedAt ?? event.timestamp ?? null,
+        },
       };
     }
 
@@ -1254,9 +1296,12 @@ export function applyNarrativeEvent(
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
+      // The model has finished streaming arguments: the call the drafting
+      // frames described is executing, and its own row reports it from here.
       if (!entry) {
         return {
           ...prev,
+          codegenProgress: null,
         };
       }
       const { blocks, designActivity } = appendActivity(
@@ -1268,6 +1313,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
+        codegenProgress: null,
       };
     }
 
