@@ -654,12 +654,20 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
     });
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
-    expect(credentialResponsePosts()[0]![1]).toMatchObject({
+    const skipBody = credentialResponsePosts()[0]![1] as Record<
+      string,
+      unknown
+    >;
+    expect(skipBody).toMatchObject({
       turn_id: "turn-1",
       workflow_copilot_chat_id: "chat-1",
       resume_token: "rt-abc",
       action: "skip",
     });
+    expect(skipBody.credential_id).toBeUndefined();
+    expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+    expect(screen.queryByText(/Credential '.*' added/)).toBeNull();
+    expect(screen.queryByText(/Credential added/)).toBeNull();
   });
 
   it("connect with an existing matched credential POSTs the credential_id", async () => {
@@ -685,10 +693,25 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(useButton);
     });
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
-    expect(credentialResponsePosts()[0]![1]).toMatchObject({
+    const pickBody = credentialResponsePosts()[0]![1] as Record<
+      string,
+      unknown
+    >;
+    expect(pickBody).toMatchObject({
+      turn_id: "turn-1",
+      workflow_copilot_chat_id: "chat-1",
+      resume_token: "rt-abc",
       action: "connected",
       credential_id: "cred-hn",
     });
+    expect(Object.keys(pickBody).sort()).toEqual([
+      "action",
+      "credential_id",
+      "resume_token",
+      "turn_id",
+      "workflow_copilot_chat_id",
+    ]);
+    expect(postStreaming).toHaveBeenCalledTimes(1);
     // Receipt keeps the credential name after the turn goes terminal.
     await act(async () => {
       streamCalls[0]!.onMessage({
@@ -781,6 +804,47 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
+  it("sends one resume POST when a second pick races the first", async () => {
+    let releaseFirstPost = () => {};
+    sansApiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirstPost = () => resolve({});
+        }),
+    );
+    credentialsData.current = [
+      { credential_id: "cred-first", name: "first", tested_url: null },
+      { credential_id: "cred-second", name: "second", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "first" }));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "second" }));
+    });
+    expect(credentialResponsePosts()).toHaveLength(1);
+    expect(credentialResponsePosts()[0]![1]).toMatchObject({
+      credential_id: "cred-first",
+    });
+    await act(async () => {
+      releaseFirstPost();
+    });
+    expect(credentialResponsePosts()).toHaveLength(1);
+  });
+
   it("keeps the card actionable, toasts, and never logs the raw error (resume_token leak) when the resume POST fails", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     // AxiosError-shaped: config.data carries the one-time resume_token.
@@ -826,10 +890,12 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await waitFor(() =>
       expect(credentialsGets().length).toBeGreaterThanOrEqual(1),
     );
-    // Failed fetch → no picker (null, not a cached []); the Connect-credential CTA remains so the
-    // user can still create one, and the pause stays answerable.
     expect(
-      await screen.findByRole("button", { name: "Connect credential" }),
+      await screen.findByText(/Couldn't load your saved logins/),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
     expect(screen.queryByText("Use existing…")).toBeNull();
     errSpy.mockRestore();

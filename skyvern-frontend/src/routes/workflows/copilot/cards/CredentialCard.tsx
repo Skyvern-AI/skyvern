@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   Cross2Icon,
   LockClosedIcon,
 } from "@radix-ui/react-icons";
+import { useDebounce } from "use-debounce";
 
 import { getClient } from "@/api/AxiosClient";
 import { isPasswordCredential, type CredentialApiResponse } from "@/api/types";
@@ -70,6 +71,13 @@ interface PickerCredential {
   secondary?: string;
 }
 
+type OrgCredentialList =
+  | { status: "loading" }
+  | { status: "error" }
+  // forSearch is the term these rows answer, so the picker can tell whether they still answer the
+  // one in the box. Offering rows fetched for an earlier term lets Enter submit an unrelated login.
+  | { status: "ready"; credentials: PickerCredential[]; forSearch: string };
+
 export interface CredentialCardProps {
   frame: CredentialRequiredFrame;
   mode: CredentialCardMode;
@@ -116,6 +124,28 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
   credential_deferred_draft:
     "You held off on this earlier — connect a credential now so the workflow can sign in when it runs.",
 };
+
+// Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
+// is rejected outright, leaving a Retry that can never succeed.
+const CREDENTIAL_SEARCH_MAX = 200;
+const CREDENTIAL_PAGE_SIZE = 100;
+
+// The box itself is capped, not just the term sent to the route: searching a silent prefix of a
+// longer visible term offers rows that its hidden characters exclude. Counted in code points, as
+// the route's length check is; slicing UTF-16 units can halve an emoji, which Axios cannot encode.
+function clampSearch(term: string): string {
+  return Array.from(term).slice(0, CREDENTIAL_SEARCH_MAX).join("");
+}
+
+// Applied to both the request and every comparison against it — trimming one side only would leave
+// forSearch and the live term permanently unequal on a padded query.
+function normalizeSearch(term: string): string {
+  return term.trim();
+}
+
+const LIVE_REGION_SELECTOR =
+  '[aria-live]:not([aria-live="off"]), [role="status"], [role="log"], [role="alert"]';
+const SEARCH_FAILED_ANNOUNCEMENT = "Couldn't run that search.";
 
 const SKIP_COPY =
   "Credential setup skipped — test run may stop at the login step";
@@ -206,6 +236,12 @@ function CredentialPicker({
   suggestedIds,
   disabled,
   onPick,
+  search,
+  onSearchChange,
+  searchFailed,
+  searchPending,
+  resultsTruncated,
+  onRetrySearch,
   triggerLabel = "Use existing…",
   triggerClassName = "h-6 w-[200px] justify-between px-3 text-xs font-normal",
   // Popover content matches the trigger width by default; a content-width trigger (e.g. "Change")
@@ -218,6 +254,18 @@ function CredentialPicker({
   suggestedIds?: string[];
   disabled?: boolean;
   onPick: (credentialId: string, name: string) => void;
+  // The org list is one unpaginated page, so searching it reaches the server and cmdk's own filter
+  // is off: it would re-filter a server result on a narrower field set and hide matched rows.
+  search: string;
+  onSearchChange: (search: string) => void;
+  // The rows below are the previous query's result when a search fails, so the list says so instead
+  // of letting them stand as the answer.
+  searchFailed: boolean;
+  // True while the rows on hand answer an earlier term than the one in the box.
+  searchPending: boolean;
+  // The response filled a whole page, so there may be more matches than are listed.
+  resultsTruncated: boolean;
+  onRetrySearch: () => void;
   triggerLabel?: string;
   triggerClassName?: string;
   contentClassName?: string;
@@ -250,7 +298,18 @@ function CredentialPicker({
     </CommandItem>
   );
   return (
-    <Popover open={open && !disabled} onOpenChange={setOpen}>
+    <Popover
+      open={open && !disabled}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        // Closing drops the term, as CredentialCombobox does. A zero-match term left behind keeps
+        // the card in search mode, and on the auto-bound receipt that hides its only route to
+        // adding a credential.
+        if (!nextOpen) {
+          onSearchChange("");
+        }
+      }}
+    >
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -265,10 +324,37 @@ function CredentialPicker({
         </Button>
       </PopoverTrigger>
       <PopoverContent className={`${contentClassName} p-0`} align="start">
-        <Command>
-          <CommandInput placeholder="Search credentials..." />
+        <Command shouldFilter={false}>
+          <CommandInput
+            placeholder="Search credentials..."
+            value={search}
+            onValueChange={onSearchChange}
+          />
           <CommandList>
-            <CommandEmpty>No credentials found.</CommandEmpty>
+            {searchFailed ? (
+              <div className="px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                Couldn&apos;t run that search.{" "}
+                <button
+                  type="button"
+                  onClick={onRetrySearch}
+                  className="font-medium text-foreground underline"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : searchPending ? (
+              <div className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                Searching…
+              </div>
+            ) : (
+              <CommandEmpty>No credentials found.</CommandEmpty>
+            )}
+            {resultsTruncated && !searchPending && !searchFailed ? (
+              <div className="px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                Showing the first {CREDENTIAL_PAGE_SIZE}. Narrow the search if
+                yours isn&apos;t listed.
+              </div>
+            ) : null}
             {suggested.length > 0 ? (
               // Copilot's suggestion(s) pinned first; cmdk highlights the first item, so one Enter
               // accepts it. The full org list stays below to override.
@@ -311,17 +397,38 @@ export function CredentialCard({
   const disabled = countdownActive && expired;
 
   const credentialGetter = useCredentialGetter();
-  const [orgCredentials, setOrgCredentials] = useState<
-    PickerCredential[] | null
-  >(null);
+  const [orgCredentials, setOrgCredentials] = useState<OrgCredentialList>({
+    status: "loading",
+  });
+  const [retryKey, setRetryKey] = useState(0);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch] = useDebounce(search, 300);
+  // The route builds its ILIKE pattern from the literal value, so " Acme " matches no credential
+  // named "Acme" and an all-space term matches almost nothing. Trimmed once here and used for the
+  // request, the fetch dependency and forSearch alike, matching CredentialCombobox.
+  const searchTerm = normalizeSearch(debouncedSearch);
+  // Which term's fetch failed, rather than a bare "a search failed": clearing the box searches for
+  // the empty term, and a boolean keyed on a non-empty term reads that failure as no failure, which
+  // leaves the rows permanently out of step with the box and the picker gone with no way back.
+  const [failedSearch, setFailedSearch] = useState<string | null>(null);
+  // Read from the page rather than inferred from `mode`: an inline pause restored after a reload
+  // renders outside the chat's live region, so the mode alone cannot say whether one surrounds us.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [insideLiveRegion, setInsideLiveRegion] = useState(false);
+  useLayoutEffect(() => {
+    setInsideLiveRegion(
+      Boolean(rootRef.current?.parentElement?.closest(LIVE_REGION_SELECTOR)),
+    );
+  }, []);
   const fetchGeneration = useRef(0);
   // Any credential ask (terminal or inline-pause) lists every org login credential so the user can
   // pick or create. credential_type=password since the card only ever asks for a sign-in; the API
   // returns them most-recent-first (created_at desc), used as-is. Direct getClient fetch, not
   // useCredentialsQuery: the copilot chat's test harness has no QueryClientProvider. Re-fetches when
   // the parent bumps reloadKey (a credential was just created) so the new one appears in the picker.
-  // page_size 100 with no pagination — a >100-credential org shows only the 100 most-recent; older
-  // ones are reachable only by creating a new credential. Add the route's `search` param if that bites.
+  // page_size 100 with no pagination, so the picker's search goes to the route's `search` param
+  // rather than filtering the page locally: a >100-credential org would otherwise get a confident
+  // empty result for a login it owns.
   const isAsk = !resolvedOutcome;
   // An auto-bound receipt only needs the org list when its Change affordance is live; a read-only
   // scrollback receipt must not each fire its own 100-credential fetch.
@@ -335,29 +442,89 @@ export function CredentialCard({
       try {
         const client = await getClient(credentialGetter);
         const res = await client.get<CredentialApiResponse[]>("/credentials", {
-          params: { page: 1, page_size: 100, credential_type: "password" },
+          params: {
+            page: 1,
+            page_size: CREDENTIAL_PAGE_SIZE,
+            credential_type: "password",
+            ...(searchTerm ? { search: searchTerm } : {}),
+          },
         });
         if (fetchGeneration.current !== generation) return;
-        setOrgCredentials(
-          (Array.isArray(res.data) ? res.data : []).map((credential) => ({
-            credentialId: credential.credential_id,
-            name: credential.name,
-            secondary:
-              credential.credential &&
-              isPasswordCredential(credential.credential)
-                ? credential.credential.username
-                : undefined,
-          })),
-        );
+        setFailedSearch(null);
+        setOrgCredentials({
+          status: "ready",
+          forSearch: searchTerm,
+          credentials: (Array.isArray(res.data) ? res.data : []).map(
+            (credential) => ({
+              credentialId: credential.credential_id,
+              name: credential.name,
+              secondary:
+                credential.credential &&
+                isPasswordCredential(credential.credential)
+                  ? credential.credential.username
+                  : undefined,
+            }),
+          ),
+        });
       } catch (error) {
-        // Leave the list null so the picker degrades to the Connect-credential CTA; null keeps
-        // not-loaded distinct from a genuinely empty org.
         if (fetchGeneration.current === generation) {
-          console.error("Failed to load credentials:", error);
+          // A failed re-fetch (reloadKey bumped, canChange flipped, a search) must keep a list the
+          // user can already pick from; only a fetch with nothing to show becomes the error state.
+          setOrgCredentials((current) =>
+            current.status === "ready" ? current : { status: "error" },
+          );
+          setFailedSearch(searchTerm);
+          // Log only the message: an AxiosError serializes its request config into the console.
+          console.error(
+            "Failed to load credentials:",
+            error instanceof Error ? error.message : String(error),
+          );
         }
       }
     })();
-  }, [needsCredentialList, reloadKey, credentialGetter]);
+  }, [needsCredentialList, reloadKey, retryKey, searchTerm, credentialGetter]);
+
+  const retryCredentialList = () => {
+    setOrgCredentials({ status: "loading" });
+    setRetryKey((key) => key + 1);
+  };
+  // Re-runs the current term without dropping to "loading": that would unmount the picker the user
+  // is typing in, along with the term itself.
+  const retrySearch = () => setRetryKey((key) => key + 1);
+  const changeSearch = (term: string) => setSearch(clampSearch(term));
+
+  // The picker offers only rows that answer the term now in the box. A row fetched for an earlier
+  // term is offered neither while the next request is in flight (cmdk highlights the first row, so
+  // Enter would submit an unrelated login) nor after a failed one.
+  const readyList =
+    orgCredentials.status === "ready" ? orgCredentials.credentials : [];
+  const searchPending =
+    orgCredentials.status === "ready" &&
+    orgCredentials.forSearch !== normalizeSearch(search);
+  // Only while the box still holds the failed term (typing past it is a new search, not a standing
+  // complaint about an abandoned one) AND the rows do not already answer it: a re-fetch that failed
+  // over rows already matching the box left nothing stale, so it stays a log line.
+  const searchFailed =
+    searchPending &&
+    failedSearch !== null &&
+    failedSearch === normalizeSearch(search);
+  const pickable = searchPending ? [] : readyList;
+  // A full page means the route had more to give, so the list says so rather than reading as the
+  // complete set of matches.
+  const resultsTruncated = pickable.length >= CREDENTIAL_PAGE_SIZE;
+  // Mounted whenever the picker is mid-search, not only when it has rows: unmounting on an empty
+  // interim result closes the dropdown and drops the user's focus mid-edit.
+  const pickerEngaged = Boolean(search) || searchPending || searchFailed;
+  const retryButton = (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={retryCredentialList}
+      className="rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+    >
+      Retry
+    </button>
+  );
 
   if (resolvedOutcome) {
     switch (resolvedOutcome.outcome) {
@@ -401,13 +568,16 @@ export function CredentialCard({
 
   if (mode === "auto-bound" && autoBound) {
     // Change re-picks only OTHER credentials (re-picking the bound one fires a redundant continuation).
-    // When none are pickable yet — list still loading, fetch failed, or the bound one is the org's only
-    // credential — fall back to adding a new credential so a correction is always reachable.
-    const others = (orgCredentials ?? []).filter(
+    // When none are pickable — still loading, or the bound one is the org's only credential — fall back
+    // to adding a new credential; a failed fetch also offers Retry so other saved logins stay reachable.
+    const others = pickable.filter(
       (credential) => credential.credentialId !== autoBound.credentialId,
     );
     return (
-      <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
+      <div
+        ref={rootRef}
+        className="rounded-lg border border-border bg-slate-elevation2 p-3"
+      >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-foreground">
             <span aria-hidden="true">🔑</span>
@@ -416,10 +586,18 @@ export function CredentialCard({
             </span>
           </div>
           {canChange ? (
-            others.length > 0 ? (
+            // An active search stays mounted on zero results: unmounting the picker would discard
+            // the term the user is still typing and read as "you own nothing by that name".
+            others.length > 0 || pickerEngaged ? (
               <CredentialPicker
                 credentials={others}
                 onPick={(credentialId, name) => onConnect(credentialId, name)}
+                search={search}
+                onSearchChange={changeSearch}
+                searchFailed={searchFailed}
+                searchPending={searchPending}
+                resultsTruncated={resultsTruncated}
+                onRetrySearch={retrySearch}
                 triggerLabel="Change"
                 triggerClassName="h-6 gap-1 px-2 text-xs font-medium"
                 contentClassName="w-[240px]"
@@ -441,6 +619,29 @@ export function CredentialCard({
             ? "Auto-selected to sign in on your behalf — Change it if this isn't right."
             : "Auto-selected to sign in on your behalf."}
         </p>
+        {canChange && orgCredentials.status === "error" ? (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              Couldn&apos;t load your other saved logins.
+            </span>
+            {retryButton}
+          </div>
+        ) : null}
+        {/* Mounted for the card's lifetime so only its text changes: a live region that appears
+            already holding its text is read as ordinary new content and never announced. It carries
+            the search failure too, whose visible text sits in a portaled popover no region reaches. */}
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {searchFailed
+            ? SEARCH_FAILED_ANNOUNCEMENT
+            : !insideLiveRegion &&
+                canChange &&
+                orgCredentials.status === "error"
+              ? "Couldn't load your other saved logins."
+              : ""}
+        </span>
       </div>
     );
   }
@@ -448,7 +649,7 @@ export function CredentialCard({
   const site = siteFromLoginPageUrls(frame.login_page_urls);
 
   return (
-    <div>
+    <div ref={rootRef}>
       {frame.message ? (
         <p className="text-sm leading-relaxed text-foreground">
           {frame.message}
@@ -510,14 +711,52 @@ export function CredentialCard({
           >
             Connect credential
           </button>
-          {orgCredentials && orgCredentials.length > 0 ? (
+          {orgCredentials.status === "ready" &&
+          (pickable.length > 0 || pickerEngaged) ? (
             <CredentialPicker
-              credentials={orgCredentials}
+              credentials={pickable}
               suggestedIds={frame.credential_refs}
               disabled={disabled}
               onPick={(credentialId, name) => onConnect(credentialId, name)}
+              search={search}
+              onSearchChange={changeSearch}
+              searchFailed={searchFailed}
+              searchPending={searchPending}
+              resultsTruncated={resultsTruncated}
+              onRetrySearch={retrySearch}
             />
           ) : null}
+          {orgCredentials.status === "loading" ? (
+            <span className="text-xs text-muted-foreground">
+              Loading saved logins…
+            </span>
+          ) : null}
+          {orgCredentials.status === "error" ? (
+            <>
+              <span className="text-xs text-muted-foreground">
+                Couldn&apos;t load your saved logins.
+              </span>
+              {retryButton}
+            </>
+          ) : null}
+          {/* Mounted for the card's lifetime so only its text changes: a live region that appears
+              already holding its text is read as ordinary new content and never announced. Inside
+              an outer live region it takes no role and repeats nothing that region already
+              contains, only the search failure, whose visible text sits in a portaled popover. */}
+          <span
+            className="sr-only"
+            role={insideLiveRegion ? undefined : "status"}
+          >
+            {searchFailed
+              ? SEARCH_FAILED_ANNOUNCEMENT
+              : insideLiveRegion
+                ? ""
+                : orgCredentials.status === "loading"
+                  ? "Loading saved logins…"
+                  : orgCredentials.status === "error"
+                    ? "Couldn't load your saved logins."
+                    : ""}
+          </span>
         </div>
       </div>
     </div>

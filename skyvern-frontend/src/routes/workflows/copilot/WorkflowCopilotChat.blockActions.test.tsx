@@ -599,16 +599,21 @@ describe("WorkflowCopilotChat — build follow", () => {
     expect(focusBlock).not.toHaveBeenCalled();
   });
 
-  it("never fights the recording overlay", async () => {
+  it("blocks Copilot submission while the recording overlay owns authoring", async () => {
     useRecordingStore.setState({ isRecording: true });
     try {
       await renderChat(makeDockedProps());
-      await submit("build it");
 
-      streamCalls[0]!.onMessage(
-        blockProgressFrame({ block_label: "login", status: "running" }),
-      );
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
+      ).toBe(true);
+      const sendButton = screen.getByRole("button", {
+        name: "Send disabled — finish the current authoring action",
+      }) as HTMLButtonElement;
+      expect(sendButton.disabled).toBe(true);
+      fireEvent.click(sendButton);
 
+      expect(postStreaming).not.toHaveBeenCalled();
       expect(focusBlock).not.toHaveBeenCalled();
     } finally {
       useRecordingStore.setState({ isRecording: false });

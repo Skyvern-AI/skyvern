@@ -32,7 +32,7 @@ describe("getDragGateReason (SKY-9061)", () => {
   test("returns the recording hint when recording is on", () => {
     expect(
       getDragGateReason({ isRecording: true, isCanvasLocked: false }),
-    ).toBe("Stop recording to reorder blocks");
+    ).toBe("Finish recording the task to reorder blocks");
   });
 
   test("returns the canvas-lock hint when only canvas is locked", () => {
@@ -43,7 +43,7 @@ describe("getDragGateReason (SKY-9061)", () => {
 
   test("prefers recording hint when both gates are active", () => {
     expect(getDragGateReason({ isRecording: true, isCanvasLocked: true })).toBe(
-      "Stop recording to reorder blocks",
+      "Finish recording the task to reorder blocks",
     );
   });
 });

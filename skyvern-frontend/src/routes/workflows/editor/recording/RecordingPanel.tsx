@@ -527,7 +527,7 @@ function RecordingPanel({ browserSessionId }: Props) {
   const showInterpretationFallbackNote =
     !interpretationEnabled && exposedEventCount > 0;
   const headerTitle = isFinishing
-    ? "Finishing recording"
+    ? "Creating workflow steps"
     : manualCapturePaused
       ? "Recording paused"
       : "Recording task";
@@ -568,9 +568,9 @@ function RecordingPanel({ browserSessionId }: Props) {
               </>
             ) : (
               <>
-                Interact with the browser.
-                <br />
-                Your clicks, typing and navigation will appear here as blocks.
+                Complete the task in the browser. Skyvern captures the browser
+                view and your clicks, typing, and navigation, then turns them
+                into workflow steps.
               </>
             )}
           </div>
@@ -640,8 +640,8 @@ function RecordingPanel({ browserSessionId }: Props) {
         {showInterpretationFallbackNote && (
           <div className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
             {exposedEventCount} interaction
-            {exposedEventCount === 1 ? "" : "s"} captured — blocks will be
-            generated when you finish.
+            {exposedEventCount === 1 ? "" : "s"} captured — workflow steps will
+            be generated when you choose Done.
           </div>
         )}
         <div ref={feedEndRef} />
@@ -649,8 +649,8 @@ function RecordingPanel({ browserSessionId }: Props) {
 
       {insertionPointMissing && (
         <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
-          Could not determine where to insert recorded blocks. Discard and start
-          recording from the workflow editor again.
+          Could not determine where to insert workflow steps. Discard and choose
+          Record task from the workflow editor again.
         </div>
       )}
 
@@ -659,7 +659,11 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Button
           variant="outline"
           size="icon"
-          title={manualCapturePaused ? "Resume capture" : "Pause capture"}
+          title={
+            manualCapturePaused
+              ? "Resume recording task"
+              : "Pause recording task"
+          }
           className="h-8 w-8"
           disabled={isCommitting || isFinishing}
           onClick={() =>
@@ -677,7 +681,7 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Button
           variant="outline"
           size="icon"
-          title="Discard recording"
+          title="Discard task recording"
           className="h-8 w-8 hover:border-red-500/40 hover:text-red-700 dark:hover:text-red-400"
           disabled={isCommitting}
           onClick={onDiscardClick}
@@ -695,7 +699,11 @@ function RecordingPanel({ browserSessionId }: Props) {
           onClick={onDoneClick}
         >
           <CheckIcon className="mr-1.5 h-4 w-4" />
-          {mutationIsError ? "Retry" : isFinishing ? "Processing…" : "Done"}
+          {mutationIsError
+            ? "Retry"
+            : isFinishing
+              ? "Creating workflow…"
+              : "Done"}
         </Button>
       </div>
 
@@ -703,14 +711,14 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Dialog open onOpenChange={setConfirmDiscardOpen}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Discard recording?</DialogTitle>
+              <DialogTitle>Discard task recording?</DialogTitle>
               <DialogDescription>
                 {visibleSteps.length > 0
-                  ? `You have ${visibleSteps.length} recorded block${
+                  ? `You have ${visibleSteps.length} captured workflow step${
                       visibleSteps.length === 1 ? "" : "s"
                     } that will be lost if you discard.`
-                  : "Your recorded interactions will be lost if you discard."}{" "}
-                Are you sure you want to discard the recording?
+                  : "Your captured browser interactions will be lost if you discard."}{" "}
+                Are you sure you want to discard this task recording?
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -718,10 +726,10 @@ function RecordingPanel({ browserSessionId }: Props) {
                 variant="outline"
                 onClick={() => setConfirmDiscardOpen(false)}
               >
-                Keep recording
+                Keep recording task
               </Button>
               <Button variant="destructive" onClick={discard}>
-                Discard recording
+                Discard
               </Button>
             </DialogFooter>
           </DialogContent>

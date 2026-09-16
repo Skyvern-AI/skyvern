@@ -23,6 +23,7 @@ import {
   ArrowUpIcon,
   Pencil1Icon,
   FileIcon,
+  UploadIcon,
   PlusIcon,
   ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
@@ -899,6 +900,12 @@ interface WorkflowCopilotChatProps {
   initialMessage?: string;
   initialAction?: CopilotProductAction;
   onInitialMessageConsumed?: () => void;
+  onUploadSOP?: (file: File) => void;
+  canUploadSOP?: boolean;
+  isUploadingSOP?: boolean;
+  onRecordTask?: () => void;
+  canRecordTask?: boolean;
+  authoringUnavailableReason?: string | null;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
   // Render frameless — no border, background, or title; the header keeps only
@@ -999,10 +1006,21 @@ export function WorkflowCopilotChat({
   initialMessage,
   initialAction,
   onInitialMessageConsumed,
+  onUploadSOP,
+  canUploadSOP = true,
+  isUploadingSOP = false,
+  onRecordTask,
+  canRecordTask = false,
+  authoringUnavailableReason,
   docked = false,
   chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
+  const sopFileInputRef = useRef<HTMLInputElement>(null);
+  const recordingAuthoringActive = useRecordingStore(
+    (state) => state.isRecording || state.finishRequested || state.isCommitting,
+  );
+  const authoringInProgress = isUploadingSOP || recordingAuthoringActive;
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
   const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
   const codeBlockModeEnabled =
@@ -3570,6 +3588,7 @@ export function WorkflowCopilotChat({
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
+      if (authoringInProgress) return;
       const candidate = messageOverride ?? inputValue;
       const pendingQuestion = questionInteractions.find(
         (item) => item.status === "pending",
@@ -4850,6 +4869,7 @@ export function WorkflowCopilotChat({
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       armStop,
+      authoringInProgress,
       autoAccept,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
@@ -5022,7 +5042,7 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    if (!queuedPrompt || hasPendingQuestion) {
+    if (!queuedPrompt || hasPendingQuestion || authoringInProgress) {
       return;
     }
     // isLoading (reactive state) is the in-flight signal here so the effect
@@ -5082,6 +5102,7 @@ export function WorkflowCopilotChat({
       console.error("Queued send failed:", error);
     });
   }, [
+    authoringInProgress,
     codeBlockModeEnabled,
     codeBlockRequestOverride,
     handleSend,
@@ -5436,26 +5457,29 @@ export function WorkflowCopilotChat({
   );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
+  const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
   // Sent, no frame yet: the control reports the wait rather than an action, and
   // cancelSend's own guard is what makes a press in this window issue no cancel.
   const turnPendingFirstFrame =
     isLoading && !turnObservablyRunning && narrative.terminal === null;
   const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
-  const morphButtonLabel = isStopping
-    ? "Stopping…"
-    : waitingOnQueueOnly
-      ? "Send disabled — waiting for live browser"
-      : morphButtonPending
-        ? "Starting…"
-        : queuedPrompt && hasComposerText
-          ? "Replace queued message"
-          : !turnObservablyRunning
-            ? isLoading
-              ? "Queue for next turn"
-              : "Send"
-            : hasComposerText
-              ? "Queue for next turn"
-              : "Stop";
+  const morphButtonLabel = authoringBlocksComposerAction
+    ? "Send disabled — finish the current authoring action"
+    : isStopping
+      ? "Stopping…"
+      : waitingOnQueueOnly
+        ? "Send disabled — waiting for live browser"
+        : morphButtonPending
+          ? "Starting…"
+          : queuedPrompt && hasComposerText
+            ? "Replace queued message"
+            : !turnObservablyRunning
+              ? isLoading
+                ? "Queue for next turn"
+                : "Send"
+              : hasComposerText
+                ? "Queue for next turn"
+                : "Stop";
   // Shared between the composer treatments so the two Build implementations
   // never drift.
   const modeMenuItems = (
@@ -5516,6 +5540,9 @@ export function WorkflowCopilotChat({
       onAnswer={(response) => void handleQuestionAnswer(interaction, response)}
     />
   );
+
+  const uploadSOPDisabled = !onUploadSOP || !canUploadSOP || isUploadingSOP;
+  const recordTaskDisabled = !onRecordTask || !canRecordTask || isUploadingSOP;
 
   const content = (
     <div
@@ -5599,24 +5626,110 @@ export function WorkflowCopilotChat({
         <div ref={scrollRef} className="h-full overflow-y-auto p-4">
           <div className="space-y-3">
             {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
-                <p className="font-semibold text-foreground">
-                  Start a new chat
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Ask the copilot to draft or edit your agent. Provide a goal,
-                  the target site, and any credentials it should use.
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Example: "Build an agent to find the top post on hackernews
-                  today"
-                </p>
-                {/* The only in-product pointer to this: the newer composer
-                    placeholder dropped the "or paste recorded steps" clause, so
-                    without it here the affordance is undiscoverable. */}
-                <p className="mt-2 text-muted-foreground">
-                  Already recorded this with another agent? Copy that workflow's
-                  prompt text and paste it here.
+              <div className="flex flex-col gap-5 rounded-lg border border-border bg-slate-elevation2 p-5 text-sm text-muted-foreground">
+                <div>
+                  <p className="text-base font-semibold text-foreground">
+                    Start a new chat
+                  </p>
+                  <p className="mt-2 leading-relaxed text-muted-foreground">
+                    Ask Copilot to draft or edit your agent. Provide a goal, the
+                    target site, and any credentials it should use.
+                  </p>
+                  <p className="mt-3 border-l-2 border-border bg-slate-elevation3 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                    Example: “Build an agent to find the top post on Hacker News
+                    today.”
+                  </p>
+                </div>
+
+                <div className="[container-name:copilot-actions] [container-type:inline-size]">
+                  <p className="font-semibold text-foreground">
+                    Or start from an existing process
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    Give Copilot the source material instead of describing it
+                    from scratch.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          uploadSOPDisabled
+                            ? (authoringUnavailableReason ??
+                              "SOP upload is not available right now")
+                            : "Upload a procedure as a PDF"
+                        }
+                        blocked={uploadSOPDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Upload an SOP"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={uploadSOPDisabled}
+                          onClick={() => sopFileInputRef.current?.click()}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
+                            <UploadIcon className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              {isUploadingSOP
+                                ? "Uploading SOP…"
+                                : "Upload an SOP"}
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Turn an existing procedure into workflow steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          recordTaskDisabled
+                            ? (authoringUnavailableReason ??
+                              "Record task is available when the browser is ready")
+                            : "Demonstrate the task in the browser"
+                        }
+                        blocked={recordTaskDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Record task"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={recordTaskDisabled}
+                          onClick={onRecordTask}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-red-500/40 bg-red-500/10">
+                            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              Record task
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Demonstrate it in the browser and create workflow
+                              steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+                    Complete the task in the browser. Skyvern captures the
+                    browser view and your clicks, typing, and navigation, then
+                    turns them into workflow steps.
+                  </p>
+                </div>
+
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Already recorded this with another agent? Copy that
+                  workflow&apos;s prompt text and paste it here.
                 </p>
               </div>
             ) : null}
@@ -6330,6 +6443,7 @@ export function WorkflowCopilotChat({
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
+            disabled={authoringInProgress}
             rows={1}
             className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
@@ -6350,16 +6464,40 @@ export function WorkflowCopilotChat({
               if (file) void uploadAttachment(file);
             }}
           />
+          <input
+            ref={sopFileInputRef}
+            type="file"
+            accept=".pdf,application/pdf"
+            aria-label="Choose an SOP PDF"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              if (!file.name.toLowerCase().endsWith(".pdf")) {
+                toast({
+                  variant: "destructive",
+                  title: "Invalid file type",
+                  description: "Please select a PDF file",
+                });
+                event.target.value = "";
+                return;
+              }
+              onUploadSOP?.(file);
+              event.target.value = "";
+            }}
+          />
           <button
             type="button"
             onClick={() => attachmentInputRef.current?.click()}
             // An answer to a pending question is sent through the question flow, which carries
             // no files, so offering the control here would stage a file nothing can send.
-            disabled={hasPendingQuestion}
+            disabled={hasPendingQuestion || authoringInProgress}
             title={
-              hasPendingQuestion
-                ? "Answer the pending question before attaching a file"
-                : "Attach a file"
+              authoringInProgress
+                ? "Finish the current authoring action before attaching a file"
+                : hasPendingQuestion
+                  ? "Answer the pending question before attaching a file"
+                  : "Attach a file"
             }
             aria-label="Attach a file"
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
@@ -6370,6 +6508,7 @@ export function WorkflowCopilotChat({
             isSupported={isSpeechSupported}
             isListening={isSpeechListening}
             isHearingSpeech={isSpeechHearing}
+            disabled={authoringInProgress && !isSpeechListening}
             onToggle={toggleSpeech}
             className="h-8 w-8 rounded-full border-0 bg-transparent"
             iconClassName="h-3.5 w-3.5"
@@ -6377,11 +6516,15 @@ export function WorkflowCopilotChat({
           <TooltipProvider>
             <ControlTooltip
               content={morphButtonLabel}
-              blocked={waitingOnQueueOnly}
+              blocked={waitingOnQueueOnly || authoringBlocksComposerAction}
             >
               <button
                 type="button"
-                disabled={waitingOnQueueOnly || isStopping}
+                disabled={
+                  waitingOnQueueOnly ||
+                  isStopping ||
+                  authoringBlocksComposerAction
+                }
                 aria-busy={isStopping}
                 onClick={() =>
                   turnObservablyRunning && !hasComposerText

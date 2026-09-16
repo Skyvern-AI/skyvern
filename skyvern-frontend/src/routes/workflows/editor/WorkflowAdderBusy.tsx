@@ -201,7 +201,7 @@ function WorkflowAdderBusy({
           <TooltipContent>
             <p>
               {operation === "recording"
-                ? "Stop recording & generate blocks"
+                ? "Stop & generate workflow steps"
                 : operation === "uploading"
                   ? "Converting SOP... (click to cancel)"
                   : "Processing..."}
@@ -232,7 +232,7 @@ function WorkflowAdderBusy({
               <p>
                 {eventCount === 0
                   ? "No events yet — click and type in the live browser"
-                  : "Events captured in this recording"}
+                  : "Interactions captured for this task"}
               </p>
             </TooltipContent>
           </Tooltip>

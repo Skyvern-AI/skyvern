@@ -337,10 +337,10 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(
-      screen.getByText("Turning 2 recorded actions into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
-    expect(screen.getByText("Recording saved")).toBeTruthy();
-    expect(screen.getByText("Recorded actions prepared")).toBeTruthy();
+    expect(screen.getByText("Task recording saved")).toBeTruthy();
+    expect(screen.getByText("Browser interactions prepared")).toBeTruthy();
     expect(screen.getByText("Refining the workflow…")).toBeTruthy();
 
     await act(async () => {
@@ -354,7 +354,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning 2 recorded actions into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
 
     await act(async () => {
@@ -405,7 +405,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning 1 recorded action into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
     expect(screen.queryByText("Workflow refinement stopped")).toBeNull();
 
@@ -436,7 +436,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning 1 recorded action into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
     expect(screen.queryByText("Workflow ready to review")).toBeNull();
 
@@ -530,7 +530,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     );
 
     expect(
-      screen.getByText("Turning 1 recorded action into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
     expect(
       screen.getByText(
@@ -966,7 +966,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
     expect(
-      screen.getByText("Turning 2 recorded actions into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
 
     Object.assign(historyResponse.data, {
@@ -1021,7 +1021,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       streamCalls[0]?.reject(new Error("stream disconnected"));
     });
     expect(
-      screen.getByText("Turning 1 recorded action into a workflow"),
+      screen.getByText("Turning your task demonstration into a workflow"),
     ).toBeTruthy();
 
     await act(async () => {
