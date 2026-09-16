@@ -6005,6 +6005,10 @@ async () => {
   // Candidates the visibility gates below drop. Those drops are silent, so a page whose whole app
   // shell is behind a boot gate renders exactly like an empty one; this is what tells the two apart.
   let hiddenDropped = 0;
+  // hiddenDropped split by the gate that dropped the control; each gate is a different fix.
+  let hiddenDroppedOffCanvas = 0;
+  let hiddenDroppedVisibility = 0;
+  let hiddenDroppedZeroRect = 0;
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
@@ -6121,12 +6125,12 @@ async () => {
     // like v1 (whose center_x check is only reached for a non-zero rect), so the zero-size
     // skinned-proxy carve-out below still runs for an off-screen-positioned skinned control.
     const centerX = (gr.left + gr.width) / 2 + window.scrollX;
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { hiddenDropped++; continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
     // v1's isElementStyleVisibilityVisible (domUtils.js) drops a control whose own computed
     // visibility is not 'visible'. Scoped to non-zero-rect elements so the zero-size skinned-proxy
     // carve-out below still runs; visibility is read per-element, so a visibility:visible child of a
     // hidden ancestor is kept. A native checkbox/radio judges the parent here instead of itself.
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { hiddenDropped++; continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { hiddenDropped++; hiddenDroppedVisibility++; continue; }
     let hidden = false;
     if (r.width === 0 || r.height === 0) {
       // Design systems skin a native SELECT/checkbox/radio/file input at zero size behind a styled
@@ -6148,6 +6152,7 @@ async () => {
         // all-hidden, or all-off-canvas host is a phantom.
       } else {
         hiddenDropped++;
+        hiddenDroppedZeroRect++;
         continue;
       }
     }
@@ -6873,7 +6878,7 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -7722,6 +7727,9 @@ _OBSERVE_SUMMED_KEYS = (
     "rootCount",
     "hiddenListed",
     "hiddenDropped",
+    "hiddenDroppedOffCanvas",
+    "hiddenDroppedVisibility",
+    "hiddenDroppedZeroRect",
     "phantomDropped",
     "markersMinted",
     "markersReused",
@@ -8517,6 +8525,9 @@ def build_browser_tools(
             "text_dropped": text_dropped,
             "hidden_listed": hidden_kept,
             "hidden_dropped": hidden_dropped,
+            "hidden_dropped_off_canvas": int(data.get("hiddenDroppedOffCanvas") or 0),
+            "hidden_dropped_visibility": int(data.get("hiddenDroppedVisibility") or 0),
+            "hidden_dropped_zero_rect": int(data.get("hiddenDroppedZeroRect") or 0),
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,

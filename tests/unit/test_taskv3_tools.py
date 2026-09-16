@@ -1808,6 +1808,9 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "text_dropped",
         "hidden_listed",
         "hidden_dropped",
+        "hidden_dropped_off_canvas",
+        "hidden_dropped_visibility",
+        "hidden_dropped_zero_rect",
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
@@ -22135,6 +22138,8 @@ async def test_observe_discloses_that_a_populated_page_was_dropped_whole_by_the_
     assert "(0 interactive elements)" in r.content, r.content
     assert "note: the page has 5 control(s) that are present but not visible" in r.content, r.content
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 5
+    assert r.data["summary"]["hidden_dropped_off_canvas"] == 1, r.data["summary"]
+    assert r.data["summary"]["hidden_dropped_visibility"] == 4, r.data["summary"]
 
 
 @_skip_no_browser
@@ -22157,6 +22162,105 @@ async def test_observe_stays_silent_about_hidden_chrome_when_it_can_still_see_th
     assert "(1 interactive elements)" in r.content, r.content
     assert "present but not visible" not in r.content, r.content
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 1
+
+
+_HIDDEN_DROP_BUCKETS = ("hidden_dropped_off_canvas", "hidden_dropped_visibility", "hidden_dropped_zero_rect")
+
+
+def _hidden_drop_split(summary: dict[str, Any]) -> dict[str, int]:
+    return {bucket: summary[bucket] for bucket in _HIDDEN_DROP_BUCKETS}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("controls", "bucket"),
+    [
+        (
+            '<button style="position:absolute;left:-9999px">A</button>'
+            '<a href="#b" style="position:absolute;left:-9999px">B</a>',
+            "hidden_dropped_off_canvas",
+        ),
+        (
+            '<button style="visibility:hidden">A</button><input style="visibility:hidden" placeholder="B">',
+            "hidden_dropped_visibility",
+        ),
+        (
+            '<button style="display:none">A</button>'
+            '<button style="display:inline-block;width:0;height:0;padding:0;border:0;overflow:hidden">B</button>',
+            "hidden_dropped_zero_rect",
+        ),
+    ],
+)
+async def test_observe_attributes_each_hidden_drop_to_the_gate_that_dropped_it(controls: str, bucket: str) -> None:
+    # The three gates are three different fixes (a viewport assumption, a visibility predicate, a
+    # layout edge), and the pooled count cannot say which one blinded a page.
+    html = f"<!doctype html><html><head><title>Portal</title></head><body>{controls}</body></html>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok" and r.data is not None, r.content
+    summary = r.data["summary"]
+    assert _hidden_drop_split(summary) == {b: (2 if b == bucket else 0) for b in _HIDDEN_DROP_BUCKETS}, summary
+    assert summary["hidden_dropped"] == 2, summary
+    assert "note: the page has 2 control(s) that are present but not visible" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_splits_a_mixed_blind_page_by_gate_and_the_pooled_count_is_their_sum() -> None:
+    # Distinct counts per gate, so a drop charged to the wrong bucket cannot still add up.
+    html = (
+        "<!doctype html><html><head><title>Portal</title></head><body>"
+        '<button style="position:absolute;left:-9999px">Off</button>'
+        '<button style="visibility:hidden">Vis1</button><button style="visibility:hidden">Vis2</button>'
+        '<div style="display:none"><button>Z1</button><button>Z2</button><a href="#z">Z3</a></div>'
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok" and r.data is not None, r.content
+    summary = r.data["summary"]
+    assert _hidden_drop_split(summary) == {
+        "hidden_dropped_off_canvas": 1,
+        "hidden_dropped_visibility": 2,
+        "hidden_dropped_zero_rect": 3,
+    }, summary
+    assert summary["hidden_dropped"] == 6, summary
+    assert "note: the page has 6 control(s) that are present but not visible" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each realm counts its own drops; a split counter left out of the frame merge would report only the
+    # main frame's share while the pooled count reported the page's.
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    frame = (
+        "<button style='position:absolute;left:-9999px'>FOff</button>"
+        "<button style='visibility:hidden'>FVis</button>"
+        "<button style='display:none'>FZ1</button><button style='display:none'>FZ2</button>"
+        "<button>Frame Live</button>"
+    )
+    html = (
+        '<button style="display:none">MainZ</button><button>Main Live</button>'
+        f'<iframe srcdoc="{frame}" width="300" height="120"></iframe>'
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        merged = await _tool(tools, "observe").handler({})
+
+    assert merged.data is not None, merged.content
+    summary = merged.data["summary"]
+    assert _hidden_drop_split(summary) == {
+        "hidden_dropped_off_canvas": 1,
+        "hidden_dropped_visibility": 1,
+        "hidden_dropped_zero_rect": 3,
+    }, summary
+    assert summary["hidden_dropped"] == 5, summary
 
 
 # The shape SKY-15662 was diagnosed on: many live, visible per-row controls whose accessible name is
