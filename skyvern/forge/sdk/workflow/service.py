@@ -1873,8 +1873,11 @@ def _workflow_save_fingerprint(request: WorkflowCreateYAMLRequest) -> str:
 
 
 class WorkflowService:
-    # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
-    _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+    def __init__(self) -> None:
+        # Per-instance so a fire-and-forget task created under one event loop cannot leak into
+        # another instance built under a later loop (a shared class-level set gathered cross-loop
+        # raises "The future belongs to a different loop"). Also prevents GC of these tasks.
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def recover_undecided_terminal_attempt(
         self, attempt: WorkflowRunAttemptModel, workflow_run: WorkflowRun | None = None
