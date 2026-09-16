@@ -2870,14 +2870,120 @@ async def test_execute_workflow_dispatches_from_latest_retry_attempt(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_first_dispatch_initializer_failure_is_retried_by_the_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization = SimpleNamespace(organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None)
-    monkeypatch.setattr(
-        app.DATABASE.workflow_runs,
-        "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(sequential_credential_id=None, status=WorkflowRunStatus.created)),
+@pytest.mark.parametrize("scenario", ["state_file", "llm_runtime", "lookup_failure", "attempt_row"])
+async def test_no_policy_initializer_failure_fails_the_run_durably(
+    interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    database = interim_retry_db
+    async with database.Session() as session:
+        run = await session.get(WorkflowRunModel, "wr_retry")
+        assert run is not None
+        run.status = "created"
+        run.started_at = None
+        run.finished_at = None
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_retry", 1))
+        assert attempt is not None
+        if scenario == "attempt_row":
+            attempt.status = "created"
+            attempt.retry_decision = None
+            attempt.finished_at = None
+            attempt.next_attempt_at = None
+        else:
+            workflow = await session.get(WorkflowModel, "wf_retry")
+            assert workflow is not None
+            workflow.workflow_definition = {"blocks": [], "parameters": []}
+            await session.delete(attempt)
+        await session.commit()
+
+    monkeypatch.setattr(background_task_executor_module, "initialize_skyvern_state_file", AsyncMock())
+    monkeypatch.setattr(background_task_executor_module, "prepare_org_llm_runtime", AsyncMock())
+    initializer = "prepare_org_llm_runtime" if scenario == "llm_runtime" else "initialize_skyvern_state_file"
+    error = RuntimeError(f"{initializer} unavailable")
+    monkeypatch.setattr(background_task_executor_module, initializer, AsyncMock(side_effect=error))
+    execute = AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "execute_workflow_with_retries", execute)
+    fail_run = AsyncMock(wraps=app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", fail_run)
+    executor = BackgroundTaskExecutor()
+    executor._schedule = MagicMock()  # type: ignore[method-assign]
+    organization = await database.organizations.get_organization("org_test")
+    assert organization is not None
+    await executor.execute_workflow(
+        request=None,
+        background_tasks=None,
+        organization=organization,
+        workflow_id="wf_retry",
+        workflow_run_id="wr_retry",
+        workflow_permanent_id="wpid_retry",
+        max_steps_override=None,
+        api_key=None,
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
     )
-    monkeypatch.setattr(app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    _background_tasks, dispatch, attempt, execution_kwargs = executor._schedule.call_args.args
+    get_attempts = database.workflow_run_attempts.get_attempts
+    if scenario == "lookup_failure":
+        monkeypatch.setattr(
+            database.workflow_run_attempts, "get_attempts", AsyncMock(side_effect=RuntimeError("db down"))
+        )
+    await dispatch(attempt, execution_kwargs)
+    execute.assert_not_awaited()
+    run = await database.workflow_runs.get_workflow_run("wr_retry")
+    assert run is not None
+    assert run.started_at is None
+    attempts = await get_attempts("wr_retry")
+    key = ("wr_retry", 1)
+    if scenario in {"lookup_failure", "attempt_row"}:
+        assert run.status == WorkflowRunStatus.queued
+        assert run.failure_reason is None
+        fail_run.assert_not_awaited()
+        assert key in executor._retry_dispatches_needing_recovery
+        assert key in executor._retry_resumes_needing_recovery
+        if scenario == "attempt_row":
+            assert len(attempts) == 1
+            assert attempts[0].status == "queued"
+            assert attempts[0].started_at is None
+        else:
+            assert not attempts
+    else:
+        assert run.status == WorkflowRunStatus.failed
+        reason = f"Workflow run initialization failed before execution: RuntimeError: {error}"
+        assert run.failure_reason == reason
+        fail_run.assert_awaited_once_with(workflow_run_id="wr_retry", failure_reason=reason)
+        assert not attempts
+        assert not executor._retry_dispatches_needing_recovery
+        assert not executor._retry_resumes_needing_recovery
+        executor._schedule.reset_mock()
+        await executor._recover_pending_retries_once(resume_fresh=True)
+        executor._schedule.assert_not_called()
+        execute.assert_not_awaited()
+    if app.WORKFLOW_SERVICE._background_tasks:
+        await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_first_dispatch_initializer_failure_is_retried_by_the_sweep(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    organization = SimpleNamespace(organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_test",
+                    organization_id="org_test",
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_test",
+                    status="created",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_test", organization_id="org_test", attempt_number=1, status="created"
+                ),
+            ]
+        )
+        await session.commit()
     initializer_calls = 0
 
     async def flaky_initialize(**kwargs: object) -> None:

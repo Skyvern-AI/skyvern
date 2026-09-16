@@ -22,7 +22,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtim
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
-from skyvern.forge.sdk.workflow.retry_policy import queue_initial_attempt
+from skyvern.forge.sdk.workflow.retry_policy import fail_run_without_attempt_row, queue_initial_attempt
 from skyvern.forge.sdk.workflow.schedules import compute_previous_fire_time
 from skyvern.services.workflow_service import prepare_workflow
 from skyvern.utils.files import initialize_skyvern_state_file
@@ -222,15 +222,29 @@ class LocalWorkflowScheduleScheduler:
                 return
             raise
 
-        # A persisted run counts as a delivered fire, so the attempt must be recoverable by the dispatch
-        # sweep before the initializers below can fail.
+        # A persisted run counts as a delivered fire. Queue its attempt for sweep recovery;
+        # without an attempt row, an initialization failure must make the run terminal.
         if not await queue_initial_attempt(workflow_run.workflow_run_id, 1):
             return
-        await initialize_skyvern_state_file(
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=organization.organization_id,
-        )
-        await prepare_org_llm_runtime(app.DATABASE, organization.organization_id, organization)
+        try:
+            await initialize_skyvern_state_file(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+            )
+            await prepare_org_llm_runtime(app.DATABASE, organization.organization_id, organization)
+        except Exception as exc:
+            if await fail_run_without_attempt_row(
+                workflow_run.workflow_run_id,
+                f"Workflow run initialization failed before execution: {type(exc).__name__}: {exc}",
+            ):
+                LOG.warning(
+                    "Scheduled workflow initialization failed without an attempt row; run is terminal",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_schedule_id=schedule.workflow_schedule_id,
+                    exc_info=True,
+                )
+                return
+            raise
         await app.WORKFLOW_SERVICE.execute_workflow_with_retries(
             workflow_run_id=workflow_run.workflow_run_id,
             api_key=None,
