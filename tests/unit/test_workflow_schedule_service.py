@@ -158,3 +158,56 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
         need_call_webhook=True,
         claim_initial_attempt=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_attempt_row", [False, True], ids=["no-policy", "policy"])
+@pytest.mark.parametrize("initializer", ["initialize_skyvern_state_file", "prepare_org_llm_runtime"])
+async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch, has_attempt_row: bool, initializer: str
+) -> None:
+    schedule = _schedule()
+    previous_fire_time = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+    run_id = schedule_service.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, previous_fire_time)
+    execute = AsyncMock()
+    fail_run = AsyncMock()
+    get_attempts = AsyncMock(return_value=[SimpleNamespace(attempt_number=1)] if has_attempt_row else [])
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            organizations=SimpleNamespace(
+                get_organization=AsyncMock(return_value=SimpleNamespace(organization_id="org_test"))
+            ),
+            workflow_runs=SimpleNamespace(queue_initial_dispatch=AsyncMock(return_value=True)),
+            workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+        ),
+        WORKFLOW_SERVICE=SimpleNamespace(
+            execute_workflow_with_retries=execute,
+            mark_workflow_run_as_failed_if_not_final=fail_run,
+        ),
+    )
+    monkeypatch.setattr(schedule_service, "app", fake_app)
+    monkeypatch.setattr(retry_policy_module, "app", fake_app)
+    monkeypatch.setattr(
+        schedule_service,
+        "prepare_workflow",
+        AsyncMock(return_value=SimpleNamespace(workflow_run_id=run_id, browser_session_id=None)),
+    )
+    monkeypatch.setattr(schedule_service, "initialize_skyvern_state_file", AsyncMock())
+    monkeypatch.setattr(schedule_service, "prepare_org_llm_runtime", AsyncMock())
+    error = RuntimeError(f"{initializer} unavailable")
+    monkeypatch.setattr(schedule_service, initializer, AsyncMock(side_effect=error))
+    scheduler = schedule_service.LocalWorkflowScheduleScheduler(poll_interval_seconds=1, max_concurrent_runs=1)
+    due = schedule_service.DueWorkflowSchedule(schedule=schedule, previous_fire_time=previous_fire_time)
+    if has_attempt_row:
+        with pytest.raises(RuntimeError, match=f"{initializer} unavailable"):
+            await scheduler._run_schedule(due)
+        fail_run.assert_not_awaited()
+    else:
+        await scheduler._run_schedule(due)
+        fail_run.assert_awaited_once_with(
+            workflow_run_id=run_id,
+            failure_reason=f"Workflow run initialization failed before execution: RuntimeError: {error}",
+        )
+    get_attempts.assert_awaited_once_with(run_id)
+    fake_app.DATABASE.workflow_runs.queue_initial_dispatch.assert_awaited_once_with(run_id, 1)
+    execute.assert_not_awaited()
