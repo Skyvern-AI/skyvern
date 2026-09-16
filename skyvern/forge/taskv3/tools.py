@@ -12585,6 +12585,7 @@ class BlankWorkingPageGuard:
         file a previous block downloaded is not this block's.
         """
         armed = False
+        attempts: int | None = None
         if self._download_attempts is not None:
             try:
                 attempts = self._download_attempts()
@@ -12609,8 +12610,16 @@ class BlankWorkingPageGuard:
                 # stop. The invariant is one close per DOWNLOAD, which means per identity.
                 identities = {_download_signal_identity(name) for name in names}
                 new = identities - self._seen_downloads
+                # Refreshed on EVERY scan, including while the counter is authoritative. Skipping the
+                # listing entirely would let it go stale, and the first scan after the counter stops
+                # being available -- a reconnect drops `browser_context`, and the interceptor is
+                # attached per context -- would see the whole run's directory as new and arm.
                 self._seen_downloads = identities
-                if self._baselined and new:
+                # Only the ARMING is gated: the listing is a fallback, not a second opinion. Allowed
+                # to arm alongside the counter, one download arms twice -- once when the counter moves
+                # and again when the file's identity first appears here -- and identity cannot dedupe
+                # that, because the counter carries none.
+                if attempts is None and self._baselined and new:
                     armed = True
         if not self._baselined:
             self._baselined = True
