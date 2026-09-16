@@ -487,6 +487,35 @@ def _has_committable_state(state: dict[str, Any] | None) -> bool:
     return isinstance(state, dict) and any(state.get(k) is not None for k in _COMMIT_STATE_KEYS)
 
 
+def _option_str_list(raw: Any) -> list[str] | None:
+    """The string options of a declared array, or None when the caller declared no usable array.
+
+    An empty string is a real option value -- `<option value="">` is selectable -- so it is kept, and
+    an empty array is a declared request to hold nothing, so it wins over a scalar like any other
+    array. Only an array with nothing usable in it falls through as undeclared.
+    """
+    if not isinstance(raw, list):
+        return None
+    items = [x for x in raw if isinstance(x, str)]
+    return items if items or not raw else None
+
+
+# select_option's readback names the options a control holds, and the page chooses that text. The
+# result is not compacted, so both the count and each option are bounded -- and marked when cut.
+SELECTION_REPORT_MAX_OPTIONS = 20
+SELECTION_REPORT_OPTION_WIDTH = 80
+
+
+def _selection_report(options: list[str]) -> str:
+    shown = [
+        o[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(o) > SELECTION_REPORT_OPTION_WIDTH else o
+        for o in options[:SELECTION_REPORT_MAX_OPTIONS]
+    ]
+    if len(shown) < len(options):
+        return f"{shown!r} (showing {len(shown)} of {len(options)})"
+    return repr(shown)
+
+
 def _classify_commit(
     pre: dict[str, Any] | None, post_matches: int, post: dict[str, Any] | None, *, committed_value: bool | None = None
 ) -> CommitStatus:
@@ -4147,6 +4176,7 @@ _SELECT_VISIBILITY_JS = (
       visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden',
       disabled: !!el.disabled,
       proxied: !!_nativeProxy(el),
+      multiple: el.multiple === true,
     };
   } catch (e) { return { exists: false, visible: false }; }
 }"""
@@ -4212,8 +4242,18 @@ _SELECT_READBACK_JS = (
     if (!el) return null;
     const idx = el.selectedIndex;
     const opt = idx >= 0 ? el.options[idx] : null;
+    // el.value and el.selectedIndex both name only the FIRST selected option, so on a
+    // <select multiple> they report a set of many as one. The set is the only honest readout.
+    const picked = Array.from(el.selectedOptions || []);
     // Playwright matches label= against option.label (whitespace-collapsed), not raw text.
-    return { value: el.value, selectedIndex: idx, selectedLabel: opt ? opt.label : null };
+    return {
+      value: el.value,
+      selectedIndex: idx,
+      selectedLabel: opt ? opt.label : null,
+      multiple: el.multiple === true,
+      selectedLabels: picked.map((o) => o.label),
+      selectedValues: picked.map((o) => o.value),
+    };
   } catch (e) { return null; }
 }"""
 )
@@ -5089,6 +5129,10 @@ OBSERVE_DISPLAY_WIDTHS = {
 # call so the longest payload-minted URL fits whole after the widest display window.
 OBSERVE_RETAIN_WIDTH_MIN = 2000
 OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
+# Width the whole selected-options list may occupy on one rendered line, repr and all. A set-valued
+# control holds an unbounded number of options and each carries a label, so capping only the count
+# still lets one control take the digest over.
+OBSERVE_SELECTED_OPTIONS_TOTAL_CAP = 600
 
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
@@ -6210,7 +6254,21 @@ async () => {
     // element line for a selector that does not exist.
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
-    if (secretValue) { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    // el.value on a <select multiple> is the FIRST selected option only: a control holding nine
+    // reads as holding one, so an overwrite and an accumulation look identical. Report the set
+    // instead -- the scalar is a false readout here, not a partial one. Single-select is untouched.
+    const _multiSelect = el.tagName === 'SELECT' && el.multiple === true;
+    if (secretValue) { if (el.value) rec.value = '(hidden)'; }
+    else if (_multiSelect) {
+      const _picked = Array.from(el.selectedOptions || []);
+      // Retained per item at the same width as the scalar branch below: this list rides in the
+      // persistent conversation prefix, so an uncapped label is paid for on every later turn.
+      rec.selectedOptions = _picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
+      // The size actually held, not the size retained. Python renders the truncation marker off
+      // this: a list that lost its tail silently reads as the whole selection.
+      rec.selectedTotal = _picked.length;
+    }
+    else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
     // React-Select-style commit: the widget clears el.value and moves the label into its own surface
     // (D3). Only when el.value is empty, so a field still holding its own text is never overridden.
     else if (_isAutocomplete(el)) {
@@ -8382,6 +8440,24 @@ def build_browser_tools(
                 extra += f" placeholder={_field(e['placeholder'], OBSERVE_DISPLAY_WIDTHS['placeholder'])!r}"
             if e.get("options"):
                 extra += f" options={e['options']}"
+            if e.get("selectedOptions") is not None:
+                held = e["selectedOptions"]
+                raw_total = e.get("selectedTotal")
+                total = len(held) if raw_total is None else int(raw_total)
+                shown: list[str] = []
+                for option in held:
+                    text = _field(option, OBSERVE_DISPLAY_WIDTHS["value"])
+                    # Measured on the RENDERED list, not the raw strings: the line is emitted through
+                    # repr, whose quotes and separators add about a third the budget charges for.
+                    if len(repr([*shown, text])) > OBSERVE_SELECTED_OPTIONS_TOTAL_CAP:
+                        break
+                    shown.append(text)
+                extra += f" selected_options={shown}"
+                # A capped selection must say it was capped. Showing 60 of 75 with no marker reads as
+                # the complete set, and the model then reasons about a selection it believes it can
+                # see whole -- the same false-readout failure the set replaced el.value to fix.
+                if len(shown) < total:
+                    extra += f" (showing {len(shown)} of {total} selected)"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
             if e.get("selected") is not None:
@@ -11413,6 +11489,8 @@ def build_browser_tools(
         selector = args["selector"]
         label = args.get("label")
         value = args.get("value")
+        label_list = _option_str_list(args.get("labels"))
+        value_list = _option_str_list(args.get("values"))
         ambiguous = await _ambiguous_selector_error(page, selector)
         if ambiguous is not None:
             return ambiguous
@@ -11436,7 +11514,15 @@ def build_browser_tools(
         # momentarily fails is never misrouted into typing.
         probe_node = str(probe.get("nodeName") or "") if isinstance(probe, dict) and probe.get("exists") else None
         if probe_node is not None and probe_node != "select":
-            chosen = label if label is not None else value
+            # A custom combobox commits one picked suggestion at a time; it has no set-valued
+            # commit path, so a requested set cannot be honoured in one call here.
+            requested = label_list or value_list
+            if requested is not None and len(requested) > 1:
+                return ToolResult.error(
+                    f"{selector} is not a native <select>, so a set of options cannot be committed in "
+                    "one call — select one option per call"
+                )
+            chosen = requested[0] if requested else (label if label is not None else value)
             if not isinstance(chosen, str) or not chosen:
                 return ToolResult.error("select_option needs a label or value to choose")
             return await _commit_custom_combobox(page, selector, _resolve_text(chosen))
@@ -11445,11 +11531,28 @@ def build_browser_tools(
         force = bool(isinstance(probe, dict) and probe.get("exists") and not probe.get("visible"))
         if force and not probe.get("proxied"):
             return await _unreachable_error(selector)
-        if label is not None:
+        # A <select multiple> discards its whole selection on every call, so a set must travel as one
+        # call; the driver takes a list natively.
+        is_multi = bool(isinstance(probe, dict) and probe.get("multiple"))
+        # What the readback is checked against comes off the SAME chain that selects, in the same
+        # order. Derived separately, `values` plus a scalar `label` selected by value and verified by
+        # label, so a call that did exactly what was asked reported `asked for ['Gamma'], it now
+        # holds ['Alpha']` and told the model to re-pass a set it had never asked for.
+        if label_list is not None:
+            by_label, asked = True, label_list
+            await page.select_option(selector, label=label_list, timeout=15000, force=force)
+        elif value_list is not None:
+            by_label, asked = False, value_list
+            await page.select_option(selector, value=value_list, timeout=15000, force=force)
+        elif label is not None:
+            by_label, asked = True, [label]
             await page.select_option(selector, label=label, timeout=15000, force=force)
         else:
+            by_label, asked = False, ([value] if isinstance(value, str) else [])
             await page.select_option(selector, value=value, timeout=15000, force=force)
-        if not force:
+        # A set-valued control is read back whether or not it was forced: without it a call that
+        # discarded every prior selection reports the same bare success as one that added to them.
+        if not force and not is_multi:
             return ToolResult.ok(f"selected on {selector}")
         try:
             readback = await page.evaluate(_SELECT_READBACK_JS, await _probe_arg(page, selector))
@@ -11458,13 +11561,35 @@ def build_browser_tools(
         value_read: Any = None
         post: dict[str, Any] | None = None
         committed_value: bool | None = None
+        expected: list[str] = []
+        held: list[str] = []
         if isinstance(readback, dict):
             value_read = readback.get("value")
-            post = {"value": value_read}
-            committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
+            if is_multi:
+                # Compare the SET, never `selectedLabel`/`el.value`: both name only the first selected
+                # option, so they read a nine-option selection and a one-option one identically.
+                expected = asked
+                key = "selectedLabels" if by_label else "selectedValues"
+                held = [x for x in (readback.get(key) or []) if isinstance(x, str)]
+                post = {"value": value_read, "selected": held}
+                # Multiplicity on the HELD side, deduped on the asked side: a page handler that also
+                # selects a duplicate-valued sibling leaves the control holding two options the form
+                # will submit twice, and comparing two sets reports that exact. Asking for the same
+                # option twice is still one request, so the ask is deduped rather than both sides.
+                committed_value = sorted(held) == sorted(set(expected))
+            else:
+                post = {"value": value_read}
+                committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
         matches = await _post_match_count(page, selector)
         verdict = _classify_commit(None, matches, post, committed_value=committed_value)
         if verdict is CommitStatus.DID_NOT_COMMIT:
+            if is_multi:
+                return ToolResult.error(
+                    f"select on {selector} did NOT commit the requested set: asked for "
+                    f"{_selection_report(expected)}, it now holds {_selection_report(held)} — one call "
+                    "REPLACES the whole selection, so pass every option "
+                    "you want held in a single call via `values` or `labels`"
+                )
             return ToolResult.error(
                 f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
                 "widget may not sync from its hidden control; re-observe and act on the visible proxy instead"
@@ -11478,6 +11603,10 @@ def build_browser_tools(
             return ToolResult.ok(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
+            )
+        if is_multi:
+            return ToolResult.ok(
+                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
             )
         return ToolResult.ok(f"selected on {selector} (hidden native select, set directly)")
 
@@ -12560,9 +12689,19 @@ def build_browser_tools(
         ),
         _spec(
             "select_option",
-            "Choose an option in a <select> by value or visible label.",
+            "Choose an option in a <select> by value or visible label. For a control observe reports as "
+            "`select-multiple`, pass ALL the options you want held in ONE call via `values` or `labels` "
+            "-- a second call does not add to the selection, it REPLACES it. The result reports the "
+            "resulting selection set, so you can tell an accumulation from an overwrite.",
             _obj(
-                {"selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}}, ["selector"]
+                {
+                    "selector": {"type": "string"},
+                    "value": {"type": "string"},
+                    "label": {"type": "string"},
+                    "values": {"type": "array", "items": {"type": "string"}},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                },
+                ["selector"],
             ),
             select_option,
         ),
