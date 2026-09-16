@@ -609,6 +609,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 if await fail_run_without_attempt_row(
                     attempt.workflow_run_id,
                     f"Workflow run initialization failed before execution: {type(exc).__name__}: {exc}",
+                    api_key=execution_kwargs.get("api_key"),
+                    need_call_webhook=execution_kwargs.get("need_call_webhook", True),
                 ):
                     self._retry_resumes_needing_recovery.discard(key)
                     LOG.warning(
@@ -819,6 +821,22 @@ class BackgroundTaskExecutor(AsyncExecutor):
                         terminal_run,
                         decision,
                         api_key=api_key,
+                    )
+            else:
+                try:
+                    terminal_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization.organization_id,
+                    )
+                    if terminal_run is not None:
+                        await app.WORKFLOW_SERVICE.execute_workflow_webhook(
+                            terminal_run, api_key=api_key, claim_kind=None
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to deliver workflow webhook after rejecting a sequential credential run",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
                     )
             raise BackgroundSequentialCredentialUnsupported(workflow_run_id)
 

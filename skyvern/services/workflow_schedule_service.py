@@ -236,6 +236,8 @@ class LocalWorkflowScheduleScheduler:
             if await fail_run_without_attempt_row(
                 workflow_run.workflow_run_id,
                 f"Workflow run initialization failed before execution: {type(exc).__name__}: {exc}",
+                api_key=None,
+                need_call_webhook=True,
             ):
                 LOG.warning(
                     "Scheduled workflow initialization failed without an attempt row; run is terminal",
