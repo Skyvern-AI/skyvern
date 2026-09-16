@@ -51,7 +51,7 @@ from skyvern.forge.taskv3.loop import (
     make_finish_tool,
     run_agent_tool_loop,
 )
-from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     PageProvider,
@@ -116,7 +116,7 @@ Rules:
 
 OPAQUE_URL_GUIDANCE = """
 
-Some values in the data provided are shown as `opaque_url_xxxxxxxx` instead of a real URL: these are references to URLs from the task data, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
+Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
 This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
@@ -229,7 +229,19 @@ async def run_task_v3_agent_loop(
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
     # tools to resolve a token with, so the payload stays verbatim for the model to judge directly.
-    refs = mask_opaque_urls(parameters) if not page_free else OpaqueUrlRefs(masked=parameters, refs={})
+    # Workflow templates render a file parameter straight into the goal, the system guidance and the
+    # block URL, so every model-facing text is minted into the same refs as the payload.
+    model_starting_url = starting_url
+    if page_free:
+        refs = OpaqueUrlRefs(masked=parameters, refs={})
+        model_goal = goal
+    else:
+        refs = mask_opaque_urls(parameters)
+        model_goal = refs.mint_in_text(goal)
+        extra_system_guidance = refs.mint_in_text(extra_system_guidance)
+        # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
+        if starting_url and is_signed_url(starting_url):
+            model_starting_url = refs.derive(starting_url)
     # The single model-facing masking boundary reads these off the task context (the chokepoint
     # hide_from_model already runs on every tool result), so a resolved ref echoed by any tool —
     # success or error — is rewritten to its token by membership, without each tool opting in. Set
@@ -378,7 +390,7 @@ async def run_task_v3_agent_loop(
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=build_user_prompt(goal, refs.masked, starting_url),
+            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
