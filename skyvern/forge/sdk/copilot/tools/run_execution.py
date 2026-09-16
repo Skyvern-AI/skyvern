@@ -113,11 +113,22 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
 )
+from skyvern.forge.sdk.copilot.enforcement import (
+    proxy_hop_failure_reason,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import _blocks_by_label, block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import frontier_dump_root, trust_snapshot, write_packet
 from skyvern.forge.sdk.copilot.narration import _TERMINAL_BLOCK_STATUSES, NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.nav_attribution import (
+    block_nav_error_codes,
+    driver_nav_code_positions,
+    iter_failure_reason_codes,
+    proxy_owns_nav_codes,
+    restore_driver_nav_codes,
+    target_owns_nav_codes,
+)
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
@@ -176,6 +187,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    is_registered_scrub_value,
     register_matching_origin_run_redaction_values,
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
@@ -209,11 +221,11 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
-from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._shared import (
@@ -228,6 +240,7 @@ from ._shared import (
     _valid_runtime_anchor_url,
     _workflow_definition_block_labels,
     _workflow_verification_evidence,
+    browser_session_hop_proxy,
 )
 from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import (
@@ -3053,6 +3066,10 @@ async def _run_blocks_and_collect_debug(
     ctx.last_frontier_start_label = frontier_start_label
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
+    # Only a dispatched run sets this below; cleared here so a turn that bails before dispatch
+    # cannot label its recorded failure with the previous run's proxy.
+    ctx.last_run_proxy_location = None
+    ctx.last_run_proxy_from_session = False
     # Verified state is NOT invalidated pre-run. On a failed / partial run we
     # want the prior verified prefix preserved so the next edit can still use
     # the optimization. YAML-diff-based invalidation for edited/downstream
@@ -3489,6 +3506,13 @@ async def _run_blocks_and_collect_debug(
                     "error": "The pending Copilot proposal changed before the test started; reload and try again.",
                 }
         ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
+        # The browser session the run attaches overrides the run row's proxy in the browser layer,
+        # so the proxy this run acts through is the session's whenever it declares one.
+        session_made_hop, run_session_proxy_location = await browser_session_hop_proxy(ctx, run_session_id)
+        ctx.last_run_proxy_from_session = session_made_hop
+        ctx.last_run_proxy_location = (
+            run_session_proxy_location if session_made_hop else runtime_proxy_location(workflow_run.proxy_location)
+        )
 
         # The ordinary Track-A producer owns this registry at run creation. Keeping the run id and
         # serialized values in one immutable carrier prevents a later context from vouching for it.
@@ -4620,20 +4644,42 @@ def _terminal_challenge_completion_verification(
     )
 
 
-# Generic failure-reason template emitted by the shared agent when the
-# browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
-# the template (not the shared classifier) lets the copilot notice a repeated
-# site-block/unreadable-page pattern even though the classifier routes it to
-# DATA_EXTRACTION_FAILURE, not ANTI_BOT_DETECTION.
-# Coupling note: these substrings come from the run-level failure_reason
-# produced when the shared scraper raises ScrapingFailed; update the tuple if that wording changes.
 def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
-    """Return the first failure_reason that matches SKIP_INNER_NAV_RETRY_ERRORS
-    (DNS / cert / SSL / invalid URL), preferring run-level over block-level.
-    Same set is_skip_inner_retry_error uses at the browser layer, so the copilot
-    classifies on exactly the patterns that already short-circuit retries in
-    navigate_with_retry (skyvern/webeye/navigation.py)."""
-    return next((reason for reason in iter_failure_reasons(result) if is_skip_inner_retry_error(reason)), None)
+    """Return the failure_reason the driver blamed on the target (DNS / cert / SSL / invalid URL).
+
+    Ownership comes from the codes the driver reported for that reason, the same channel proxy
+    ownership uses, never from the reason text: failure_reason is model-authored on some paths, so a
+    quoted code is a sentence about a verdict rather than the verdict. A resolver-corroborated dead
+    host is no exception: UnresolvableNavigationHost carries NO_ADDRESS_RECORD_NAV_ERROR_CODE as its
+    own driver code, so it reaches target_owns_nav_codes through the same channel as any other.
+    """
+    return next(
+        (reason for reason, codes in iter_failure_reason_codes(result) if target_owns_nav_codes(codes)),
+        None,
+    )
+
+
+def _proxy_attributed_failure_reason(
+    copilot_ctx: CopilotContext, reason: str | None, result: dict[str, Any]
+) -> str | None:
+    """Name Skyvern's proxy hop in the recorded reason, so the run observation and every later reply
+    that renders it inherit the attribution. A run the target also failed keeps its own reason: the
+    stop decision owns that one.
+
+    Ownership comes from the codes the driver reported on the result, never from ``reason`` itself:
+    a task's failure_reason can be model-authored verbatim."""
+    if (
+        not reason
+        or copilot_ctx.last_test_non_retriable_nav_error is not None
+        or not proxy_owns_nav_codes(block_nav_error_codes(result, reason))
+    ):
+        return reason
+    return proxy_hop_failure_reason(
+        copilot_ctx,
+        reason,
+        copilot_ctx.last_run_proxy_location,
+        session_made_hop=copilot_ctx.last_run_proxy_from_session,
+    )
 
 
 def _infrastructure_runner_error_codes(result: dict[str, Any]) -> list[str]:
@@ -4765,6 +4811,9 @@ def _record_run_blocks_result(
     copilot_ctx.last_test_anti_bot = None
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
+    # Cleared per run beside its sibling: the flag is only assigned past the success-path return, so
+    # without this one proxy failure would hold authoring repair off for the rest of the session.
+    copilot_ctx.last_test_proxy_owned_failure = False
     copilot_ctx.last_infrastructure_tool_error = None
     copilot_ctx.post_run_page_observation_tool = None
     copilot_ctx.post_run_page_observation_url = None
@@ -4969,15 +5018,21 @@ def _record_run_blocks_result(
         # User-facing surfaces read this; the result dict keeps the run's own reason for the
         # repair signature, the failure summary and loop detection.
         copilot_ctx.last_test_failure_reason = connect_failure_reason
+    # Scoped to the reason a reader will see, exactly as the attribution below is: a run whose first
+    # block timed out and whose second hit the proxy shows the timeout, so calling that run
+    # proxy-owned would put egress copy on it and hold authoring repair off the block that failed.
+    copilot_ctx.last_test_proxy_owned_failure = proxy_owns_nav_codes(
+        block_nav_error_codes(result, copilot_ctx.last_test_failure_reason)
+    )
+    copilot_ctx.last_test_failure_reason = _proxy_attributed_failure_reason(
+        copilot_ctx, copilot_ctx.last_test_failure_reason, result
+    )
     _update_verification_evidence_from_run_result(copilot_ctx, result)
+    displayed_failure_reason = copilot_ctx.last_test_failure_reason or str(result.get("error") or "The run failed.")
     recorded_outcome = RecordedRunOutcome(
         verdict="not_demonstrated",
         reason_code="blocker_reported",
-        display_reason=run_outcome_display_reason(
-            connect_failure_reason
-            or copilot_ctx.last_test_failure_reason
-            or str(result.get("error") or "The run failed.")
-        ),
+        display_reason=run_outcome_display_reason(displayed_failure_reason),
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         run_completed=False,
     )
@@ -4988,15 +5043,26 @@ def _record_run_blocks_result(
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
 
 
+def _preserved_driver_nav_codes(copilot_ctx: CopilotContext, result: dict[str, Any]) -> list[tuple[int, int, str]]:
+    """The driver codes to put back after scrubbing: a code that is itself a registered value stays scrubbed."""
+    return [
+        position
+        for position in driver_nav_code_positions(result)
+        if not is_registered_scrub_value(copilot_ctx, position[2])
+    ]
+
+
 def _commit_run_blocks_record(copilot_ctx: CopilotContext, result: dict[str, Any]) -> RecordedRunOutcome | None:
     """Commit the run's structured outcome once, marking the result so the shared seam does not redo it.
 
     The browser-loss stamp runs here rather than at the shared seam: the commit happens upstream of
     that seam, so a stamp applied there would never reach the committed record."""
+    driver_codes = _preserved_driver_nav_codes(copilot_ctx, result)
     sanitized = scrub_secrets_from_structure(copilot_ctx, result)
     if sanitized is not result:
         result.clear()
         result.update(sanitized)
+    restore_driver_nav_codes(result, driver_codes)
     connect_failure_reason = _stamp_run_side_connect_failure(copilot_ctx, result)
     recorded = _record_run_blocks_result(
         copilot_ctx, result, completion_verification=None, connect_failure_reason=connect_failure_reason
@@ -6127,14 +6193,28 @@ def finalize_build_test_result(
                 "challenge_notices": challenge_notices(contract.challenge, list(contract.levers)),
             }
         )
-    data[BUILD_TEST_PACKET_KEY] = scrub_secrets_from_structure(
-        copilot_ctx,
-        packet.model_dump(mode="json", exclude_none=True),
-    )
+    # Both scrubs below reach the model, so the driver codes the run commit restored are restored again:
+    # in the result, and in the packet's copy of the failed block's codes.
+    driver_codes = _preserved_driver_nav_codes(copilot_ctx, result)
+    driver_code_values = {code for _, _, code in driver_codes}
+    packet_payload = packet.model_dump(mode="json", exclude_none=True)
+    packet_failure = packet_payload.get("failure")
+    packet_codes = packet_failure.get("error_codes") if isinstance(packet_failure, dict) else None
+    packet_driver_codes = [(index, code) for index, code in enumerate(packet_codes or []) if code in driver_code_values]
+    data[BUILD_TEST_PACKET_KEY] = scrub_secrets_from_structure(copilot_ctx, packet_payload)
     sanitized = scrub_secrets_from_structure(copilot_ctx, result)
     if sanitized is not result:
         result.clear()
         result.update(sanitized)
+    restore_driver_nav_codes(result, driver_codes)
+    scrubbed_data = result.get("data")
+    scrubbed_packet = scrubbed_data.get(BUILD_TEST_PACKET_KEY) if isinstance(scrubbed_data, dict) else None
+    scrubbed_failure = scrubbed_packet.get("failure") if isinstance(scrubbed_packet, dict) else None
+    scrubbed_codes = scrubbed_failure.get("error_codes") if isinstance(scrubbed_failure, dict) else None
+    if isinstance(scrubbed_codes, list):
+        for index, code in packet_driver_codes:
+            if index < len(scrubbed_codes):
+                scrubbed_codes[index] = code
     return result
 
 

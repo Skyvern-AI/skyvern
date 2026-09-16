@@ -214,7 +214,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
-from skyvern.webeye.navigation import revalidate_redirect_chain
+from skyvern.webeye.navigation import reported_nav_error_code, revalidate_redirect_chain
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -4516,6 +4516,11 @@ class ScopedXhrDownloadCapture:
         self._status_observation_deadline = None
 
 
+# Terminate and complete are how a task ends, so a navigation failure before one of them is the
+# failure the task reports rather than something it moved past.
+_TASK_ENDING_ACTION_TYPES = frozenset({ActionType.TERMINATE, ActionType.COMPLETE})
+
+
 class ActionHandler:
     _handled_action_types: dict[
         ActionType,
@@ -4585,6 +4590,11 @@ class ActionHandler:
         # browser, chooses the download-capturing path or persists a row.
         preflight_action(action, page, site="handle_action")
         action.started_at = naive_utc_now()
+        # A later action running means the earlier navigation failure did not end the task, so its
+        # code no longer describes the failure this task will report. Terminate and complete are the
+        # exception: they are how a task ends, so the navigation before them is what it ends on.
+        if action.action_type not in _TASK_ENDING_ACTION_TYPES:
+            _clear_task_nav_error_code(task)
         # Hydrated/cached actions can arrive with a prior finished_at; clear it so the
         # exceptional-exit fallback below stamps this execution, not the previous one.
         action.finished_at = None
@@ -10642,6 +10652,35 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
+async def _record_task_nav_error_code(task: Task, error: BaseException, url: str | None = None) -> None:
+    """Keep the driver's code for a navigation action that failed.
+
+    These actions call the driver directly, so their failure becomes an ``ActionFailure`` and never
+    reaches the typed navigation error. Without this the code is gone by the time anything decides
+    who owned the failure, and an egress fault reads as a defect in the run.
+    """
+    context = skyvern_context.current()
+    if context is None:
+        return
+    # Dropped before the current attempt is read, not only on success: an attempt that reports no
+    # code of its own would otherwise be judged on the one before it.
+    context.task_nav_error_codes.pop(task.task_id, None)
+    code = await reported_nav_error_code(error, url)
+    if code:
+        context.task_nav_error_codes[task.task_id] = code
+
+
+def _clear_task_nav_error_code(task: Task) -> None:
+    """Drop a code kept from an earlier attempt once this task navigates successfully.
+
+    A retry that succeeds leaves the failure behind it, so a later failure of a different kind would
+    otherwise inherit the old code and be reported as a network fault.
+    """
+    context = skyvern_context.current()
+    if context is not None:
+        context.task_nav_error_codes.pop(task.task_id, None)
+
+
 @traced(name="skyvern.agent.action.goto_url")
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
@@ -10651,8 +10690,13 @@ async def handle_goto_url_action(
     step: Step,
 ) -> list[ActionResult]:
     validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
-    response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+    try:
+        response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+    except Exception as navigation_error:
+        await _record_task_nav_error_code(task, navigation_error, url=validated_url)
+        raise
+    _clear_task_nav_error_code(task)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -10667,7 +10711,12 @@ async def handle_go_back_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.go_back(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    try:
+        await page.go_back(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    except Exception as navigation_error:
+        await _record_task_nav_error_code(task, navigation_error)
+        raise
+    _clear_task_nav_error_code(task)
     return [ActionSuccess()]
 
 
@@ -10678,7 +10727,12 @@ async def handle_go_forward_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.go_forward(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    try:
+        await page.go_forward(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    except Exception as navigation_error:
+        await _record_task_nav_error_code(task, navigation_error)
+        raise
+    _clear_task_nav_error_code(task)
     return [ActionSuccess()]
 
 
@@ -10689,7 +10743,14 @@ async def handle_reload_page_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    try:
+        await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    except Exception as navigation_error:
+        # Unlike back and forward, whose target is a history entry rather than this URL, a reload
+        # names the page it is on -- so the resolver can be asked about the right host.
+        await _record_task_nav_error_code(task, navigation_error, url=page.url)
+        raise
+    _clear_task_nav_error_code(task)
     # Reloading re-renders the DOM and invalidates the scraped page's element ids; stop the
     # batch so the next step re-scrapes before any later actions run.
     result = ActionSuccess()
@@ -10743,6 +10804,7 @@ async def handle_new_tab_action(
     try:
         await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
+        await _record_task_nav_error_code(task, e, url=validated_url)
         # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
         try:
             await new_page.close()

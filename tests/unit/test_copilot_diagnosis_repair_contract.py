@@ -1274,7 +1274,14 @@ def test_runtime_authoring_repair_context_ignores_policy_verdict_but_respects_st
             "data": {
                 "workflow_run_id": "wr_stop",
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
     )
@@ -2301,7 +2308,14 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
             "ok": False,
             "data": {
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
         ctx=stop_ctx,

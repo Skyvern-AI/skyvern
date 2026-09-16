@@ -33,9 +33,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import author_time_levers
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _requested_output_labels_by_path
+from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    _requested_output_labels_by_path,
+)
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_extraction_plan import _exact_path, _value_witness_bindings
+from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -450,6 +454,11 @@ async def _composition_evidence_after_navigation_failure(
     navigation_error: str,
     requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> tuple[dict[str, Any], CapturedFrame | None] | None:
+    # The capture succeeds on Chrome's error page, so without the error the packet is the interstitial.
+    # The text is model-facing, so it takes the same redaction and URL-to-origin rewrite as a run reason.
+    displayed_error = run_outcome_display_reason(navigation_error) or ""
+    before_html_capture = f"navigation_error_before_html_capture: {displayed_error}"
+    before_evidence_capture = f"navigation_error_before_evidence_capture: {displayed_error}"
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
     requested_targets = _seeded_capture_targets(ctx, requested_reads)
@@ -462,7 +471,7 @@ async def _composition_evidence_after_navigation_failure(
     if structured is not None and has_bounded_page_schema(structured):
         evidence = _composition_add_inspection_warning(
             structured,
-            "navigation_error_before_html_capture",
+            before_html_capture,
         )
         frame = None
         if page_evidence_needs_visual_fallback(evidence):
@@ -475,7 +484,7 @@ async def _composition_evidence_after_navigation_failure(
         evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
             evidence,
-            "navigation_error_before_evidence_capture",
+            before_evidence_capture,
         )
         evidence = _composition_add_inspection_warning(
             evidence,
@@ -495,7 +504,7 @@ async def _composition_evidence_after_navigation_failure(
         )
         evidence = _composition_add_inspection_warning(
             evidence,
-            "navigation_error_before_html_capture",
+            before_html_capture,
         )
         if html_truncated:
             evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
@@ -508,7 +517,7 @@ async def _composition_evidence_after_navigation_failure(
     evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
     evidence = _composition_add_inspection_warning(
         evidence,
-        "navigation_error_before_evidence_capture",
+        before_evidence_capture,
     )
     evidence = _composition_add_inspection_warning(
         evidence,

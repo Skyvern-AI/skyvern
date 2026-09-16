@@ -316,6 +316,10 @@ class SkyvernContext:
     # unbiased secure-vs-legacy comparison. Left None when no genuine assignment was made (no browser
     # session, provider unreachable) so a degraded provider never biases the legacy arm.
     codeblock_execution_path: str | None = None
+    # The driver's navigation error code for a task whose failure was handled rather than raised,
+    # keyed by task id. Keyed rather than last-one-wins because one browser state serves every block
+    # in a run: a later block that fails without navigating must not inherit an earlier block's code.
+    task_nav_error_codes: dict[str, str] = field(default_factory=dict)
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False

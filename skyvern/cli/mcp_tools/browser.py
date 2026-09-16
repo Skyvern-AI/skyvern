@@ -96,6 +96,7 @@ from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.navigation import reported_nav_error_code
 from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._common import (
@@ -576,7 +577,16 @@ async def skyvern_navigate(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible", exc=e),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    str(e),
+                    "Check that the URL is valid and accessible",
+                    # The driver's own code, read from the exception it raised. A caller deciding who
+                    # owns the failure cannot get that from the message: this path returns str(e), and
+                    # a page or a model can write any sentence.
+                    details={"nav_error_code": await reported_nav_error_code(e, url)},
+                    exc=e,
+                ),
             )
         finally:
             # No publication made while navigation was in flight is trustworthy:

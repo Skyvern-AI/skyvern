@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
+    register_secret_scrub_value,
 )
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
@@ -112,6 +113,109 @@ def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: p
     assert encoded not in str(scrubbed)
     assert "[redacted]" in str(scrubbed)
     assert seen_parameters == [{"magic_link": secret}]
+
+
+def test_a_driver_navigation_code_survives_a_scrubbed_value_that_spells_part_of_it() -> None:
+    """Workflow parameter values are registered for scrubbing with no minimum length, so "net" is enough
+    to corrupt the token before it is lifted, and a proxy outage then reads as a target failure."""
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, "net")
+    raw = {
+        "ok": False,
+        "error": {
+            "code": "ACTION_FAILED",
+            "message": "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            "hint": "",
+            "details": {"nav_error_code": "net::ERR_TUNNEL_CONNECTION_FAILED"},
+        },
+    }
+
+    flattened = mcp_to_copilot(mcp_adapter.scrub_model_facing_tool_result(ctx, raw, tool_name="skyvern_navigate"))
+
+    assert flattened["nav_error_code"] == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    assert "net::" not in flattened["error"]
+    # The flattened shape is scrubbed again on its way to the model.
+    rescrubbed = mcp_adapter.scrub_model_facing_tool_result(ctx, flattened, tool_name="skyvern_navigate")
+    assert rescrubbed["nav_error_code"] == flattened["nav_error_code"]
+
+    # A scrub that fails closed stays empty: a code written into it would turn a failed call into a success.
+    register_secret_scrub_value(ctx, "target")
+    fail_closed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {**flattened, "target": {"page": 0}}, tool_name="skyvern_navigate"
+    )
+    assert fail_closed == {}
+
+
+@pytest.mark.parametrize(
+    ("code", "registered", "tool_name", "survives"),
+    [
+        # Every code the driver writes reaches the model intact, not only the ones ownership reads.
+        pytest.param("net::ERR_CONNECTION_REFUSED", "net", "skyvern_navigate", True, id="a_code_holding_a_value"),
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", "net", "skyvern_navigate", True, id="a_proxy_code"),
+        # Only the navigation tool reports a code. Another tool echoing an argument into the field
+        # would otherwise have the whole token written back over the scrub.
+        pytest.param("net::ERR_HUNTER2", "HUNTER2", "skyvern_evaluate", False, id="another_tool_echoed_a_secret"),
+        pytest.param(
+            "net::ERR_CERT_HUNTER2", "net::ERR_CERT_HUNTER2", "skyvern_navigate", False, id="the_code_is_the_secret"
+        ),
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", "net", None, False, id="a_result_with_no_provenance"),
+    ],
+)
+def test_the_model_facing_scrub_keeps_driver_codes_only_where_the_driver_reports_them(
+    code: str, registered: str, tool_name: str | None, survives: bool
+) -> None:
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, registered)
+
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {"ok": False, "nav_error_code": code}, tool_name=tool_name
+    )
+
+    assert (scrubbed.get("nav_error_code") == code) is survives
+    assert (registered in str(scrubbed)) is (survives and registered in code)
+
+
+@pytest.mark.parametrize(
+    ("parameter_value", "survives"),
+    [
+        # The run's redaction parameters are a second vocabulary the scrub applies. A parameter that
+        # IS a code would be redacted by that pass and written back whole by the restore.
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", False, id="a_parameter_that_is_the_code"),
+        # An ordinary parameter occurring inside a code must still not cost the model the code.
+        pytest.param("net", True, id="a_parameter_inside_the_code"),
+    ],
+)
+def test_the_model_facing_scrub_reads_the_run_parameters_before_restoring_a_code(
+    monkeypatch: pytest.MonkeyPatch, parameter_value: str, survives: bool
+) -> None:
+    """A redaction parameter never registered with the exact-value scrubber is still redacted, so the
+    restore has to consult it too or it hands back what the parameter pass was hiding."""
+
+    def redact(value: object, parameters: dict[str, object]) -> object:
+        secret = str(next(iter(parameters.values())))
+
+        def walk(node: object) -> object:
+            if isinstance(node, str):
+                return node.replace(secret, "[redacted]")
+            if isinstance(node, dict):
+                return {key: walk(item) for key, item in node.items()}
+            if isinstance(node, list):
+                return [walk(item) for item in node]
+            return node
+
+        return walk(value)
+
+    monkeypatch.setattr(mcp_adapter.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
+    code = "net::ERR_TUNNEL_CONNECTION_FAILED"
+    ctx = make_copilot_ctx()
+    ctx.codeblock_redaction_parameters = {"site": parameter_value}
+
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {"ok": False, "nav_error_code": code}, tool_name="skyvern_navigate"
+    )
+
+    assert (scrubbed.get("nav_error_code") == code) is survives
+    assert (parameter_value in str(scrubbed)) is survives
 
 
 class TestRequestedOutputPathChoices:

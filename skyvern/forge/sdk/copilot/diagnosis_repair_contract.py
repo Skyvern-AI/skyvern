@@ -24,11 +24,13 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     run_challenge_is_runtime_clearable,
     run_id_from_result_data,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
+from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
 from skyvern.webeye.actions.action_types import ActionType
 
 if TYPE_CHECKING:
@@ -394,7 +396,9 @@ def _levers(
                 "unresolved" if solver_available is None else ("available" if solver_available else "unavailable")
             ),
         ),
-        Lever(mechanism="proxy_location", knowledge_topic="proxy_location", availability=_proxy_label(ctx)),
+        Lever(
+            mechanism="proxy_location", knowledge_topic="proxy_location", availability=proxy_location_lever_label(ctx)
+        ),
         Lever(mechanism="browser_profile", knowledge_topic="proxy_location"),
         credential_lever,
         human_lever,
@@ -433,38 +437,54 @@ def _solver_available_for_current_page(ctx: CopilotContext, data: dict[str, Any]
 _NO_PROXY_VALUES = {"NONE", "NULL", "NO_PROXY"}
 
 
-def _raw_proxy_location(ctx: CopilotContext) -> Any:
-    raw = getattr(ctx, "effective_workflow_proxy_location", None)
-    if raw is None:
-        raw = getattr(getattr(ctx, "last_workflow", None), "proxy_location", None)
-    return raw
+def _raw_proxy_location(ctx: AgentContext, session_proxy_location: ProxyLocationInput = None) -> ProxyLocationInput:
+    """The proxy the failing hop acted through. A browser session's own proxy overrides the
+    workflow's declared one, the same override real_browser_manager applies when a session is
+    attached; the workflow answers only when no session made the hop."""
+    if session_proxy_location is not None:
+        return session_proxy_location
+    if ctx.effective_workflow_proxy_location is not None:
+        return ctx.effective_workflow_proxy_location
+    if ctx.last_workflow is not None:
+        return ctx.last_workflow.proxy_location
+    return None
 
 
 def _declares_no_proxy(ctx: CopilotContext) -> bool:
     """True only when the run named a no-proxy location, never when it named nothing at all."""
     raw = _raw_proxy_location(ctx)
-    if raw is None or isinstance(raw, dict):
+    if raw is None or isinstance(raw, (dict, GeoTarget)):
         return False
-    value = _safe_str(getattr(raw, "value", raw))
-    return value is not None and value.upper() in _NO_PROXY_VALUES
+    return raw.strip().upper() in _NO_PROXY_VALUES
 
 
-def _proxy_label(ctx: CopilotContext) -> str | None:
-    """A non-secret label for the run's proxy. A custom proxy is a dict whose URL can embed
-    credentials, so it is named by shape and never serialized."""
-    raw = _raw_proxy_location(ctx)
-    if raw is None:
+def proxy_location_label(proxy_location: ProxyLocationInput) -> str | None:
+    """A non-secret label for a proxy. Any dict is a custom proxy whose URL can embed credentials, so
+    it is named by shape and never serialized; a geo target is named by country alone, because
+    joining subdivision and city narrows the label past what naming the failing hop needs."""
+    if proxy_location is None:
         return None
-    if isinstance(raw, dict):
+    if isinstance(proxy_location, dict):
         return "custom proxy"
-    country = getattr(raw, "country", None)
-    if country is not None:
-        parts = [str(country)] + [
-            str(part) for part in (getattr(raw, "subdivision", None), getattr(raw, "city", None)) if part
-        ]
-        return "-".join(parts)
-    value = _safe_str(getattr(raw, "value", raw))
-    return None if value is None or value.upper() in _NO_PROXY_VALUES else value
+    if isinstance(proxy_location, GeoTarget):
+        country = (proxy_location.country or "").strip()
+        return country or None
+    value = proxy_location.strip()
+    return None if not value or value.upper() in _NO_PROXY_VALUES else value
+
+
+def effective_proxy_label(ctx: AgentContext, session_proxy_location: ProxyLocationInput = None) -> str | None:
+    return proxy_location_label(_raw_proxy_location(ctx, session_proxy_location))
+
+
+def proxy_location_lever_label(ctx: AgentContext) -> str | None:
+    """The lever's availability has to tell one geo target from another or the model can re-propose
+    the location it just ran on, so it keeps the subdivision and city the hop label drops."""
+    raw = _raw_proxy_location(ctx)
+    if not isinstance(raw, GeoTarget):
+        return proxy_location_label(raw)
+    parts = [str(part).strip() for part in (raw.country, raw.subdivision, raw.city) if part and str(part).strip()]
+    return "-".join(parts) or None
 
 
 def _dict(value: Any) -> dict[str, Any]:

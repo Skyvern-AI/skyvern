@@ -4,6 +4,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import FailedToNavigateToUrl
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.handler import (
     handle_close_page_action,
@@ -58,17 +61,31 @@ async def test_new_tab_closes_tab_and_fails_when_navigation_fails() -> None:
     new_page.close = AsyncMock()
     browser_state = MagicMock()
     browser_state.new_page = AsyncMock(return_value=new_page)
-    browser_state.navigate_to_url = AsyncMock(side_effect=Exception("net::ERR_NAME_NOT_RESOLVED"))
+    # The browser state navigates through navigate_with_retry, which raises the typed error with the
+    # driver's code already read; its message leads with Skyvern's sentence, not the driver's.
+    browser_state.navigate_to_url = AsyncMock(
+        side_effect=FailedToNavigateToUrl(
+            url="https://does-not-exist.test",
+            error_message="Page.goto: net::ERR_NAME_NOT_RESOLVED at https://does-not-exist.test/",
+            nav_error_code="net::ERR_NAME_NOT_RESOLVED",
+        )
+    )
     browser_state.set_active_page = AsyncMock()
 
     action = actions.NewTabAction(url="https://does-not-exist.test")
+    task = _task()
+    task.task_id = "tsk_new_tab"
+    context = SkyvernContext(run_id="wr_new_tab")
     with patch("skyvern.webeye.actions.handler.app", _mock_app(browser_state)):
-        result = await handle_new_tab_action(action, MagicMock(), MagicMock(), _task(), MagicMock())
+        with patch.object(skyvern_context, "current", return_value=context):
+            result = await handle_new_tab_action(action, MagicMock(), MagicMock(), task, MagicMock())
 
     assert isinstance(result[0], ActionFailure)
     # The failed/blank tab must be closed so the next scrape doesn't fail the task.
     new_page.close.assert_awaited_once()
     browser_state.set_active_page.assert_not_awaited()
+    # Opening a tab navigates, so its failure carries the driver's verdict like any other.
+    assert context.task_nav_error_codes == {"tsk_new_tab": "net::ERR_NAME_NOT_RESOLVED"}
 
 
 @pytest.mark.asyncio

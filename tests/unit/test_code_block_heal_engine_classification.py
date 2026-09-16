@@ -54,6 +54,7 @@ def _block() -> CodeBlock:
 def _recording_page(recorded_exception: Exception | None) -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception.return_value = recorded_exception
+    page.failure_nav_error_code.return_value = None
     return page
 
 

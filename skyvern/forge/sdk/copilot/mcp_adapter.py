@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -68,10 +69,12 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    is_registered_scrub_value,
     matching_origin_run_redaction_parameters,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.workflow.models.block import parameter_strings
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_retirement import BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
@@ -345,7 +348,9 @@ def _record_browser_call_outcome(
 
 
 def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome) -> _BrowserCallOutcome:
-    scrubbed = outcome.with_raw_result(scrub_model_facing_tool_result(ctx, outcome.raw_result()))
+    scrubbed = outcome.with_raw_result(
+        scrub_model_facing_tool_result(ctx, outcome.raw_result(), tool_name=outcome.raw_tool_name)
+    )
     if outcome.protocol_error_detail is None:
         return scrubbed
     detail_result = scrub_model_facing_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
@@ -661,10 +666,19 @@ def _mapping_keys_preserved(source: Any, scrubbed: Any) -> bool:
     return True
 
 
-def scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
-    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
-    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
-        return {}
+# A driver navigation token names a Chromium error, but a registered value occurring inside it (a
+# parameter "net") would corrupt it: the model would read a mangled code, and a proxy outage would
+# reach attribution as an authoring defect. A token that is itself a registered value is left scrubbed.
+_DRIVER_NAV_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
+
+
+# Only the navigation tool reports a driver code, and only its own reader writes one. Preserving the
+# field for any tool would let one that echoes an argument into it disclose a registered value.
+_NAVIGATION_TOOL_NAME = "skyvern_navigate"
+
+
+def _active_parameter_sets(ctx: AgentContext) -> list[dict[str, Any]]:
+    """The redaction parameter sets this scrub applies, in the order it applies them."""
     parameter_sets: list[dict[str, Any]] = []
     parameters = getattr(ctx, "codeblock_redaction_parameters", None)
     if isinstance(parameters, dict) and parameters:
@@ -672,9 +686,60 @@ def scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, 
     origin_parameters = matching_origin_run_redaction_parameters(ctx)
     if origin_parameters:
         parameter_sets.append(origin_parameters)
+    return parameter_sets
 
+
+def _preserved_nav_code(ctx: AgentContext, tool_name: str | None, value: object) -> str | None:
+    if tool_name != _NAVIGATION_TOOL_NAME:
+        return None
+    if not isinstance(value, str) or not _DRIVER_NAV_ERROR_CODE.fullmatch(value):
+        return None
+    if is_registered_scrub_value(ctx, value):
+        return None
+    # The scrub redacts registered values AND the run's redaction parameters, so a guard that reads
+    # only the first restores whatever the second was hiding. A walk that does not finish cannot say
+    # the code is absent, so it refuses too.
+    for parameter_set in _active_parameter_sets(ctx):
+        carried_strings = parameter_strings(parameter_set)
+        if carried_strings is None or value in carried_strings:
+            return None
+    return value
+
+
+# Where a navigation code sits: the flattened Copilot result, and the raw MCP error's details.
+_NAV_ERROR_CODE_PARENTS: tuple[tuple[str, ...], ...] = ((), ("error", "details"))
+
+
+def _mapping_at(value: Any, path: tuple[str, ...]) -> dict[str, Any] | None:
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name: str | None = None) -> dict[str, Any]:
+    driver_codes = {
+        path: code
+        for path in _NAV_ERROR_CODE_PARENTS
+        if (code := _preserved_nav_code(ctx, tool_name, (_mapping_at(result, path) or {}).get("nav_error_code")))
+        is not None
+    }
+    scrubbed = _scrub_model_facing_tool_result(ctx, result)
+    # An empty result is the fail-closed answer; writing a code into it would read as a successful call.
+    if not scrubbed:
+        return scrubbed
+    for path, code in driver_codes.items():
+        parent = _mapping_at(scrubbed, path)
+        if parent is not None:
+            parent["nav_error_code"] = code
+    return scrubbed
+
+
+def _scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
+    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
+    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
+        return {}
     scrubbed = scrubbed_secrets
-    for parameter_set in parameter_sets:
+    for parameter_set in _active_parameter_sets(ctx):
         candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed, parameter_set)
         if not isinstance(candidate, dict) or not _mapping_keys_preserved(scrubbed, candidate):
             return {}
@@ -1577,7 +1642,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
             else:
-                result = scrub_model_facing_tool_result(copilot_ctx, result)
+                result = scrub_model_facing_tool_result(copilot_ctx, result, tool_name=mcp_name)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
@@ -1611,7 +1676,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                     hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
-                    hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result)
+                    hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result, tool_name=mcp_name)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result, tool_name)
             return None
@@ -1727,7 +1792,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             phases.pause()
             # Scrub before the post hook so evidence the hooks record from raw_mcp
             # (flow evidence, scout observations) is scrubbed too.
-            raw_mcp = scrub_model_facing_tool_result(copilot_ctx, raw_mcp)
+            raw_mcp = scrub_model_facing_tool_result(copilot_ctx, raw_mcp, tool_name=mcp_name)
             session_lost = False
             error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
             if (
@@ -1826,7 +1891,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                             **binding.provenance(),
                         }
 
-            copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result)
+            copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result, tool_name=mcp_name)
 
             def _commit_evidence() -> None:
                 if browser_outcome is not None:
@@ -2145,7 +2210,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
                     browser_outcome=outcome,
                 )
-            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result))
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
         phases.enter("session_prepare")
         try:
             err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
@@ -2392,7 +2457,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             phases.settle()
         call_status = "error" if failed else post_dispatch_status
         _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
-        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp)
+        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp, tool_name=mcp_tool_name)
         error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
         if (
             ctx.turn_origin != TurnOrigin.runtime_self_heal
