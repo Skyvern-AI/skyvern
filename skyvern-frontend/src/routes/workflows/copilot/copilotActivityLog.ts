@@ -71,16 +71,13 @@ export interface ActivityLog {
 }
 
 // Block-scoped authoring tools, absent from narrativeState's AUTHORING_TOOLS.
-// The rail buckets them as pre-authoring today (SKY-14524); this set diverges
-// deliberately rather than widening AUTHORING_TOOLS and moving the rail.
 const LOG_AUTHORING_TOOLS = new Set([
   "edit_block",
   "add_block",
   "delete_block",
 ]);
 
-// update_and_run_blocks belongs to both sets, so RUN_TOOLS has to win — the
-// same precedence bucketActivity already applies.
+// update_and_run_blocks belongs to both sets, so RUN_TOOLS has to win.
 export function kindOf(entry: ActivityEntry): ActivityKind | null {
   const toolName = entry.toolName;
   if (entry.kind === "narration" || toolName === undefined) {

@@ -16,28 +16,34 @@ const response = (
 });
 
 describe("shouldAutoApplyWorkflowResponse", () => {
-  it("auto-applies auto_applicable proposals when auto accept is enabled", () => {
-    expect(shouldAutoApplyWorkflowResponse(response(), true, false)).toBe(true);
-  });
-
-  it("auto-applies proposals already committed by the backend", () => {
+  it("auto-applies only what the backend says it applied", () => {
     expect(
       shouldAutoApplyWorkflowResponse(
         response({ workflow_applied: true }),
-        false,
         false,
       ),
     ).toBe(true);
   });
 
-  it("keeps a verified fix pending when auto accept is off and the backend did not apply it", () => {
-    // A verified fix the backend left pending (workflow_applied=false) must NOT
-    // auto-apply when auto accept is off — it lands as a pending proposal for
-    // the review gate.
+  it("keeps a verified fix pending when the backend did not apply it", () => {
+    // The server owns this: Turn off can commit there before the browser sees its request resolve.
     expect(
       shouldAutoApplyWorkflowResponse(
         response({ workflow_applied: false }),
         false,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not auto-apply a frame that carries no workflow_applied at all", () => {
+    // Every frame the backend emits carries the field; without it there is no authority to apply.
+    const frame = response() as unknown as Record<string, unknown>;
+    delete frame.workflow_applied;
+    expect(
+      shouldAutoApplyWorkflowResponse(
+        frame as unknown as Parameters<
+          typeof shouldAutoApplyWorkflowResponse
+        >[0],
         false,
       ),
     ).toBe(false);
@@ -49,7 +55,6 @@ describe("shouldAutoApplyWorkflowResponse", () => {
       expect(
         shouldAutoApplyWorkflowResponse(
           response({ proposal_disposition }),
-          true,
           false,
         ),
       ).toBe(false);
@@ -60,7 +65,6 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     expect(
       shouldAutoApplyWorkflowResponse(
         response({ proposal_disposition: "no_proposal" }),
-        true,
         false,
       ),
     ).toBe(false);
@@ -68,12 +72,8 @@ describe("shouldAutoApplyWorkflowResponse", () => {
 
   it("does not auto-apply cancelled turns", () => {
     expect(
-      shouldAutoApplyWorkflowResponse(
-        response({ cancelled: true }),
-        true,
-        false,
-      ),
+      shouldAutoApplyWorkflowResponse(response({ cancelled: true }), false),
     ).toBe(false);
-    expect(shouldAutoApplyWorkflowResponse(response(), true, true)).toBe(false);
+    expect(shouldAutoApplyWorkflowResponse(response(), true)).toBe(false);
   });
 });

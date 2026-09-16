@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { derivePhases } from "./copilotPhases";
 import {
   ActivityEntry,
   EMPTY_NARRATIVE,
@@ -1410,14 +1409,6 @@ describe("a real cancel's backend payload still renders neutrally", () => {
   it("re-reads a backend-failed block on a cancelled turn as stopped", () => {
     const turn = hydrateNarrativeFromPayload(cancelledPayload());
     expect(turn?.blocks[0]?.state).toBe("stopped");
-  });
-
-  it("does not redden the rail for a run the user stopped", () => {
-    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
-    const phases = derivePhases(turn);
-    const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
-    expect(byId.done).toBe("stopped");
-    expect(byId.test).toBe("stopped");
   });
 
   it("keeps a genuine error turn's block failed when it was not cancelled", () => {
