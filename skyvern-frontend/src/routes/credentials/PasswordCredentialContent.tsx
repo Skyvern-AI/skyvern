@@ -1000,7 +1000,7 @@ function PasswordCredentialContent({
                         <span className="text-destructive"> *</span>
                       </Label>
                     </div>
-                    {valuesReadOnly ? (
+                    {valuesReadOnly && totp_type === "authenticator" ? (
                       <div className="relative w-full">
                         <Input
                           value="••••••••"

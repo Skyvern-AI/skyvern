@@ -203,7 +203,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           className="h-4 w-4 text-muted-foreground"
                           aria-hidden
                         />
-                        Workflow Settings
+                        Agent Settings
                       </span>
                     </AccordionTrigger>
                     <AccordionContent className="pl-6 pr-1 pt-1">

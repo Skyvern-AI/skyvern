@@ -218,9 +218,9 @@ describe("StartNode inputs summary", () => {
     expect(screen.getByText(/None yet/)).toBeDefined();
   });
 
-  test("Inputs sit under the Start heading and above Workflow Settings", () => {
+  test("Inputs sit under the Start heading and above Agent Settings", () => {
     // Start is the first thing on the canvas; Inputs read as something Start
-    // declares, next to Workflow Settings (SKY-15467).
+    // declares, next to Agent Settings (SKY-15467).
     useWorkflowParametersStore.setState({
       parameters: [
         {
@@ -238,7 +238,7 @@ describe("StartNode inputs summary", () => {
     const start = screen.getByText("Start");
     const inputs = screen.getByText("Inputs");
     expect(precedes(start, inputs)).toBe(true);
-    expect(precedes(inputs, screen.getByText("Workflow Settings"))).toBe(true);
+    expect(precedes(inputs, screen.getByText("Agent Settings"))).toBe(true);
   });
 
   test("a view-only workflow can read its inputs but not add one", () => {
@@ -298,10 +298,11 @@ describe("StartNode inputs summary", () => {
 });
 
 describe("StartNode workflow settings affordance", () => {
-  test("renders the Workflow Settings entry collapsed by default", () => {
+  test("renders the Agent Settings entry collapsed by default", () => {
     renderStartNode();
 
-    expect(screen.getByText("Workflow Settings")).toBeDefined();
+    expect(screen.getByText("Agent Settings")).toBeDefined();
+    expect(screen.queryByText("Workflow Settings")).toBeNull();
     expect(screen.queryByTestId("workflow-settings-editor")).toBeNull();
   });
 
@@ -318,7 +319,7 @@ describe("StartNode workflow settings affordance", () => {
   test("the accordion trigger still toggles the settings manually", () => {
     renderStartNode();
 
-    const trigger = screen.getByText("Workflow Settings");
+    const trigger = screen.getByText("Agent Settings");
     fireEvent.click(trigger);
     expect(screen.getByTestId("workflow-settings-editor")).toBeDefined();
 
@@ -329,7 +330,7 @@ describe("StartNode workflow settings affordance", () => {
   test("the open event keeps already-open settings mounted", () => {
     renderStartNode();
 
-    fireEvent.click(screen.getByText("Workflow Settings"));
+    fireEvent.click(screen.getByText("Agent Settings"));
     expect(screen.getByTestId("workflow-settings-editor")).toBeDefined();
 
     act(() => {
@@ -344,7 +345,7 @@ describe("StartNode workflow settings affordance", () => {
     // click that toggled the trigger, before React commits the close; the
     // listener must read the still-committed "open" value and stay quiet.
     renderStartNode();
-    const trigger = screen.getByText("Workflow Settings");
+    const trigger = screen.getByText("Agent Settings");
     fireEvent.click(trigger);
     expect(screen.getByTestId("workflow-settings-editor")).toBeDefined();
 
