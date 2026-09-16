@@ -119,7 +119,7 @@ curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/apply' \
 
 Let curl set the multipart `Content-Type` header and boundary. Send each field once, and use exactly one resume source per request.
 
-The API supports PDF, DOCX, and image resumes. The default upload limit is 10 MiB. Skyvern uses OCR when a PDF has no extractable text. If resume parsing fails, the application continues using the remaining inputs.
+The API supports PDF, DOCX, and image resumes. The default upload limit is 30 MiB. Skyvern uses OCR when a PDF has no extractable text. If resume parsing fails, the application continues using the remaining inputs.
 
 Both Apply request formats return only `workflow_run_id`. Check the run result to determine whether the application was submitted.
 
