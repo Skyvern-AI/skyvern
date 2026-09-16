@@ -10073,3 +10073,61 @@ async def test_page_authored_notice_shaped_text_never_folds_into_a_frozen_verdic
 
     assert not (outcome.reason or "").startswith(PERCEPTION_STALL_REASON_PREFIX), outcome.reason
     assert outcome.status == "completed", (outcome.status, outcome.reason)
+
+
+_FILL_CALLS = {
+    "type": {"selector": "#q", "text": "Jane Doe"},
+    "select_option": {"selector": "#s", "value": "a"},
+    "select_combobox": {"selector": "#c", "value": "a"},
+    "file_upload": {"selector": "#f", "file_url": "https://example.com/a.pdf"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", [True, False])
+@pytest.mark.parametrize("fill_tool", sorted(_FILL_CALLS))
+async def test_extraction_entry_guard_refuses_every_fill_tool_but_not_click(fill_tool: str, refuse: bool) -> None:
+    assert set(_FILL_CALLS) == loop_module.FILL_TOOLS
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool(fill_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [(fill_tool, _FILL_CALLS[fill_tool])],
+        [("click", {"selector": "#tab"})],
+        [("finish", {"status": "completed", "reason": "read"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, refuse_input_entry=refuse)
+
+    assert outcome.status == "completed"
+    dispatched = [name for name, _ in calls]
+    refusals = [e for e in logs if e["event"] == loop_module.EXTRACTION_ENTRY_REFUSED_EVENT]
+    if refuse:
+        assert dispatched == ["click"]
+        assert [e["tool"] for e in refusals] == [fill_tool]
+        fill_results = [m for m in caller.message_history if m.get("role") == "tool" and m["name"] == fill_tool]
+        assert [m["content"].split(":")[0] for m in fill_results] == ["refused"]
+    else:
+        assert dispatched == [fill_tool, "click"]
+        assert refusals == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fill_tool", sorted(_FILL_CALLS))
+async def test_refused_fill_call_stops_the_rest_of_its_batch(fill_tool: str) -> None:
+    # A completed verdict batched behind a refused fill was written as if the fill had landed.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool(fill_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [
+            (fill_tool, _FILL_CALLS[fill_tool]),
+            ("click", {"selector": "#search"}),
+            ("finish", {"status": "completed", "reason": "searched and read"}),
+        ],
+        [("finish", {"status": "failed", "reason": "the value is not on the page"})],
+    ]
+    outcome, caller = await _run(script, tools, refuse_input_entry=True)
+
+    assert calls == []
+    assert outcome.status == "failed", outcome.reason
+    batch_results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"][:3]
+    assert batch_results == ["refused", "skipped", "skipped"]
