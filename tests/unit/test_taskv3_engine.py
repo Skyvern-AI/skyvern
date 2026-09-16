@@ -1375,6 +1375,26 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_type", "refused_count"), [("extraction", 1), ("task", 0), ("navigation", 0), (None, 0)]
+)
+async def test_entry_is_refused_only_in_an_extraction_block(block_type: str | None, refused_count: int) -> None:
+    script = [
+        [("type", {"selector": "#q", "text": "Jane Doe"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type=block_type,
+        )
+    refused = [e for e in logs if e.get("event") == "taskv3 loop extraction entry refused"]
+    assert len(refused) == refused_count
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_loop_telemetry_and_the_two_terminal_records_stay_dead() -> None:
     # The only test that can catch the loop telemetry silently dropping off this line, or either
     # per-run record it replaced coming back — everything else asserts the payload, not the join.
