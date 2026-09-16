@@ -2810,7 +2810,7 @@ async def test_get_html_marks_truncation_explicitly() -> None:
     r = await _tool(tools, "get_html").handler({"selector": "#big"})
     assert r.status == "ok"
     assert len(r.content) < 30000
-    assert r.content.endswith(taskv3_tools._MARKUP_CUT)
+    assert r.content.endswith(taskv3_tools._markup_cut(taskv3_tools.HTML_MAX_CHARS, 30000, scoped=True))
 
 
 # A branch-local witness, not captured production DOM: a stylesheet larger than get_html's whole
@@ -2848,8 +2848,9 @@ async def test_get_html_text_format_returns_the_record_a_style_prefix_hides_from
 
     markup = await _tool(tools, "get_html").handler({})
     assert markup.status == "ok" and _STYLE_PREFIX_RECORD not in markup.content
-    assert markup.content.endswith(taskv3_tools._PAGE_MARKUP_CUT), markup.content[-200:]
-    assert "format=text" in taskv3_tools._PAGE_MARKUP_CUT and '"' not in taskv3_tools._PAGE_MARKUP_CUT
+    page_cut = taskv3_tools._markup_cut(taskv3_tools.HTML_MAX_CHARS, len(_STYLE_PREFIX_DOC), scoped=False)
+    assert markup.content.endswith(page_cut), markup.content[-200:]
+    assert "format=text" in page_cut and '"' not in page_cut
 
     text = await _tool(tools, "get_html").handler({"format": "text"})
     assert text.status == "ok", text.content
@@ -2862,7 +2863,10 @@ async def test_get_html_text_format_names_a_real_continuation_when_over_bound() 
     tools = build_browser_tools(_fixed_page_provider(_FakeTextPage(_STYLE_PREFIX_DOC, "Statement line\n" * 3000)))
     r = await _tool(tools, "get_html").handler({"format": "text"})
     assert r.status == "ok"
-    assert r.content.endswith(taskv3_tools._RENDERED_TEXT_CUT), r.content[-300:]
+    text_total = len("Statement line\n" * 3000)
+    assert r.content.endswith(taskv3_tools._rendered_text_cut(taskv3_tools.HTML_MAX_CHARS, text_total, scoped=False)), (
+        r.content[-300:]
+    )
     assert {"get_html", "observe"} <= {spec.name for spec in tools}
 
 
@@ -24601,3 +24605,385 @@ async def test_the_fallback_does_not_arm_on_everything_when_the_counter_goes_awa
     # Nothing new has landed since the handover, so nothing may arm -- and the tab the model opened
     # must survive.
     assert not later_tab.is_closed()
+
+
+# SKY-16330. A document whose ONE record sits past the markup cap, in markup and in rendered text
+# alike, so no single read of either format can contain it. Branch-local witness, not captured DOM.
+_PAST_CAP_RECORD = "Statement STMT-9182 issued 2026-03-02"
+_PAST_CAP_TEXT = "filler row\n" * 5000 + _PAST_CAP_RECORD
+_PAST_CAP_DOC = "<html><body><main>" + _PAST_CAP_TEXT + "</main></body></html>"
+
+
+def _past_cap_tools() -> list[Any]:
+    assert len(_PAST_CAP_TEXT) > 2 * taskv3_tools.HTML_MAX_CHARS
+    assert _PAST_CAP_RECORD not in _PAST_CAP_TEXT[: taskv3_tools.HTML_MAX_CHARS]
+    return build_browser_tools(_fixed_page_provider(_FakeTextPage(_PAST_CAP_DOC, _PAST_CAP_TEXT)))
+
+
+@pytest.mark.asyncio
+async def test_get_html_can_resume_a_read_past_the_cap() -> None:
+    # The cap bounds ONE result; it must not bound what the page can ever say. Without a way to
+    # advance the read, everything past the first 20000 chars is unreachable by any argument the
+    # model can pass, and the only remaining move is to guess at selectors for a region it cannot see.
+    tools = _past_cap_tools()
+    first = await _tool(tools, "get_html").handler({"format": "text"})
+    assert first.status == "ok" and _PAST_CAP_RECORD not in first.content
+
+    seen = first.content
+    offset = taskv3_tools.HTML_MAX_CHARS
+    for _ in range(5):
+        nxt = await _tool(tools, "get_html").handler({"format": "text", "offset": offset})
+        assert nxt.status == "ok", nxt.content
+        assert nxt.content != seen, "offset returned the same window — the read never advanced"
+        seen = nxt.content
+        if _PAST_CAP_RECORD in nxt.content:
+            break
+        offset += taskv3_tools.HTML_MAX_CHARS
+    assert _PAST_CAP_RECORD in seen, "the record past the cap was never reachable"
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_reports_how_much_it_did_not_return() -> None:
+    # A cut that says only THAT it happened leaves the model unable to tell a page it has nearly read
+    # from one it has barely started. The size it did not return, and the offset that continues the
+    # read, are effects of the read the tool knows and the model cannot infer.
+    tools = _past_cap_tools()
+    markup = await _tool(tools, "get_html").handler({})
+    assert markup.status == "ok"
+    assert str(len(_PAST_CAP_DOC)) in markup.content, markup.content[-300:]
+    assert f"offset={taskv3_tools.HTML_MAX_CHARS}" in markup.content, markup.content[-300:]
+
+    text = await _tool(tools, "get_html").handler({"format": "text"})
+    assert str(len(_PAST_CAP_TEXT)) in text.content, text.content[-300:]
+    assert f"offset={taskv3_tools.HTML_MAX_CHARS}" in text.content, text.content[-300:]
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_is_declared_so_the_model_can_use_it() -> None:
+    # An argument the handler honours but the spec never advertises is an argument no model passes.
+    tools = _past_cap_tools()
+    props = _tool(tools, "get_html").parameters["properties"]
+    assert "offset" in props and props["offset"]["type"] == "integer"
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_past_the_end_errors_rather_than_reading_as_empty() -> None:
+    # An empty string is what an empty page returns, so a read that ran off the end must not be one.
+    # It is an ERROR and not an ok result for a second reason: an ok result carrying a constant
+    # string would let a run page past the end forever under a fresh (tool, args) key every call —
+    # identical content the perception-stall guard cannot witness, because `live` takes the MINIMUM
+    # of the per-tool and per-probe counters and the per-probe one never leaves zero.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({"format": "text", "offset": 10 * len(_PAST_CAP_TEXT)})
+    assert r.status == "error"
+    assert r.error_class == "offset_past_end"
+    assert str(len(_PAST_CAP_TEXT)) in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_normalizes_offset_so_one_read_has_one_identity() -> None:
+    # `args` is what the loop hashes into the call's identity, which decides what supersedes what in
+    # the transcript AND what counts as the same probe to the stall guard. Three spellings of a read
+    # of the same bytes must not be three identities.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    bare: dict[str, Any] = {"format": "text"}
+    zero: dict[str, Any] = {"format": "text", "offset": 0}
+    stringy: dict[str, Any] = {"format": "text", "offset": "20000"}
+    assert (await handler(bare)).content == (await handler(zero)).content
+    await handler(stringy)
+    assert bare == zero == {"format": "text"}  # a zero offset is removed, not carried as a variant
+    assert stringy == {"format": "text", "offset": 20000}  # and a parsed one is written back as int
+
+
+@pytest.mark.asyncio
+async def test_get_html_rejects_an_unusable_offset_instead_of_re_serving_the_head() -> None:
+    # Silently falling back to offset 0 would hand the model the window it already has, labelled as
+    # the one it asked for. Infinity is reachable: json.loads accepts the literal by default.
+    tools = _past_cap_tools()
+    for bad in (-1, "abc", float("inf"), True, {"a": 1}):
+        r = await _tool(tools, "get_html").handler({"format": "text", "offset": bad})
+        assert r.status == "error", (bad, r.content[:80])
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_notice_does_not_read_as_one_call_carrying_both_formats() -> None:
+    # The two formats index DIFFERENT strings, so an offset is not portable between them. A steer
+    # joined by `or` reads as a conjunction, and a model that sends {offset: N, format: text} lands
+    # at character N of a different, usually much shorter, document.
+    markup_cut = taskv3_tools._markup_cut(20000, 60000, scoped=False)
+    assert "format=text" in markup_cut and " or format=text" not in markup_cut
+    # A read that already carries a selector is not told to go FIND one — but it is told to repeat
+    # the one it has, which is a continuation instruction rather than advice.
+    scoped_text = taskv3_tools._rendered_text_cut(20000, 60000, scoped=True)
+    assert "a selector read or observe reaches one region directly" not in scoped_text
+    assert "the same selector" in scoped_text
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_notices_stay_stable_across_two_reads_of_one_page() -> None:
+    # get_html's content is hashed into the loop's perception digests, which decide whether a run has
+    # returned to known ground. A notice carrying anything call-scoped and varying would make an
+    # unchanged page read as fresh ground on every look.
+    tools = _past_cap_tools()
+    a = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000})
+    b = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000})
+    assert a.content == b.content
+    # No quote character in any notice: loop._TV3_MARKER_CUT_RE reads a marker the cut left open only
+    # while no quote follows it, and the notice is what follows.
+    assert '"' not in taskv3_tools._markup_cut(0, 1, scoped=False)
+    assert '"' not in taskv3_tools._markup_cut(0, 1, scoped=True)
+    assert '"' not in taskv3_tools._rendered_text_cut(0, 1, scoped=False)
+    assert '"' not in taskv3_tools._rendered_text_cut(0, 1, scoped=True)
+
+
+@pytest.mark.asyncio
+async def test_get_html_redacts_a_hidden_secret_before_a_window_boundary_can_split_it() -> None:
+    # SKY-16330. The loop hides model_hidden_values by whole-substring replacement, on what the tool
+    # returns. A secret straddling a window boundary matches neither half, so both halves would reach
+    # the model in the clear — and offsets are what make the second half reachable at all.
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    secret = "MAGICLINKTOKEN-" + "S" * 60
+    boundary = taskv3_tools.HTML_MAX_CHARS - 20  # the secret starts 20 chars before the cut
+    text = "f" * boundary + secret + "t" * taskv3_tools.HTML_MAX_CHARS
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        tools = build_browser_tools(_fixed_page_provider(_FakeTextPage("<html></html>", text)))
+        first = await _tool(tools, "get_html").handler({"format": "text"})
+        second = await _tool(tools, "get_html").handler({"format": "text", "offset": taskv3_tools.HTML_MAX_CHARS})
+        assert first.status == "ok" and second.status == "ok", (first.content[:80], second.content[:80])
+        joined = first.content + second.content
+        assert secret not in joined
+        # Neither HALF survives either: a split placeholder is harmless, a split secret is the bug.
+        assert secret[:20] not in joined, first.content[-120:]
+        assert secret[-20:] not in joined, second.content[:120]
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_normalization_survives_the_selector_guards_arg_copy() -> None:
+    # `_with_selector_guard` hands the handler a COPY of args whenever a selector is present, and the
+    # loop hashes the CALLER's dict into the call identity. A normalization applied inside that copy
+    # would unify nothing for exactly the reads most likely to be repeated.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    zero: dict[str, Any] = {"selector": "body", "offset": 0}
+    stringy: dict[str, Any] = {"selector": "body", "offset": "20000"}
+    await handler(zero)
+    await handler(stringy)
+    assert zero == {"selector": "body"}
+    assert stringy == {"selector": "body", "offset": 20000}
+
+
+@pytest.mark.asyncio
+async def test_a_cut_read_reports_where_it_put_its_notice() -> None:
+    # The loop folds the notice out of the perception digest at the index reported here — there is no
+    # pattern and no wording coupling left, which is what makes the fold immune to page- and
+    # server-authored text wearing the same shape. The contract is that the index is exact.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({})
+    assert r.status == "ok"
+    at = (r.data or {}).get("notice_at")
+    assert isinstance(at, int), r.data
+    assert r.content[at:].startswith("…["), r.content[at : at + 40]
+    assert r.content[at:].endswith("]")
+    # And the part before it is exactly one window of the document, notice excluded.
+    assert len(r.content[:at]) == taskv3_tools.HTML_MAX_CHARS
+
+    # A read that was NOT cut reports no boundary, so nothing is folded for it.
+    tail = await _tool(tools, "get_html").handler({"offset": len(_PAST_CAP_DOC) - 10})
+    assert tail.status == "ok"
+    assert (tail.data or {}).get("notice_at") is None, tail.data
+
+
+@pytest.mark.asyncio
+async def test_get_html_rejects_a_fractional_offset_rather_than_reading_a_different_window() -> None:
+    # int(20000.9) is 20000, so truncating would execute and record a DIFFERENT read from the one
+    # asked for, under a handler that promises to reject a non-whole character count.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000.9})
+    assert r.status == "error" and r.error_class == "invalid_offset", r.content
+    # A whole-valued float is still a whole number of characters and is accepted.
+    ok = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000.0})
+    assert ok.status == "ok", ok.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_equivalent_format_spellings_are_one_read_identity() -> None:
+    # The handler strips, lowercases and defaults `format`, so these are all one read. `args` is what
+    # the loop hashes into the call identity, and with a retention window of two, duplicates of one
+    # region would fill it and evict the different region the window exists to hold.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    # Including the spellings a non-strict provider reaches for when an optional argument is absent:
+    # omitted, null, and empty. The handler reads all of these as the whole-page HTML read.
+    spellings: list[dict[str, Any]] = [
+        {},
+        {"format": "html"},
+        {"format": " HTML "},
+        {"format": ""},
+        {"format": None},
+        {"selector": None},
+        {"selector": ""},
+    ]
+    for args in spellings:
+        await handler(args)
+    assert spellings == [{}] * 7
+
+    # Whitespace is NOT one of them. It is not "absent" — the handler acts on it and reports what the
+    # model typed, and collapsing it here would turn a named error into a silent whole-page read.
+    kept: list[dict[str, Any]] = [{"selector": "   "}, {"format": "  "}]
+    for args in kept:
+        await handler(args)
+    assert kept == [{"selector": "   "}, {"format": "  "}]
+
+    texts: list[dict[str, Any]] = [{"format": "text"}, {"format": " Text "}]
+    for args in texts:
+        await handler(args)
+    assert texts == [{"format": "text"}, {"format": "text"}]
+
+    # An unrecognized spelling is left as typed so the handler's error names what the model wrote.
+    bad: dict[str, Any] = {"format": "txt"}
+    r = await handler(bad)
+    assert r.status == "error" and "txt" in r.content
+    assert bad == {"format": "txt"}
+
+
+@pytest.mark.asyncio
+async def test_following_a_text_cut_literally_continues_the_text_not_the_markup() -> None:
+    # `get_html` defaults format to html, so a cut TEXT read whose notice names only an offset sends
+    # the model to that character of the MARKUP — a different string, the same integer, and a
+    # continuation from a meaningless position it cannot detect.
+    #
+    # Asserted as an EQUIVALENCE, not as "the notice mentions format": the arguments the notice
+    # prescribes must produce the same read as spelling the format out. A containment check on the
+    # string passes for the wrong reason.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+
+    first = await handler({"format": "text"})
+    assert first.status == "ok" and first.content.endswith("]"), first.content[-120:]
+
+    prescribed: dict[str, Any] = {}
+    for token in first.content.rsplit("…[", 1)[-1].replace("]", " ").split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            if key in ("offset", "format"):
+                prescribed[key] = int(value) if key == "offset" else value
+    assert prescribed.get("offset"), first.content[-200:]
+
+    followed = await handler(dict(prescribed))
+    spelled_out = await handler({"format": "text", "offset": prescribed["offset"]})
+    assert followed.status == "ok", followed.content
+    assert followed.content == spelled_out.content, "following the notice read a different string"
+    # And it is genuinely the text continuation, not markup starting at the same integer.
+    assert "<" not in followed.content[:200], followed.content[:200]
+
+
+def test_a_cut_notice_names_every_argument_that_identifies_the_read() -> None:
+    # Tool arguments do not carry between calls, so a notice that omits one sends a model following
+    # it literally to the same integer offset of a DIFFERENT string: an omitted `format` defaults to
+    # markup, an omitted `selector` widens to the whole page. Both are silent.
+    for scoped in (False, True):
+        for cut in (taskv3_tools._markup_cut, taskv3_tools._rendered_text_cut):
+            notice = cut(20000, 60000, scoped=scoped)
+            assert "offset=20000" in notice, notice
+            assert ("the same selector" in notice) is scoped, notice
+            assert ("format=text and offset" in notice) is (cut is taskv3_tools._rendered_text_cut), notice
+            # The selector is DESCRIBED, never echoed: it is model-authored and may hold a quote,
+            # which no notice may carry (loop._TV3_MARKER_CUT_RE reads a marker the cut left open
+            # only while no quote follows it, and the notice is what follows).
+            assert '"' not in notice, notice
+
+
+@pytest.mark.asyncio
+async def test_a_whitespace_selector_is_still_reported_rather_than_read_as_the_whole_page() -> None:
+    # `if selector:` treats "   " as a real address, so the handler reports a stale_selector naming
+    # what the model typed. Dropping it as "not supplied" would turn a named error into a silent
+    # whole-page read — the context blow-up this change exists to stop.
+    tools = _past_cap_tools()
+    args: dict[str, Any] = {"selector": "   "}
+    scoped = await _tool(tools, "get_html").handler(args)
+    whole_page = await _tool(tools, "get_html").handler({})
+
+    # It took the SELECTOR path — on a real page that is a stale_selector error naming the address
+    # the model wrote. What must never happen is the whole document coming back as though nothing
+    # had been asked for.
+    assert scoped.content != whole_page.content, scoped.content[:120]
+    assert not scoped.content.startswith("<html>"), scoped.content[:120]
+    # And it survives normalization, so the loop's call identity still records that an address was given.
+    assert args == {"selector": "   "}
+
+
+def test_neither_the_page_nor_the_server_can_author_text_that_steals_the_notice_fold() -> None:
+    # The cut notice is folded out of the digest because it carries the document's TOTAL. Both ends
+    # of the string are authored by someone else: the PAGE can render an unterminated notice-shaped
+    # prefix, and the SERVER can name a download so its filename wears the same shape. Recognizing
+    # the notice by pattern trades one of those for the other; an index the tool reported is immune
+    # to both, because it does not depend on anything around it.
+    from skyvern.forge.taskv3.loop import _canonical_perception_content as canon
+
+    notice = taskv3_tools._rendered_text_cut(20000, 60000, scoped=True)
+    forged_a, forged_b = "rows …[truncated at page-value-100", "rows …[truncated at page-value-900"
+    a, b = forged_a + notice, forged_b + notice
+    assert canon(a, notice_at=len(forged_a)) != canon(b, notice_at=len(forged_b))
+
+    # Nor can a SERVER-controlled download filename wearing the same shape steal the fold: the
+    # download notice is appended after ours, and an index does not care what follows it.
+    body = "frozen"
+    trailer = "\nDownloaded: …[truncated at 10 of 100 chars].pdf"
+    own_a = body + taskv3_tools._markup_cut(20000, 60000, scoped=True) + trailer
+    own_b = body + taskv3_tools._markup_cut(20000, 60999, scoped=True) + trailer
+    assert canon(own_a, notice_at=len(body)) == canon(own_b, notice_at=len(body))
+
+
+def test_a_marker_cut_anywhere_inside_its_attribute_is_reported() -> None:
+    # A window boundary can land inside the attribute's own NAME, not just inside its value — a
+    # window beginning `a-tv3="t123"`. A search bounded at the boundary misses those, the marker
+    # value then goes unfolded, and an unchanged window gets a fresh digest every time a remount
+    # re-mints it: that is how a frozen page evades the perception-stall guard rather than tripping
+    # it. Swept across every position, because the earlier version was right for most of them.
+    doc = '<p>x</p><input data-tv3="t123" id=y><span>tail</span>'
+    opener = doc.index('data-tv3="')
+    closing = doc.index('"', opener + len('data-tv3="'))
+
+    for offset in range(opener + 1, closing + 1):
+        reported = taskv3_tools._marker_head_fragment_len(doc, offset)
+        assert reported == closing - offset + 1, (offset, doc[offset : offset + 8], reported)
+        # What it reports is exactly the fragment through the closing quote, which is what the
+        # canonicalizer folds away.
+        assert doc[offset:][:reported].endswith('"')
+
+    # A boundary with nothing open at it reports nothing.
+    assert taskv3_tools._marker_head_fragment_len(doc, opener) == 0
+    assert taskv3_tools._marker_head_fragment_len(doc, closing + 1) == 0
+    assert taskv3_tools._marker_head_fragment_len(doc, 0) == 0
+
+
+def test_only_an_engine_minted_marker_value_is_folded_at_a_window_head() -> None:
+    # A page can author `data-tv3` itself — it is an ordinary attribute — so matching the opener and
+    # the closing quote is not enough. Folding a page-authored value that is genuinely changing makes
+    # the window read as frozen, and the perception-stall guard TERMINATES on that.
+    #
+    # This is not the shape-matching a FRAGMENT forbids: by the time the closing quote is found the
+    # whole value is in hand, and a complete value is unambiguous where a prefix is not. It is the
+    # same test `MINTED_MARKER_RE` applies in the observe JS before trusting one as a selector.
+    minted = ("t123", "t0", "t123-4")
+    foreign = ("balance-100", "", "t1a", "T123", "t", "123", "t123 ", "t-1", "t 1")
+
+    for value in minted + foreign:
+        doc = f'<i data-tv3="{value}" x><b>tail</b>'
+        opener = doc.index('data-tv3="')
+        closing = doc.index('"', opener + len('data-tv3="'))
+        # Sweep every boundary inside the attribute, name and value alike.
+        for offset in range(opener + 1, closing + 1):
+            reported = taskv3_tools._marker_head_fragment_len(doc, offset)
+            if value in minted:
+                assert reported == closing - offset + 1, (value, offset, reported)
+            else:
+                assert reported == 0, (value, offset, reported)

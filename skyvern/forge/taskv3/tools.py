@@ -118,20 +118,200 @@ HTML_MAX_CHARS = 20000
 
 # Nothing in these may vary between two reads of an unchanged page: get_html's content is hashed
 # into the loop's perception digests, which decide whether the run has returned to known ground.
-# No quote character may appear in either notice: loop._TV3_MARKER_CUT_RE recognizes a marker the cut
+# `total` is a property of the page and `next_offset` of the call, so both are stable under a re-read
+# of unchanged bytes at the same offset — which is the whole of what the digest requires.
+# No quote character may appear in any notice: loop._TV3_MARKER_CUT_RE recognizes a marker the cut
 # left open only while no quote follows it, and the notice is what follows. Only the whole-page read
 # is steered toward text — a cut element read already has the element it asked about.
-_MARKUP_CUT = f"…[truncated at {HTML_MAX_CHARS} chars]"
-_PAGE_MARKUP_CUT = (
-    f"…[truncated at {HTML_MAX_CHARS} chars - for the visible text instead of markup, call get_html with format=text]"
-)
-# ponytail: text past the cap stays unreachable; add an offset argument if a real page needs it.
-# Component text is appended after the light DOM (_PAGE_TEXT_JS walks document first), so it is what
-# a cut drops first — hence naming the component read here rather than only a generic selector.
-_RENDERED_TEXT_CUT = (
-    f"…[rendered text truncated at {HTML_MAX_CHARS} chars - text inside components is appended last "
-    "and is cut first; read one region with get_html and a selector, or call observe]"
-)
+
+
+def _continuation_args(next_offset: int, *, scoped: bool, text: bool) -> str:
+    """How to spell the call that continues this read.
+
+    Every argument that identifies WHICH read this is has to be named, because tool arguments do not
+    carry over between calls: an omitted `format` defaults to markup and an omitted `selector` widens
+    to the whole page, so either one missing sends a model that follows the notice literally to the
+    same integer offset of a DIFFERENT string.
+
+    The selector is described, never echoed. It is model-authored and may contain a quote character,
+    and no notice may carry one — `loop._TV3_MARKER_CUT_RE` recognizes a marker the cut left open
+    only while no quote follows it, and the notice is what follows.
+    """
+    parts = ["the same selector"] if scoped else []
+    if text:
+        parts.append("format=text")
+    parts.append(f"offset={next_offset}")
+    return ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1]
+
+
+def _markup_cut(next_offset: int, total: int, *, scoped: bool) -> str:
+    """The notice a cut markup read ends with: where it stopped, how much there is, how to continue.
+
+    The offsets of the two formats are NOT interchangeable — they index different strings — so the
+    steer toward text says restart, never `or`, which reads as one call carrying both.
+    """
+    steer = "" if scoped else " Markup not what you want? format=text is a separate read, from its own offset 0."
+    args = _continuation_args(next_offset, scoped=scoped, text=False)
+    return f"…[truncated at {next_offset} of {total} chars - call get_html again with {args} for the next part.{steer}]"
+
+
+def _rendered_text_cut(next_offset: int, total: int, *, scoped: bool) -> str:
+    # Component text is appended after the light DOM (_PAGE_TEXT_JS walks document first), so it is what
+    # a cut drops first — hence naming the component read here rather than only a generic selector.
+    # A read that already carries a selector is not told to use one.
+    steer = (
+        ""
+        if scoped
+        else " Text inside components is appended last and is cut first, so a selector read or observe reaches one region directly."
+    )
+    args = _continuation_args(next_offset, scoped=scoped, text=True)
+    return (
+        f"…[rendered text truncated at {next_offset} of {total} chars - call get_html again with "
+        f"{args} for the next part.{steer}]"
+    )
+
+
+def _past_end_error(total: int) -> ToolResult:
+    """A read that starts past the content. An ERROR, not an empty ok result, for two reasons: the
+    empty string is what an empty page legitimately returns, and an ok result carrying a constant
+    string would let a run page past the end forever — identical content under a fresh (tool, args)
+    key every call, which is the one shape the perception-stall guard cannot witness."""
+    return ToolResult.error(
+        f"offset is past the end of this read, which is {total} chars - pass an offset below that",
+        error_class="offset_past_end",
+    )
+
+
+_MARKER_ATTR_OPEN = 'data-tv3="'
+# The value shape this engine mints, and the same test `MINTED_MARKER_RE` applies in the observe JS
+# before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
+# is what separates ours from theirs.
+_MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
+
+
+def _marker_head_fragment_len(content: str, offset: int) -> int:
+    """How many characters at `offset` are the tail of a marker attribute the cut opened, or 0.
+
+    Computed from the boundary itself rather than by recognizing the fragment's SHAPE. Every prefix
+    of the attribute is also legal page text — `123"`, `t123"`, `="t123"` — so a pattern cannot tell
+    a split marker from a page that merely starts that way, and folding page text that differs makes
+    it read as frozen, which the perception-stall guard terminates on.
+    """
+    if offset <= 0:
+        return 0
+    # The opener may STRADDLE the boundary — a window can begin `a-tv3="t123"` — so the search admits
+    # any occurrence starting before `offset`, not only ones ending before it. Bounded at `0, offset`
+    # it misses every cut that lands inside the attribute's own name, and the marker value then goes
+    # unfolded: an unchanged window gets a fresh digest whenever a remount re-mints it, which is how
+    # a frozen page evades the stall guard instead of tripping it.
+    opened = content.rfind(_MARKER_ATTR_OPEN, 0, offset + len(_MARKER_ATTR_OPEN) - 1)
+    if opened < 0 or opened >= offset:
+        return 0
+    closed = content.find('"', opened + len(_MARKER_ATTR_OPEN))
+    if closed < offset:
+        # A boundary at or past the closing quote left nothing open.
+        return 0
+    # The VALUE decides, and by here the whole of it is in hand — which is why this is not the
+    # shape-matching the fragment forbids. A prefix is ambiguous (`123"`, `t123"` are also legal page
+    # text); a complete value is not. A page may author `data-tv3` itself, and folding a
+    # page-authored value that is changing makes the window read as frozen, which the
+    # perception-stall guard terminates on. Same test the observe JS applies before it will trust one
+    # of these as a selector.
+    if not _MINTED_MARKER_VALUE_RE.match(content[opened + len(_MARKER_ATTR_OPEN) : closed]):
+        return 0
+    return closed - offset + 1
+
+
+def _window(content: str, offset: int, cut: Callable[[int, int], str]) -> tuple[str, int, int | None] | ToolResult:
+    """`content` from `offset`, capped, ending in `cut` when bytes remain after it.
+
+    Redacts BEFORE it cuts. The loop hides `model_hidden_values` from tool output by whole-substring
+    replacement, and it runs on what this returns — so a secret straddling a window boundary matches
+    neither half and both halves reach the model in the clear. Before offsets existed the tail was
+    simply unreachable; making it reachable is what turns a truncated prefix into the whole value,
+    delivered in two pieces. Redacting the whole string first means a boundary can only ever split
+    the placeholder. The loop's own pass still runs and is then a no-op on this content.
+    """
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        content = ctx.hide_from_model(content)
+    total = len(content)
+    if offset >= total:
+        # An unasked-for offset on an empty read is not a read that ran off the end: an empty page is
+        # an ordinary answer and must stay the empty string, or every blank page reads as a paging
+        # mistake. Only a read the model deliberately advanced can overshoot.
+        return ("", 0, None) if offset == 0 else _past_end_error(total)
+    head = _marker_head_fragment_len(content, offset)
+    end = offset + HTML_MAX_CHARS
+    if end >= total:
+        return content[offset:], head, None
+    # The exact BOUNDARIES, not a flag. The loop canonicalizes our notice out of the perception
+    # digest because it carries the document's TOTAL, which moves when bytes outside the window
+    # change — and it must fold OUR notice and never text that merely looks like one. Both the page
+    # (a forged unterminated prefix) and the server (a download filename) control text that can wear
+    # that shape, so no pattern and no match-selection rule can tell them apart. This function put
+    # the notice there and knows where; carrying the index is the only answer that stays correct.
+    windowed = content[offset:end]
+    return windowed + cut(end, total), head, len(windowed)
+
+
+def _normalize_read_args(args: dict[str, Any]) -> None:
+    """Rewrite the arguments that name WHICH read this is to the single form the handler will act on,
+    dropping any that mean "not supplied". Mutates `args`, which is what the loop hashes into this
+    call's identity.
+
+    A non-strict provider spells an absent optional argument in several ways — omitted, `null`, or
+    the empty string — and the handler treats all of them as the whole-page HTML read. Left as sent
+    they are several identities for one read, and with a two-snapshot window duplicates of the head
+    can fill it and evict the different region the window exists to hold.
+    """
+    # Absent or empty only — never whitespace. `if selector:` treats "   " as a real address, so the
+    # handler reports a stale_selector naming what the model typed; dropping it here would turn that
+    # into a silent WHOLE-PAGE read, which is the context blow-up this change exists to stop. A
+    # whitespace `format` likewise reaches the handler's unknown-format error rather than defaulting.
+    for name in ("selector", "format"):
+        if args.get(name) is None or args.get(name) == "":
+            args.pop(name, None)
+    fmt = args.get("format")
+    if isinstance(fmt, str):
+        # An unrecognized spelling is left as typed, so the handler's error names what the model wrote.
+        normalized = fmt.strip().lower()
+        if normalized == "html":
+            del args["format"]
+        elif normalized == "text":
+            args["format"] = normalized
+
+
+def _read_offset(args: dict[str, Any]) -> int | str:
+    """The requested offset, or an error message. A model that sends a bad offset must be told, not
+    silently re-served the head — it would read the same window as a fresh document.
+
+    The accepted value is written back over `args`, and an offset of 0 is removed outright. `args` is
+    what the loop hashes into this call's identity, which decides both what supersedes what in the
+    transcript and what counts as the same probe to the stall guard. Without this, `{}`,
+    `{offset: 0}` and `{offset: "0"}` are three identities for one read of the same bytes.
+
+    MUST run outside `_with_selector_guard`, which hands the handler a COPY of `args` whenever a
+    selector is present — a write-back inside it reaches nothing the loop will hash.
+    """
+    raw = args.pop("offset", None)
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, (int, str, float)):
+        return f"offset must be a whole number of characters, not {raw!r}"
+    # Integrality is checked, never coerced: int(20000.9) is 20000, which would execute and record a
+    # DIFFERENT read from the one asked for, under a handler that promises to reject a non-whole count.
+    if isinstance(raw, float) and not raw.is_integer():
+        return f"offset must be a whole number of characters, not {raw!r}"
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return f"offset must be a whole number of characters, not {raw!r}"
+    if value < 0:
+        return f"offset must not be negative, got {value}"
+    if value:
+        args["offset"] = value
+    return value
 
 
 def _escape_tags_in_text(text: str) -> str:
@@ -8306,7 +8486,7 @@ def build_browser_tools(
         # is untouched. url= is already masked before truncation above; re-masking a token is a no-op.
         return ToolResult.ok(_mask_refs("\n".join(lines)), data={"count": len(elements), "summary": summary})
 
-    async def _rendered_text_result(page: Any, selector: str | None) -> ToolResult:
+    async def _rendered_text_result(page: Any, selector: str | None, offset: int) -> ToolResult:
         # rendered_text marks this result as prose rather than markup, which is what tells a reader
         # of `data` that its content carries no start tags of the page's own.
         target = page
@@ -8322,9 +8502,20 @@ def build_browser_tools(
             # another document's text to it would answer a different question than the one asked.
             text += await _child_frame_text(page)
         body = _escape_tags_in_text(_mask_refs(text))
-        if len(body) > HTML_MAX_CHARS:
-            body = body[:HTML_MAX_CHARS] + _RENDERED_TEXT_CUT
-        return ToolResult.ok(body, data={"rendered_text": True})
+        # Windowed AFTER masking and escaping, never before: both rewrite lengths, so an offset taken
+        # against the raw text would address a different character in the text the model is handed.
+        scoped = bool(selector)
+        windowed = _window(body, offset, lambda end, total: _rendered_text_cut(end, total, scoped=scoped))
+        if isinstance(windowed, ToolResult):
+            return windowed
+        text, head, notice_at = windowed
+        # Present only when non-zero. Adding a key to every result would widen a `data` shape other
+        # tests pin exactly, for no reader that needs it: the loop uses `.get`, so absent and the
+        # inert value are the same answer. A rendered-text read has no markup and so no head fragment.
+        data: dict[str, Any] = {"rendered_text": True}
+        if notice_at is not None:
+            data["notice_at"] = notice_at
+        return ToolResult.ok(text, data=data)
 
     async def _child_frame_text(page: Any) -> str:
         """Each readable child frame's rendered text, labelled, appended to the page's own.
@@ -8376,9 +8567,11 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args.get("selector")
+        # Already parsed, normalized and validated by `_with_read_offset`, outside the selector guard.
+        offset = int(args.get("offset") or 0)
         fmt = str(args.get("format") or "html").strip().lower()
         if fmt == "text":
-            return await _rendered_text_result(page, selector)
+            return await _rendered_text_result(page, selector, offset)
         if fmt != "html":
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
@@ -8405,10 +8598,18 @@ def build_browser_tools(
         # costs truncation budget the model needs for real markup.
         html = _ACT_ATTR_RE.sub("", html)
         html = _mask_refs(html)
-        if len(html) > HTML_MAX_CHARS:
-            cut = _MARKUP_CUT if selector else _PAGE_MARKUP_CUT
-            return ToolResult.ok(html[:HTML_MAX_CHARS] + cut)
-        return ToolResult.ok(html)
+        scoped = bool(selector)
+        windowed = _window(html, offset, lambda end, total: _markup_cut(end, total, scoped=scoped))
+        if isinstance(windowed, ToolResult):
+            return windowed
+        markup, head, notice_at = windowed
+        # Same rule as the text read: a markup read with nothing to report carries no `data` at all.
+        report: dict[str, Any] = {}
+        if head:
+            report["head_fragment_len"] = head
+        if notice_at is not None:
+            report["notice_at"] = notice_at
+        return ToolResult.ok(markup, data=report or None)
 
     async def _unreachable_error(selector: str) -> ToolResult:
         # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
@@ -12135,6 +12336,30 @@ def build_browser_tools(
             # guards then see less than they could, which is the pre-existing behaviour.
             LOG.info("taskv3 could not record frame work", exc_info=True)
 
+    def _with_read_identity(handler: ToolHandler) -> ToolHandler:
+        """Normalize the arguments that name WHICH read this is, on the ORIGINAL args dict.
+
+        Outermost of get_html's wrappers by necessity: `_with_selector_guard` rebuilds `args` as a
+        copy whenever a selector is present, and the loop hashes the caller's dict, not the copy. A
+        normalization applied any further in is invisible to the call identity it exists to unify.
+
+        Spellings the handler treats as identical must not survive as different keys. The handler
+        strips and lowercases `format` and defaults it to html, so `{}`, `{format: html}` and
+        `{format: " HTML "}` are one read — left raw they are three keys, and with a retention window
+        of two, duplicates of one region can fill it and evict the different region the window exists
+        to hold. An unrecognized spelling is left untouched for the handler to reject, so its error
+        still names what the model actually typed.
+        """
+
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            offset = _read_offset(args)
+            if isinstance(offset, str):
+                return ToolResult.error(offset, error_class="invalid_offset")
+            _normalize_read_args(args)
+            return await handler(args)
+
+        return wrapped
+
     def _with_ref_resolution(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
             # Read ONCE, so the value stamped on the row is provably the one that chose the branch
@@ -12256,7 +12481,8 @@ def build_browser_tools(
             "get_html",
             "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe), or "
             'with format "text" its rendered visible text instead - what a user sees, no markup. Both '
-            f"are capped at {HTML_MAX_CHARS} chars and say when they were cut.",
+            f"are capped at {HTML_MAX_CHARS} chars per call; a cut result reports the total size and the "
+            "offset that continues the read, so a page larger than one call is read in parts.",
             _obj(
                 {
                     "selector": {
@@ -12267,6 +12493,13 @@ def build_browser_tools(
                         "type": "string",
                         "enum": ["html", "text"],
                         "description": 'Default "html". "text" returns the visible text instead of markup.',
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "Character to start this read at; default 0. Pass the offset a previous cut "
+                            "result named to read the next part of the same page."
+                        ),
                     },
                 }
             ),
@@ -12415,6 +12648,9 @@ def build_browser_tools(
             _tool_spec.handler = _with_ref_resolution(
                 _tool_spec.name, _with_selector_guard(_tool_spec.handler, diagnose)
             )
+        if _tool_spec.name == "get_html":
+            # After the selector-guard block above, so this sits OUTSIDE it and sees the caller's dict.
+            _tool_spec.handler = _with_read_identity(_tool_spec.handler)
         if _tool_spec.name in ("click", "type"):
             # OUTERMOST wrapper: resolve mark=N to a selector before preflight builds its action from
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
