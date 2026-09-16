@@ -25,9 +25,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -50,7 +48,6 @@ const FINISHED_RUN_BROWSER_LABEL =
 
 export function BrowserPaneViewPills() {
   const compact = useStudioPaneCompact();
-  const { browserStreamingMode } = useBrowserStreamingMode();
   const { view, setView, visuals, inspectingRun } = useBrowserPaneView();
   const hasRecording = visuals.recordingUrls.length > 0;
   // Sitting beside the inspected run's replay pills, a pulsing "Live" reads as
@@ -60,11 +57,6 @@ export function BrowserPaneViewPills() {
 
   return (
     <>
-      {/* Stream-transport diagnostics are a local-dev aid; deployed builds
-          keep the header clean. */}
-      {compact || !import.meta.env.DEV ? null : (
-        <StreamModeBadge mode={browserStreamingMode} className="shrink-0" />
-      )}
       <div
         role="group"
         aria-label="Browser view"
@@ -228,20 +220,23 @@ export function BrowserPaneActions() {
             const tooltip = debugHidden
               ? blockedTitle
               : startRecordingAtEnd
-                ? "Record browser interactions"
+                ? "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps."
                 : "Recording is available when the editor is ready";
             return (
-              <ControlTooltip content={tooltip} blocked={disabled}>
+              <ControlTooltip
+                content={<span className="block max-w-[260px]">{tooltip}</span>}
+                blocked={disabled}
+              >
                 <Button
                   variant="ghost"
                   size="sm"
                   className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
-                  aria-label="Record browser"
+                  aria-label="Record task"
                   disabled={disabled}
                   onClick={() => startRecordingAtEnd?.()}
                 >
                   <span className="h-2 w-2 rounded-full bg-red-500" />
-                  {compact ? null : "Record"}
+                  {compact ? null : "Record task"}
                 </Button>
               </ControlTooltip>
             );

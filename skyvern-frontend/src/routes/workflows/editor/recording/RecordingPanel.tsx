@@ -530,7 +530,7 @@ function RecordingPanel({ browserSessionId }: Props) {
     ? "Finishing recording"
     : manualCapturePaused
       ? "Recording paused"
-      : "Recording browser";
+      : "Recording task";
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden rounded-xl border bg-slate-elevation2">
@@ -564,7 +564,7 @@ function RecordingPanel({ browserSessionId }: Props) {
               <>
                 Capture is paused.
                 <br />
-                Resume to continue recording browser actions.
+                Resume to continue recording the task.
               </>
             ) : (
               <>
