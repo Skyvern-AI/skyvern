@@ -170,7 +170,9 @@ async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
     previous_fire_time = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
     run_id = schedule_service.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, previous_fire_time)
     execute = AsyncMock()
-    fail_run = AsyncMock()
+    failed_run = SimpleNamespace(workflow_run_id=run_id, status=WorkflowRunStatus.failed)
+    fail_run = AsyncMock(return_value=failed_run)
+    webhook = AsyncMock()
     get_attempts = AsyncMock(return_value=[SimpleNamespace(attempt_number=1)] if has_attempt_row else [])
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
@@ -183,6 +185,7 @@ async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
         WORKFLOW_SERVICE=SimpleNamespace(
             execute_workflow_with_retries=execute,
             mark_workflow_run_as_failed_if_not_final=fail_run,
+            execute_workflow_webhook=webhook,
         ),
     )
     monkeypatch.setattr(schedule_service, "app", fake_app)
@@ -202,12 +205,14 @@ async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
         with pytest.raises(RuntimeError, match=f"{initializer} unavailable"):
             await scheduler._run_schedule(due)
         fail_run.assert_not_awaited()
+        webhook.assert_not_awaited()
     else:
         await scheduler._run_schedule(due)
         fail_run.assert_awaited_once_with(
             workflow_run_id=run_id,
             failure_reason=f"Workflow run initialization failed before execution: RuntimeError: {error}",
         )
+        webhook.assert_awaited_once_with(failed_run, api_key=None, claim_kind=None)
     get_attempts.assert_awaited_once_with(run_id)
     fake_app.DATABASE.workflow_runs.queue_initial_dispatch.assert_awaited_once_with(run_id, 1)
     execute.assert_not_awaited()
