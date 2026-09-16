@@ -211,6 +211,7 @@ async def test_run_schedule_no_policy_initializer_failure_fails_the_run(
         fail_run.assert_awaited_once_with(
             workflow_run_id=run_id,
             failure_reason=f"Workflow run initialization failed before execution: RuntimeError: {error}",
+            cascade_children=False,
         )
         webhook.assert_awaited_once_with(failed_run, api_key=None, claim_kind=None)
     get_attempts.assert_awaited_once_with(run_id)
