@@ -62,6 +62,12 @@ ToolErrorClass = Literal[
     "covered",
     "inert",
     "unreachable",
+    # `file_upload`: the target is not a file input, holds no single one, and opened no file picker;
+    # or it is one whose click would submit its form, so it was not clicked.
+    "no_file_input",
+    "submits_form",
+    # `file_upload`: the input could not be read back and no upload request was seen.
+    "attach_unconfirmed",
     # The field resolved and the page cooperated, but the requested VALUE named no single option.
     # Each of these names only what was READ: an absence claim holds solely over a list read in full,
     # which is why a declared-but-truncated list gets `rows_unread` rather than `no_matching_row`.
@@ -95,6 +101,11 @@ ToolOkClass = Literal[
     "solved",
     "absent",
     "attempts_exhausted",
+    # `file_upload`. `attached_no_activity` is the file confirmed on the input with no upload request
+    # seen -- a form that sends the file with the submit lands here, and so does an unwired handler.
+    "upload_seen",
+    "consumed_shown",
+    "attached_no_activity",
 ]
 
 
