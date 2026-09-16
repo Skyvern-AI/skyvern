@@ -980,7 +980,7 @@ def json_safe_recorder_output(value: Any) -> Any:
 
     A leaked proxy is a generated-code defect with no meaningful serializable value, so it collapses
     to a type marker rather than its selector: a selector is only a lossy display fragment and can
-    embed a resolved credential, which mask_secrets_in_data does not scrub out of a dict key."""
+    embed a resolved credential, and this runs before any masking."""
     if isinstance(value, (RecordingLocator, RecordingKeyboard, RecordingPage)):
         return f"<{type(value).__name__}>"
     if isinstance(value, dict):
