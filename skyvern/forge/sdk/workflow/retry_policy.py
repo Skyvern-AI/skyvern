@@ -337,6 +337,27 @@ async def ensure_attempt_row(
     return True
 
 
+async def fail_run_without_attempt_row(workflow_run_id: str, failure_reason: str) -> bool:
+    """Fail a queued run that no recovery sweep can see. Returns False when an attempt row exists."""
+    if await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id):
+        return False
+    try:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+            workflow_run_id=workflow_run_id,
+            failure_reason=failure_reason,
+        )
+    except Exception:
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
+        if workflow_run is not None and not workflow_run.status.is_final():
+            raise
+        LOG.warning(
+            "Workflow run is terminal after initialization failure despite a finalization error",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+    return True
+
+
 async def queue_initial_attempt(workflow_run_id: str, attempt_number: int) -> bool:
     """Queue a new run's durable rows before its dispatch, retrying a failed write.
 

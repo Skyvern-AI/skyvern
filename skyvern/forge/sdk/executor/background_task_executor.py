@@ -32,6 +32,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_TAKEOVER_SECONDS,
     RetryDecision,
+    fail_run_without_attempt_row,
     finalize_abandoned_attempt,
     get_recorded_decision,
     latest_attempt_awaiting_preparation,
@@ -596,12 +597,27 @@ class BackgroundTaskExecutor(AsyncExecutor):
             ):
                 self._retry_resumes_needing_recovery.discard(key)
                 return
-            # Initialization belongs to the dispatch: a failure here is re-dispatched by the sweep, whereas a
-            # created attempt that never reached the dispatch matches no recovery predicate.
-            await initialize_skyvern_state_file(
-                workflow_run_id=attempt.workflow_run_id, organization_id=attempt.organization_id
-            )
-            await prepare_org_llm_runtime(app.DATABASE, attempt.organization_id, execution_kwargs.get("organization"))
+            # Attempt rows let the sweep recover initialization failures; attempt-less runs must fail durably.
+            try:
+                await initialize_skyvern_state_file(
+                    workflow_run_id=attempt.workflow_run_id, organization_id=attempt.organization_id
+                )
+                await prepare_org_llm_runtime(
+                    app.DATABASE, attempt.organization_id, execution_kwargs.get("organization")
+                )
+            except Exception as exc:
+                if await fail_run_without_attempt_row(
+                    attempt.workflow_run_id,
+                    f"Workflow run initialization failed before execution: {type(exc).__name__}: {exc}",
+                ):
+                    self._retry_resumes_needing_recovery.discard(key)
+                    LOG.warning(
+                        "Workflow run initialization failed without an attempt row; run is terminal",
+                        workflow_run_id=attempt.workflow_run_id,
+                        exc_info=True,
+                    )
+                    return
+                raise
             await app.WORKFLOW_SERVICE.execute_workflow_with_retries(
                 **execution_kwargs, on_execution_start=on_execution_start
             )

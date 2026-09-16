@@ -249,7 +249,19 @@ def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
     return {artifact.uri: artifact.checksum for artifact in artifacts if artifact.uri and artifact.checksum}
 
 
-def dedupe_run_scoped_download_artifacts(artifacts: list[Artifact]) -> list[Artifact]:
+def is_download_timestamp_current(timestamp: datetime | None, attempt_started_at: datetime | None) -> bool:
+    if attempt_started_at is None or timestamp is None:
+        return True
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    if attempt_started_at.tzinfo is None:
+        attempt_started_at = attempt_started_at.replace(tzinfo=UTC)
+    return timestamp >= attempt_started_at
+
+
+def dedupe_run_scoped_download_artifacts(
+    artifacts: list[Artifact], attempt_started_at: datetime | None = None
+) -> list[Artifact]:
     """Collapse the two representations of one persistent-session download in a run's DOWNLOAD set.
 
     A download can be registered both session-produced (``browser_session_id`` set — run-bound at
@@ -258,14 +270,26 @@ def dedupe_run_scoped_download_artifacts(artifacts: list[Artifact]) -> list[Arti
     the run-scoped one as canonical. Pairing is one-for-one: a checksum with N run-scoped rows drops at
     most N session rows, so two legitimate same-content session downloads backed by a single run-scoped
     row keep one. Order is preserved; distinct/absent checksums, twinless session rows, and multiple
-    run-scoped rows are all kept. Run-scoped only — never call on a session listing.
+    run-scoped rows are all kept. Rows before the attempt cutoff pass through without pairing.
+    Run-scoped only — never call on a session listing.
     """
-    run_scoped_checksums = Counter(a.checksum for a in artifacts if a.browser_session_id is None and a.checksum)
+    run_scoped_checksums = Counter(
+        a.checksum
+        for a in artifacts
+        if a.browser_session_id is None
+        and a.checksum
+        and is_download_timestamp_current(a.modified_at or a.created_at, attempt_started_at)
+    )
     if not run_scoped_checksums:
         return artifacts
     kept: list[Artifact] = []
     for a in artifacts:
-        if a.browser_session_id is not None and a.checksum and run_scoped_checksums[a.checksum] > 0:
+        if (
+            a.browser_session_id is not None
+            and a.checksum
+            and run_scoped_checksums[a.checksum] > 0
+            and is_download_timestamp_current(a.modified_at or a.created_at, attempt_started_at)
+        ):
             run_scoped_checksums[a.checksum] -= 1
             continue
         kept.append(a)
@@ -508,21 +532,16 @@ class BaseStorage(ABC):
         return []
 
     async def get_current_attempt_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
-        files = await self.get_downloaded_files(organization_id=organization_id, run_id=run_id)
         started_at = await get_download_retry_started_at(organization_id, run_id)
-        if started_at is None:
-            return files
-        current_files = []
-        for file_info in files:
-            modified_at = file_info.modified_at
-            if modified_at is not None and modified_at.tzinfo is None:
-                modified_at = modified_at.replace(tzinfo=UTC)
-            if modified_at is None or modified_at >= started_at:
-                current_files.append(file_info)
-        return current_files
+        files = await self.get_downloaded_files(
+            organization_id=organization_id, run_id=run_id, attempt_started_at=started_at
+        )
+        return [file_info for file_info in files if is_download_timestamp_current(file_info.modified_at, started_at)]
 
     @abstractmethod
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         pass
 
     @abstractmethod
