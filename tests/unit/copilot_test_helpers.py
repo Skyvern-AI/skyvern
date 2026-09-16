@@ -44,6 +44,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatReques
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
@@ -134,6 +136,13 @@ def stub_artifact_app(
     )
     monkeypatch.setattr(run_execution_module, "app", fake_app)
     return retrieved_ids
+
+
+_RUN_SESSION_ID = "pbs_run"
+_CHAT_SESSION_ID = "pbs_chat"
+# The chat session answers with a different proxy than the run session, so a lookup that reads the
+# wrong session shows up as the wrong label instead of passing.
+_CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 
 
 def _fake_workflow_run(status: str) -> SimpleNamespace:
@@ -255,6 +264,8 @@ async def install_run_blocks_harness(
     dispatch_to_worker: bool = False,
     terminal_blocks: list[WorkflowRunBlock] | None = None,
     recent_actions: list[MagicMock] | None = None,
+    run_proxy_location: ProxyLocationInput = None,
+    run_session_proxy_location: ProxyLocationInput = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -314,8 +325,16 @@ async def install_run_blocks_harness(
         workflow_run_id="wr_paused",
         workflow_id="w_source",
         sequential_credential_id=None,
+        proxy_location=run_proxy_location,
+        runnable_id=None,
     )
     monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
+
+    async def _get_session(session_id: str, _organization_id: str | None = None) -> SimpleNamespace:
+        proxy_location = run_session_proxy_location if session_id == _RUN_SESSION_ID else _CHAT_SESSION_PROXY_LOCATION
+        return SimpleNamespace(proxy_location=proxy_location, runnable_id=None)
+
+    monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
 
     polled_run = _fake_workflow_run(status=polled_status)
 
@@ -329,8 +348,8 @@ async def install_run_blocks_harness(
     association = ActiveRunSessionAssociation(
         organization_id="org-1",
         workflow_permanent_id="wfp-1",
-        debug_browser_session_id="pbs_chat",
-        run_browser_session_id="pbs_run",
+        debug_browser_session_id=_CHAT_SESSION_ID,
+        run_browser_session_id=_RUN_SESSION_ID,
         workflow_run_id="wr_paused",
         turn_id="turn-1",
         generation="gen-1",

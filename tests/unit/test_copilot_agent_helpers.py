@@ -32,6 +32,8 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
+    _FAILURE_FOLLOW_UP,
+    _SKYVERN_EGRESS_FOLLOW_UP,
     _build_goal_satisfied_exit_result,
     _format_chat_history,
     _resolve_wrapped_exception_exit_result,
@@ -107,7 +109,7 @@ from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, interim_run_start_outcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTION_MAX_CHARS
-from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -144,6 +146,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -252,6 +255,34 @@ def _challenge_effects_contract() -> DiagnosisRepairContract:
             kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
         ),
         levers=[Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")],
+    )
+
+
+_PROXY_HOP_NAVIGATION_FAILURE = (
+    "Failed to navigate to url https://x.test. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
+
+
+def _record_failed_navigation_run(
+    ctx: CopilotContext, failure_reason: str, driver_codes: list[str] | None = None
+) -> None:
+    """``driver_codes`` is what the browser reported; the sentence alone attributes nothing."""
+    ctx.test_after_update_done = True
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "blocks": [
+                    {
+                        "label": "open_page",
+                        "status": "failed",
+                        "failure_reason": failure_reason,
+                        "error_codes": driver_codes or [],
+                    }
+                ]
+            },
+        },
     )
 
 
@@ -458,6 +489,32 @@ class TestFailedTestResponseNormalization:
         assert "tested it" not in rewritten
         assert "test failed" not in rewritten
 
+    def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
+        # The challenge path returns before the follow-up, so the label has to be on the
+        # recorded-run sentence itself or a walled page silently hides who owned the failure.
+        ctx = _challenge_failure_ctx()
+        ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
+        _record_failed_navigation_run(ctx, _PROXY_HOP_NAVIGATION_FAILURE, ["net::ERR_TUNNEL_CONNECTION_FAILED"])
+        ctx.latest_diagnosis_repair_contract = _challenge_effects_contract()
+        ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
+        model_reply = "The proxy hop died before the page loaded. I can retry from another location."
+
+        rewritten = _rewrite_failed_test_response(model_reply, ctx)
+
+        assert "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in rewritten
+        assert model_reply in rewritten
+
+    def test_prose_quoting_a_proxy_code_never_blames_our_own_egress(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
+        _record_failed_navigation_run(ctx, "The page said net::ERR_TUNNEL_CONNECTION_FAILED, so I stopped.")
+        ctx.latest_diagnosis_repair_contract = _challenge_effects_contract()
+        ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
+
+        rewritten = _rewrite_failed_test_response("I could not continue.", ctx)
+
+        assert "Skyvern proxy hop failed" not in rewritten
+
     def test_without_challenge_effects_the_base_follow_up_template_is_unchanged(self) -> None:
         no_contract_ctx = _challenge_failure_ctx()
         empty_recourse_ctx = _challenge_failure_ctx()
@@ -465,7 +522,7 @@ class TestFailedTestResponseNormalization:
 
         expected = (
             "I created a draft workflow with 2 blocks and tested it, but the test failed. "
-            "Failure: Verify you are human. Want me to retry with a different proxy location?"
+            "Failure: Verify you are human. Want me to retry?"
             " Keep the draft to iterate on, or discard."
         )
         assert _rewrite_failed_test_response("The site blocked me.", no_contract_ctx) == expected
@@ -489,9 +546,30 @@ class TestFailedTestResponseNormalization:
         assert "test failed" in rewritten.lower()
         assert "Call log:" not in rewritten
 
-    def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
+    @pytest.mark.parametrize("failure_category", ["NAVIGATION_FAILURE", "PAGE_LOAD_TIMEOUT"])
+    def test_proxy_transport_failure_reply_does_not_blame_the_url(self, failure_category: str) -> None:
+        ctx = _ctx(
+            last_update_block_count=1,
+            last_test_ok=False,
+            effective_workflow_proxy_location=ProxyLocation.RESIDENTIAL_ES,
+        )
+        _record_failed_navigation_run(
+            ctx,
+            "Failed to execute code block. Reason: Error: Page.goto: "
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/catalogue",
+            ["net::ERR_TUNNEL_CONNECTION_FAILED"],
+        )
+        ctx.last_failure_category_top = failure_category
 
+        rewritten = _rewrite_failed_test_response("The test failed.", ctx)
+
+        assert "confirm the URL" not in rewritten
+        assert "Can you confirm the URL is correct?" not in rewritten
+        assert "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in rewritten
+        assert _SKYVERN_EGRESS_FOLLOW_UP.strip() in rewritten
+        assert _FAILURE_FOLLOW_UP["PROXY_ERROR"].strip() not in rewritten
+
+    def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         sentinel_workflow = object()
         ctx = MagicMock()
         ctx.last_workflow = sentinel_workflow
@@ -518,8 +596,6 @@ class TestFailedTestResponseNormalization:
         assert ctx.last_test_failure_reason == "net::ERR_NAME_NOT_RESOLVED"
 
     def test_current_state_block_run_records_partial_verification_evidence(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
-
         ctx = _ctx(
             last_workflow_yaml="""
 workflow_definition:
