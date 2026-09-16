@@ -338,7 +338,12 @@ async def ensure_attempt_row(
 
 
 async def fail_run_without_attempt_row(
-    workflow_run_id: str, failure_reason: str, *, api_key: str | None = None, need_call_webhook: bool = True
+    workflow_run_id: str,
+    failure_reason: str,
+    *,
+    api_key: str | None = None,
+    need_call_webhook: bool = True,
+    cascade_children: bool = False,
 ) -> bool:
     """Fail a queued run that no recovery sweep can see. Returns False when an attempt row exists."""
     if await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id):
@@ -347,6 +352,7 @@ async def fail_run_without_attempt_row(
         workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
             workflow_run_id=workflow_run_id,
             failure_reason=failure_reason,
+            cascade_children=cascade_children,
         )
     except Exception as finalization_error:
         try:
