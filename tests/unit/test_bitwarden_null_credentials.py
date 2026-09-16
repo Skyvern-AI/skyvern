@@ -52,16 +52,24 @@ def _stub_bitwarden_auth(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("login", "expected"),
+    [
+        ({"username": None, "password": None, "totp": None}, ("", "", "")),
+        ({"username": "example-user"}, ("example-user", "", "")),
+        ({"password": "example-password", "username": None}, ("", "example-password", "")),
+        ({"totp": "  EXAMPLESEED  "}, ("", "", "EXAMPLESEED")),
+    ],
+    ids=["all-null", "username-only", "password-only", "totp-only"],
+)
 async def test_get_secret_value_by_item_id_coerces_null_fields_to_empty_string(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, login: dict, expected: tuple[str, str, str]
 ) -> None:
     item_payload = {
+        "object": "item",
         "id": "11111111-1111-1111-1111-111111111111",
-        "login": {
-            "username": None,
-            "password": None,
-            "totp": None,
-        },
+        "type": 1,
+        "login": login,
     }
 
     async def fake_run_command(command: list[str], **_: object) -> RunCommandResult:
@@ -78,9 +86,9 @@ async def test_get_secret_value_by_item_id_coerces_null_fields_to_empty_string(
         item_id="11111111-1111-1111-1111-111111111111",
     )
 
-    assert result[BitwardenConstants.USERNAME] == ""
-    assert result[BitwardenConstants.PASSWORD] == ""
-    assert result[BitwardenConstants.TOTP] == ""
+    assert result[BitwardenConstants.USERNAME] == expected[0]
+    assert result[BitwardenConstants.PASSWORD] == expected[1]
+    assert result[BitwardenConstants.TOTP] == expected[2]
 
 
 @pytest.mark.asyncio
@@ -123,7 +131,9 @@ async def test_get_secret_value_by_item_id_preserves_real_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     item_payload = {
+        "object": "item",
         "id": "33333333-3333-3333-3333-333333333333",
+        "type": 1,
         "login": {
             "username": "alice@example.com",
             "password": "hunter2",
@@ -156,7 +166,9 @@ async def test_get_secret_value_by_item_id_preserves_raw_totp_uri(
 ) -> None:
     totp_uri = "otpauth://totp/user@example.test?secret=JBSWY3DPEHPK3PXP&issuer=Example"
     item_payload = {
+        "object": "item",
         "id": "55555555-5555-5555-5555-555555555555",
+        "type": 1,
         "login": {
             "username": "alice@example.test",
             "password": "hunter2",
@@ -182,10 +194,12 @@ async def test_get_secret_value_by_item_id_preserves_raw_totp_uri(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("card_code", [None, "123"], ids=["null-code", "with-code"])
 async def test_get_credit_card_data_includes_billing_custom_fields(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, card_code: str | None
 ) -> None:
     item_payload = {
+        "object": "item",
         "id": "44444444-4444-4444-4444-444444444444",
         "type": 3,
         "organizationId": "org-id",
@@ -195,7 +209,7 @@ async def test_get_credit_card_data_includes_billing_custom_fields(
             "number": "4111111111111111",
             "expMonth": "12",
             "expYear": "2030",
-            "code": "123",
+            "code": card_code,
             "brand": "visa",
         },
         "fields": [
@@ -222,6 +236,7 @@ async def test_get_credit_card_data_includes_billing_custom_fields(
     )
 
     assert result[BitwardenConstants.CREDIT_CARD_NUMBER] == "4111111111111111"
+    assert result[BitwardenConstants.CREDIT_CARD_CVV] == card_code
     assert result["billing_address_line1"] == "123 Main St"
     assert result["billing_address_country_code"] == "US"
     assert result["billing_email"] == "billing@example.com"
