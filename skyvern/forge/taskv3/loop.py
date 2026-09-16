@@ -69,6 +69,11 @@ ToolErrorClass = Literal[
     "identical_rows",
     "no_matching_row",
     "rows_unread",
+    # A read asked to resume past the end of what it was reading. Not an address failure and not a
+    # page refusal: the call was well-formed and the page cooperated, the offset simply named nothing.
+    "offset_past_end",
+    # The offset itself was unusable — negative, or not a whole number of characters.
+    "invalid_offset",
     # The handler raised instead of returning; classified by `_raised_error_class`.
     "driver_timeout",
     "timeout_other",
@@ -446,6 +451,21 @@ NO_TOOL_CALL_NUDGE = (
 PERCEPTION_STALL_NUDGE_AFTER = 6
 PERCEPTION_STALL_TERMINATE_AFTER = 15
 
+# SKY-16330. How many DISTINCT reads of one compactable tool survive compaction. Supersession means a
+# snapshot went stale, and a read of region B does not make a read of region A stale — they answer
+# different questions — so eliding A on B's arrival leaves a document larger than one result
+# impossible to assemble: broad reads are cut at HTML_MAX_CHARS and narrow ones are erased.
+#
+# 2, and the ceiling is what sets it. `st.total_tokens` accumulates the re-sent transcript EVERY turn
+# against DEFAULT_MAX_TOKENS, which exists for exactly this spiral, and the measured failing runs are
+# dying on it — so every retained snapshot costs its size times the turns that follow it. At 2 this
+# holds ~2x HTML_MAX_CHARS of get_html; each further unit is another HTML_MAX_CHARS re-sent ~100
+# times. RAISE ONLY ON MEASURED EVIDENCE that two windows are not enough, not on the intuition that
+# more context helps. It cannot widen a tool whose reads do not differ: observe and look declare no
+# arguments, and the key is built from DECLARED arguments only, so all of their calls share one key
+# and exactly one of each survives, as before — whatever a non-strict provider adds to the call.
+PERCEPTION_SNAPSHOT_RETAIN = 2
+
 # Stable, facetable prefix for the stall verdict's reason — telemetry queries key on it to measure
 # how often the policy fires; change it only with the dashboards that read it.
 PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
@@ -577,6 +597,12 @@ _TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
 # quote-bearing placeholder — either broken silently brings the leak back.
 _TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
 
+# A read can now start at an offset, so a marker can be cut open at the HEAD of a window too. Same
+# leak, same canonicalization, opposite end — but the boundary can land at ANY of the sixteen
+# characters of `data-tv3="tN"`, not only inside the digits, so the pattern is every suffix of the
+# attribute's fixed prefix (longest first) plus the empty one for a cut inside the value. Anchored at
+# the very start of the content, so the only thing it can take is the fragment a window made.
+
 
 # observe prints its own address as `ref=N` at the head of each element line. The number is
 # engine-minted identity, not page semantics: a framework that remounts a control between readings
@@ -590,21 +616,52 @@ _TV3_REF_ADDRESS_RE = re.compile(r"^ref=\d+", re.MULTILINE)
 _PERCEPTION_URL_LINE_RE = re.compile(r"^url=\S+", flags=re.MULTILINE)
 
 
-def _canonical_perception_content(content: str, *, is_observe: bool = False) -> str:
+def _canonical_perception_content(
+    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+) -> str:
     # The ref pass is scoped to observe's own payload, not to every compactable result: get_html
     # returns page-authored bytes, and a page can write a line that opens `ref=<digits>` there. The
     # marker passes below are attribute-shaped and page-authored values in that shape stay significant.
     addressed = _TV3_REF_ADDRESS_RE.sub("ref=*", content) if is_observe else content
-    closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', addressed)
+    # Before the marker passes: the notice is what the tail lookahead below scans through, and a
+    # window's head fragment is what the value pattern cannot close.
+    # Only for a read the TOOL said it cut, and only the LAST match — which is then provably the
+    # notice it appended, since our notice comes after all of the window's page content. Folded
+    # unconditionally this reaches page-authored text that merely LOOKS like a notice, in `observe`
+    # and `look` as well, and a page whose notice-shaped numbers change then digests identically on
+    # every read: the stall guard sees frozen and ends a run that was still moving.
+    # Both folds are applied at boundaries the TOOL reported, never by recognizing a shape. Every
+    # prefix of the marker attribute is legal page text, and both the page (a forged unterminated
+    # prefix) and the server (a download filename) can author text wearing the cut notice's shape —
+    # so no pattern and no match-selection rule can tell ours from theirs. Folding something that is
+    # not ours makes content that genuinely differs read as frozen, which the perception-stall guard
+    # TERMINATES on: it ends a run that was still making progress.
+    #
+    # The notice first, because its index is into the string as the tool returned it and the head
+    # fold would shift everything after itself.
+    noticed = addressed
+    if notice_at is not None and 0 <= notice_at < len(addressed):
+        closing = addressed.find("]", notice_at)
+        if closing != -1:
+            noticed = addressed[:notice_at] + "…[*]" + addressed[closing + 1 :]
+    head_folded = '*"' + noticed[head_fragment_len:] if head_fragment_len else noticed
+    closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', head_folded)
     return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
 
 
-def _content_only_perception(content: str, *, is_observe: bool = False) -> str:
+def _content_only_perception(
+    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+) -> str:
     # The URL is a hint, not content: history.pushState moves it without changing the document. The
     # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
     # differ only by URL must survive — but budget-extension evidence hashes THIS, so a URL flip
     # alone can never earn budget.
-    return _PERCEPTION_URL_LINE_RE.sub("url=*", _canonical_perception_content(content, is_observe=is_observe))
+    return _PERCEPTION_URL_LINE_RE.sub(
+        "url=*",
+        _canonical_perception_content(
+            content, is_observe=is_observe, head_fragment_len=head_fragment_len, notice_at=notice_at
+        ),
+    )
 
 
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
@@ -1347,7 +1404,7 @@ def _refresh_nudge_text() -> str:
 def _budget_extended_observation(cap: str, recency: ActivityRecency | None) -> str:
     """The retraction of a `_budget_exhausted_observation` whose cap has since been raised.
 
-    APPENDED, never popped: `snapshot_indices` stores absolute message indices, so deleting the
+    APPENDED, never popped: `snapshot_keys` is keyed by absolute message index, so deleting the
     stale message would silently re-anchor compaction onto the wrong ones. Without this the model
     keeps reading "this is the final turn" for the rest of the run and wraps up early — which spends
     the extension the release exists to preserve, through the prompt instead of through a counter."""
@@ -1878,32 +1935,84 @@ def make_finish_tool(
     )
 
 
+# Caps the arguments an elision placeholder echoes: a selector is model-authored and unbounded.
+_READ_LABEL_MAX_CHARS = 120
+
+
+def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
+    """The supersession identity of one read: only the arguments the tool DECLARES.
+
+    A tool's result can depend on an argument it declares and on nothing else, so an undeclared one
+    cannot make two calls different reads. The specs are not emitted strict, so a provider is free to
+    add one — and for an argumentless tool that would split the key and retain two snapshots where the
+    tool only ever describes the page as it is NOW.
+
+    For `look` that is not merely wasted context. Every call disposes the previous handles, clears
+    `_look_manifest` and renumbers the marks (`tools.py`), so a retained older legend describes numbers
+    that now address different controls, and `click(mark=N)` following it acts on the wrong one. It
+    fails open: the stale legend looks perfectly valid. Keyed on declared arguments, `look` and
+    `observe` declare none, so all their calls collapse to one key and exactly one survives.
+    """
+    declared = (spec.parameters or {}).get("properties") or {}
+    return json.dumps({k: v for k, v in args.items() if k in declared}, sort_keys=True, default=str)
+
+
+def _read_label(tool_name: str, args_key: str) -> str:
+    """How an elided snapshot names the read it dropped, e.g. `get_html(selector=#rows, offset=20000)`.
+
+    A tool whose reads cannot differ is named bare, exactly as before: observe and look take no
+    arguments, so decorating them would add a token to every elision and distinguish nothing. The
+    arguments are the model's own, echoed from the assistant message that already carries them, so
+    this discloses nothing the transcript did not already hold — but it is capped anyway, because a
+    selector has no length the model cannot choose.
+    """
+    try:
+        args = json.loads(args_key)
+    except (TypeError, ValueError):
+        return tool_name
+    if not isinstance(args, dict) or not args:
+        return tool_name
+    rendered = ", ".join(f"{k}={args[k]}" for k in sorted(args))
+    if len(rendered) > _READ_LABEL_MAX_CHARS:
+        rendered = rendered[:_READ_LABEL_MAX_CHARS] + "…"
+    return f"{tool_name}({rendered})"
+
+
 _COMPACTED_PREFIX = "[superseded "
 
 
 def _compact_transcript(
     messages: list[dict[str, Any]],
-    snapshot_indices: set[int],
+    snapshot_keys: dict[int, str],
 ) -> None:
     """Bound the persistent conversation by eliding stale perception snapshots.
 
     The full transcript is re-sent every turn, so large perception outputs (an `observe` snapshot the
     agent has already acted past, or a 20k-char `get_html` dump) otherwise pile up until the token
-    backstop trips on perception-heavy pages. `snapshot_indices` holds the message indices of the
-    *successful* perception results (recorded as they are appended); keep the newest of each such tool
-    and replace older ones' content with a short placeholder. Two things are deliberately protected:
+    backstop trips on perception-heavy pages. `snapshot_keys` maps the message index of each
+    *successful* perception result (recorded as it is appended) to its supersession key; keep the
+    newest snapshot of each of the `PERCEPTION_SNAPSHOT_RETAIN` most recent distinct keys per tool,
+    and replace the rest with a short placeholder.
+
+    The key is the READ, not the tool. A second `observe` is a fresh view of the same thing and
+    genuinely supersedes the first; a `get_html` of one region does not supersede a read of another,
+    and eliding it there is what makes a document larger than one result impossible to assemble.
+    Re-reading the SAME region still supersedes, which is what keeps a run that hammers one read
+    bounded. Three things are deliberately protected:
 
     - The most-recent round (results after the last assistant message) is never touched — a single turn
       can batch several perception calls, and compaction runs *before* the model has seen that round's
       results, so eliding any of them would drop data the model requested but never read.
     - Only a successful snapshot is ever a candidate: a skip/error result is never recorded in
-      `snapshot_indices`, so it can neither be elided nor shadow the real snapshot and leave the agent
+      `snapshot_keys`, so it can neither be elided nor shadow the real snapshot and leave the agent
       with no usable page view — regardless of content length (a verbose provider error included).
+    - The placeholder NAMES the read it dropped. An erasure the model cannot see is one it cannot
+      plan around: it re-reads by accident instead of by decision, which is the loop this bounds.
 
     Only a `tool` message's content is shrunk, never removed, so every tool_call keeps a matching result
     and the transcript stays valid. Eliding also drops the index, so re-running is a no-op and an elided
     placeholder can never re-anchor as the live snapshot."""
-    if not snapshot_indices:
+    if not snapshot_keys:
         return
     last_assistant_idx = -1
     for i in range(len(messages) - 1, -1, -1):
@@ -1911,14 +2020,30 @@ def _compact_transcript(
             last_assistant_idx = i
             break
 
-    seen: set[str] = set()
-    for i in sorted(snapshot_indices, reverse=True):
+    # Per tool: the reads of the still-unread round, and the distinct keys the retention window has
+    # kept, newest first. A key seen newer — in the unread round or already in the window — is
+    # superseded, because a re-read of one region is a fresher view of the same bytes.
+    #
+    # The unread round is protected but does NOT spend retention slots. It cannot: one turn may batch
+    # several reads (the prompt asks for batching), and counting them against the window would let a
+    # single batched turn evict every earlier read and make accumulation a no-op on exactly the
+    # behaviour the prompt trains. Its size is bounded by the per-turn tool-call budget, and the old
+    # rule protected the whole round the same way, so nothing here widens that.
+    unread: dict[str, set[str]] = {}
+    kept: dict[str, list[str]] = {}
+    for i in sorted(snapshot_keys, reverse=True):
         cls = messages[i]["name"]
-        if i > last_assistant_idx or cls not in seen:
-            seen.add(cls)  # the still-unread latest round, or the newest snapshot of this class — keep
+        key = snapshot_keys[i]
+        if i > last_assistant_idx:
+            unread.setdefault(cls, set()).add(key)
             continue
-        messages[i]["content"] = f"{_COMPACTED_PREFIX}{cls} output elided to bound context]"
-        snapshot_indices.discard(i)
+        window = kept.setdefault(cls, [])
+        seen_newer = key in unread.get(cls, frozenset()) or key in window
+        if not seen_newer and len(window) < PERCEPTION_SNAPSHOT_RETAIN:
+            window.append(key)
+            continue
+        messages[i]["content"] = f"{_COMPACTED_PREFIX}{_read_label(cls, key)} output elided to bound context]"
+        del snapshot_keys[i]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1998,8 +2123,11 @@ class LoopState:
     # assistant reply or tool results itself, so multi-turn tool use must be threaded here.
     messages: list[dict[str, Any]] = field(default_factory=list)
     # Indices into `messages` of successful perception results, recorded as they are appended so
-    # compaction can keep only the newest of each without inferring "real snapshot" from content size.
-    snapshot_indices: set[int] = field(default_factory=set)
+    # compaction can keep the newest without inferring "real snapshot" from content size. The value is
+    # the read's supersession key — the loop's own `action_key`, the (tool, args) identity the
+    # perception-stall policy already calls "the same probe". Keying on the tool name alone would make
+    # a read of one region supersede a read of another.
+    snapshot_keys: dict[int, str] = field(default_factory=dict)
     perception: _PerceptionLedger = field(default_factory=_PerceptionLedger)
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress: _ProgressLedger | None = None
@@ -2483,7 +2611,7 @@ async def run_agent_tool_loop(
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
-        _compact_transcript(st.messages, st.snapshot_indices)
+        _compact_transcript(st.messages, st.snapshot_keys)
         llm_caller.message_history = list(st.messages)
         # Consume any pending look image into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
@@ -3031,9 +3159,24 @@ async def run_agent_tool_loop(
             action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
             attribution: dict[str, Any] = {"action_key_hash": telemetry_hash(telemetry_salt, *action_key)}
             content_digest: str | None = None
+            # Whether this result is markup a window cut open — the only thing that can carry a
+            # marker fragment at its head. `rendered_text` is the tool's own statement that its
+            # content holds no start tags of the page's own; asking the ARGUMENTS instead would make
+            # the loop re-derive from a tool's argument conventions something the tool already said.
+            # Exact spans the TOOL reported: where it cut a marker open at the window's head, and
+            # where it appended its own notice. Neither is re-derived here, because page- and
+            # server-authored text can both wear those shapes and only the tool knows what it wrote.
+            reported = result.data or {}
+            head_fragment_len = int(reported.get("head_fragment_len") or 0)
+            notice_at = reported.get("notice_at")
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
-                    _canonical_perception_content(result.content, is_observe=tool_name == "observe").encode()
+                    _canonical_perception_content(
+                        result.content,
+                        is_observe=tool_name == "observe",
+                        head_fragment_len=head_fragment_len,
+                        notice_at=notice_at,
+                    ).encode()
                 ).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
                 attribution["probe_first_time"] = st.perception.first_time(action_key)
@@ -3101,7 +3244,9 @@ async def run_agent_tool_loop(
                     )
 
             if spec is not None and spec.compactable and result.status == "ok":
-                st.snapshot_indices.add(len(st.messages))  # index this successful snapshot will occupy, pre-append
+                # The index this successful snapshot will occupy, pre-append, against the read's
+                # identity — the tool half is `messages[i]["name"]`, which compaction reads there.
+                st.snapshot_keys[len(st.messages)] = _declared_args_key(spec, args)
             model_facing_content = result.content
             skyvern_ctx = skyvern_context.current()
             if skyvern_ctx is not None:
@@ -3156,7 +3301,12 @@ async def run_agent_tool_loop(
                     tool_name,
                     attribution,
                     content_only_digest=hashlib.sha256(
-                        _content_only_perception(result.content, is_observe=tool_name == "observe").encode()
+                        _content_only_perception(
+                            result.content,
+                            is_observe=tool_name == "observe",
+                            head_fragment_len=head_fragment_len,
+                            notice_at=notice_at,
+                        ).encode()
                     ).hexdigest(),
                     refresh_pending=refresh_pending,
                 )
