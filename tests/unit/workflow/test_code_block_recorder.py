@@ -2225,8 +2225,8 @@ def test_json_safe_recorder_output_normalizes_leaked_locator_used_as_key() -> No
 
 
 def test_json_safe_recorder_output_never_leaks_a_secret_bearing_selector() -> None:
-    """A resolved credential can end up in a locator selector; mask_secrets_in_data scrubs dict
-    values, not keys, so the marker must not carry the selector at all — as a value or a key."""
+    """A resolved credential can end up in a locator selector, and this runs before any masking, so
+    the marker must not carry the selector at all — as a value or a key."""
     secret = "s3cr3t-token"
     recorder = _Recorder(None)
     as_value = RecordingLocator(FakeLocator(), recorder, f"text={secret}")

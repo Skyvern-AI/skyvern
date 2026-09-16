@@ -117,6 +117,14 @@ def test_standalone_short_secret_leaf_still_masks() -> None:
     assert context.mask_secrets_in_data(["587"]) == ["*****"]
 
 
+def test_secret_used_as_a_dict_key_masks() -> None:
+    context = _context_with_secrets(otp="778899")
+
+    assert context.mask_secrets_in_data({"778899": True}) == {"*****": True}
+    assert context.mask_secrets_in_data([{"778899": {"seen": "778899"}}]) == [{"*****": {"seen": "*****"}}]
+    assert context.mask_secrets_in_data({1: "ok", None: "ok"}) == {1: "ok", None: "ok"}
+
+
 def test_four_char_year_masks_only_as_whole_value() -> None:
     context = _context_with_secrets(card_exp_year="2030")
     payload = {"due": "2030-01-15", "note": "renews in 2030"}
