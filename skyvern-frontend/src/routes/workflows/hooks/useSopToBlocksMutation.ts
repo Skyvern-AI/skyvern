@@ -44,7 +44,7 @@ function useSopToBlocksMutation({ onSuccess }: UseSopToBlocksMutationOptions) {
       toast({
         variant: "success",
         title: "SOP converted",
-        description: `Generated ${result.blocks.length} block${result.blocks.length === 1 ? "" : "s"}`,
+        description: `Generated ${result.blocks.length} workflow step${result.blocks.length === 1 ? "" : "s"}`,
       });
       onSuccess?.(result);
     },

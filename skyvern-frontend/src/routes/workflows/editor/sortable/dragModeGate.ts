@@ -30,7 +30,7 @@ export function getDragGateReason({
   isRecording,
   isCanvasLocked,
 }: DragModeGateInputs): string | null {
-  if (isRecording) return "Stop recording to reorder blocks";
+  if (isRecording) return "Finish recording the task to reorder blocks";
   if (isCanvasLocked) return "Unlock canvas to reorder blocks";
   return null;
 }

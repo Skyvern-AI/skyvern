@@ -142,7 +142,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     : isBlockedByFinally
       ? "Finally block must run last - choose a position above it"
       : !isBusy && recordingStore.isRecording
-        ? "Stop recording to add a block"
+        ? "Finish recording the task to add a block"
         : null;
 
   const updateWorkflowPanelState = (

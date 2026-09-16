@@ -66,6 +66,15 @@ export const CREDENTIAL_REQUIRED_FRAME_MINIMAL: CredentialRequiredFrame = {
   reason: "workflow_credential_inputs_unbound",
 };
 
+// The shape a raw-secret ask actually reaches the card with: the supplied name was replaced by
+// the redaction upstream, so no ask text and no candidate ids survive to pin a suggestion.
+export const CREDENTIAL_REQUIRED_FRAME_REDACTED_ASK: CredentialRequiredFrame =
+  buildCredentialRequiredFrame({
+    reason: "raw_secret",
+    message: undefined,
+    credential_refs: undefined,
+  });
+
 export const RESOLVED_OUTCOME_CONNECTED: CredentialPauseHistorical = {
   outcome: "connected",
   credentialId: "cred_hn",

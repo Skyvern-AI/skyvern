@@ -64,7 +64,9 @@ describe("formatDropBlockedToast (SKY-9062)", () => {
         kind: "drag-mode",
       });
       expect(content.title).toContain("recording");
-      expect(content.description).toBe("Stop recording to reorder blocks.");
+      expect(content.description).toBe(
+        "Finish recording the task to reorder blocks.",
+      );
       expect(content.details).toEqual([]);
     });
   });

@@ -187,10 +187,10 @@ const useProcessRecordingMutation = ({
         }
         toast({
           variant: "success",
-          title: evidence ? "Recorded steps added" : "Recording processed",
+          title: evidence ? "Workflow steps captured" : "Workflow steps added",
           description: evidence
             ? "Copilot is refining the workflow now. Follow its progress in the Copilot pane."
-            : "The recording has been successfully processed.",
+            : "Skyvern turned your browser demonstration into workflow steps.",
         });
 
         onSuccess?.({ recordingId, blocks, parameters: parameters });
@@ -217,8 +217,9 @@ const useProcessRecordingMutation = ({
 
       toast({
         variant: "warning",
-        title: "Recording Processed (No Blocks)",
-        description: "No blocks could be created from the recording.",
+        title: "No workflow steps created",
+        description:
+          "Skyvern couldn't turn this task recording into workflow steps.",
       });
     },
     onError: (error) => {
@@ -233,9 +234,9 @@ const useProcessRecordingMutation = ({
         recordingStore.reset();
         toast({
           variant: "warning",
-          title: "Nothing was recorded",
+          title: "No task captured",
           description:
-            "Interact with the live browser (clicks, typing, navigation), then stop recording again to generate blocks.",
+            "Complete the task in the browser. Skyvern captures your clicks, typing, and navigation, then turns them into workflow steps.",
         });
         return;
       }
@@ -247,7 +248,7 @@ const useProcessRecordingMutation = ({
 
       toast({
         variant: "destructive",
-        title: "Error Processing Recording",
+        title: "Couldn't create workflow steps",
         description: error instanceof Error ? error.message : String(error),
       });
     },

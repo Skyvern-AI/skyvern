@@ -54,9 +54,8 @@ function RecordingRefinementProgressCard({
     return () => window.clearInterval(timer);
   }, [startedAtMs, working]);
 
-  const actionLabel = `${actionCount} recorded action${actionCount === 1 ? "" : "s"}`;
   const title = working
-    ? `Turning ${actionLabel} into a workflow`
+    ? "Turning your task demonstration into a workflow"
     : status === "complete"
       ? awaitingReview
         ? "Workflow ready to review"
@@ -103,7 +102,7 @@ function RecordingRefinementProgressCard({
           </div>
           <div className="mt-0.5 text-[11.5px] leading-relaxed text-muted-foreground">
             {working
-              ? "Copilot is reviewing the recording and preparing changes for you to review."
+              ? `Copilot is reviewing ${actionCount} captured interaction${actionCount === 1 ? "" : "s"} and preparing changes for you to review.`
               : status === "complete"
                 ? awaitingReview
                   ? "Review the changes below, then save when you’re ready."
@@ -124,8 +123,8 @@ function RecordingRefinementProgressCard({
       </div>
 
       <div className="ml-9 mt-3 flex flex-col gap-2 border-l border-border/70 pl-3">
-        <CompletedStep>Recording saved</CompletedStep>
-        <CompletedStep>Recorded actions prepared</CompletedStep>
+        <CompletedStep>Task recording saved</CompletedStep>
+        <CompletedStep>Browser interactions prepared</CompletedStep>
         <div
           className={`flex items-center gap-2 text-xs ${
             failed ? "text-red-600 dark:text-red-400" : "text-foreground"
