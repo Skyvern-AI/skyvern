@@ -19,6 +19,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from skyvern.exceptions import BitwardenGetItemError
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
@@ -30,6 +31,7 @@ APPDATA_ENV = bitwarden_module._BITWARDEN_APPDATA_ENV_VAR
 ITEM_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ITEM_ID = "22222222-2222-2222-2222-222222222222"
 CARD_ITEM = {
+    "object": "item",
     "id": ITEM_ID,
     "type": 3,
     "organizationId": "org-id",
@@ -62,6 +64,7 @@ class FakeVaultCli:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
         self.item: dict = {
+            "object": "item",
             "id": ITEM_ID,
             "type": 1,
             "login": {"username": "alice@example.com", "password": "hunter2", "totp": ""},
@@ -70,6 +73,7 @@ class FakeVaultCli:
         # stderr to answer the next `bw get` / `bw list` calls with, one per entry, before succeeding.
         self.get_failures: list[str] = []
         self.list_failures: list[str] = []
+        self.get_stderr = ""
 
     @property
     def steps(self) -> list[str]:
@@ -91,7 +95,7 @@ class FakeVaultCli:
         if command[1] == "get":
             if self.get_failures:
                 return RunCommandResult(stdout="", stderr=self.get_failures.pop(0), returncode=1)
-            return RunCommandResult(stdout=json.dumps(self.item), stderr="", returncode=0)
+            return RunCommandResult(stdout=json.dumps(self.item), stderr=self.get_stderr, returncode=0)
         if command[1] == "list":
             if self.list_failures:
                 # How the CLI reports a dead session: non-zero, nothing on stdout, reason on stderr.
@@ -348,7 +352,14 @@ async def test_fetches_for_different_organizations_do_not_serialize(monkeypatch:
                 order.append("second")
                 second_get_entered.set()
             return RunCommandResult(
-                stdout=json.dumps({"id": ITEM_ID, "login": {"username": "u", "password": "p", "totp": ""}}),
+                stdout=json.dumps(
+                    {
+                        "object": "item",
+                        "id": ITEM_ID,
+                        "type": 1,
+                        "login": {"username": "u", "password": "p", "totp": ""},
+                    }
+                ),
                 stderr="",
                 returncode=0,
             )
@@ -465,7 +476,14 @@ async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPat
             return RunCommandResult(stdout="You are logged in!", stderr="", returncode=0)
         if command[1] == "get":
             return RunCommandResult(
-                stdout=json.dumps({"id": ITEM_ID, "login": {"username": "u", "password": "p", "totp": ""}}),
+                stdout=json.dumps(
+                    {
+                        "object": "item",
+                        "id": ITEM_ID,
+                        "type": 1,
+                        "login": {"username": "u", "password": "p", "totp": ""},
+                    }
+                ),
                 stderr="",
                 returncode=0,
             )
@@ -601,6 +619,39 @@ async def _fetch_card(item_id: str = ITEM_ID) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("card", [False, True], ids=["login", "card"])
+async def test_event_upload_advisory_preserves_fetched_credentials(cli: FakeVaultCli, card: bool) -> None:
+    cli.get_stderr = "Event post failed.\n"
+    if card:
+        cli.item = CARD_ITEM.copy()
+        result = await _fetch_card()
+        assert result[BitwardenConstants.CREDIT_CARD_NUMBER] == CARD_ITEM["card"]["number"]
+        assert result[BitwardenConstants.CREDIT_CARD_CVV] == CARD_ITEM["card"]["code"]
+    else:
+        result = await _fetch()
+        assert result == {
+            BitwardenConstants.USERNAME: "alice@example.com",
+            BitwardenConstants.PASSWORD: "hunter2",
+            BitwardenConstants.TOTP: "",
+        }
+
+
+@pytest.mark.asyncio
+async def test_login_fetch_rejects_a_valid_card_before_reading_login(cli: FakeVaultCli) -> None:
+    cli.item = CARD_ITEM.copy()
+
+    with pytest.raises(BitwardenGetItemError):
+        await BitwardenService._get_secret_value_from_url(
+            client_id="client-id",
+            client_secret="client-secret",
+            master_password="master-password",
+            bw_organization_id=None,
+            bw_collection_ids=None,
+            item_id=ITEM_ID,
+        )
+
+
+@pytest.mark.asyncio
 async def test_an_expired_session_is_re_established_on_the_credit_card_path(cli: FakeVaultCli) -> None:
     cli.item = CARD_ITEM
     await _fetch_card()
@@ -714,7 +765,14 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
                 all_reading.set()
             await all_reading.wait()
             return RunCommandResult(
-                stdout=json.dumps({"id": ITEM_ID, "login": {"username": "u", "password": "p", "totp": ""}}),
+                stdout=json.dumps(
+                    {
+                        "object": "item",
+                        "id": ITEM_ID,
+                        "type": 1,
+                        "login": {"username": "u", "password": "p", "totp": ""},
+                    }
+                ),
                 stderr="",
                 returncode=0,
             )
