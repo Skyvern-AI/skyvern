@@ -650,7 +650,7 @@ function RecordingPanel({ browserSessionId }: Props) {
       {insertionPointMissing && (
         <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
           Could not determine where to insert workflow steps. Discard and choose
-          Record task from the workflow editor again.
+          Record Task from the workflow editor again.
         </div>
       )}
 
