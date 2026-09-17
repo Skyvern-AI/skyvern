@@ -9,9 +9,12 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
+from fastmcp import FastMCP
 from mcp.types import CallToolResult
 from structlog.testing import capture_logs
 
+from skyvern.cli.core import client as client_module
+from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
@@ -818,6 +821,54 @@ async def test_internal_call_preserves_explicit_session_across_session_prepare(
     assert result["ok"] is True
     assert dispatched == [{"expression": "scan()", "session_id": "pbs_snapshot"}]
     assert ctx.browser_session_id == "pbs_replacement"
+
+
+def _whoami_server(ctx: AgentContext, seen: list[str | None]) -> SkyvernOverlayMCPServer:
+    probe = FastMCP("whoami-probe")
+
+    @probe.tool()
+    async def skyvern_whoami() -> dict[str, Any]:
+        seen.append(get_active_api_key())
+        return {"ok": True, "data": {}}
+
+    return SkyvernOverlayMCPServer(
+        transport=probe,
+        overlays={"whoami": SchemaOverlay()},
+        alias_map={"whoami": "skyvern_whoami"},
+        allowlist=frozenset({"skyvern_whoami"}),
+        context_provider=lambda: ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_browser_tool_body_runs_with_the_org_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_module.settings, "SKYVERN_API_KEY", "sk-server-default")
+    seen: list[str | None] = []
+    server = _whoami_server(make_copilot_ctx(api_key="sk-copilot-org"), seen)
+
+    await server.connect()
+    try:
+        assert get_active_api_key() == "sk-server-default"
+        result = await server.call_tool("whoami", {})
+    finally:
+        await server.cleanup()
+
+    assert result.isError is False
+    assert seen == ["sk-copilot-org"]
+    assert get_active_api_key() == "sk-server-default"
+
+
+@pytest.mark.asyncio
+async def test_connect_without_an_api_key_never_reaches_a_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_module.settings, "SKYVERN_API_KEY", "sk-server-default")
+    seen: list[str | None] = []
+    server = _whoami_server(make_copilot_ctx(api_key=None), seen)
+
+    with pytest.raises(RuntimeError, match="missing api_key"):
+        await server.connect()
+
+    assert server._client is None
+    assert seen == []
 
 
 @pytest.mark.usefixtures("_stub_browser_session")

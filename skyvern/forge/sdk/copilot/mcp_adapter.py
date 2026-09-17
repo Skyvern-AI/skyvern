@@ -30,6 +30,7 @@ from mcp.types import (
 )
 from playwright.async_api import Browser, BrowserContext
 
+from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
@@ -1402,11 +1403,20 @@ class SkyvernOverlayMCPServer(MCPServer):
         return "skyvern"
 
     async def connect(self) -> None:
+        ctx = self._context_provider()
+        if not ctx.api_key:
+            raise RuntimeError("Copilot agent context missing api_key")
         stack = AsyncExitStack()
         await stack.__aenter__()
         client = Client(self._transport)
-        with request_session_scope(self._context_provider().organization_id):
-            await stack.enter_async_context(client)
+        # The in-process transport's server task copies context vars once, at client entry, so a
+        # per-call override never reaches tool bodies; without this they authenticate as the server key.
+        override_token = set_api_key_override(ctx.api_key)
+        try:
+            with request_session_scope(ctx.organization_id):
+                await stack.enter_async_context(client)
+        finally:
+            reset_api_key_override(override_token)
         self._client = client
         self._exit_stack = stack
 

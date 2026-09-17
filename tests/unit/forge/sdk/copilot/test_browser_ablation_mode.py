@@ -151,7 +151,13 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
 
     assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
     assert withheld.ordered_native_names
-    assert withheld.ordered_mcp_names == ("get_workflow_knowledge", "get_block_schema", "validate_block")
+    assert withheld.ordered_mcp_names == (
+        "get_workflow_knowledge",
+        "get_block_schema",
+        "validate_block",
+        "list_org_workflows",
+        "get_org_workflow",
+    )
     assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
     assert withheld.overlays == {name: overlays[name] for name in withheld.ordered_mcp_names}
     assert all(not overlay.requires_browser for overlay in withheld.overlays.values())

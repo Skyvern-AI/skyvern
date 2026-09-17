@@ -1834,6 +1834,8 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "get_workflow_knowledge": "skyvern_workflow_knowledge",
         "get_block_schema": "skyvern_block_schema",
         "validate_block": "skyvern_block_validate",
+        "list_org_workflows": "skyvern_workflow_list",
+        "get_org_workflow": "skyvern_workflow_get",
         "navigate_browser": "skyvern_navigate",
         "get_browser_screenshot": "skyvern_screenshot",
         "evaluate": "skyvern_evaluate",
@@ -1925,6 +1927,26 @@ def _build_skyvern_mcp_overlays(
             post_hook=_get_block_schema_post_hook,
         ),
         "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
+        "list_org_workflows": SchemaOverlay(
+            description=(
+                "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
+                "when the user refers to one of their existing workflows ('like my X workflow', 'the one I "
+                "built for Y'), or before building for a site the org may already automate, so the new build "
+                "reuses the org's proven parameters, TOTP wiring and loop style. Each match carries "
+                "workflow_permanent_id (wpid_...), workflow_id, title, version, status and description. Pass "
+                "the workflow_permanent_id -- not workflow_id -- to get_org_workflow for the full definition."
+            ),
+            hide_params=frozenset({"query"}),
+        ),
+        "get_org_workflow": SchemaOverlay(
+            description=(
+                "Read one saved workflow's full definition. workflow_id must be the wpid_... value that "
+                "list_org_workflows returns as workflow_permanent_id; pass version=<n> for an earlier saved "
+                "version. Use it to copy an existing workflow's structure into a new build, or to answer "
+                "questions about a previous saved version of the workflow open in this chat (version=<n-1>). "
+                "Read-only; it does not change the current draft."
+            ),
+        ),
         "navigate_browser": SchemaOverlay(
             description=(
                 "Navigate the debug browser to a URL. "
