@@ -171,7 +171,13 @@ def test_unrecoverable_browser_session_error_stops_after_second_failure() -> Non
         _maybe_raise_unrecoverable_tool_error,
     )
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
+        user_message="",
+    )
     output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
 
     _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
@@ -912,6 +918,31 @@ def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> 
     assert packet["challenge"]["solver_result"] == "failed"
     assert [lever["mechanism"] for lever in packet["levers"]] == ["human_interaction"]
     assert packet["challenge_notices"]
+
+
+def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through() -> None:
+    """Retention copies the challenge dict rather than re-hydrating the model, whose wall-shaped
+    fields would otherwise come back as defaults without the excluded ``basis`` to disqualify them."""
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "contract_version": "build_test_evidence_packet_v1",
+                    "run": {"workflow_run_id": "wr_challenge", "status": "completed"},
+                    "challenge": {"frame_hosts": ["challenges.cloudflare.com"]},
+                }
+            },
+        }
+    )
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+
+    synopsis = json.loads(pruned[0]["output"])
+    packet = synopsis.get("build_test_packet", synopsis.get("data", {}).get("build_test_packet"))
+    assert packet is not None, synopsis
+    assert packet["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
 
 
 def test_an_evicted_page_evidence_summary_keeps_the_author_time_levers() -> None:
