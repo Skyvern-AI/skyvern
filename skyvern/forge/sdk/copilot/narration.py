@@ -114,6 +114,8 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "inspect_locator_matches": "Comparing locator candidates",
     "list_credentials": "Checking saved credentials",
     "validate_block": "Checking the block",
+    "list_org_workflows": "Searching your saved workflows",
+    "get_org_workflow": "Reading a saved workflow",
     "console_messages": "Reading the browser console",
     "wait_for_either_state": "Waiting for the page",
     "skyvern_frame_list": "Finding embedded pages",
