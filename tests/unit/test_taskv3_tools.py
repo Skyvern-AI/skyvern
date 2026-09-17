@@ -34,7 +34,7 @@ import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -1814,6 +1814,9 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "hidden_dropped_off_canvas",
         "hidden_dropped_visibility",
         "hidden_dropped_zero_rect",
+        "hidden_dropped_off_viewport",
+        "off_viewport_unreachable_unnamed",
+        "off_viewport_unnamed_host_exempt",
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
@@ -22764,10 +22767,15 @@ async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch:
         "<button style='position:absolute;left:-9999px'>FOff</button>"
         "<button style='visibility:hidden'>FVis</button>"
         "<button style='display:none'>FZ1</button><button style='display:none'>FZ2</button>"
+        "<button style='position:fixed;left:10px;top:calc(100vh + 200px);width:40px;height:20px'></button>"
+        "<script>customElements.define('x-lite', class extends HTMLElement {});</script>"
+        "<x-lite><button style='position:fixed;left:60px;top:calc(100vh + 200px);width:40px;height:20px'>"
+        "</button></x-lite>"
         "<button>Frame Live</button>"
     )
     html = (
         '<button style="display:none">MainZ</button><button>Main Live</button>'
+        '<button style="position:fixed;left:10px;top:calc(100vh + 200px);width:40px;height:20px"></button>'
         f'<iframe srcdoc="{frame}" width="300" height="120"></iframe>'
     )
     async with _live_page(html) as page:
@@ -22782,6 +22790,9 @@ async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch:
         "hidden_dropped_zero_rect": 3,
     }, summary
     assert summary["hidden_dropped"] == 5, summary
+    # Counted in every arm and in every realm: this one is armed off, and each frame holds one.
+    assert summary["off_viewport_unreachable_unnamed"] == 2, summary
+    assert summary["off_viewport_unnamed_host_exempt"] == 1, summary
 
 
 # The shape SKY-15662 was diagnosed on: many live, visible per-row controls whose accessible name is
@@ -25911,3 +25922,158 @@ async def test_press_key_accepts_the_key_names_v1_accepts() -> None:
             r = await _tool(tools, "press_key").handler({"key": key, "selector": "#field"})
             assert r.status == "ok", (key, r.content)
             assert expected in await page.evaluate("window.__keys"), key
+
+
+# Controls placed past the bottom and past the right edge: the one-sided off-canvas gate (center-x left
+# of the page) reaches neither. Each carries a distinct tag/type so its digest line is identifiable
+# without a name. A fixed box does not move with the document, so no scroll brings either on screen.
+_OFFVIEWPORT_UNNAMED_HTML = (
+    "<!doctype html><html><head><title>Portal</title><style>"
+    ".away { position: fixed; width: 40px; height: 40px; }"
+    "</style></head><body>"
+    '<button id="go">Go</button>'
+    '<button type="submit" class="away" style="left:40px;top:calc(100vh + 200px)"></button>'
+    '<button type="reset" class="away" style="top:40px;left:calc(100vw + 200px)"></button>'
+    # Must-drop: a hyphenated tag that is not an upgraded custom element has no root that could hide a
+    # scroller, so it must not exempt its children.
+    '<app-shell><div role="option" tabindex="0" class="away" style="left:40px;top:calc(100vh + 200px)"></div></app-shell>'
+    # Must-not-drop: named, same off-screen geometry as the first.
+    '<button type="button" class="away" aria-label="Close notice" style="left:40px;top:calc(100vh + 200px)"></button>'
+    # Must-not-drop: unnamed, off screen, but its scroll container brings it into view. The container
+    # scrolls further than the document does, so only the container can be what keeps it.
+    '<div style="height:200px;overflow:auto"><div style="height:6000px"></div>'
+    '<a href="#in-scroller" style="display:inline-block;width:40px;height:40px"></a></div>'
+    # Must-not-drop: the same, but slotted into a component whose shadow scroll container wraps the slot.
+    '<x-scroller><div style="height:6000px"></div>'
+    '<div role="switch" aria-checked="false" tabindex="0" style="width:40px;height:40px"></div></x-scroller>'
+    # Must-not-drop: the same, slotted into a CLOSED root, whose scroll container is unreadable.
+    '<x-sealed><div style="height:6000px"></div>'
+    '<div role="menuitem" tabindex="0" style="width:40px;height:40px"></div></x-sealed>'
+    # Must-not-drop: the same closed root, with a form between that clobbers the host's own properties.
+    '<x-sealed><form><img name="tagName" alt=""><img name="shadowRoot" alt="">'
+    '<div role="menuitem" tabindex="0" class="away" style="left:40px;top:calc(100vh + 200px)"></div>'
+    "</form></x-sealed>"
+    # Must-not-drop: fixed, but a translated wrapper re-anchors it inside a scroll container.
+    '<div style="height:200px;overflow:auto"><div style="height:6000px"></div><div style="translate:0 0">'
+    '<div role="radio" aria-checked="false" tabindex="0" class="away" style="left:0;top:0"></div></div></div>'
+    # Must-not-drop: state carried the way a widget role carries it, which has no el.value at all.
+    '<div role="tab" aria-selected="true" tabindex="0" class="away"'
+    ' style="left:120px;top:calc(100vh + 200px)"></div>'
+    '<div role="switch" aria-checked="true" tabindex="0" class="away"'
+    ' style="left:180px;top:calc(100vh + 200px)"></div>'
+    # Must-not-drop: value-bearing in the two forms that reach the record after this gate runs -- a
+    # committed autocomplete surface, and a spinbutton's aria-valuenow.
+    '<div class="away" style="left:40px;top:calc(100vh + 400px);width:120px;height:40px">'
+    '<div class="single-value">Paris</div>'
+    '<input role="combobox" aria-autocomplete="list" aria-expanded="false"></div>'
+    '<div role="spinbutton" aria-valuenow="3" tabindex="0" class="away"'
+    ' style="left:40px;top:calc(100vh + 500px);width:40px;height:40px"></div>'
+    # Must-not-drop: a file input takes files without being visible.
+    '<input type="file" class="away" style="left:40px;top:calc(100vh + 200px)">'
+    # Must-not-drop: unnamed, below the fold of a document that scrolls to it.
+    '<div style="height:3000px"></div>'
+    '<div role="checkbox" aria-checked="false" tabindex="0" style="width:40px;height:40px"></div>'
+    "<script>customElements.define('x-scroller', class extends HTMLElement { constructor() { super();"
+    " this.attachShadow({ mode: 'open' }).innerHTML ="
+    " '<div style=\"height:200px;overflow-y:auto\"><slot></slot></div>'; } });"
+    "customElements.define('x-sealed', class extends HTMLElement { constructor() { super();"
+    " this.attachShadow({ mode: 'closed' }).innerHTML ="
+    " '<div style=\"height:200px;overflow-y:auto\"><slot></slot></div>'; } });</script>"
+    "</body></html>"
+)
+
+
+async def _observe_offviewport_fixture(monkeypatch: pytest.MonkeyPatch, arm: RunArm) -> Any:
+    # Driven by the run's pinned arm, not the env force, so the observe tool is shown to read the arm.
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    context = skyvern_context.SkyvernContext(
+        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
+    )
+    skyvern_context.set(context)
+    try:
+        async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "observe").handler({})
+    finally:
+        skyvern_context.reset()
+    assert r.status == "ok" and r.data is not None, r.content
+    return r
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_drops_an_unnamed_control_no_scroll_can_bring_into_the_viewport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r = await _observe_offviewport_fixture(monkeypatch, arm="treatment")
+
+    assert "button/submit ''" not in r.content, r.content
+    assert "button/reset ''" not in r.content, r.content
+    assert "div/option ''" not in r.content, r.content
+    assert "Close notice" in r.content, r.content
+    assert re.search(r"ref=\S+ a ''", r.content), r.content
+    for kept in ("div/checkbox", "div/switch", "div/menuitem", "div/radio", "input/file", "div/spinbutton"):
+        assert re.search(rf"ref=\S+ {kept} ''", r.content), (kept, r.content)
+    assert "Paris" in r.content, r.content
+    assert "(13 interactive elements)" in r.content, r.content
+    assert r.data["summary"]["hidden_dropped_off_viewport"] == 3, r.data["summary"]
+    assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
+    # The closed-root host's controls are kept and counted apart, not as at-risk candidates.
+    assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]
+    assert r.data["summary"]["hidden_dropped"] == 3, r.data["summary"]
+
+
+async def _observe_records(page: Any, arm: RunArm) -> dict[str, Any]:
+    from skyvern.forge.taskv3.tools import observe_js  # noqa: PLC0415
+
+    context = skyvern_context.SkyvernContext(
+        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
+    )
+    skyvern_context.set(context)
+    try:
+        return json.loads(await page.evaluate(observe_js()))
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_drop_never_removes_a_control_whose_record_reports_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The property, over whatever the page holds: a control the arm removes must not be one whose
+    # record carries state. Asserting the class rather than the three forms a field list happens to
+    # enumerate -- that list is what drifted before (SKY-16501).
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
+        listed_off = await _observe_records(page, "control")
+        listed_on = await _observe_records(page, "treatment")
+
+    def _identity(e: dict[str, Any]) -> str:
+        return str(e.get("selector") or f"i={e.get('i')}")
+
+    state_keys = ("value", "checked", "selected", "selectedOptions")
+    stateful = {_identity(e) for e in listed_off["elements"] if any(k in e for k in state_keys)}
+    kept = {_identity(e) for e in listed_on["elements"]}
+    dropped = {_identity(e) for e in listed_off["elements"]} - kept
+
+    assert dropped, listed_off["elements"]
+    assert stateful & dropped == set(), sorted(stateful & dropped)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["control", "unrandomized"])
+async def test_observe_lists_unnamed_offviewport_controls_outside_treatment(
+    monkeypatch: pytest.MonkeyPatch, arm: RunArm
+) -> None:
+    r = await _observe_offviewport_fixture(monkeypatch, arm=arm)
+
+    assert "button/submit ''" in r.content, r.content
+    assert "button/reset ''" in r.content, r.content
+    assert "div/option ''" in r.content, r.content
+    assert "(16 interactive elements)" in r.content, r.content
+    assert r.data["summary"]["hidden_dropped_off_viewport"] == 0, r.data["summary"]
+    # Exposure is measured in every arm, so treatment and control can be compared on the same set.
+    assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
+    assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]
