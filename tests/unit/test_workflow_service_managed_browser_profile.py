@@ -1894,20 +1894,31 @@ async def test_timed_out_retry_gets_fresh_admission_budget(
             raise RuntimeError("attempt timed out")
         return result
 
-    def scaled_timeout(seconds: float) -> asyncio.Timeout:
-        admission_budgets.append(seconds)
-        return asyncio.timeout(seconds / 60)
+    admission_timeout: asyncio.Timeout | None = None
 
-    async def fast_sleep(seconds: float) -> None:
-        if seconds:
+    def record_admission_timeout(seconds: float) -> asyncio.Timeout:
+        nonlocal admission_timeout
+        admission_budgets.append(seconds)
+        admission_timeout = asyncio.timeout(None)
+        return admission_timeout
+
+    async def expire_timeout_at_gate_sleep(seconds: float) -> None:
+        if seconds > 0:
             gate_sleeps.append(seconds)
-        await asyncio.sleep(0.01 if seconds else 0)
+            assert admission_timeout is not None
+            # Cancel at the gate sleep, after the database read and session cleanup complete.
+            admission_timeout.reschedule(asyncio.get_running_loop().time())
+        await asyncio.sleep(0)
 
     monkeypatch.setattr(service, "execute_workflow", execute_attempt)
     monkeypatch.setattr(
         database.workflow_runs, "get_blocking_sequential_workflow_run", AsyncMock(return_value=run if blocked else None)
     )
-    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(timeout=scaled_timeout, sleep=fast_sleep))
+    monkeypatch.setattr(
+        service_module,
+        "asyncio",
+        ScopedAsyncio(timeout=record_admission_timeout, sleep=expire_timeout_at_gate_sleep),
+    )
 
     result = await service.execute_workflow_with_retries(
         run.workflow_run_id, api_key=None, organization=SimpleNamespace(organization_id="o_test")
