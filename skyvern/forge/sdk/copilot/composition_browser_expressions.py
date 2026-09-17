@@ -1784,3 +1784,21 @@ def value_witness_read_expression(container_selector: str, match_count: int, pos
         + "]; if (!leaf) return null; "
         + "return String(leaf.textContent || '').replace(/\\s+/g, ' ').trim(); })()"
     )
+
+
+DECLARED_IFRAME_SRC_EXPRESSION = (
+    "(() => {"
+    "  try {"
+    "    return Array.from(document.querySelectorAll('iframe'))"
+    "      .map((el) => {"
+    "        const src = el.getAttribute('src') || '';"
+    "        if (!src) return '';"
+    "        try { return new URL(src, document.baseURI).href; } catch (e) { return ''; }"
+    "      })"
+    "      .filter(Boolean);"
+    "  } catch (e) { return []; }"
+    "})()"
+)
+"""Every ``iframe@src`` the document declares, resolved against the page's own base URL, because a
+challenge frame whose request never committed reports an empty ``frame.url`` while its element still
+names the vendor."""

@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    MAX_CHALLENGE_FRAME_HOSTS,
     carrier_backed_anti_bot_categories,
     interactive_challenge_controls,
 )
@@ -380,16 +381,26 @@ class ChallengeEffects(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: str | None = None
+    # ``page_frames`` means only a vendor frame the page mounted or declared built this record; it is
+    # the default because the dump excludes the field, so a revalidated record cannot mint a wall.
+    basis: Literal["run_wall", "page_frames"] = Field(default="page_frames", exclude=True, repr=False)
     solver_available: bool | None = None
     solver_attempted: bool | None = None
-    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] = "unresolved"
+    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] | None = None
     solver_failure: str | None = None
+    frame_hosts: list[str] | None = Field(default=None, max_length=MAX_CHALLENGE_FRAME_HOSTS)
 
 
 def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -> list[str]:
     """Prose facts for the typed record, so a reader that skips the keys still meets them; no ranking."""
     notices: list[str] = []
-    if challenge is not None:
+    if challenge is not None and challenge.basis == "page_frames":
+        hosts = ", ".join(challenge.frame_hosts or [])
+        notices.append(
+            "challenge frames: the final page mounted or declared a frame served by a challenge vendor; that is "
+            f"what the page holds, not a finding that this run was blocked. Frame hosts: {hosts}."
+        )
+    elif challenge is not None:
         kind = challenge.kind or "unclassified"
         if challenge.solver_available is True:
             availability = "the managed captcha solver is available for this run"

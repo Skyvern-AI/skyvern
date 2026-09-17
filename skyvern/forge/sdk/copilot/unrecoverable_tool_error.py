@@ -1,12 +1,17 @@
 """Unrecoverable browser-session tool-error detection, shared by enforcement and the stream adapter."""
 
+from __future__ import annotations
+
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 LOG = structlog.get_logger()
 
@@ -88,7 +93,7 @@ def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, An
     return has_session_signal and has_lost_signal
 
 
-def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: str) -> None:
+def _record_unrecoverable_tool_error_contract(ctx: CopilotContext, tool_name: str, reason: str) -> None:
     result = {
         "ok": False,
         "error": reason,
@@ -114,7 +119,7 @@ def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: 
         pass
 
 
-def _maybe_raise_unrecoverable_tool_error(ctx: Any, tool_name: str, output: dict[str, Any]) -> None:
+def _maybe_raise_unrecoverable_tool_error(ctx: CopilotContext, tool_name: str, output: dict[str, Any]) -> None:
     if not _is_unrecoverable_browser_session_error(tool_name, output):
         if tool_name in _BROWSER_SESSION_TOOL_NAMES and output.get("ok", False):
             ctx.unrecoverable_tool_error_streak_count = 0

@@ -38,7 +38,13 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     carry_author_time_findings,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
-from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    BlockEditError,
+    apply_block_edit,
+    delete_block_from_workflow,
+    stored_block_code,
+    stored_workflow_yaml,
+)
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 
 
@@ -575,6 +581,52 @@ async def test_model_declared_download_contract_keeps_write_seam_secret_redactio
 
 
 @pytest.mark.asyncio
+async def test_a_rewritten_submission_returns_the_stored_bytes_and_names_the_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A following anchored edit is matched against what the server stored, so the write result has
+    to say both what that is and that it is not what the model sent."""
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    secret = "hunter2-correct-horse"
+    register_secret_scrub_value(ctx, secret)
+    submitted = _code_yaml(f'await page.locator("#password").fill("{secret}")')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    stored = result["data"]["stored_code"]["submit_search"]
+    assert result["data"]["stored_code_rewritten"] == ["submit_search"]
+    assert stored == stored_block_code(stored_workflow_yaml(ctx), "submit_search")
+    assert secret not in stored
+    assert REDACTED_SECRET_PLACEHOLDER in stored
+
+    edited = apply_block_edit(
+        stored_workflow_yaml(ctx),
+        "submit_search",
+        expected_code=REDACTED_SECRET_PLACEHOLDER,
+        replacement_code="{password}",
+    )
+    assert "{password}" in edited
+
+    with pytest.raises(BlockEditError):
+        apply_block_edit(
+            stored_workflow_yaml(ctx), "submit_search", expected_code=secret, replacement_code="{password}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_submission_the_server_stored_verbatim_names_no_rewrite(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    submitted = _code_yaml('await page.locator("#go").click()')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    assert result["data"]["stored_code"]["submit_search"]
+    assert "stored_code_rewritten" not in result["data"]
+
+
+@pytest.mark.asyncio
 async def test_deleting_download_block_removes_its_model_declared_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -737,14 +789,14 @@ class TestBodyReadinessAdvisoryDelivery:
             schema_incompatibility=None,
             metadata_violations=[],
             code_block_diagnostics=_advisory_labels_by_diagnostic(
-                _changed_code_blocks(prior, accepted, accepted), accepted
+                _changed_code_blocks(prior, accepted, accepted)[0], accepted
             ),
         )
 
     def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
         accepted = _code_yaml(self._oversized_block(), label="read_summary")
 
-        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted))
+        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted)[0])
         findings = self._findings(None, accepted)
 
         assert stored_code == {}

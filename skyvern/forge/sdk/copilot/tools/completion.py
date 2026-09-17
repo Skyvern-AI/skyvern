@@ -9,6 +9,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    PAGE_EVIDENCE_STAMP_KEYS,
     _artifact_contract_paths,
     _GroundingCtx,
     floor_rekeyed_path_backing,
@@ -90,11 +91,6 @@ LOG = structlog.get_logger()
 
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
-# Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
-# and observation flag cannot be traversed as observed page content.
-_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset(
-    {"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"}
-)
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
@@ -966,7 +962,7 @@ def _bind_independent_post_run_page_evidence(
     if evidence is None:
         return
     block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = model_visible_composition_evidence(
-        {key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS}
+        {key: value for key, value in evidence.items() if key not in PAGE_EVIDENCE_STAMP_KEYS}
     )
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
     LOG.info(

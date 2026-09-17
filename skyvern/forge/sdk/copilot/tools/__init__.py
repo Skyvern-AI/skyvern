@@ -408,7 +408,10 @@ async def edit_block_tool(
     For a `code` block, pass `expected_code` (a snippet of its current code, unique within that block)
     and `replacement_code`. The edit is rejected if the snippet is missing or appears more than once,
     which is how an edit written against a stale copy of the block fails instead of overwriting newer
-    code. Read the block first if you are unsure what it currently contains.
+    code. Read the block first if you are unsure what it currently contains. The snippet is matched
+    against `data.stored_code[label]` from the latest write result, which can differ from what you
+    submitted — `data.stored_code_rewritten` names the labels the server rewrote and
+    `data.stored_code_withheld` the labels too large to return.
 
     For other settings, pass `fields` with just the keys to change (e.g. a navigation goal or url).
 
@@ -466,9 +469,12 @@ async def edit_block_and_run_tool(
     """Apply one anchored code edit and immediately test the affected frontier.
 
     Use this for a repair to an existing code block. ``label`` must name exactly one existing block,
-    and ``expected_code`` must occur exactly once in its current stored code. The tool changes only
-    that code span, persists the reversible draft through the normal author-time safety boundary,
-    then runs ``block_labels`` (or just ``label`` when omitted).
+    and ``expected_code`` must occur exactly once in its current stored code — that is
+    ``data.stored_code[label]`` from the latest write result, which can differ from what you submitted
+    (``data.stored_code_rewritten`` names the labels the server rewrote and ``data.stored_code_withheld``
+    the labels too large to return). The tool changes only that code span, persists the reversible
+    draft through the normal author-time safety boundary, then runs ``block_labels`` (or just
+    ``label`` when omitted).
 
     This is one model-invoked edit and one run. It does not choose an edit, create a block, retry, or
     decide whether the result achieved the user's goal. Its response is the same sanitized run/debug
@@ -1105,6 +1111,10 @@ async def update_and_run_blocks_tool(
     authentication, a credential or OTP step, or state an upstream block creates.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+
+    The result carries `data.stored_code` — the code each changed block now holds, which is what a
+    following edit must anchor to — plus `data.stored_code_rewritten` for the labels the server
+    rewrote away from what you submitted and `data.stored_code_withheld` for any too large to return.
 
     `block_labels` may be a tested frontier subset of the full workflow YAML;
     save the complete reusable workflow, then run only the next 1-2 unverified
