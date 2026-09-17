@@ -1023,12 +1023,28 @@ class IncrementalScrapePage(ElementTreeBuilder):
         )
 
     async def get_incremental_elements_num(self) -> int:
-        # check if the DOM has navigated away or refreshed
-        js_script = "() => window.globalOneTimeIncrementElements === undefined"
-        if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
-            return 0
-
-        js_script = "() => window.globalOneTimeIncrementElements.length"
+        # A persistent browser page may still run an observer injected by another rolling-deploy build.
+        # The current observer (exact version match) and a transitional unstamped/mismatched build that
+        # already bumped the scalar both keep a correct cumulative count in globalIncrementalJobCount.
+        # A pre-splice build never bumped it, leaving a reinjection-zeroed scalar, so for that case fall
+        # back to the length of the monotonic history array the pre-splice callback only ever pushed to.
+        js_script = """() => {
+            const observer = window.globalObserverForDOMIncrement;
+            const currentVersion = window.INCREMENTAL_OBSERVER_VERSION;
+            const isCurrent = Boolean(
+                observer &&
+                currentVersion !== undefined &&
+                observer.skyvernObserverVersion === currentVersion
+            );
+            const jobCount = window.globalIncrementalJobCount;
+            if ((isCurrent || jobCount > 0) && jobCount !== undefined) {
+                return jobCount;
+            }
+            if (window.globalOneTimeIncrementElements !== undefined) {
+                return window.globalOneTimeIncrementElements.length;
+            }
+            return 0;
+        }"""
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
