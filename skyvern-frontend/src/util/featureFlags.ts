@@ -41,3 +41,6 @@ export const ONBOARDING_TRACK_FLAG = "onboarding_track_v1";
 // Gates the second-agent track row and retires the standalone credit card.
 export const ONBOARDING_TRACK_SECOND_AGENT_FLAG =
   "onboarding_track_second_agent_v1";
+
+// A/B experiment: on for allow-listed organizations (organization_id person property), off otherwise.
+export const NEW_ONBOARDING_EXPERIENCE_FLAG = "new_onboarding_experience";
