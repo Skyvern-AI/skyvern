@@ -7119,16 +7119,58 @@ def _newly_rendered_lines(before: str, after: str) -> list[str]:
     return [line.strip() for line in after.splitlines() if line.strip() and line.strip() not in seen]
 
 
-async def _input_holds_file(el: Any) -> bool:
+async def _input_holds_file(el: Any) -> bool | None:
     """Playwright-layer readback that set_input_files populated the control — proves the file attached to
-    the input element, not that the site registered it. Fail-open: an unreadable control must never turn a
-    real upload into a false negative."""
+    the input element, not that the site registered it. None when the control is unreadable, which must
+    never turn a real upload into a false negative, nor count as confirmation."""
     try:
         count = await el.evaluate("e => (e && e.files) ? e.files.length : 0")
         return bool(count) and int(count) > 0
     except Exception:
-        LOG.info("taskv3 file-input populate readback failed, assuming populated", exc_info=True)
-        return True
+        LOG.info("taskv3 file-input populate readback failed", exc_info=True)
+        return None
+
+
+# Where a file_upload target's file goes, answered as v1's upload handler does: the target itself when
+# it is a file input, its control when it is a <label> for one, else the single file input inside it,
+# open shadow roots included. More than one inside is ambiguous and yields nothing. The control, not
+# the label, because the populate readback reads `.files` off whatever this returns.
+_FILE_INPUT_FOR_JS = (
+    r"""(e) => {
+  const _shadowRoots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  const isFile = (n) => !!n && n.tagName === 'INPUT' && String(n.type || '').toLowerCase() === 'file';
+  if (isFile(e)) return e;
+  if (e.tagName === 'LABEL' && isFile(e.control)) return e.control;
+  const starts = [e];
+  if (e.shadowRoot && e.shadowRoot.nodeType === 11) starts.push(e.shadowRoot);
+  const found = new Set();
+  for (const root of starts.flatMap(_shadowRoots)) {
+    try { for (const n of root.querySelectorAll('input')) if (isFile(n)) found.add(n); } catch (err) {}
+  }
+  return found.size === 1 ? found.values().next().value : null;
+}"""
+)
+
+# `type` is `submit` on a typeless <button> too, so this covers the implicit default button of a form.
+_SUBMITS_FORM_JS = "e => !!e.form && (e.tagName === 'BUTTON' || e.tagName === 'INPUT') && ['submit', 'image'].includes(String(e.type).toLowerCase())"
+
+_FILE_CHOOSER_TIMEOUT_MS = 3000
+
+
+async def _file_input_for(el: Any) -> Any | None:
+    """The element to set files on, or None when no file input is associated with `el`. An unreadable
+    target keeps `el`, so the driver's own error still reports it."""
+    try:
+        handle = await el.evaluate_handle(_FILE_INPUT_FOR_JS)
+    except Exception:
+        LOG.info("taskv3 file_upload file-input resolution failed, using the target as given", exc_info=True)
+        return el
+    target = handle.as_element()
+    if target is None:
+        await handle.dispose()
+    return target
 
 
 # Counts fields holding in-progress state a reload would discard, piercing shadow roots. Unlike the
@@ -11793,6 +11835,16 @@ def build_browser_tools(
                 {**staged, "page_state_changed": True},
                 error_class="stale_selector",
             )
+        file_input = await _file_input_for(el)
+        if file_input is None and await el.evaluate(_SUBMITS_FORM_JS) is True:
+            # v1 would click it and hope for a file picker; a click here can send the form instead.
+            return ToolResult(
+                "error",
+                f"{selector} is not a file input and clicking it would submit the form, so nothing was "
+                f"clicked — target the file input or the control that opens the file picker",
+                staged,
+                error_class="submits_form",
+            )
         # Verify the upload took EFFECT, not just that set_input_files did not raise. Watch upload-like
         # network dispatches across the set_input_files + settle window (the window we already dwell in,
         # so this adds no latency); a genuine upload dispatches at least one, a silent no-op none.
@@ -11812,8 +11864,28 @@ def build_browser_tools(
         text_before = await _whole_page_text(_current_page())
         probe.start()
         try:
-            await el.set_input_files([local_path])
-            populated = await _input_holds_file(el)
+            if file_input is None:
+                # A styled dropzone or button with no file input inside it: click it and fill the
+                # picker it opens, as v1 does. The picker belongs to the page, whichever frame opened it.
+                try:
+                    async with _current_page().expect_file_chooser(timeout=_FILE_CHOOSER_TIMEOUT_MS) as chooser_info:
+                        await el.click(timeout=_FILE_CHOOSER_TIMEOUT_MS)
+                    chooser = await chooser_info.value
+                except Exception as exc:
+                    if not is_driver_timeout_error(exc):
+                        raise
+                    return ToolResult(
+                        "error",
+                        f"{selector} is not a file input, holds no single file input, and clicking it opened "
+                        f"no file picker — target the file input or the control that opens the file picker",
+                        {**staged, "page_state_changed": True},
+                        error_class="no_file_input",
+                    )
+                await chooser.set_files([local_path])
+                file_input = chooser.element
+            else:
+                await file_input.set_input_files([local_path])
+            populated = await _input_holds_file(file_input)
             # Settle + a small randomized delay so the upload and a following submit are not dispatched
             # in the same instant, matching v1's upload cadence (the engine that clears this step reliably).
             # Page-level too: it reuses v1's network-idle/DOM-stability wait, which describes the whole
@@ -11822,7 +11894,11 @@ def build_browser_tools(
             await _upload_submit_delay()
         finally:
             probe.stop()
-        if not populated:
+        if populated is not False and not probe.saw_upload():
+            # With no request seen, the readback alone decides the ok, so it must describe the input as it
+            # is now: a change handler can clear or reject the file during the settle.
+            populated = await _input_holds_file(file_input)
+        if populated is False:
             # A consume-and-clear dropzone reads the file on change, uploads it and resets the input, so
             # an empty control after a genuine upload is normal there. Confirming it needs every signal
             # a silent no-op cannot fake at once: the file's own name newly rendered on the page AND an
@@ -11846,6 +11922,7 @@ def build_browser_tools(
                     return ToolResult.ok(
                         f"uploaded 1 file to {selector} (the site consumed the file and now shows it: {said!r})",
                         staged,
+                        ok_class="consumed_shown",
                     )
                 LOG.info(
                     "taskv3 file_upload input cleared after attach; page names the file without confirming it",
@@ -11858,18 +11935,27 @@ def build_browser_tools(
                     staged,
                 )
             return ToolResult("error", f"file did not attach to {selector} — re-observe the field", staged)
-        if not probe.saw_upload():
-            # The file is on the input but the site never reacted: report a recoverable error (not a
-            # confident OK) so the loop re-verifies before submitting. A submit-time-upload form lands
-            # here too and costs one re-plan turn, never a lost file.
+        if probe.saw_upload():
+            return ToolResult.ok(f"uploaded 1 file to {selector}", staged, ok_class="upload_seen")
+        if populated is None:
             return ToolResult(
                 "error",
-                f"attached the file to {selector} but observed no upload activity — re-observe the field "
-                f"to confirm the file is shown before submitting; if the form uploads on submit this may "
-                f"be expected",
+                f"set the file on {selector} but could neither read the input back nor see an upload "
+                f"request — re-observe the field to confirm the file is shown before submitting",
                 staged,
+                error_class="attach_unconfirmed",
             )
-        return ToolResult.ok(f"uploaded 1 file to {selector}", staged)
+        # The tool's postcondition is the file on the input, and the readback confirmed it; whether the
+        # page sends it now or with the submit is the form's behaviour. An unwired change handler also
+        # lands here: the recoverable error this used to be drew no retry from the model either.
+        return ToolResult.ok(
+            f"uploaded 1 file to {selector}: the input holds it, and the site sent no upload request yet — "
+            f"normal for a form that sends the file when it is submitted. A hidden file input does not show "
+            f"in observe, so re-checking it will not show the file; look instead for an upload error or a "
+            f"still-required file field on the page",
+            staged,
+            ok_class="attached_no_activity",
+        )
 
     async def select_combobox(args: dict[str, Any]) -> ToolResult:
         # Explicit typeahead fill (type() also drives this automatically). Routes through the shared
@@ -12451,9 +12537,9 @@ def build_browser_tools(
         if not kind:
             return
         # A FILL is recorded whether or not the VERDICT was ok, because mutating the control and
-        # returning an error are independent outcomes. `file_upload` reports an error with the file
-        # ALREADY on the input when it sees no upload activity -- the ordinary submit-time-upload form --
-        # and a typeahead commit can fail with the text typed. Gated on the verdict, that work is
+        # returning an error are independent outcomes. `file_upload` can report an error after the file
+        # was set (an unreadable input with no upload request seen), and a typeahead commit can fail with
+        # the text typed. Gated on the verdict, that work is
         # invisible to the reload guard and a same-url `navigate()` discards it, the file included.
         #
         # Recording an attempt that changed nothing is the benign direction: it costs one recoverable
@@ -12759,7 +12845,8 @@ def build_browser_tools(
         _spec("navigate", "Navigate the browser to a URL.", _obj({"url": {"type": "string"}}, ["url"]), navigate),
         _spec(
             "file_upload",
-            "Upload a file (local path or URL) into a file input by its observe ref (e.g. ref=12) or a CSS selector.",
+            "Upload a file (local path or URL) into a file input, or into the upload button/dropzone that "
+            "holds or opens one, by its observe ref (e.g. ref=12) or a CSS selector.",
             _obj({"selector": {"type": "string"}, "file": {"type": "string"}}, ["selector", "file"]),
             file_upload,
         ),
