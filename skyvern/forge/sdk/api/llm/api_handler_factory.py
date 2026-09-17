@@ -223,6 +223,10 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_REQUIRED_PROMPT_NAMES = {
+    "workflow-copilot-video-perception",
+    "workflow-copilot-video-secret-safety",
+}
 VISION_FALLBACK_PROMPT_NAMES = {
     "anthropic-cua",
     "css-shape-convert",
@@ -230,6 +234,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "solve-arithmetic-captcha",
     "solve-dice-captcha",
     "ui-tars-system-prompt",
+    *VISION_REQUIRED_PROMPT_NAMES,
 }
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
@@ -505,6 +510,8 @@ def _llm_screenshots_for_call(
     prompt_name: str | None = None,
     step: Step | None = None,
 ) -> list[bytes] | None:
+    if screenshots and prompt_name in VISION_REQUIRED_PROMPT_NAMES and not llm_config.supports_vision:
+        raise ValueError(f"Prompt {prompt_name!r} requires a vision-capable model")
     if not llm_config.supports_vision:
         return None
     if context and not context.llm_screenshots_enabled_for_prompt(

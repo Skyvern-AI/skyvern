@@ -77,6 +77,7 @@ from skyvern.forge.taskv3.loop import (
     _raised_error_class,
     _RevisitMemory,
     make_finish_tool,
+    record_covered_layer,
     record_frame_perception,
     record_hit_class,
     record_resolve_seconds,
@@ -9851,6 +9852,74 @@ async def test_a_round_carries_billability_from_the_spec_not_from_a_name_list() 
     acted = [entry for round_ in rounds for entry in round_ if entry.tool == "execute_python"]
     assert acted, "the billable tool should have produced a round entry"
     assert all(entry.billable for entry in acted)
+
+
+@pytest.mark.asyncio
+async def test_every_covered_row_carries_the_branch_the_control_count_and_the_layer_kind() -> None:
+    """All three `covered` messages log as one `tool_error_class`, so the only way to size the split
+    was to pull step archives and classify the prose. The count and the layer kind are separate
+    facets because neither recovers the other: the named branch spans "eight controls listed" and
+    "no controls were found on it", and a zero count spans a real overlay whose controls were
+    dropped and a probe that named the hit element itself, where there is nothing to dismiss."""
+
+    async def covered(args: dict[str, Any]) -> ToolResult:
+        record_covered_layer("named", controls=0, layer_kind="hit_fallback")
+        return ToolResult.error('#a is covered by "May"', error_class="covered")
+
+    async def other_error(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("no element for selector '#gone'", error_class="stale_selector")
+
+    tools = [
+        ToolSpec(name="click", description="c", parameters={}, handler=covered, billable=True),
+        ToolSpec(name="hover", description="h", parameters={}, handler=other_error, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#a"})],
+        [("hover", {"selector": "#b"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+    assert outcome.status == "completed"
+    by_tool = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert by_tool["click"]["covered_branch"] == "named"
+    assert by_tool["click"]["covered_controls"] == 0
+    assert by_tool["click"]["covered_layer_kind"] == "hit_fallback"
+    # A row that refused for another reason carries none of the three -- absent, not a fabricated
+    # value: a groupBy on covered_branch must show the covered rows and nothing else.
+    assert "covered_branch" not in by_tool["hover"]
+    assert "covered_controls" not in by_tool["hover"]
+    assert "covered_layer_kind" not in by_tool["hover"]
+
+    # The recorder is per call. A covered refusal followed by an unrelated one must not lend its
+    # facets to the next row, or the count reads as a measurement where none was taken.
+    async def covered_then(args: dict[str, Any]) -> ToolResult:
+        record_covered_layer("unnamed", controls=0, layer_kind="unnamed")
+        return ToolResult.error("#a is rendered but something else is on top of it", error_class="covered")
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=covered_then, billable=True)
+    with capture_logs() as logs:
+        await _run(script, tools)
+    rows = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert rows["click"]["covered_branch"] == "unnamed"
+    assert rows["click"]["covered_layer_kind"] == "unnamed"
+    assert "covered_branch" not in rows["hover"]
+
+    # A covered refusal built somewhere other than the message helper records nothing, and must then
+    # carry NOTHING -- an earlier call's reading standing in for this one is worse than the gap it
+    # fills, because a stale count is indistinguishable from a measured one.
+    async def covered_unrecorded(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("#a is covered", error_class="covered")
+
+    tools[1] = ToolSpec(name="hover", description="h", parameters={}, handler=covered_unrecorded, billable=True)
+    with capture_logs() as logs:
+        await _run(script, tools)
+    rows = {e["tool"]: e for e in logs if e["event"] == "taskv3 tool call finished"}
+    assert rows["click"]["covered_branch"] == "unnamed"
+    assert "covered_branch" not in rows["hover"]
+    assert "covered_controls" not in rows["hover"]
+    assert "covered_layer_kind" not in rows["hover"]
 
 
 @pytest.mark.asyncio

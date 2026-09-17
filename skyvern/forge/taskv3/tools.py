@@ -53,10 +53,13 @@ from skyvern.forge.taskv3.loop import (
     REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    CoveredBranch,
+    CoveredLayerKind,
     SemanticCommitStats,
     ToolHandler,
     ToolResult,
     ToolSpec,
+    record_covered_layer,
     record_frame_perception,
     record_hit_class,
     record_resolve_seconds,
@@ -4014,8 +4017,11 @@ _TYPE_TARGET_PROBE_JS = (
       return isHit ? big : pos === 'absolute' && big;
     };
     let layer = null;
+    // Which element ends up named, which the message itself cannot express: a qualifying layer and
+    // the hit element the walk fell back to render the same sentence.
+    let layerKind = 'unnamed';
     for (let n = top; n && n.nodeType === 1 && n !== document.body; n = n.parentNode || n.host || null) {
-      if (isLayer(n, n === top)) { layer = n; break; }
+      if (isLayer(n, n === top)) { layer = n; layerKind = 'qualified'; break; }
     }
     if (!layer) {
       // Nothing in the walk qualified, and top is merely an ancestor/clipping container of the
@@ -4032,6 +4038,7 @@ _TYPE_TARGET_PROBE_JS = (
         return out;
       }
       layer = top;
+      layerKind = 'hit_fallback';
     }
     // Own name, then whichever names the DIALOG this layer wraps (deepAll pierces into the layer's
     // shadow tree, since a component-hosted consent widget renders entirely inside one), then a
@@ -4087,6 +4094,7 @@ _TYPE_TARGET_PROBE_JS = (
     const truncated = allControls.length > 8;
     const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    out.occluder.layerKind = layerKind;
     // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
     // pointer (elementFromPoint returned it) but can paint nothing -- fully transparent, no visible
     // control, heading or text -- so the field looks clear on screen and "dismiss the overlay you
@@ -8772,13 +8780,55 @@ def build_browser_tools(
             error_class="disabled",
         )
 
+    def _named_controls(occluder: dict[str, Any] | None) -> list[str]:
+        """The controls the MESSAGE names. A control with neither a selector nor a label is dropped
+        from the sentence, so the list the model acts on is not always the list the probe found."""
+        parts = []
+        for control in (occluder or {}).get("controls") or []:
+            control_selector = control.get("selector") if isinstance(control, dict) else None
+            label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
+            if control_selector and label:
+                parts.append(f'{control_selector} "{label}"')
+            elif control_selector:
+                parts.append(control_selector)
+            elif label:
+                parts.append(f'"{label}" (no selector — re-observe to address it)')
+        return parts
+
+    def _covered_branch(occluder: dict[str, Any] | None) -> CoveredBranch:
+        """Which of the three messages will render. The dispatch below branches on THIS, so the
+        recorded branch and the sentence the model got cannot disagree -- including after a new
+        branch is added, which only has to be expressed here once."""
+        if not occluder:
+            return "unnamed"
+        if occluder.get("invisible"):
+            return "invisible"
+        return "named"
+
+    def _record_covered(occluder: dict[str, Any] | None, branch: CoveredBranch, *, controls: list[str]) -> None:
+        # The ghost-cover branch returns before the probe names an element, so it reports no kind at
+        # all; that absence IS `unnamed`, not a missing reading.
+        kind = (occluder or {}).get("layerKind")
+        layer_kind: CoveredLayerKind = kind if kind in ("qualified", "hit_fallback") else "unnamed"
+        # `controls` is the list the message will name, which is why it is passed in rather than
+        # recomputed here: the INVISIBLE message omits controls on purpose, and it stays truthful only
+        # because the probe sets `invisible` solely on a layer that had none to name.
+        record_covered_layer(branch, controls=len(controls), layer_kind=layer_kind)
+
     def _covered_error(
         selector: str, occluder: dict[str, Any] | None = None, *, verb: str = "typed into"
     ) -> ToolResult:
         also = "" if verb == "clicked" else " — a person could not click it either"
         name = str((occluder or {}).get("name") or "").strip()
         layer_selector = (occluder or {}).get("selector")
-        if occluder and occluder.get("invisible"):
+        # Recorded from here, above every return, because this helper is the single place all three
+        # messages are built: one call covers click, both typing paths and the two re-raises, and a
+        # branch added below cannot slip out un-recorded. The layer's NAME is deliberately not
+        # recorded -- it is page text, and these names carry personal data.
+        parts = _named_controls(occluder)
+        branch = _covered_branch(occluder)
+        _record_covered(occluder, branch, controls=parts)
+        if branch == "invisible":
             # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
             # Telling the model to dismiss an overlay it can see is then a false instruction that makes
             # it flail; name the layer as invisible and point at recovery routes that do not depend on
@@ -8799,7 +8849,7 @@ def build_browser_tools(
                 "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way.",
                 error_class="covered",
             )
-        if not occluder:
+        if branch == "unnamed":
             return ToolResult.error(
                 f"{selector} is rendered but something else is on top of it, so it cannot be {verb}{also}. "
                 "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe.",
@@ -8808,21 +8858,11 @@ def build_browser_tools(
         layer_desc = f'"{name}"' if name else "a layer"
         if layer_selector:
             layer_desc = f"{layer_desc} ({layer_selector})"
-        parts = []
-        for control in occluder.get("controls") or []:
-            control_selector = control.get("selector") if isinstance(control, dict) else None
-            label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
-            if control_selector and label:
-                parts.append(f'{control_selector} "{label}"')
-            elif control_selector:
-                parts.append(control_selector)
-            elif label:
-                parts.append(f'"{label}" (no selector — re-observe to address it)')
         if parts:
             controls_desc = "; ".join(parts)
         else:
             controls_desc = "re-observe — no controls were found on it"
-        if occluder.get("truncated"):
+        if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
         return ToolResult.error(
             f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. "
