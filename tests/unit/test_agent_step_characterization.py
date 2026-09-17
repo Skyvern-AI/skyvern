@@ -456,6 +456,134 @@ async def test_parallel_verification_marks_speculative_original_status(monkeypat
 # get_failure_reason_for_task is the only source of that reason for a terminated task; either
 # empty path below used to return None, which handle_completed_step then handed straight to
 # update_task, tripping the invariant and crashing the step as an "unexpected exception".
+def _prime_blank_recovery(rig: AgentStepRig, *, survivors: list[str] | None = None, dead_url: str = ":") -> MagicMock:
+    """Make the step-body scrape raise a dead-blank error and shape the browser so recovery can
+    inspect a dead working page plus any survivors. Returns the dead working page mock."""
+    from skyvern.exceptions import ScrapingFailedBlankPage
+
+    dead_page = MagicMock()
+    dead_page.url = dead_url
+    dead_page.main_frame.child_frames = []
+    dead_page.is_closed.return_value = False
+    rig.browser_state.get_working_page = AsyncMock(return_value=dead_page)
+
+    pages = [dead_page]
+    for url in survivors or []:
+        survivor = MagicMock()
+        survivor.url = url
+        survivor.is_closed.return_value = False
+        pages.append(survivor)
+    rig.browser_state.list_valid_pages = AsyncMock(return_value=pages)
+
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=ScrapingFailedBlankPage())
+    return dead_page
+
+
+@pytest.mark.asyncio
+async def test_dead_blank_working_page_recovers_by_injecting_internal_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A ":" working page with one http survivor: the step's plan is exactly one internal-recovery
+    # ClosePageAction, synthesized with no action-plan LLM call, and the step completes.
+    rig = make_agent_step_rig(monkeypatch)
+    _prime_blank_recovery(rig, survivors=["https://survivor.test/app"])
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.completed
+    assert rig.llm_handler.await_count == 0
+    assert output.actions is not None
+    assert len(output.actions) == 1
+    close = output.actions[0]
+    assert close.action_type == ActionType.CLOSE_PAGE
+    assert close.is_internal_recovery is True
+    assert rig.action_handler.await_args.kwargs["action"] is close
+    assert rig.context.empty_page_recovery_step_id == step.step_id
+    assert rig.context.empty_page_recovery_attempts[rig.task.task_id] == 1
+
+
+@pytest.mark.asyncio
+async def test_dead_blank_without_http_survivor_reraises_to_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.exceptions import ScrapingFailedBlankPage
+
+    # No usable survivor -> ineligible -> the original blank exception propagates to the terminal
+    # handler, and nothing (no LLM, no action) is executed.
+    rig = make_agent_step_rig(monkeypatch)
+    _prime_blank_recovery(rig, survivors=[])
+
+    with pytest.raises(ScrapingFailedBlankPage):
+        await rig.run()
+    assert rig.llm_handler.await_count == 0
+    assert rig.action_handler.await_count == 0
+    assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
+
+
+@pytest.mark.asyncio
+async def test_dead_blank_recovery_cap_reraises_after_three_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.exceptions import ScrapingFailedBlankPage
+
+    rig = make_agent_step_rig(monkeypatch)
+    _prime_blank_recovery(rig, survivors=["https://survivor.test/app"])
+    rig.context.empty_page_recovery_attempts[rig.task.task_id] = 3
+
+    with pytest.raises(ScrapingFailedBlankPage):
+        await rig.run()
+    # The cap was already consumed; a 4th detection declines rather than injecting again.
+    assert rig.action_handler.await_count == 0
+    assert rig.context.empty_page_recovery_attempts[rig.task.task_id] == 3
+
+
+@pytest.mark.asyncio
+async def test_speculative_plan_consumption_resets_recovery_attempt_counter(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.agent import SpeculativePlan
+
+    # A step that consumes a successfully-scraped speculative plan (parallel-verification path) is a
+    # successful scrape too, so it must reset the per-task recovery counter — otherwise the
+    # "consecutive" cap silently becomes cumulative across non-adjacent blank incidents.
+    rig = make_agent_step_rig(monkeypatch)
+    rig.agent._persist_scrape_artifacts = AsyncMock()
+    rig.context.empty_page_recovery_attempts[rig.task.task_id] = 2
+    rig.context.speculative_plans[rig.step.step_id] = SpeculativePlan(
+        scraped_page=rig.scraped_page,
+        extract_action_prompt="prompt",
+        use_caching=False,
+        llm_json_response={"actions": [{"action_type": "CLICK", "element_id": "node-1"}]},
+    )
+
+    step, _output = await rig.run()
+
+    assert step.status == StepStatus.completed
+    assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
+
+
+@pytest.mark.asyncio
+async def test_non_blank_scrape_failure_is_not_recovered(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.exceptions import ScrapingFailed
+
+    # A generic scrape failure (not a dead blank) must propagate untouched: recovery only ever adds a
+    # path for the blank signature, never intercepts other terminal scrape errors.
+    rig = make_agent_step_rig(monkeypatch)
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=ScrapingFailed())
+
+    with pytest.raises(ScrapingFailed):
+        await rig.run()
+    assert rig.action_handler.await_count == 0
+    assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
+
+
+@pytest.mark.asyncio
+async def test_successful_scrape_resets_recovery_attempt_counter(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A normal (non-blank) step-body scrape clears a prior task's recovery counter so the next dead
+    # blank starts from a fresh budget.
+    rig = make_agent_step_rig(monkeypatch)
+    rig.context.empty_page_recovery_attempts[rig.task.task_id] = 2
+
+    step, _output = await rig.run()
+
+    assert step.status == StepStatus.completed
+    assert rig.task.task_id not in rig.context.empty_page_recovery_attempts
+
+
 @pytest.mark.asyncio
 async def test_get_failure_reason_for_task_falls_back_when_terminate_reasoning_is_empty(
     monkeypatch: pytest.MonkeyPatch,
