@@ -45,6 +45,10 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import frontier as frontier_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools._shared import (
+    _composition_unverified_current_workflow_labels,
+    _unverified_current_workflow_labels,
+)
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _credit_composition_verified_labels,
     _record_run_blocks_result,
@@ -175,6 +179,14 @@ def _make_ctx(**kwargs: object) -> CopilotContext:
     return CopilotContext(**defaults)
 
 
+def _prefix_ran_in(ctx: CopilotContext, session_id: str, end_urls: dict[str, str]) -> str:
+    """Record where the verified prefix's browser stopped; returns the page a resume has to see."""
+    ctx.verified_prefix_block_end_urls = dict(end_urls)
+    ctx.verified_prefix_block_end_session_id = session_id
+    ctx.verified_prefix_terminal_label = list(end_urls)[-1]
+    return end_urls[ctx.verified_prefix_terminal_label]
+
+
 # --------------------------------------------------------------------------- #
 # Frontier selection — core behavior                                          #
 # --------------------------------------------------------------------------- #
@@ -215,35 +227,42 @@ def test_plan_frontier_append_after_success_runs_only_appended() -> None:
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["a", "b"]
     ctx.verified_block_outputs = {"a": "nav_ok", "b": {"title": "hi"}}
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"a": "https://example.com/a", "b": "https://example.com/b"})
 
-    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["a", "b", "c"], old, new)
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["a", "b", "c"], old, new, page)
     assert labels == ["c"]
     assert frontier == "c"
+    assert provenance == "resumed"
+    assert ctx.frontier_resume_session_id == "pbs_prefix_run"
 
 
-def test_plan_frontier_append_walks_back_when_workflow_prefix_is_not_verified() -> None:
+def test_plan_frontier_append_never_runs_an_unverified_prefix_the_caller_left_out() -> None:
+    # Appending a block after an unverified prefix is a request to run that block. Rebuilding the
+    # state it expects would place the order sitting in front of it, which nobody asked for.
     old = _FakeDefinition(
         [
-            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
-            _FakeBlock("set_search", "navigation", {"prompt": "Fill search fields"}),
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/cart"}),
+            _FakeBlock("place_order", "navigation", {"prompt": "Click Place order"}),
         ]
     )
     new = _FakeDefinition(
         [
-            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
-            _FakeBlock("set_search", "navigation", {"prompt": "Fill updated search fields"}),
-            _FakeBlock("submit_search", "navigation", {"prompt": "Click Search"}),
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/cart"}),
+            _FakeBlock("place_order", "navigation", {"prompt": "Click Place order"}),
+            _FakeBlock("read_receipt", "extraction", {"prompt": "Read the receipt number"}),
         ]
     )
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open"]
     ctx.verified_block_outputs = {"open": "opened"}
 
-    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["submit_search"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["read_receipt"], old, new)
 
-    assert labels == ["open", "set_search", "submit_search"]
-    assert seed == {}
-    assert frontier == "open"
+    assert labels == ["read_receipt"]
+    assert frontier == "read_receipt"
+    # The recorded output of an earlier block is data the appended block may reference; handing it
+    # over is not the same as running that block again, and `place_order` supplies neither.
+    assert seed == {"open": "opened"}
 
 
 def test_plan_frontier_unchanged_workflow_continues_from_first_unverified_label() -> None:
@@ -257,20 +276,23 @@ def test_plan_frontier_unchanged_workflow_continues_from_first_unverified_label(
     )
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open", "set_search"]
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://example.com", "set_search": "https://example.com/s"})
 
-    labels, seed, frontier, _provenance = _plan_frontier(
+    labels, seed, frontier, provenance = _plan_frontier(
         ctx,
         ["open", "set_search", "submit_search", "extract"],
         definition,
         definition,
+        page,
     )
 
     assert labels == ["submit_search", "extract"]
     assert seed == {}
     assert frontier == "submit_search"
+    assert provenance == "resumed"
 
 
-def test_plan_frontier_verified_only_request_advances_to_next_unverified_workflow_label() -> None:
+def test_plan_frontier_verified_only_request_reruns_only_what_was_requested() -> None:
     definition = _FakeDefinition(
         [
             _FakeBlock("open", "goto_url"),
@@ -281,17 +303,20 @@ def test_plan_frontier_verified_only_request_advances_to_next_unverified_workflo
     )
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open", "set_search"]
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://example.com", "set_search": "https://example.com/s"})
 
-    labels, seed, frontier, _provenance = _plan_frontier(
+    labels, seed, frontier, provenance = _plan_frontier(
         ctx,
         ["open", "set_search"],
         definition,
         definition,
+        page,
     )
 
-    assert labels == ["submit_search"]
+    assert labels == ["open", "set_search"]
     assert seed == {}
-    assert frontier == "submit_search"
+    assert frontier == "open"
+    assert provenance == "initial"
 
 
 def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -> None:
@@ -309,9 +334,15 @@ def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -
         "open": {"current_url": "https://example.com/search"},
         "search": {"current_url": "https://example.com/search/results"},
     }
+    page = _prefix_ran_in(
+        ctx,
+        "pbs_prefix_run",
+        {"open": "https://example.com/search", "search": "https://example.com/search/results"},
+    )
 
-    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["expand"], definition, definition)
+    labels, seed, frontier, provenance = _plan_frontier(ctx, ["expand"], definition, definition, page)
 
+    assert provenance == "resumed"
     assert labels == ["expand"]
     assert seed == {
         "open": {"current_url": "https://example.com/search"},
@@ -663,9 +694,10 @@ def test_plan_frontier_edit_resumes_at_edited_block_when_live_page_matches_recor
         "login_to_site": "https://app.example.com/dashboard",
         "inspect_summary": "https://app.example.com/dashboard/logs",
     }
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
     ctx.verified_prefix_terminal_label = "inspect_summary"
 
-    labels, _seed, frontier, _provenance = _plan_frontier(
+    labels, _seed, frontier, provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -674,6 +706,30 @@ def test_plan_frontier_edit_resumes_at_edited_block_when_live_page_matches_recor
     )
     assert frontier == "inspect_summary"
     assert labels == ["inspect_summary"]
+    assert provenance == "resumed"
+    assert ctx.frontier_resume_session_id == "pbs_login_run"
+
+
+def test_plan_frontier_edit_runs_in_its_own_browser_when_the_prefix_browser_is_unknown() -> None:
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_terminal_label = "login_to_site"
+
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+    assert frontier == labels[0]
+    assert set(labels) <= set(_LOGIN_THEN_INSPECT_LABELS)
+    assert ctx.frontier_requires_own_browser is True
+    assert provenance != "resumed"
+    assert ctx.frontier_resume_session_id is None
 
 
 def test_plan_frontier_edit_walks_back_when_a_loop_hides_a_credential_fill() -> None:
@@ -706,7 +762,10 @@ def test_plan_frontier_edit_walks_back_when_a_loop_hides_a_credential_fill() -> 
         "https://app.example.com/signin",
     )
 
+    # The caller asked for the workflow from its head, so a run given its own browser runs all of
+    # what was asked rather than a slice a blank browser could not satisfy.
     assert frontier == "open_site"
+    assert ctx.frontier_requires_own_browser is True
 
 
 def test_plan_frontier_resume_names_the_browser_that_must_run_it() -> None:
@@ -761,6 +820,184 @@ def test_plan_frontier_append_names_the_browser_that_ran_the_prefix() -> None:
 
     assert frontier == "read_total"
     assert ctx.frontier_resume_session_id == "pbs_login_run"
+
+
+def test_plan_frontier_append_that_signs_in_again_runs_in_its_own_browser() -> None:
+    # The prefix's browser is already signed in, so the plan restarts from the head (where the run
+    # gets its own browser) and keeps every appended block after the second sign-in.
+    login = "await page.locator('#pw').fill(creds.password)"
+    open_site = _FakeBlock("open_site", "navigation", {"url": "https://app.example.com/signin"})
+    old = _FakeDefinition([open_site, _FakeBlock("login_to_site", "code", {"code": login})])
+    new = _FakeDefinition(
+        [
+            open_site,
+            _FakeBlock("login_to_site", "code", {"code": login}),
+            _FakeBlock("login_to_partner", "code", {"code": "await page.locator('#partner_pw').fill(creds.password)"}),
+            _FakeBlock("read_partner_total", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site", "login_to_site"]
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+    ctx.verified_prefix_terminal_label = "login_to_site"
+
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx,
+        ["open_site", "login_to_site", "login_to_partner", "read_partner_total"],
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+
+    assert frontier == labels[0]
+    assert set(labels) <= {"open_site", "login_to_site", "login_to_partner", "read_partner_total"}
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_continue_at_an_unverified_sign_in_runs_in_its_own_browser() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("sheets_read", "code", {"code": "result = rows"}),
+            _FakeBlock("sign_in", "code", {"code": "await page.locator('#pw').fill(creds.password)"}),
+            _FakeBlock("extract", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["sheets_read"]
+    ctx.verified_block_outputs = {"sheets_read": "ok"}
+
+    labels, seed, frontier, _provenance = _plan_frontier(
+        ctx, ["sheets_read", "sign_in", "extract"], definition, definition, None
+    )
+
+    assert frontier == labels[0]
+    assert set(labels) <= {"sheets_read", "sign_in", "extract"}
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_edited_sign_in_block_alone_runs_in_its_own_browser() -> None:
+    open_site = _FakeBlock("open_site", "goto_url", {"url": "https://app.example.com/signin"})
+    old = _FakeDefinition(
+        [open_site, _FakeBlock("sign_in", "code", {"code": "await page.locator('#pw').fill(creds.password)"})]
+    )
+    new = _FakeDefinition(
+        [open_site, _FakeBlock("sign_in", "code", {"code": "await page.locator('#password').fill(creds.password)"})]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site"]
+    ctx.verified_block_outputs = {"open_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"open_site": "https://app.example.com/signin"}
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+    ctx.verified_prefix_terminal_label = "open_site"
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["sign_in"], old, new, "https://app.example.com/signin")
+
+    assert frontier == labels[0]
+    assert labels == ["sign_in"]
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_append_beside_a_finally_block_that_does_not_sign_in_keeps_the_prefix_browser() -> None:
+    code = "await page.locator('#pw').fill(creds.password)"
+    cleanup = _FakeBlock("cleanup", "code", {"code": "await page.close()"})
+    old = _FakeDefinition(
+        [_FakeBlock("open_site", "navigation"), _FakeBlock("login_to_site", "code", {"code": code}), cleanup]
+    )
+    old.finally_block_label = "cleanup"
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("login_to_site", "code", {"code": code}),
+            _FakeBlock("read_total", "code", {"code": "result = {}"}),
+            cleanup,
+        ]
+    )
+    new.finally_block_label = "cleanup"
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site", "login_to_site"]
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+    ctx.verified_prefix_terminal_label = "login_to_site"
+
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx,
+        ["open_site", "login_to_site", "read_total"],
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+
+    assert frontier == "read_total"
+    assert labels == ["read_total"]
+    assert provenance == "resumed"
+    assert ctx.frontier_resume_session_id == "pbs_login_run"
+
+
+def test_plan_frontier_append_beside_a_finally_block_that_signs_in_runs_in_its_own_browser() -> None:
+    code = "await page.locator('#pw').fill(creds.password)"
+    relogin = _FakeBlock("relogin", "code", {"code": code})
+    open_site = _FakeBlock("open_site", "navigation", {"url": "https://app.example.com/signin"})
+    old = _FakeDefinition([open_site, _FakeBlock("login_to_site", "code", {"code": code})])
+    new = _FakeDefinition(
+        [
+            open_site,
+            _FakeBlock("login_to_site", "code", {"code": code}),
+            _FakeBlock("read_total", "code", {"code": "result = {}"}),
+            relogin,
+        ]
+    )
+    new.finally_block_label = "relogin"
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site", "login_to_site"]
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    page = _prefix_ran_in(ctx, "pbs_login_run", {"login_to_site": "https://app.example.com/dashboard"})
+
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx, ["open_site", "login_to_site", "read_total"], old, new, page
+    )
+
+    assert frontier == labels[0]
+    assert set(labels) <= {"open_site", "login_to_site", "read_total"}
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_continuation_with_the_browser_position_forgotten_runs_in_its_own_browser() -> None:
+    # A credential-bearing run keeps its verified labels but forgets where its browser stopped,
+    # so the next frontier cannot be proven against any browser and the head is re-run.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("fill_search", "navigation", {"prompt": "search"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_block_outputs = {"open": "ok"}
+
+    labels, seed, frontier, provenance = _plan_frontier(ctx, ["open", "fill_search"], definition, definition, None)
+
+    assert frontier == labels[0]
+    assert set(labels) <= {"open", "fill_search"}
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_drops_a_resume_browser_named_by_an_earlier_plan() -> None:
+    definition = _FakeDefinition([_FakeBlock("open_site", "goto_url", {"url": "https://app.example.com"})])
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_named_but_never_dispatched"
+
+    _labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open_site"], None, definition)
+
+    assert frontier == "open_site"
+    assert ctx.frontier_resume_session_id is None
 
 
 def test_plan_frontier_does_not_name_a_browser_when_the_seeder_vetoes_the_frontier() -> None:
@@ -1273,12 +1510,18 @@ def test_plan_frontier_append_with_block_form_jinja_ref_seeds_the_prefix_output(
         "open_page": "nav_ok",
         "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
     }
+    page = _prefix_ran_in(
+        ctx,
+        "pbs_prefix_run",
+        {"open_page": "https://example.com/article", "extract_article_info": "https://example.com/article"},
+    )
 
     labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_page", "extract_article_info", "summarize_article"],
         old,
         new,
+        page,
     )
 
     assert labels == ["summarize_article"]
@@ -1318,12 +1561,18 @@ def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
         "open_page": "nav_ok",
         "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
     }
+    page = _prefix_ran_in(
+        ctx,
+        "pbs_prefix_run",
+        {"open_page": "https://example.com/article", "extract_article_info": "https://example.com/article"},
+    )
 
     labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_page", "extract_article_info", "summarize_article"],
         old,
         new,
+        page,
     )
 
     assert labels == ["summarize_article"]
@@ -1673,8 +1922,9 @@ def test_plan_frontier_append_only_with_workflow_param_does_not_fall_back() -> N
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open_page"]
     ctx.verified_block_outputs = {"open_page": "nav_ok"}
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open_page": "https://example.com"})
 
-    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["open_page", "search"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["open_page", "search"], old, new, page)
 
     assert labels == ["search"]
     assert seed == {"open_page": "nav_ok"}
@@ -1863,59 +2113,187 @@ def _recorded_failed_outcome(
     )
 
 
-def test_plan_frontier_uses_recorded_failed_block_position_for_same_request_order() -> None:
+def test_plan_frontier_retry_after_a_failed_run_runs_in_its_own_browser() -> None:
+    # A failed run forgets the browser's position, so the retry cannot resume the failed block in
+    # the browser that reached it and the workflow is re-run from the head instead.
     ctx = _make_ctx()
     definition = _wf_def(
         ("open", "goto_url", {"url": "https://example.com"}),
         ("search", "navigation", {"url": None}),
         ("extract", "extraction", {"prompt": "extract"}),
     )
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_block_outputs = {"open": "opened"}
     ctx.latest_recorded_build_test_outcome = _recorded_failed_outcome(
         block_labels=["open", "search", "extract"],
         attempted_block_label="search",
         workflow_definition=definition,
     )
 
-    labels, seed, frontier, _provenance = _plan_frontier(
+    labels, seed, frontier, provenance = _plan_frontier(
         ctx,
         ["open", "search", "extract"],
         definition,
         definition,
+        "https://example.com",
     )
+
+    assert frontier == labels[0]
+    assert set(labels) <= {"open", "search", "extract"}
+    assert ctx.frontier_requires_own_browser is True
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_does_not_resume_when_stored_order_is_not_run_order() -> None:
+    # `read_total` is stored before the block that jumps to it, so position cannot say what ran
+    # first. Resuming here would put the run in whatever state the other block left behind.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("read_total", "code", {"code": "result = rows"}),
+            _FakeBlock(
+                "open_site", "goto_url", {"url": "https://app.example.com/list", "next_block_label": "read_total"}
+            ),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["read_total"]
+    ctx.verified_block_outputs = {"read_total": "ok"}
+    ctx.verified_prefix_block_end_urls = {"read_total": "https://app.example.com/list"}
+    ctx.verified_prefix_block_end_session_id = "pbs_prefix_run"
+    ctx.verified_prefix_terminal_label = "read_total"
+
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx, ["open_site"], definition, definition, "https://app.example.com/list"
+    )
+
+    assert labels == ["open_site"]
+    assert frontier == "open_site"
+    assert provenance != "resumed"
+    assert ctx.frontier_resume_session_id is None
+    assert ctx.frontier_requires_own_browser is True
+
+
+def test_plan_frontier_resumes_when_the_workflow_branches_after_the_frontier() -> None:
+    # Most real workflows branch somewhere. A conditional downstream of the frontier cannot change
+    # which blocks ran before it, so it must not cost the continuation the browser holding that state.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://app.example.com/"}),
+            _FakeBlock("read", "code", {"code": "result = rows"}),
+            _FakeBlock("branch", "conditional", {"ordered_branches": [{"label": "x"}]}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open"]
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://app.example.com/list"})
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["read"], definition, definition, page)
+
+    assert labels == ["read"]
+    assert frontier == "read"
+    assert provenance == "resumed"
+    assert ctx.frontier_resume_session_id == "pbs_prefix_run"
+    assert ctx.frontier_requires_own_browser is False
+
+
+def test_plan_frontier_reads_traversal_order_when_the_finally_block_is_stored_first() -> None:
+    # Stored first, the finally block would otherwise count as part of every body block's prefix,
+    # so a verified body prefix would read as unverified and the continuation would lose its browser.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("cleanup", "code", {"code": "await page.locator('#logout').click()"}),
+            _FakeBlock("open_site", "goto_url", {"url": "https://app.example.com/list"}),
+            _FakeBlock("read_total", "code", {"code": "result = rows"}),
+        ]
+    )
+    definition.finally_block_label = "cleanup"
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site"]
+    ctx.verified_block_outputs = {"open_site": "ok"}
+
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["read_total"], definition, definition, None)
+
+    assert labels == ["read_total"]
+    assert frontier == "read_total"
+    # Read as unverified, this plain continuation would have been handed the chat's page instead.
+    assert ctx.frontier_requires_own_browser is True
+
+
+def test_plan_frontier_never_adds_a_block_the_caller_did_not_request() -> None:
+    # An earlier block can submit, send or pay, so rebuilding state by replaying it would repeat an
+    # effect the caller left out of this request.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("login", "code", {"code": "await page.locator('#pw').fill(creds.password)"}),
+            _FakeBlock("submit_order", "code", {"code": "await page.locator('#pay').click()"}),
+            _FakeBlock("read", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["login", "submit_order"]
+    ctx.verified_block_outputs = {"login": "ok", "submit_order": "ok"}
+
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["read"], definition, definition, None)
+
+    assert labels == ["read"]
+    assert frontier == "read"
+    assert ctx.frontier_requires_own_browser is True
+
+
+def test_plan_frontier_retry_of_a_head_request_keeps_every_requested_block() -> None:
+    # A blank browser cannot satisfy a suffix that assumed the earlier blocks ran, and the caller
+    # did ask for them, so the retry runs the list it was given.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("search", "code", {"code": "await page.locator('#q').fill('x')"}),
+            _FakeBlock("extract", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_block_outputs = {"open": "ok"}
+    ctx.latest_recorded_build_test_outcome = _recorded_failed_outcome(
+        block_labels=["open", "search", "extract"],
+        attempted_block_label="search",
+        workflow_definition=definition,
+    )
+
+    labels, _seed, frontier, _provenance = _plan_frontier(
+        ctx, ["open", "search", "extract"], definition, definition, None
+    )
+
+    assert labels == ["open", "search", "extract"]
+    assert frontier == "open"
+
+
+def test_plan_frontier_retry_of_a_partial_request_keeps_every_requested_block() -> None:
+    # Same reason as the head retry, for a request that starts mid-workflow: `search` established
+    # what `extract` needs, and narrowing the retry to the block that failed hands a blank browser
+    # a suffix whose state nothing produced. Both blocks were asked for, so both run.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("search", "code", {"code": "await page.locator('#q').fill('x')"}),
+            _FakeBlock("extract", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    # `search` passed inside the attempt that failed at `extract`, and the browser it passed in is
+    # gone — so this retry is minted a blank one.
+    ctx.verified_prefix_labels = ["open", "search"]
+    ctx.verified_block_outputs = {"open": "ok"}
+    ctx.latest_recorded_build_test_outcome = _recorded_failed_outcome(
+        block_labels=["search", "extract"],
+        attempted_block_label="extract",
+        workflow_definition=definition,
+    )
+
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["search", "extract"], definition, definition, None)
 
     assert labels == ["search", "extract"]
-    assert seed == {}
     assert frontier == "search"
-
-
-def test_plan_frontier_maps_recorded_failed_block_by_structure_across_label_churn() -> None:
-    ctx = _make_ctx()
-    old = _wf_def(
-        ("open_old", "goto_url", {"url": "https://example.com"}),
-        ("search_old", "navigation", {"url": None}),
-        ("extract_old", "extraction", {"prompt": "extract"}),
-    )
-    new = _wf_def(
-        ("open_new", "goto_url", {"url": "https://example.com"}),
-        ("search_new", "navigation", {"url": None}),
-        ("extract_new", "extraction", {"prompt": "extract"}),
-    )
-    ctx.latest_recorded_build_test_outcome = _recorded_failed_outcome(
-        block_labels=["open_old", "search_old", "extract_old"],
-        attempted_block_label="search_old",
-        workflow_definition=old,
-    )
-
-    labels, seed, frontier, _provenance = _plan_frontier(
-        ctx,
-        ["open_new", "search_new", "extract_new"],
-        old,
-        new,
-    )
-
-    assert labels == ["search_new", "extract_new"]
-    assert seed == {}
-    assert frontier == "search_new"
+    assert ctx.frontier_requires_own_browser is True
 
 
 def test_plan_frontier_fails_closed_when_recorded_failed_order_differs() -> None:
@@ -1976,38 +2354,6 @@ def test_plan_frontier_fails_closed_when_recorded_failed_shapes_are_ambiguous() 
     assert labels == ["second_new", "first_new", "extract_new"]
     assert seed == {}
     assert frontier == "second_new"
-
-
-def test_plan_frontier_does_not_index_suffix_failed_run_into_full_request() -> None:
-    ctx = _make_ctx()
-    ctx.verified_prefix_labels = ["open_new"]
-    old = _wf_def(
-        ("open_old", "goto_url", {"url": "https://example.com"}),
-        ("search_old", "navigation", {"url": None}),
-        ("extract_old", "extraction", {"prompt": "extract"}),
-    )
-    new = _wf_def(
-        ("open_new", "goto_url", {"url": "https://example.com"}),
-        ("search_new", "navigation", {"url": None}),
-        ("extract_new", "extraction", {"prompt": "extract"}),
-    )
-    ctx.latest_recorded_build_test_outcome = _recorded_failed_outcome(
-        block_labels=["search_old", "extract_old"],
-        attempted_block_label="search_old",
-        requested_block_labels=["open_old", "search_old", "extract_old"],
-        workflow_definition=old,
-    )
-
-    labels, seed, frontier, _provenance = _plan_frontier(
-        ctx,
-        ["open_new", "search_new", "extract_new"],
-        old,
-        new,
-    )
-
-    assert labels == ["search_new", "extract_new"]
-    assert seed == {}
-    assert frontier == "search_new"
 
 
 def test_recorded_failed_prefix_anchor_maps_relabels_from_recorded_shapes() -> None:
@@ -2147,9 +2493,11 @@ def test_edit_invalidates_verified_goal_block_on_split_path() -> None:
 
     # Split path: run_blocks passes old==new; the pruned prefix makes the edited
     # block the frontier again instead of reusing it as verified.
-    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open", "search", "extract"], new, new)
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://example.com", "search": "https://example.com/r"})
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "search", "extract"], new, new, page)
     assert frontier == "extract"
     assert "extract" in labels
+    assert provenance == "resumed"
 
 
 def test_append_only_edit_keeps_prefix_but_drops_end_to_end_claim() -> None:
@@ -2530,9 +2878,11 @@ def test_appended_block_output_parameter_keeps_upstream_verified_prefix() -> Non
     assert ctx.workflow_verification_evidence.full_workflow_verified is False
     assert ctx.last_full_workflow_test_ok is False
 
-    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["sign_in", "read_summary"], prior, new)
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"sign_in": "https://example.com/home"})
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["sign_in", "read_summary"], prior, new, page)
     assert labels == ["read_summary"]
     assert frontier == "read_summary"
+    assert provenance == "resumed"
 
 
 def test_parameter_named_only_by_workflow_system_prompt_resets_verified_trust() -> None:
@@ -2719,17 +3069,15 @@ def test_reorder_resets_verified_trust() -> None:
     assert ctx.last_full_workflow_test_ok is False
 
 
-def test_unanchored_append_is_never_credited_as_composition_verified() -> None:
-    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
+def test_unanchored_block_is_never_credited_as_composition_verified() -> None:
     appended = _wf_def(
         ("open", "goto_url", {"url": "https://example.com"}),
         ("add_to_cart", "navigation", {"prompt": "add the item to the cart"}),
     )
     ctx = _make_ctx()
-    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
     ctx.composition_verified_labels = ["open"]
 
-    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "add_to_cart"], prior, appended)
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["add_to_cart"], appended, appended)
 
     assert frontier == "add_to_cart"
     assert provenance == "unanchored"
@@ -2739,19 +3087,132 @@ def test_unanchored_append_is_never_credited_as_composition_verified() -> None:
     assert "add_to_cart" not in ctx.composition_verified_labels
 
 
+def test_a_native_login_block_does_not_resume_the_browser_it_would_sign_into() -> None:
+    # A login block authenticates through its type and parameters and carries no code, so a guard
+    # reading code alone would call the one block built to sign in safe to replay in place.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://app.example.com/"}),
+            _FakeBlock("sign_in", "login"),
+            _FakeBlock("read", "code", {"code": "result = rows"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open"]
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://app.example.com/login"})
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["sign_in"], definition, definition, page)
+
+    assert labels == ["sign_in"]
+    assert frontier == "sign_in"
+    assert provenance != "resumed"
+    assert ctx.frontier_resume_session_id is None
+    assert ctx.frontier_requires_own_browser is True
+
+
+def test_a_workflow_with_a_cleanup_block_can_be_declared_tested() -> None:
+    # The cleanup block runs on its own after the body, so no body run ever verifies it. Counted
+    # among the blocks still needing proof, it would keep every such workflow from being tested.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://app.example.com/"}),
+            _FakeBlock("read", "code", {"code": "result = rows"}),
+            _FakeBlock("cleanup", "code", {"code": "await page.locator('#logout').click()"}),
+        ]
+    )
+    definition.finally_block_label = "cleanup"
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.verified_prefix_labels = ["open", "read"]
+    ctx.composition_verified_labels = ["open", "read"]
+
+    assert terminal_ready_for_latch(
+        current_workflow_labels=["open", "read"],
+        planned_block_labels=["open", "read"],
+        completed_block_labels=["open", "read"],
+        all_run_blocks_completed=True,
+        unverified=_unverified_current_workflow_labels(ctx),
+        composition_unverified=_composition_unverified_current_workflow_labels(ctx),
+        artifact_reason=None,
+        structured_blocker=None,
+        empty_data_blocks=False,
+    )
+
+
+def test_a_full_run_earns_credit_though_its_labels_carry_the_cleanup_block() -> None:
+    # A blank-browser run of the whole workflow executes the cleanup block too, so its label list
+    # holds one the workflow's own order leaves out. Compared unfiltered, the run proving the
+    # entire body would be the one rejected.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://app.example.com/"}),
+            _FakeBlock("read", "code", {"code": "result = rows"}),
+            _FakeBlock("cleanup", "code", {"code": "await page.locator('#logout').click()"}),
+        ]
+    )
+    definition.finally_block_label = "cleanup"
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.composition_verified_labels = []
+
+    _credit_composition_verified_labels(ctx, ["open", "read", "cleanup"], "initial")
+
+    assert ctx.composition_verified_labels == ["open", "read"]
+    assert _composition_unverified_current_workflow_labels(ctx) == []
+
+
+def test_the_cleanup_block_is_recognised_from_the_workflow_yaml_alone() -> None:
+    # A saved workflow can be tested before its model object is loaded, when labels come from the
+    # YAML. Reading the cleanup block only from the model leaves that path treating it as body work.
+    ctx = _make_ctx()
+    ctx.last_workflow = None
+    ctx.last_workflow_yaml = (
+        "workflow_definition:\n"
+        "  finally_block_label: cleanup\n"
+        "  blocks:\n"
+        "    - label: open\n"
+        "    - label: read\n"
+        "    - label: cleanup\n"
+    )
+    ctx.verified_prefix_labels = ["open", "read"]
+    ctx.composition_verified_labels = ["open", "read"]
+
+    assert _unverified_current_workflow_labels(ctx) == []
+    assert _composition_unverified_current_workflow_labels(ctx) == []
+
+
+def test_a_head_run_earns_composition_credit_when_the_finally_block_is_stored_first() -> None:
+    # Counted in stored order the finally block occupies position 0, so the body's own first block
+    # looks like it starts mid-chain and earns nothing — leaving the workflow never terminal-ready.
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("cleanup", "code", {"code": "await page.locator('#logout').click()"}),
+            _FakeBlock("open", "goto_url", {"url": "https://app.example.com/"}),
+            _FakeBlock("read", "code", {"code": "result = rows"}),
+        ]
+    )
+    definition.finally_block_label = "cleanup"
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.composition_verified_labels = []
+
+    _credit_composition_verified_labels(ctx, ["open"], "initial")
+
+    assert ctx.composition_verified_labels == ["open"]
+    assert _composition_unverified_current_workflow_labels(ctx) == ["read"]
+
+
 def test_a_lone_mid_workflow_block_that_opens_a_page_is_not_a_replay() -> None:
-    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
     appended = _wf_def(
         ("open", "goto_url", {"url": "https://example.com"}),
         ("open_cart", "goto_url", {"url": "https://example.com/cart"}),
     )
     ctx = _make_ctx()
-    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
     ctx.composition_verified_labels = ["open"]
     ctx.last_workflow = _FakeWorkflow(appended)
     ctx.last_workflow_yaml = "workflow: yaml"
 
-    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "open_cart"], prior, appended)
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open_cart"], appended, appended)
 
     assert frontier == "open_cart"
     assert provenance == "unanchored"
@@ -3002,18 +3463,16 @@ def test_a_non_contiguous_run_credits_no_composition_labels() -> None:
 
 
 def test_a_passing_unanchored_run_still_leaves_the_workflow_composition_unverified() -> None:
-    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
     appended = _wf_def(
         ("open", "goto_url", {"url": "https://example.com"}),
         ("add_to_cart", "navigation", {"prompt": "add the item to the cart"}),
     )
     ctx = _make_ctx()
-    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
     ctx.composition_verified_labels = ["open"]
     ctx.last_workflow = _FakeWorkflow(appended)
     ctx.last_workflow_yaml = "workflow: yaml"
 
-    labels, _seed, _frontier, provenance = _plan_frontier(ctx, ["open", "add_to_cart"], prior, appended)
+    labels, _seed, _frontier, provenance = _plan_frontier(ctx, ["add_to_cart"], appended, appended)
     _credit_composition_verified_labels(ctx, labels, provenance)
     ctx.verified_prefix_labels = ["open", "add_to_cart"]
 
@@ -3154,8 +3613,9 @@ def test_frontier_planning_adds_no_rerun_floor_or_goal_classifier() -> None:
     )
     ctx = _make_ctx()
     _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
+    page = _prefix_ran_in(ctx, "pbs_prefix_run", {"open": "https://example.com/list"})
 
-    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open", "extract"], definition, definition)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open", "extract"], definition, definition, page)
 
     assert labels == ["extract"]
     assert frontier == "extract"
