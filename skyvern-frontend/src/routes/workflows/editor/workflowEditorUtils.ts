@@ -7,8 +7,6 @@ import { TSON } from "@/util/tson";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 
 import {
-  WorkflowBlockType,
-  WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
   BranchCriteriaTypes,
@@ -61,18 +59,7 @@ import {
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
-import {
-  EMAIL_BLOCK_SENDER,
-  REACT_FLOW_EDGE_Z_INDEX,
-  SMTP_HOST_AWS_KEY,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_AWS_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_AWS_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_AWS_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
-} from "./constants";
+import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
@@ -655,6 +642,23 @@ function layout(
   };
 }
 
+// Keep this sentinel aligned with skyvern/forge/sdk/workflow/models/parameter.py.
+const UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER";
+
+// Custom SMTP placeholders are undeclared; saving their keys would prevent
+// switching back to the platform sender after clearing the custom host.
+function declaredSmtpParameterKey(
+  parameter: AWSSecretParameter | undefined,
+): string | undefined {
+  if (
+    !parameter ||
+    parameter.aws_key === UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY
+  ) {
+    return undefined;
+  }
+  return parameter.key;
+}
+
 function convertToNode(
   identifiers: { id: string; parentId?: string },
   block: WorkflowBlock,
@@ -992,10 +996,14 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           sender: block.sender,
-          smtpHostSecretParameterKey: block.smtp_host?.key,
-          smtpPortSecretParameterKey: block.smtp_port?.key,
-          smtpUsernameSecretParameterKey: block.smtp_username?.key,
-          smtpPasswordSecretParameterKey: block.smtp_password?.key,
+          smtpHostSecretParameterKey: declaredSmtpParameterKey(block.smtp_host),
+          smtpPortSecretParameterKey: declaredSmtpParameterKey(block.smtp_port),
+          smtpUsernameSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtpPasswordSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           customSmtpHost: block.custom_smtp_host ?? null,
           customSmtpPort:
             block.custom_smtp_port !== null &&
@@ -4184,72 +4192,6 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   });
 }
 
-const sendEmailExpectedParameters = [
-  {
-    key: SMTP_HOST_PARAMETER_KEY,
-    aws_key: SMTP_HOST_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PORT_PARAMETER_KEY,
-    aws_key: SMTP_PORT_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_USERNAME_PARAMETER_KEY,
-    aws_key: SMTP_USERNAME_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PASSWORD_PARAMETER_KEY,
-    aws_key: SMTP_PASSWORD_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-] as const;
-
-function getBlocksOfType(
-  blocks: Array<BlockYAML>,
-  blockType: WorkflowBlockType,
-): Array<BlockYAML> {
-  const blocksOfType: Array<BlockYAML> = [];
-  for (const block of blocks) {
-    if (
-      block.block_type === WorkflowBlockTypes.ForLoop ||
-      block.block_type === WorkflowBlockTypes.WhileLoop
-    ) {
-      const subBlocks = block.loop_blocks;
-      const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
-      blocksOfType.push(...subBlocksOfType);
-    } else {
-      if (block.block_type === blockType) {
-        blocksOfType.push(block);
-      }
-    }
-  }
-  return blocksOfType;
-}
-
-function getAdditionalParametersForEmailBlock(
-  blocks: Array<BlockYAML>,
-  parameters: Array<ParameterYAML>,
-): Array<ParameterYAML> {
-  const emailBlocks = getBlocksOfType(blocks, WorkflowBlockTypes.SendEmail);
-  if (emailBlocks.length === 0) {
-    return [];
-  }
-  const sendEmailParameters = sendEmailExpectedParameters.flatMap(
-    (parameter) => {
-      const existingParameter = parameters.find((p) => p.key === parameter.key);
-      if (existingParameter) {
-        return [];
-      }
-      return [parameter];
-    },
-  );
-
-  return sendEmailParameters;
-}
-
 function getUniqueLabelForExistingNode(
   label: string,
   existingLabels: Array<string>,
@@ -4927,10 +4869,18 @@ function convertBlocksToBlockYAML(
         const blockYaml: SendEmailBlockYAML = {
           ...base,
           block_type: "send_email",
-          smtp_host_secret_parameter_key: block.smtp_host?.key,
-          smtp_port_secret_parameter_key: block.smtp_port?.key,
-          smtp_username_secret_parameter_key: block.smtp_username?.key,
-          smtp_password_secret_parameter_key: block.smtp_password?.key,
+          smtp_host_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_host,
+          ),
+          smtp_port_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_port,
+          ),
+          smtp_username_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtp_password_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           custom_smtp_host: block.custom_smtp_host,
           custom_smtp_port: block.custom_smtp_port,
           custom_smtp_username: block.custom_smtp_username,
@@ -5518,7 +5468,6 @@ export {
   generateNodeLabel,
   getAffectedBlocks,
   getNestingLevel,
-  getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   urlMayBeGoogleDrive,

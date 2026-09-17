@@ -80,7 +80,6 @@ import {
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
   AzureVaultCredentialParameterYAML,
-  ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
 import {
@@ -136,7 +135,6 @@ import {
   createNode,
   descendants,
   generateNodeLabel,
-  getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
@@ -1014,23 +1012,8 @@ function FlowRenderer({
 
     const echoParameters = convertEchoParameters(filteredParameters);
 
-    const overallParameters = [
-      ...parameters,
-      ...echoParameters,
-    ] as Array<ParameterYAML>;
-
-    // if there is an email node, we need to add the email aws secret parameters
-    const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
-      upgradedBlocks,
-      overallParameters,
-    );
-
     return {
-      parameters: [
-        ...echoParameters,
-        ...parametersInYAMLConvertibleJSON,
-        ...emailAwsSecretParameters,
-      ],
+      parameters: [...echoParameters, ...parametersInYAMLConvertibleJSON],
       blocks: upgradedBlocks,
       workflowDefinitionVersion,
       title,
