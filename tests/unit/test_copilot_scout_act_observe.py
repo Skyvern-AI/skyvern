@@ -197,6 +197,11 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         reached_download_target=None,
         pending_scout_popup=None,
         pending_scout_popup_content_type=None,
+        pending_scout_challenge_frames=[],
+        pending_scout_challenge_detachers=[],
+        pending_scout_challenge_prior_frames=[],
+        last_scout_act_observe_recapture_attempted=False,
+        pending_scout_challenge_armed_at=None,
         pre_run_gated_output_warning_fingerprint=(),
     )
 

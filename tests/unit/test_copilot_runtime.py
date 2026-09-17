@@ -1619,6 +1619,29 @@ async def test_every_turn_exit_releases_the_driver_it_attached(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
+async def test_every_turn_exit_releases_a_click_listener_its_post_hook_never_reached(
+    monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
+    """A click cancelled between its pre-hook and post-hook never reaches the post-hook's release, so
+    the turn's own exit is the last place its listener on the persistent page can be removed."""
+    detached: list[str] = []
+
+    async def _armed_click_that_never_reported(ctx: AgentContext) -> None:
+        ctx.pending_scout_challenge_detachers.append(lambda: detached.append("framenavigated"))
+
+    await run_turn_to_exit(
+        monkeypatch,
+        manager=_release_manager(),
+        exit_path=exit_path,
+        browser_state=MagicMock(),
+        on_attached=_armed_click_that_never_reported,
+    )
+
+    assert detached == ["framenavigated"]
+
+
+@pytest.mark.asyncio
 async def test_a_cancel_during_prior_run_hydration_still_releases_the_driver_it_attached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

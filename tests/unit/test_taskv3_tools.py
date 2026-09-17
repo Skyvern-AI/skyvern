@@ -4115,6 +4115,15 @@ def test_the_frame_census_control_set_cannot_silently_fall_behind_the_scanners_o
     assert not missing, f"census control set fell behind `q`: {sorted(missing)}"
 
 
+def test_observe_js_renders_the_shared_challenge_signature_verbatim() -> None:
+    # The alternation is spliced in from a constant the copilot scout also compiles, so a change
+    # made for the scout's benefit must not quietly rewrite the regex this script evaluates.
+    assert (
+        r"    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome"
+        r"|perimeterx|verify you are human|security challenge/i;"
+    ) in taskv3_tools._OBSERVE_JS
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_frame_census_leaves_the_capped_frames_countable() -> None:
