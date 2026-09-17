@@ -88,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
+from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -888,6 +889,16 @@ def block_yaml_to_block(
             totp_identifier=block_yaml.totp_identifier,
             max_iterations=block_yaml.max_iterations,
             max_steps=block_yaml.max_steps,
+        )
+    elif block_yaml.block_type == BlockType.WEB_SEARCH:
+        return WebSearchBlock(
+            **base_kwargs,
+            query=block_yaml.query,
+            provider=block_yaml.provider,
+            num_results=block_yaml.num_results,
+            prompt=block_yaml.prompt,
+            json_schema=block_yaml.json_schema,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
     elif block_yaml.block_type == BlockType.HTTP_REQUEST:
         http_request_block_parameters = _resolve_block_parameters(block_yaml, parameters)

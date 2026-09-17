@@ -24,6 +24,7 @@ const REACT_FLOW_TYPE_TO_BLOCK_TYPE: Record<string, string> = {
   taskv2: "task_v2",
   url: "goto_url",
   http_request: "http_request",
+  web_search: "web_search",
   printPage: "print_page",
   workflowTrigger: "workflow_trigger",
   emailInbox: "email_inbox",

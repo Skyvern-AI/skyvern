@@ -92,6 +92,7 @@ export const workflowBlockTitle: {
   task_v2: "Browser Task v2",
   goto_url: "Go to URL",
   http_request: "HTTP Request",
+  web_search: "Web Search",
   print_page: "Print Page",
   workflow_trigger: "Agent Trigger",
   email_inbox: "Email Inbox",

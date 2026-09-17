@@ -164,6 +164,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
+    WebSearchBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
@@ -1100,7 +1101,12 @@ def _collect_enterprise_gated_workflow_features(
     all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
     if block_labels:
         blocks_by_label = {block.label: block for block in all_blocks}
-        blocks_to_check = get_all_blocks([blocks_by_label[label] for label in block_labels if label in blocks_by_label])
+        selected_labels = set(block_labels)
+        if workflow.workflow_definition.finally_block_label:
+            selected_labels.add(workflow.workflow_definition.finally_block_label)
+        blocks_to_check = get_all_blocks(
+            [blocks_by_label[label] for label in selected_labels if label in blocks_by_label]
+        )
     else:
         blocks_to_check = all_blocks
 
@@ -1111,9 +1117,10 @@ def _collect_enterprise_gated_workflow_features(
         if isinstance(block, BaseTaskBlock) and block.block_type != BlockType.HUMAN_INTERACTION:
             task_block_uses_engine_and_model = True
             engine = block.engine
-        block_uses_model = task_block_uses_engine_and_model or isinstance(
-            block,
-            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock),
+        block_uses_model = (
+            task_block_uses_engine_and_model
+            or isinstance(block, (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock))
+            or (isinstance(block, WebSearchBlock) and bool(block.prompt and block.prompt.strip()))
         )
         model = block.model if block_uses_model else None
         feature_names.update(
@@ -6993,6 +7000,12 @@ class WorkflowService:
         in_process_script_execution_denied = False
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
+
+        if any(block.block_type == BlockType.WEB_SEARCH for block in all_blocks) and not any(
+            is_block_type_cacheable(block) for block in top_level_blocks
+        ):
+            script = None
+            is_script_run = False
 
         # Resolve the workflow-block engine A/B once, before any block runs: eligibility is a
         # property of the whole run (see v3_ab_ineligibility_reason), and every block of a run must

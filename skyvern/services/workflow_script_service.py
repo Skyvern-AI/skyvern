@@ -58,6 +58,16 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 }
 
 
+def _contains_web_search(block: Any) -> bool:
+    block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
+    if block_type == BlockType.WEB_SEARCH:
+        return True
+    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
+        children = block.get("loop_blocks", []) if isinstance(block, dict) else block.loop_blocks
+        return any(_contains_web_search(child) for child in children)
+    return False
+
+
 def is_block_type_cacheable(block: Any) -> bool:
     """Whether a block instance is eligible for script caching.
 
@@ -72,6 +82,8 @@ def is_block_type_cacheable(block: Any) -> bool:
     """
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
     if block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED:
+        return False
+    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP} and _contains_web_search(block):
         return False
     if block_type == BlockType.EXTRACTION:
         export_enabled = (

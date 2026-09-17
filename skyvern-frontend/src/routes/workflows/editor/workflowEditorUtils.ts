@@ -51,6 +51,7 @@ import {
   URLBlockYAML,
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
+  WebSearchBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
   EmailInboxBlockYAML,
@@ -136,6 +137,7 @@ import {
   validateUrl,
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
+import { webSearchNodeDefaultData } from "./nodes/WebSearchNode/types";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import { analyzeCodeBlockErrorCodes } from "./codeBlockErrorCodeDiagnostics";
@@ -1187,6 +1189,22 @@ function convertToNode(
         data: {
           ...commonData,
           url: block.url,
+        },
+      };
+    }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...commonData,
+          query: block.query,
+          provider: block.provider ?? "auto",
+          numResults: block.num_results ?? 10,
+          prompt: block.prompt ?? "",
+          jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -2754,6 +2772,17 @@ function createNode(
         },
       };
     }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...webSearchNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "http_request": {
       return {
         ...identifiers,
@@ -3426,6 +3455,18 @@ function getWorkflowBlock(
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "web_search": {
+      return {
+        ...base,
+        block_type: "web_search",
+        query: node.data.query,
+        provider: node.data.provider,
+        num_results: node.data.numResults,
+        prompt: node.data.prompt || null,
+        json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "http_request": {
@@ -4902,6 +4943,20 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "web_search": {
+        const blockYaml: WebSearchBlockYAML = {
+          ...base,
+          block_type: "web_search",
+          model: block.model,
+          query: block.query,
+          provider: block.provider,
+          num_results: block.num_results,
+          prompt: block.prompt,
+          json_schema: block.json_schema,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "http_request": {
         const blockYaml: HttpRequestBlockYAML = {
           ...base,
@@ -5336,6 +5391,28 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(
         `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
       );
+    }
+  });
+
+  nodes.forEach((node) => {
+    if (node.type !== "web_search") return;
+    if (!node.data.query.trim()) {
+      errors.push(`${node.data.label}: Search query is required.`);
+    }
+    if (
+      !Number.isInteger(node.data.numResults) ||
+      node.data.numResults < 1 ||
+      node.data.numResults > 100
+    ) {
+      errors.push(
+        `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
+      );
+    }
+    if (node.data.prompt.trim()) {
+      const result = validateJson(node.data.jsonSchema);
+      if (!result.valid) {
+        errors.push(`${node.data.label}: Data schema - ${result.message}`);
+      }
     }
   });
 

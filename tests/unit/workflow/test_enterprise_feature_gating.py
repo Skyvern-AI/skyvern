@@ -15,6 +15,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     SplitPdfBlock,
     TaskV2Block,
+    WebSearchBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
@@ -199,8 +200,26 @@ def test_collects_direct_run_enterprise_features() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    workflow = _workflow([_navigation_block("openai", engine=RunEngine.openai_cua)])
+@pytest.mark.parametrize("finally_search", [False, True])
+async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(
+    monkeypatch: pytest.MonkeyPatch, finally_search: bool
+) -> None:
+    block_labels = None
+    feature_names = {"OpenAI CUA"}
+    if finally_search:
+        search = WebSearchBlock(
+            label="search",
+            query="example",
+            prompt="Summarize",
+            output_parameter=_output_parameter("search_output"),
+            model={"model_name": "claude-opus-5"},
+        )
+        workflow = _workflow([_navigation_block("plain"), search])
+        workflow.workflow_definition.finally_block_label = "search"
+        block_labels = ["plain"]
+        feature_names = {"Anthropic Claude Opus 5"}
+    else:
+        workflow = _workflow([_navigation_block("openai", engine=RunEngine.openai_cua)])
     workflow_run = SimpleNamespace(
         workflow_run_id="wr_1",
         workflow_id=workflow.workflow_id,
@@ -223,13 +242,17 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
     organization = SimpleNamespace(organization_id="org")
     agent_function = SimpleNamespace(
         validate_enterprise_feature_access=AsyncMock(
-            side_effect=DisabledBlockExecutionError("Enterprise plan required for OpenAI CUA")
+            side_effect=DisabledBlockExecutionError("Enterprise plan required")
         )
     )
     monkeypatch.setattr(service_module.app, "AGENT_FUNCTION", agent_function)
     monkeypatch.setattr(service_module.workflow_script_service, "workflow_has_conditionals", lambda _workflow: False)
 
     svc = WorkflowService()
+    dispatch = AsyncMock()
+    finally_dispatch = AsyncMock()
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", dispatch)
+    monkeypatch.setattr(svc, "_execute_finally_block_if_configured", finally_dispatch)
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=workflow_run))
     monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
     mark_workflow_run_as_failed = AsyncMock(return_value=failed_workflow_run)
@@ -241,12 +264,15 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         workflow_run_id="wr_1",
         api_key="api_key",
         organization=organization,
+        block_labels=block_labels,
     )
 
+    dispatch.assert_not_awaited()
+    finally_dispatch.assert_not_awaited()
     assert result is failed_workflow_run
     agent_function.validate_enterprise_feature_access.assert_awaited_once_with(
         organization_id="org",
-        feature_names={"OpenAI CUA"},
+        feature_names=feature_names,
     )
     mark_workflow_run_as_failed.assert_awaited_once()
     clean_up_workflow.assert_awaited_once_with(
@@ -258,3 +284,47 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         need_call_webhook=True,
         attempt_number=1,
     )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_features"),
+    [
+        (None, set()),
+        ("", set()),
+        ("   ", set()),
+        ("Summarize", {"Anthropic Claude Opus 5"}),
+        ("{{ instructions }}", {"Anthropic Claude Opus 5"}),
+    ],
+)
+def test_web_search_gates_enterprise_model_only_when_prompt_is_present(
+    prompt: str | None, expected_features: set[str]
+) -> None:
+    search = WebSearchBlock(
+        label="search",
+        query="site:example.com docs",
+        prompt=prompt,
+        output_parameter=_output_parameter("search_output"),
+        model={"model_name": "claude-opus-5"},
+    )
+
+    assert _collect_enterprise_gated_workflow_features(_workflow([search])) == expected_features
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_partial_run_collects_finally_search_model(nested: bool) -> None:
+    search = WebSearchBlock(
+        label="search",
+        query="example",
+        prompt="Summarize",
+        output_parameter=_output_parameter("search_output"),
+        model={"model_name": "claude-opus-5"},
+    )
+    finally_block = (
+        ForLoopBlock(label="cleanup", output_parameter=_output_parameter("cleanup_output"), loop_blocks=[search])
+        if nested
+        else search
+    )
+    workflow = _workflow([_navigation_block("plain"), finally_block])
+    workflow.workflow_definition.finally_block_label = finally_block.label
+
+    assert _collect_enterprise_gated_workflow_features(workflow, block_labels=["plain"]) == {"Anthropic Claude Opus 5"}

@@ -109,6 +109,7 @@ describe("BLOCK_FORMS dispatcher", () => {
         "human_interaction",
         "url",
         "http_request",
+        "web_search",
         "printPage",
         "workflowTrigger",
         "googleSheetsRead",
@@ -119,7 +120,7 @@ describe("BLOCK_FORMS dispatcher", () => {
         "emailInbox",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(30);
+    expect(BLOCK_FORM_KEYS).toHaveLength(31);
   });
 
   test("conditional routes to a sidebar form that shows branch prompts", () => {

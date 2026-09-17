@@ -16,6 +16,7 @@ import { FileParserBlockForm } from "./BlockConfigForm/FileParserBlockForm";
 import { FileUploadBlockForm } from "./BlockConfigForm/FileUploadBlockForm";
 import { GoogleSheetsReadBlockForm } from "./BlockConfigForm/GoogleSheetsReadBlockForm";
 import { GoogleSheetsWriteBlockForm } from "./BlockConfigForm/GoogleSheetsWriteBlockForm";
+import { WebSearchBlockForm } from "./BlockConfigForm/WebSearchBlockForm";
 import { HttpRequestBlockForm } from "./BlockConfigForm/HttpRequestBlockForm";
 import { HumanInteractionBlockForm } from "./BlockConfigForm/HumanInteractionBlockForm";
 import { LoginBlockForm } from "./BlockConfigForm/LoginBlockForm";
@@ -64,6 +65,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   human_interaction: HumanInteractionBlockForm,
   url: URLBlockForm,
   http_request: HttpRequestBlockForm,
+  web_search: WebSearchBlockForm,
   printPage: PrintPageBlockForm,
   pdfFill: PdfFillBlockForm,
   workflowTrigger: WorkflowTriggerBlockForm,

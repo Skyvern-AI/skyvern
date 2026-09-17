@@ -171,6 +171,7 @@ export type BlockYAML =
   | Taskv2BlockYAML
   | URLBlockYAML
   | HttpRequestBlockYAML
+  | WebSearchBlockYAML
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
   | EmailInboxBlockYAML
@@ -491,6 +492,17 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
 export type URLBlockYAML = BlockYAMLBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type WebSearchBlockYAML = BlockYAMLBase & {
+  block_type: "web_search";
+  model?: WorkflowModel | null;
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameter_keys?: Array<string> | null;
 };
 
 export type HttpRequestBlockYAML = BlockYAMLBase & {
