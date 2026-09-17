@@ -626,9 +626,9 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(STUDIO_PATH);
 
     const recordTaskButton = screen.getByRole("button", {
-      name: "Record task",
+      name: "Record Task",
     });
-    expect(recordTaskButton.textContent).toContain("Record task");
+    expect(recordTaskButton.textContent).toContain("Record Task");
     fireEvent.click(recordTaskButton);
 
     expect(startRecording).toHaveBeenCalledOnce();
@@ -726,7 +726,7 @@ describe("BrowserTab pills and selection sync", () => {
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
     for (const name of [
-      "Record task",
+      "Record Task",
       "Reconnect browser stream",
       "Open browser in new tab",
       "Turn off browser",

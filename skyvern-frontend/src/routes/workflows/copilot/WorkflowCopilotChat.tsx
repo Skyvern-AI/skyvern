@@ -5792,7 +5792,7 @@ export function WorkflowCopilotChat({
                         content={
                           recordTaskDisabled
                             ? (authoringUnavailableReason ??
-                              "Record task is available when the browser is ready")
+                              "Record Task is available when the browser is ready")
                             : "Demonstrate the task in the browser"
                         }
                         blocked={recordTaskDisabled}
@@ -5801,7 +5801,7 @@ export function WorkflowCopilotChat({
                       >
                         <button
                           type="button"
-                          aria-label="Record task"
+                          aria-label="Record Task"
                           className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={recordTaskDisabled}
                           onClick={onRecordTask}
@@ -5811,7 +5811,7 @@ export function WorkflowCopilotChat({
                           </span>
                           <span className="min-w-0">
                             <span className="block font-medium text-foreground">
-                              Record task
+                              Record Task
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
                               Demonstrate it in the browser and create workflow

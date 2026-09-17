@@ -505,7 +505,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("Start a new chat")).toBeTruthy(),
     );
     expect(screen.getByText("Upload an SOP")).toBeTruthy();
-    expect(screen.getByText("Record task")).toBeTruthy();
+    expect(screen.getByText("Record Task")).toBeTruthy();
     const actionLayout = screen.getByRole("button", {
       name: "Upload an SOP",
     }).parentElement?.parentElement;
@@ -527,7 +527,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     });
     expect(onUploadSOP).toHaveBeenCalledWith(file);
 
-    fireEvent.click(screen.getByRole("button", { name: "Record task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Record Task" }));
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
@@ -550,7 +550,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("Uploading SOP…")).toBeTruthy(),
     );
     const recordTaskButton = screen.getByRole("button", {
-      name: "Record task",
+      name: "Record Task",
     });
     expect(recordTaskButton.hasAttribute("disabled")).toBe(true);
     expect(recordTaskButton.parentElement?.getAttribute("tabindex")).toBe("0");
