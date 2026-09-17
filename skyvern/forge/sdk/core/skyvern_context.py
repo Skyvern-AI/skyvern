@@ -348,6 +348,10 @@ class SkyvernContext:
     # this like workflow_block_engine_lock or one task's refs stomp another's mid-flight.
     opaque_url_refs: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
+    # Empty-page recovery: the step whose plan was replaced by an internal-recovery
+    # ClosePageAction, and a per-task consecutive-attempt counter that caps recovery at 3.
+    empty_page_recovery_step_id: str | None = None
+    empty_page_recovery_attempts: dict[str, int] = field(default_factory=dict)
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
     max_screenshot_scrolls: int | None = None
@@ -738,6 +742,13 @@ class SkyvernContext:
         else:
             del self.download_popup_claims[task_id]
         return True
+
+    def has_download_popup_claim(self, task_id: str, page: Page) -> bool:
+        """Identity read: is this exact Page still held as a task-scoped download-popup claim."""
+        claims = self.download_popup_claims.get(task_id)
+        if not claims:
+            return False
+        return any(existing is page for existing in claims)
 
     def take_download_popup_claims(self, task_id: str) -> list[Page]:
         return self.download_popup_claims.pop(task_id, [])

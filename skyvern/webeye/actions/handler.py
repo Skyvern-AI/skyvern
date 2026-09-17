@@ -168,6 +168,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     CheckboxAction,
     ClickAction,
+    ClosePageAction,
     CompleteVerifyResult,
     DownloadFileAction,
     InputOrSelectContext,
@@ -225,6 +226,8 @@ from skyvern.webeye.scraper.scraped_page import (
 from skyvern.webeye.scraper.scraper import (
     IncrementalScrapePage,
     hash_element,
+    page_is_dead_blank,
+    page_is_http_survivor,
     structural_identity,
     trim_element_tree,
 )
@@ -4604,8 +4607,15 @@ class ActionHandler:
         # download credit. Identity-based, before any action-specific branch so it covers the false-click,
         # explicit-download, and non-download paths alike; recovery rebinds and switch-tab adoption are the
         # next action entry's transfer, not this one.
+        # An internal-recovery close must NOT retire the dead page's claim here: the recovery guard
+        # below reads it to fail closed on a claimed download popup, so retiring it would blind that
+        # check and let recovery close a page that is still capturing a download.
         _reuse_owning_context = skyvern_context.current()
-        if _reuse_owning_context is not None and _reuse_owning_context.discard_download_popup_claim(task.task_id, page):
+        if (
+            not (isinstance(action, ClosePageAction) and action.is_internal_recovery)
+            and _reuse_owning_context is not None
+            and _reuse_owning_context.discard_download_popup_claim(task.task_id, page)
+        ):
             with contained_effect("retire reused download popup claim"):
                 LOG.info(
                     "Retired download popup claim for reused page",
@@ -10767,6 +10777,24 @@ async def handle_close_page_action(
     step: Step,
 ) -> list[ActionResult]:
     target_page = page
+    if action.is_internal_recovery:
+        # Sub-second, LLM-free recheck against the page as it is now: only close it if it is still a
+        # dead blank, another usable page survives, and it holds no download-popup claim. Any drift
+        # declines with a non-terminal failure so the next cycle re-detects.
+        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        ctx = skyvern_context.current()
+        pages = await browser_state.list_valid_pages(max_pages=0) if browser_state is not None else []
+        if (
+            not page_is_dead_blank(page)
+            or not any(p is not page and page_is_http_survivor(p) for p in pages)
+            or (ctx is not None and ctx.has_download_popup_claim(task.task_id, page))
+        ):
+            return [
+                ActionFailure(
+                    Exception("recovery close declined: page state changed"),
+                    stop_execution_on_failure=False,
+                )
+            ]
     if action.tab_index is not None:
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is None:

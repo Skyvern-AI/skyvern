@@ -3,6 +3,7 @@ import copy
 import json
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -35,7 +36,7 @@ from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -516,6 +517,23 @@ def _record_scrape_span_attrs(
         span.set_attribute("screenshots_consumed", ctx.scrape_screenshots_consumed)
 
 
+def page_has_meaningful_child_frame(page: Page) -> bool:
+    # Blank/empty frame urls (ad iframes, tracking pixels, detached frames) don't make a blank page
+    # scrapeable; a real child frame (e.g. an Edge PDF interstitial rendered on about:blank) does.
+    return any(f.url and f.url not in ("about:blank", "") for f in page.main_frame.child_frames)
+
+
+def page_is_dead_blank(page: Page) -> bool:
+    return page.url in BLANK_PAGE_URLS and not page_has_meaningful_child_frame(page)
+
+
+def page_is_http_survivor(page: Page) -> bool:
+    # A usable fallback target: an open http/https page. Blank (":"/"about:blank") and
+    # chrome-error:// pages are not survivors, so recovery stays fail-closed when only dead pages
+    # remain (planning and execution-time rechecks share this one definition).
+    return not page.is_closed() and urlparse(page.url).scheme in ("http", "https")
+
+
 @traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -555,17 +573,13 @@ async def scrape_web_unsafe(
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
     url = page.url
-    if url == "about:blank" and not support_empty_page:
-        # Allow scraping if the page has child frames with meaningful content
-        # (e.g., Edge PDF interstitial pages render content via iframes on about:blank).
-        # Filter out empty/blank frames (ad iframes, tracking pixels, detached frames).
-        meaningful_frames = [f for f in page.main_frame.child_frames if f.url and f.url not in ("about:blank", "")]
-        if not meaningful_frames:
+    if url in BLANK_PAGE_URLS and not support_empty_page:
+        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
+        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
+        # is a dead blank and must fail classification so the caller can recover or fail closed.
+        if not page_has_meaningful_child_frame(page):
             raise ScrapingFailedBlankPage()
-        LOG.info(
-            "about:blank page has meaningful child frames, proceeding with scraping",
-            frame_count=len(meaningful_frames),
-        )
+        LOG.info("blank page has meaningful child frames, proceeding with scraping")
 
     skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
     await _wait_for_scrape_ready(skyvern_frame)
