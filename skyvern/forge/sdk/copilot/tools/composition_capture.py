@@ -12,11 +12,17 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.forge.sdk.copilot.challenge_evidence import ChallengeKind, challenge_evidence_unsettled
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_FRAMES_KEY,
+    ChallengeKind,
+    challenge_evidence_unsettled,
+    stamp_challenge_frame_fact,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    DECLARED_IFRAME_SRC_EXPRESSION,
     value_witness_read_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -49,6 +55,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_page_custody_lock,
     clear_sensitive_origin_page_taint,
     effective_browser_session_id,
+    resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
 )
@@ -119,6 +126,8 @@ def _capture_result_parts(
 
 
 _POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
+_POST_RUN_CHILD_FRAME_READ_TIMEOUT_SECONDS = 5.0
+_MAX_POST_RUN_FRAME_URLS = 64
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -941,6 +950,50 @@ async def _capture_composition_evidence(
     return CompositionEvidenceCapture(evidence, None, frame)
 
 
+async def _run_session_child_frame_urls(ctx: CopilotContext, run_session_id: str) -> tuple[list[str], bool] | None:
+    """URLs of every committed non-main frame (nested included) plus the top document's ``iframe@src`` values, and
+    whether both reads succeeded uncapped. ``None`` when neither read succeeded, which is not a page with no frames."""
+    # The session manager owns the attach bound (decision 0032); the deadline covers only the page reads.
+    browser_state = await resolve_browser_state_for_context(ctx, session_id=run_session_id)
+    deadline = time.monotonic() + _POST_RUN_CHILD_FRAME_READ_TIMEOUT_SECONDS
+    page = (
+        await asyncio.wait_for(browser_state.get_working_page(), timeout=max(0.0, deadline - time.monotonic()))
+        if browser_state is not None
+        else None
+    )
+    if page is None:
+        return None
+    frame_urls: list[str] = []
+    committed_read = False
+    truncated = False
+    try:
+        # ``main_frame`` raises on the raw-CDP facade until a main frame id is bound, which would
+        # otherwise take the iframe-src read down with it.
+        main_frame = page.main_frame
+        child_urls = [frame.url for frame in page.frames if frame is not main_frame]
+        truncated = len(child_urls) > _MAX_POST_RUN_FRAME_URLS
+        frame_urls.extend(child_urls[:_MAX_POST_RUN_FRAME_URLS])
+        committed_read = True
+    except Exception:
+        LOG.debug("Post-run child frame list read failed", exc_info=True)
+    declared_read = False
+    try:
+        # The element read is awaited after the committed list is already in hand, so a timeout here
+        # narrows the record to a partial read instead of discarding the frames that were read.
+        declared = await asyncio.wait_for(
+            page.evaluate(DECLARED_IFRAME_SRC_EXPRESSION), timeout=max(0.0, deadline - time.monotonic())
+        )
+        if isinstance(declared, list):
+            truncated = truncated or len(declared) > _MAX_POST_RUN_FRAME_URLS
+            frame_urls.extend(src for src in declared[:_MAX_POST_RUN_FRAME_URLS] if isinstance(src, str) and src)
+            declared_read = True
+    except Exception:
+        LOG.debug("Post-run iframe src read failed", exc_info=True)
+    if not committed_read and not declared_read:
+        return None
+    return list(dict.fromkeys(frame_urls)), committed_read and declared_read and not truncated
+
+
 async def _read_run_session_page_evidence(
     ctx: CopilotContext,
     *,
@@ -963,6 +1016,19 @@ async def _read_run_session_page_evidence(
             LOG.debug("Post-run run-session page capture failed", exc_info=True)
             observation_error = observation_error or "Post-run page capture against the run session failed."
             evidence = None
+        if isinstance(evidence, dict):
+            frame_read: tuple[list[str], bool] | None = None
+            try:
+                frame_read = await _run_session_child_frame_urls(ctx, run_session_id)
+            except Exception:
+                LOG.debug("Post-run child frame read failed", exc_info=True)
+            # An unreadable frame list stamps the read as failed rather than dropping the packet the
+            # capture already produced.
+            evidence = stamp_challenge_frame_fact(
+                evidence,
+                frame_read[0] if frame_read is not None else None,
+                complete=frame_read[1] if frame_read is not None else False,
+            )
 
     if not observed_session_id:
         # An unknown source id grants post-run identity, so an unprovable source drops the packet
@@ -999,6 +1065,10 @@ def store_post_run_page_evidence(
         run_id=run_id,
         run_browser_session_id=run_browser_session_id,
     )
+    # A path that stored a packet without reading frames records that, rather than leaving the key
+    # absent for a reader to mistake for a page that mounted no challenge frame.
+    if CHALLENGE_FRAMES_KEY not in stamped:
+        stamped = stamp_challenge_frame_fact(stamped, None)
     LOG.info(
         "copilot_post_run_page_evidence_sourced",
         run_id=run_id,

@@ -1689,7 +1689,7 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             follow_up = _SKYVERN_EGRESS_FOLLOW_UP
         contract = ctx.latest_diagnosis_repair_contract
         recorded_run = f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}."
-        if contract is not None and (contract.challenge is not None or contract.levers):
+        if contract is not None and contract.levers:
             # The packet carried the wall's effects and levers, so the model's own reply names what
             # the product can do; the harness only keeps the recorded-run sentence in front of it,
             # which states the failure before anything the model wrote. Judging that prose for
