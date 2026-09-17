@@ -9,7 +9,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type StudioPaneId } from "./panes";
 import { paneAccessibleName } from "./paneMeta";
 import { paneExpansionKeyframes } from "./paneLayout";
-import { panesAfterRecordingTransition } from "./recordingPaneLifecycle";
+import {
+  advanceRecordingStopLifecycle,
+  panesAfterRecordingTransition,
+} from "./recordingPaneLifecycle";
 import { EmbeddedBrowserOverlays, StudioPane } from "./StudioShell";
 
 vi.mock("./useRunVisuals", () => ({
@@ -41,7 +44,7 @@ describe("panesAfterRecordingTransition", () => {
   test("replaces the Editor with Browser and Copilot when recording starts", () => {
     expect(
       panesAfterRecordingTransition(["overview", "editor"], "started"),
-    ).toEqual(["overview", "copilot", "browser"]);
+    ).toEqual(["overview", "browser", "copilot"]);
   });
 
   test("replaces Browser with Editor when a recording starts processing", () => {
@@ -50,13 +53,61 @@ describe("panesAfterRecordingTransition", () => {
         ["overview", "copilot", "browser"],
         "processing",
       ),
-    ).toEqual(["overview", "copilot", "editor"]);
+    ).toEqual(["overview", "editor", "copilot"]);
   });
 
-  test("restores Editor but leaves Browser open when recording ends without processing", () => {
+  test("restores Editor but leaves Browser open when recording is discarded", () => {
     expect(
       panesAfterRecordingTransition(["copilot", "browser"], "ended"),
-    ).toEqual(["copilot", "browser", "editor"]);
+    ).toEqual(["browser", "editor", "copilot"]);
+  });
+
+  test("remembers zero-action Done without leaking into the next Discard", () => {
+    let lifecycle = advanceRecordingStopLifecycle(false, {
+      isRecording: true,
+      wasRecording: false,
+      finishRequested: false,
+      processingRecording: false,
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: true,
+      wasRecording: true,
+      finishRequested: true,
+      processingRecording: true,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: true,
+      transition: null,
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: false,
+      wasRecording: true,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: false,
+      transition: "processing",
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: true,
+      wasRecording: false,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: false,
+      wasRecording: true,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: false,
+      transition: "ended",
+    });
   });
 
   test("does not duplicate panes already in the requested layout", () => {
@@ -65,7 +116,7 @@ describe("panesAfterRecordingTransition", () => {
         ["copilot", "browser", "editor"],
         "started",
       ),
-    ).toEqual(["copilot", "browser"]);
+    ).toEqual(["browser", "copilot"]);
   });
 });
 
