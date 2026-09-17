@@ -590,6 +590,24 @@ def test_finalize_context_persists_carried_trajectory() -> None:
     ]
 
 
+def test_carried_trajectory_keeps_the_challenge_a_click_raised() -> None:
+    carry = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "click",
+                "selector": "#submit-search",
+                "source_url": "https://records.example.test/search",
+                "result_url": "https://records.example.test/search",
+                "observed_effects": {"url_changed": False, "challenge_raised": True},
+                "challenge_vendor": "turnstile",
+            }
+        ]
+    )
+
+    assert carry[0]["observed_effects"] == {"url_changed": False, "challenge_raised": True}
+    assert carry[0]["challenge_vendor"] == "turnstile"
+
+
 def test_carried_trajectory_records_credential_field_inventory() -> None:
     carry = _carried_trajectory_from_scout_trajectory(
         [

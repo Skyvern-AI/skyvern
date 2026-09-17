@@ -57,6 +57,32 @@ def test_analyze_maps_page_evaluate_and_other_recorder_calls_to_action_types():
     ]
 
 
+def test_analyze_maps_the_bare_solve_captcha_builtin_to_a_step_with_its_line():
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    await page.get_by_role('button', name='Search').click()\n"
+        "    await solve_captcha(page)\n"
+        "    await page.get_by_role('button', name='Continue').click()\n"
+    )
+    spans = analyze_code_actions(code)
+    assert [(s.action_type, s.line_start) for s in spans] == [
+        ("goto_url", 2),
+        ("click", 3),
+        ("solve_captcha", 4),
+        ("click", 5),
+    ]
+    solve = spans[2]
+    assert solve.receiver == ""
+    assert solve.first_arg is None
+    assert solve.prompt is None
+
+
+def test_analyze_ignores_a_bare_call_that_is_not_a_code_block_builtin():
+    code = "async def run(page):\n    await fetch_rows(page)\n    await page.click('#next')\n"
+    assert [(s.action_type, s.line_start) for s in analyze_code_actions(code)] == [("click", 3)]
+
+
 def test_derive_steps_surfaces_page_evaluate_with_a_label():
     code = (
         "async def run(page):\n"

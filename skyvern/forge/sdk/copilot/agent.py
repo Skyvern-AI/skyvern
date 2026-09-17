@@ -229,7 +229,10 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     hydrate_prior_run_packet,
     run_workflow_end_to_end,
 )
-from skyvern.forge.sdk.copilot.tools.scouting import hydrate_prior_carried_trajectory
+from skyvern.forge.sdk.copilot.tools.scouting import (
+    _release_scout_challenge_listeners,
+    hydrate_prior_carried_trajectory,
+)
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     publish_workflow_candidate,
     restore_pending_workflow_proposal,
@@ -4995,6 +4998,11 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
+                if turn_end_ctx is not None:
+                    # A click cancelled or failed between its pre-hook and post-hook never reaches the
+                    # post-hook's release, which would leave its frame listener on the persistent page
+                    # holding this context. Released before the driver detaches, while the page is live.
+                    _release_scout_challenge_listeners(turn_end_ctx)
                 if turn_end_ctx is not None and turn_end_ctx.attached_browser_drivers:
                     # Concurrently, so one session's wedged detach can neither skip the sessions
                     # behind it nor stack another cleanup timeout onto the turn's exit.

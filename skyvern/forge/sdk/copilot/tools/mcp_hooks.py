@@ -101,6 +101,7 @@ from .page_observation import (
 )
 from .scouting import (
     _SCOUT_RESULT_CHAR_CAP,
+    _arm_scout_challenge_listener,
     _arm_scout_download_listener,
     _arm_scout_popup_listener,
     _attach_evaluate_page_facts,
@@ -111,8 +112,10 @@ from .scouting import (
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _clear_pending_scout_selector_facts,
+    _close_scout_challenge_baseline,
     _consume_scout_source_url,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_observed_challenge,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
     _page_evidence_location_fingerprint,
@@ -122,10 +125,12 @@ from .scouting import (
     _record_scout_trajectory_fact,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
+    _release_scout_challenge_listeners,
     _resolve_scout_role_name,
     _scout_act_observe_page_evidence,
     _scout_session_download_names,
     _shed_scout_page_summary_section,
+    _start_scout_challenge_settle,
     record_signed_out_page_observation,
 )
 
@@ -565,6 +570,7 @@ _MODEL_SCOUT_FACT_KEYS = (
     "source_url",
     "result_url",
     "observed_effects",
+    "challenge_vendor",
     "observed_wait_ms",
     "observation_step",
     "input_id",
@@ -731,19 +737,27 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
+    ctx.pending_scout_challenge_frames = []
+    ctx.pending_scout_challenge_prior_frames = []
+    ctx.pending_scout_challenge_armed_at = None
+    ctx.pending_scout_click_records = []
+    _release_scout_challenge_listeners(ctx)
     sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
     await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
-    if not selector:
-        return None
-    ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
-        await _arm_scout_download_listener(ctx)
-        await _arm_scout_popup_listener(ctx)
+    # Armed before the selector check: an intent or coordinate click carries no selector going in but
+    # reports the element it resolved, and the challenge it raises is recorded against that.
+    await _arm_scout_challenge_listener(ctx)
+    if selector:
+        ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
+            await _arm_scout_download_listener(ctx)
+            await _arm_scout_popup_listener(ctx)
+    await _close_scout_challenge_baseline(ctx)
     return None
 
 
@@ -967,6 +981,20 @@ async def _click_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _start_scout_challenge_settle(ctx)
+    try:
+        return await _click_post_hook_body(result, raw, ctx)
+    finally:
+        ctx.pending_scout_challenge_frames = []
+        ctx.pending_scout_challenge_armed_at = None
+        _release_scout_challenge_listeners(ctx)
+
+
+async def _click_post_hook_body(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
     page_evidence: dict[str, Any] | None = None
@@ -1055,6 +1083,7 @@ async def _click_post_hook(
             # href-shape prediction — and is the only source that sees a command-URL download.
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(ctx, result, page_evidence)
         elif ctx.last_scout_act_observe_outcome == "unchanged":
@@ -1103,7 +1132,11 @@ async def _click_post_hook(
             page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
             if page_evidence is not None:
                 _attach_scout_page_summary(ctx, result, page_evidence)
+        # A handler can mount a challenge and then stall the navigation the click was waiting on.
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
         _bound_failed_click_result(ctx, result)
+    else:
+        await _maybe_attach_observed_challenge(ctx, result, url=source_url or "")
     # The round-trip is skipped only when the evidence positively names the obstruction a frame
     # would have shown; evidence that merely parsed is not a substitute for looking at the page.
     if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):

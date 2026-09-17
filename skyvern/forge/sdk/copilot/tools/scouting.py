@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 from urllib.parse import urlparse, urlsplit
 
 import structlog
-from playwright.async_api import BrowserContext, Download, Page, Response
+from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -90,6 +90,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -951,7 +952,14 @@ def _record_scouted_interaction(
     interactions.append(artifact)
     ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
 
-    _record_scout_trajectory_fact(ctx, artifact)
+    recorded = _record_scout_trajectory_fact(ctx, artifact)
+    if artifact["tool_name"] == "click":
+        # Both collections hold their own object for this click, and an effect observed after the
+        # fact updates these rather than re-finding them by an identity the scrub may have removed.
+        click_records: list[ScoutedInteraction] = [artifact]
+        if recorded is not None:
+            click_records.append(recorded)
+        ctx.pending_scout_click_records = click_records
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -2027,6 +2035,153 @@ async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
         LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
 
 
+_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
+
+
+def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
+    for detach in ctx.pending_scout_challenge_detachers:
+        try:
+            detach()
+        except Exception:
+            LOG.debug("copilot_scout_challenge_listener_detach_failed", exc_info=True)
+    ctx.pending_scout_challenge_detachers = []
+
+
+# A managed widget preloads small and grows when it actually challenges, so "rendered" cannot mean
+# "has a box": a 1x1 iframe measures 25 once default borders are counted. Anything at or under this
+# much on-screen area is a placeholder rather than a challenge a person could answer.
+# ponytail: one sentinel for every vendor — revisit if a vendor's real widget ships smaller than 16x16.
+_CHALLENGE_FRAME_PLACEHOLDER_AREA = 256.0
+
+# Layout area is not screen area: a widget preloaded at full size can sit off-viewport, inside a
+# zero-size overflow:hidden ancestor, under a clip-path, behind visibility:hidden, or under an
+# opacity:0 ancestor, and still report its whole box. checkVisibility answers the style half;
+# IntersectionObserver answers the geometry half, ancestor clip rects included, so neither the
+# viewport nor a clipping container has to be walked by hand.
+_CHALLENGE_FRAME_ONSCREEN_AREA_JS = """
+el => {
+  if (el.checkVisibility && !el.checkVisibility({
+    opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
+  })) return 0;
+  return new Promise(resolve => {
+    let observer = null;
+    let timer = null;
+    const done = area => {
+      if (observer) observer.disconnect();
+      if (timer) clearTimeout(timer);
+      resolve(area);
+    };
+    observer = new IntersectionObserver(entries => {
+      const rect = entries[entries.length - 1].intersectionRect;
+      done(rect.width * rect.height);
+    });
+    timer = setTimeout(() => done(null), 1000);
+    observer.observe(el);
+  });
+}
+"""
+
+
+_ELEMENT_STYLE_VISIBLE_JS = """
+el => !el.checkVisibility || el.checkVisibility({
+  opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
+})
+"""
+
+
+async def _frame_element_style_visible(frame: Frame) -> bool:
+    try:
+        element = await frame.frame_element()
+        return bool(await element.evaluate(_ELEMENT_STYLE_VISIBLE_JS))
+    except Exception:
+        return False
+
+
+async def _embedding_frames_style_visible(frame: Frame) -> bool:
+    """Whether every iframe embedding this one, up to the top page, is visible by style.
+
+    The observer's implicit root already clips geometry through each ancestor frame, but style is judged
+    per document: an opacity:0 or visibility:hidden iframe further up still lets this frame report its
+    full box. An ancestor that cannot be read counts as hidden.
+    """
+    ancestors: list[Frame] = []
+    current = frame.parent_frame
+    while current is not None and current.parent_frame is not None:
+        ancestors.append(current)
+        current = current.parent_frame
+    return all(await asyncio.gather(*(_frame_element_style_visible(ancestor) for ancestor in ancestors)))
+
+
+# The script's own timer cannot fire in a renderer that never yields, and the click pre-hook runs outside
+# the MCP call timeout, so the deadline is held here.
+_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+async def _challenge_frame_rendered_area(frame: Frame) -> float | None:
+    """On-screen area of the frame's own element, or None when it cannot be measured in time."""
+    try:
+        return await asyncio.wait_for(
+            _measure_challenge_frame_area(frame), timeout=_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return None
+
+
+async def _measure_challenge_frame_area(frame: Frame) -> float | None:
+    element = await frame.frame_element()
+    area = await element.evaluate(_CHALLENGE_FRAME_ONSCREEN_AREA_JS)
+    if area is None:
+        return None
+    if not await _embedding_frames_style_visible(frame):
+        return 0.0
+    return float(area)
+
+
+async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
+    """Arm a frame-navigation listener for the click about to dispatch.
+
+    A widget already mounted before the click is not this click's effect, so only navigations
+    inside the click's window count; main-frame navigations are left to ``url_changed`` and the
+    page summary. A preloaded widget the click merely reveals never navigates, so its rendered area
+    is measured here and compared after the settle."""
+    _release_scout_challenge_listeners(ctx)
+    ctx.pending_scout_challenge_frames = []
+    ctx.pending_scout_challenge_prior_frames = []
+    ctx.pending_scout_challenge_armed_at = None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+        # A widget already showing a vendor URL re-navigates to refresh its token, and that fires
+        # framenavigated on the same frame — which is the widget's own upkeep, not this click.
+        already_challenged = [
+            frame
+            for frame in page.frames
+            if frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+        ]
+
+        def _capture(frame: Frame) -> None:
+            if frame.parent_frame is None:
+                return
+            baseline = (seen for seen, _area in ctx.pending_scout_challenge_prior_frames)
+            if any(frame is seen for seen in (*already_challenged, *baseline, *ctx.pending_scout_challenge_frames)):
+                return
+            if _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or ""):
+                ctx.pending_scout_challenge_frames.append(frame)
+
+        # Listening before the measurement below yields, so a frame that mounts while it runs is still seen.
+        page.on("framenavigated", _capture)
+        ctx.pending_scout_challenge_detachers.append(lambda: page.remove_listener("framenavigated", _capture))
+        ctx.pending_scout_challenge_armed_at = time.monotonic()
+        # Measured together: each reading stops itself after its observer timeout, so a page with several
+        # vendor frames costs one bound before the click dispatches rather than one per frame.
+        prior_areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in already_challenged))
+        ctx.pending_scout_challenge_prior_frames = list(zip(already_challenged, prior_areas, strict=True))
+    except Exception:
+        LOG.warning("copilot_scout_challenge_listener_failed", exc_info=True)
+
+
 # Bounded so a page that stalls the probe cannot spend the turn budget one click at a time.
 _RENDER_PROBE_TIMEOUT_MS = 5000.0
 
@@ -2035,27 +2190,29 @@ def _attach_observed_click_effect(
     ctx: AgentContext,
     result: dict[str, Any],
     *,
-    selector: str,
     effect: str,
+    challenge_vendor: str | None = None,
 ) -> None:
-    """Attach a browser-observed click effect without choosing a future action or locator."""
+    """Attach a browser-observed click effect without choosing a future action or locator.
+
+    The records this click just wrote are updated directly. Searching for them by selector would miss
+    a click whose locator the scrub removed, and could land the effect on an older click that used
+    the same selector.
+    """
     data = result.get("data")
     if not isinstance(data, dict):
         return
     result_effects = data.setdefault("observed_effects", {})
     if isinstance(result_effects, dict):
         result_effects[effect] = True
-    for collection_name in ("scout_trajectory", "scouted_interactions"):
-        collection = getattr(ctx, collection_name, None)
-        if not isinstance(collection, list):
-            continue
-        for interaction in reversed(collection):
-            if interaction.get("tool_name") != "click" or interaction.get("selector") != selector:
-                continue
-            effects = dict(interaction.get("observed_effects") or {})
-            effects[effect] = True
-            interaction["observed_effects"] = effects
-            break
+    if challenge_vendor is not None:
+        data["challenge_vendor"] = challenge_vendor
+    for interaction in ctx.pending_scout_click_records:
+        effects = dict(interaction.get("observed_effects") or {})
+        effects[effect] = True
+        interaction["observed_effects"] = effects
+        if challenge_vendor is not None:
+            interaction["challenge_vendor"] = challenge_vendor
 
 
 async def _maybe_attach_observed_render_target(
@@ -2082,7 +2239,7 @@ async def _maybe_attach_observed_render_target(
         if not content_type.lower().startswith("image/"):
             LOG.debug("copilot_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
             return
-        _attach_observed_click_effect(ctx, result, selector=selector, effect="rendered_document_opened")
+        _attach_observed_click_effect(ctx, result, effect="rendered_document_opened")
     except Exception:
         LOG.warning("copilot_observed_render_target_attach_failed", exc_info=True)
 
@@ -2113,9 +2270,99 @@ async def _maybe_attach_observed_download_target(
                 return
             download_signal = "store_diff"
         LOG.info("copilot_observed_download_signal", signal=download_signal, url=url)
-        _attach_observed_click_effect(ctx, result, selector=selector, effect="download_started")
+        _attach_observed_click_effect(ctx, result, effect="download_started")
     except Exception:
         LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+
+
+async def _close_scout_challenge_baseline(ctx: AgentContext) -> None:
+    """Close the pre-click window at the dispatch boundary.
+
+    Frames that navigated since the listener went on arrived before the click, so they join the baseline:
+    one the click later reveals is still credited through the reveal check, a visible one is not.
+    """
+    if ctx.pending_scout_challenge_armed_at is None:
+        return
+    arrivals = list(ctx.pending_scout_challenge_frames)
+    ctx.pending_scout_challenge_frames.clear()
+    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in arrivals))
+    ctx.pending_scout_challenge_prior_frames.extend(zip(arrivals, areas, strict=True))
+    # Frames that navigated during that measurement are baselined unmeasured, with no await before dispatch:
+    # an unmeasured baseline frame is never credited, as new or as revealed.
+    ctx.pending_scout_challenge_prior_frames.extend((frame, None) for frame in ctx.pending_scout_challenge_frames)
+    ctx.pending_scout_challenge_frames.clear()
+
+
+def _start_scout_challenge_settle(ctx: AgentContext) -> None:
+    """Start the settle window when the click tool returns.
+
+    The browser clicks somewhere inside the tool call, after resolving and waiting for its target, which
+    can outlast the window; the return is the first moment known to follow the click.
+    """
+    if ctx.pending_scout_challenge_armed_at is not None:
+        ctx.pending_scout_challenge_armed_at = time.monotonic()
+
+
+async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
+    """Vendor of the first challenge frame the click put on screen, whether it mounted one or revealed a placeholder.
+
+    A widget often arrives with hidden helper frames beside it, so every candidate is measured rather
+    than the first to navigate. A hidden vendor frame is still a marker the solve ladder acts on, and
+    crediting one would send a solve through the whole ladder against nothing a person could answer.
+    """
+    # A preload is only revealable if it measured as a placeholder before the click: without that
+    # reading there is no growth to observe, and an already-challenging widget would be credited to
+    # whatever click happened to follow it.
+    revealable = [
+        frame
+        for frame, prior_area in ctx.pending_scout_challenge_prior_frames
+        if prior_area is not None and prior_area <= _CHALLENGE_FRAME_PLACEHOLDER_AREA
+    ]
+    # A captured frame can navigate away before this runs, so each is matched on its current URL.
+    candidates = [
+        (frame, match)
+        for frame in [*ctx.pending_scout_challenge_frames, *revealable]
+        if (match := _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
+    ]
+    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame, _match in candidates))
+    for (_frame, match), area in zip(candidates, areas, strict=True):
+        if area is not None and area > _CHALLENGE_FRAME_PLACEHOLDER_AREA:
+            # The matched text is one of the signature's own literals, so the vendor is named from a closed
+            # vocabulary. A hostname would carry whatever the page put in it — a tenant slug or a secret, in
+            # any case or encoding — and no scrub can enumerate every spelling of that.
+            return match.group(0).casefold()
+    return None
+
+
+async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    """Report when the scout's click raised an anti-bot challenge.
+
+    Needs no locator: a coordinate click has none, and still raises challenges. The effect goes on the
+    tool result either way, and onto whatever records this click wrote, which for a click with no
+    locator is none. A failed click may carry no data at all, and gets some only when a challenge is found.
+    """
+    if result.get("data") is not None and not isinstance(result.get("data"), dict):
+        return
+    armed_at = ctx.pending_scout_challenge_armed_at
+    if armed_at is None:
+        return
+    vendor = await _on_screen_challenge_vendor(ctx)
+    if vendor is None:
+        # The window started when the click returned, and the observation between then and now usually
+        # outlasts it by itself. Wait only for what is left of it, so a widget
+        # that mounts or grows a beat late still lands without adding a delay to every click.
+        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - armed_at)
+        if owed > 0:
+            await asyncio.sleep(owed)
+        vendor = await _on_screen_challenge_vendor(ctx)
+    if vendor is None:
+        return
+    try:
+        LOG.info("copilot_observed_challenge_signal", vendor=vendor, page_origin=safe_page_origin(url))
+        result.setdefault("data", {})
+        _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
+    except Exception:
+        LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
