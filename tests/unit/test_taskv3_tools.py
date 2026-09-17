@@ -14536,6 +14536,65 @@ async def test_covered_error_message_when_the_occluding_layer_has_no_controls_at
         assert "no controls were found on it" in r.content, r.content
 
 
+# A cover that qualifies as NOTHING: not pinned, no layer role, no aria-modal, not view-sized, and
+# not an ancestor of the field. The walk finds no layer and names the hit element itself, which is
+# the production shape behind most zero-control refusals -- an option row or a value cell, which has
+# no actionable child and nothing to dismiss.
+_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<span id="row" style="position:absolute;left:0;top:0;width:200px;height:30px;background:#fff">May</span>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hit_element() -> None:
+    """Both shapes render the same sentence with the same empty controls list, so the message cannot
+    tell them apart -- and they are not the same event. One is an overlay whose controls the
+    enumeration did not name; the other has no overlay at all."""
+    async with _content_page(_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert "no controls were found on it" in r.content, r.content
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "hit_fallback"}, recorded
+
+    async with _content_page(_DIALOG_WITH_NO_CONTROLS_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert "no controls were found on it" in r.content, r.content
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_covered_record_names_the_invisible_branch_from_both_of_its_constructions() -> None:
+    """The INVISIBLE branch through the real probe rather than a fake handler, and its two sub-cases
+    separately: they reach the same message from different constructions -- one names a layer and
+    finds it paints nothing, the other bails before naming anything at all, which is why the recorded
+    layer kind differs while the branch does not."""
+    cases = [
+        (_INVISIBLE_RESIDUAL_BACKDROP_HTML, ("qualified", "hit_fallback")),
+        (_INVISIBLE_ANCESTOR_WRAPPER_HTML, ("unnamed",)),
+    ]
+    for markup, kinds in cases:
+        async with _content_page(markup) as page:
+            taskv3_loop._COVERED_LAYER.set(None)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+            assert r.status == "error", r.content
+            assert "invisible" in r.content.lower(), r.content
+            recorded = taskv3_loop._COVERED_LAYER.get() or {}
+            assert recorded.get("branch") == "invisible", (recorded, r.content)
+            assert recorded.get("controls") == 0, (recorded, r.content)
+            assert recorded.get("layer_kind") in kinds, (recorded, r.content)
+
+
 # The HTML inert attribute makes a subtree non-focusable and non-clickable without touching any
 # computed style property that :disabled, opacity, or pointer-events would catch -- it is its own,
 # separate mechanism.
