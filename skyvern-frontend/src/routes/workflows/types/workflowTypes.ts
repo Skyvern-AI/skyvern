@@ -222,6 +222,7 @@ export type WorkflowBlock =
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
+  | WebSearchBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
   | EmailInboxBlock
@@ -255,6 +256,7 @@ export const WorkflowBlockTypes = {
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  WebSearch: "web_search",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
   EmailInbox: "email_inbox",
@@ -637,6 +639,16 @@ export type PDFParserBlock = WorkflowBlockBase & {
 export type URLBlock = WorkflowBlockBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type WebSearchBlock = WorkflowBlockBase & {
+  block_type: "web_search";
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type HttpRequestBlock = WorkflowBlockBase & {

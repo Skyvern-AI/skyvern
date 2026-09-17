@@ -39,6 +39,7 @@ describe("nodeTypes composition order", () => {
         "taskv2",
         "url",
         "http_request",
+        "web_search",
         "printPage",
         "workflowTrigger",
         "googleSheetsRead",

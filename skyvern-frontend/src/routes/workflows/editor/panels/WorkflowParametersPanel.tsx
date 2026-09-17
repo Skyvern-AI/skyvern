@@ -297,6 +297,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                           node.type === "fileDownload" ||
                           node.type === "action" ||
                           node.type === "http_request" ||
+                          node.type === "web_search" ||
                           node.type === "validation" ||
                           node.type === "codeBlock" ||
                           node.type === "printPage"
