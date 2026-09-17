@@ -850,6 +850,23 @@ async def test_skyvern_press_key_selector_only_uses_fast_default_timeout(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "pressed"), [("CTRL+a", "Control+a"), ("left", "ArrowLeft"), ("esc", "Escape")])
+async def test_skyvern_press_key_sends_the_driver_the_key_name_it_accepts(
+    monkeypatch: pytest.MonkeyPatch, key: str, pressed: str
+) -> None:
+    # The driver raises "Unknown key" on these spellings, which models write routinely.
+    press = AsyncMock()
+    page = SimpleNamespace(locator=MagicMock(return_value=SimpleNamespace(press=press)))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key=key, selector="#field")
+
+    assert result["ok"] is True
+    press.assert_awaited_once_with(pressed, timeout=5000)
+
+
+@pytest.mark.asyncio
 async def test_skyvern_press_key_intent_explicit_timeout_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
     press = AsyncMock()
     locator = MagicMock()
