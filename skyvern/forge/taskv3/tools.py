@@ -67,6 +67,7 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -6745,7 +6746,9 @@ async () => {
   // input is not actionable.
   const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,[role=button],[role=option],[role=combobox],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
   try {
-    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    const sig = /"""
+    + CHALLENGE_VENDOR_SIGNATURE
+    + r"""/i;
     const vw = window.innerWidth || document.documentElement.clientWidth || 0;
     const vh = window.innerHeight || document.documentElement.clientHeight || 0;
     // A design system packages the widget inside its own shadow root, where a document query cannot
