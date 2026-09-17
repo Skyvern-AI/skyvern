@@ -49,7 +49,12 @@ function forLoop(
 describe("buildCodeStepsByLabel", () => {
   it("maps code block labels to their step outline", () => {
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open page", line_start: 1, line_end: 1 },
+      {
+        action_type: "goto",
+        description: "Open page",
+        line_start: 1,
+        line_end: 1,
+      },
     ];
     const map = buildCodeStepsByLabel([codeBlock("run_script", steps)]);
     expect(map.get("run_script")).toEqual(steps);
@@ -156,17 +161,7 @@ describe("visitWorkflowBlocks", () => {
 });
 
 describe("getCodeStepPlainText", () => {
-  it("prefers the step title", () => {
-    expect(
-      getCodeStepPlainText({
-        action_type: "extract",
-        title: "Extract the product details",
-        description: "page.extract",
-      }),
-    ).toBe("Extract the product details");
-  });
-
-  it("falls back to the description when there is no title", () => {
+  it("uses the description", () => {
     expect(
       getCodeStepPlainText({
         action_type: "click",
@@ -175,7 +170,7 @@ describe("getCodeStepPlainText", () => {
     ).toBe("Click submit");
   });
 
-  it("humanizes the action type when title and description are absent", () => {
+  it("humanizes the action type when the description is absent", () => {
     expect(getCodeStepPlainText({ action_type: "extract" })).toBe(
       "Extract Data",
     );
@@ -184,12 +179,11 @@ describe("getCodeStepPlainText", () => {
     );
   });
 
-  it("ignores blank title and description", () => {
+  it("ignores a blank description", () => {
     expect(
       getCodeStepPlainText({
         action_type: "extract",
-        title: "   ",
-        description: "",
+        description: "   ",
       }),
     ).toBe("Extract Data");
   });
@@ -197,9 +191,14 @@ describe("getCodeStepPlainText", () => {
 
 describe("findCodeStepForLine", () => {
   const steps: Array<CodeBlockStep> = [
-    { action_type: "goto", title: "Open page", line_start: 1, line_end: 1 },
-    { action_type: "click", title: "Submit", line_start: 3, line_end: 6 },
-    { action_type: "extract", title: "No line position" },
+    {
+      action_type: "goto",
+      description: "Open page",
+      line_start: 1,
+      line_end: 1,
+    },
+    { action_type: "click", description: "Submit", line_start: 3, line_end: 6 },
+    { action_type: "extract", description: "No line position" },
   ];
 
   it("returns null when the action carries no code line", () => {
@@ -207,19 +206,29 @@ describe("findCodeStepForLine", () => {
   });
 
   it("matches a step by exact line_start", () => {
-    expect(findCodeStepForLine(steps, 1)?.title).toBe("Open page");
+    expect(findCodeStepForLine(steps, 1)?.description).toBe("Open page");
   });
 
   it("matches a step by range containment when no exact line_start matches", () => {
-    expect(findCodeStepForLine(steps, 4)?.title).toBe("Submit");
+    expect(findCodeStepForLine(steps, 4)?.description).toBe("Submit");
   });
 
   it("prefers an exact line_start over a containing range", () => {
     const overlapping: Array<CodeBlockStep> = [
-      { action_type: "click", title: "Range", line_start: 1, line_end: 5 },
-      { action_type: "extract", title: "Exact", line_start: 3, line_end: 3 },
+      {
+        action_type: "click",
+        description: "Range",
+        line_start: 1,
+        line_end: 5,
+      },
+      {
+        action_type: "extract",
+        description: "Exact",
+        line_start: 3,
+        line_end: 3,
+      },
     ];
-    expect(findCodeStepForLine(overlapping, 3)?.title).toBe("Exact");
+    expect(findCodeStepForLine(overlapping, 3)?.description).toBe("Exact");
   });
 
   it("returns null when no step covers the line", () => {

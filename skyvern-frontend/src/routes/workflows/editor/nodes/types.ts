@@ -62,9 +62,7 @@ function truncateTitle(value: string): string {
 
 export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
   return truncateTitle(
-    normalizeTitle(source.prompt) ??
-      normalizeTitle(source.steps?.[0]?.title) ??
-      CODE_BLOCK_FALLBACK_TITLE,
+    normalizeTitle(source.prompt) ?? CODE_BLOCK_FALLBACK_TITLE,
   );
 }
 

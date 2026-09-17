@@ -904,7 +904,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "goto",
-        title: "Open the homepage",
+        description: "Open the homepage",
         line_start: 1,
         line_end: 1,
       },
@@ -946,7 +946,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Run a script" },
+      { action_type: "execute_js", description: "Run a script" },
     ];
 
     render(
@@ -975,7 +975,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Summarize the page" },
+      { action_type: "execute_js", description: "Summarize the page" },
     ];
 
     render(
@@ -1055,7 +1055,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
     ];
 
     render(
@@ -1106,12 +1106,16 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto_url", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      {
+        action_type: "goto_url",
+        description: "Open the homepage",
+        line_start: 1,
+      },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
       {
         action_type: "execute_js",
-        title: "Summarize the page",
+        description: "Summarize the page",
         line_start: 7,
         line_end: 8,
       },
@@ -1168,8 +1172,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
     ];
 
     render(
@@ -1208,8 +1212,12 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "Has a line position", line_start: 5 },
-      { action_type: "execute_js", title: "No line position" },
+      {
+        action_type: "extract",
+        description: "Has a line position",
+        line_start: 5,
+      },
+      { action_type: "execute_js", description: "No line position" },
     ];
 
     render(
@@ -1248,7 +1256,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "A later step", line_start: 5 },
+      { action_type: "extract", description: "A later step", line_start: 5 },
     ];
 
     render(
@@ -1286,8 +1294,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
     ];
 
     render(
@@ -1325,7 +1333,10 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Outline step that should be hidden" },
+      {
+        action_type: "goto",
+        description: "Outline step that should be hidden",
+      },
     ];
 
     render(
@@ -1367,7 +1378,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "Extract the product details",
+        description: "Extract the product details",
         line_start: 12,
         line_end: 12,
       },
@@ -1415,7 +1426,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "click",
-        title: "Submit the application",
+        description: "Submit the application",
         line_start: 3,
         line_end: 6,
       },
@@ -1457,7 +1468,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "A step on another line",
+        description: "A step on another line",
         line_start: 1,
       },
     ];

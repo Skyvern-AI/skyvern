@@ -394,7 +394,6 @@ export type WhileLoopBlock = WorkflowBlockBase & {
 };
 
 export type CodeBlockStep = {
-  title?: string | null;
   description?: string | null;
   action_type: string;
   line_start?: number | null;

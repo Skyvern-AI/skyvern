@@ -106,15 +106,10 @@ export function buildCodeStepsByLabel(
 }
 
 /**
- * Plain-English text for a code-block step: prefer the generated title, then
- * the description, and only humanize the raw action type when neither is
- * present.
+ * Plain-English text for a code-block step: the description, and only
+ * humanize the raw action type when it is absent.
  */
 export function getCodeStepPlainText(step: CodeBlockStep): string {
-  const title = step.title?.trim();
-  if (title) {
-    return title;
-  }
   const description = step.description?.trim();
   if (description) {
     return description;
