@@ -166,6 +166,9 @@ credential_vault/
 videos/
 skyvern/artifacts/
 artifacts/
+# The bare artifacts/ rule above is unanchored and would otherwise swallow the
+# Fern-generated TS SDK resource of the same name, breaking the npm release build.
+!skyvern-ts/client/src/api/resources/artifacts/
 traces/
 *.pkl
 har/
