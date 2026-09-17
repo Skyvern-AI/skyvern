@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -239,6 +239,9 @@ class DialogEntry(TypedDict):
     count: int
 
 
+RunArm = Literal["treatment", "control", "unrandomized"]
+
+
 class EnrichTreeMode(StrEnum):
     CONTROL = "control"
     ENRICHED_TREE = "enriched_tree"
@@ -418,6 +421,10 @@ class SkyvernContext:
     frame_perception_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
+    # Task V3 run arms by flag: (run id the arm was resolved for, arm). Same pin contract as frame perception
+    # above; written and read only through skyvern.forge.taskv3.run_arms.
+    run_arms: dict[str, tuple[str, RunArm]] = field(default_factory=dict)
+    run_arms_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
     # The lock makes first-use resolution single-flight under parallel prompt builds.

@@ -67,6 +67,7 @@ from skyvern.forge.taskv3.loop import (
     set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
+from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
@@ -5177,6 +5178,7 @@ async () => {
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
+  const _DROP_OFFVIEWPORT_UNNAMED = __OBSERVE_DROP_OFFVIEWPORT_UNNAMED__;
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -5197,6 +5199,14 @@ async () => {
   };
   const _parentOf = _getter(Node.prototype, 'parentElement');
   const _scrollLeftOf = _getter(Element.prototype, 'scrollLeft');
+  const _assignedSlotOf = _getter(Element.prototype, 'assignedSlot');
+  const _tagNameOf = _getter(Element.prototype, 'tagName');
+  const _localNameOf = _getter(Element.prototype, 'localName');
+  const _shadowRootOf = _getter(Element.prototype, 'shadowRoot');
+  const _scrollHeightOf = _getter(Element.prototype, 'scrollHeight');
+  const _scrollWidthOf = _getter(Element.prototype, 'scrollWidth');
+  const _clientHeightOf = _getter(Element.prototype, 'clientHeight');
+  const _clientWidthOf = _getter(Element.prototype, 'clientWidth');
   const _prevOf = _getter(Node.prototype, 'previousSibling');
   const _nextOf = _getter(Node.prototype, 'nextSibling');
   const _firstChildOf = _getter(Node.prototype, 'firstChild');
@@ -6041,6 +6051,9 @@ async () => {
   let hiddenDroppedOffCanvas = 0;
   let hiddenDroppedVisibility = 0;
   let hiddenDroppedZeroRect = 0;
+  let hiddenDroppedOffViewport = 0;
+  let offViewportUnreachableUnnamed = 0;
+  let offViewportUnnamedHostExempt = 0;
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
@@ -6077,6 +6090,106 @@ async () => {
       }
     }
     return false;
+  };
+  // The state the record reports for a control, computed once and used by both the record below and
+  // the off-viewport gate. Asked in one place on purpose: two enumerations of "carries state" drift,
+  // and the gate's copy drifting is a silently dropped control.
+  const _stateFields = (el) => {
+    const out = {};
+    const role = el.getAttribute('role');
+    const secret = el.type === 'password' || isOtpInputValueSecret(el);
+    if (secret) { if (el.value) out.value = '(hidden)'; }
+    else if (el.tagName === 'SELECT' && el.multiple === true) {
+      const picked = Array.from(el.selectedOptions || []);
+      out.selectedOptions = picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
+      out.selectedTotal = picked.length;
+    }
+    else if (el.value) out.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    else if (_isAutocomplete(el)) {
+      const sv = ownCommittedSurface(el);
+      if (sv) out.value = String(sv).slice(0, _RETAIN_WIDTH);
+    }
+    if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
+    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+      const ck = el.getAttribute('aria-checked');
+      if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
+    }
+    const selected = el.getAttribute('aria-selected');
+    if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) out.selected = selected === 'true';
+    if (role === 'spinbutton' && !secret) {
+      const now = el.getAttribute('aria-valuenow');
+      if (now !== null && !out.value) out.value = String(now).slice(0, _RETAIN_WIDTH);
+    }
+    return out;
+  };
+  // Fails towards reporting state, so a control whose state cannot be read is never dropped for being empty.
+  const _reportsState = (el) => {
+    try {
+      for (const k in _stateFields(el)) return true;
+      return false;
+    } catch (e) {
+      return true;
+    }
+  };
+  const _outsideViewport = (b) => b.right <= 0 || b.bottom <= 0 || b.left >= window.innerWidth || b.top >= window.innerHeight;
+  const _SCROLLS = /^(?:auto|scroll|overlay|hidden)$/;
+  // Walks the flat tree: a slotted node is laid out inside its slot, so a scroll container wrapping
+  // the slot in the host's shadow tree moves it; and a scroll container or fixed ancestor outside
+  // the control's own tree still decides whether a scroll can move it.
+  const _layoutParentOf = (n) => {
+    let slot = null;
+    try { slot = _assignedSlotOf.call(n); } catch (e) { slot = null; }
+    if (slot) return slot;
+    const p = _parentOf.call(n);
+    if (p) return p;
+    let r = null;
+    try { r = Node.prototype.getRootNode.call(n); } catch (e) { r = null; }
+    return r instanceof ShadowRoot ? r.host : null;
+  };
+  // A registered custom element whose shadow root reads null has one that is closed or none at all:
+  // the two cannot be told apart without attaching a root, which would mutate the page. Either way a
+  // slot and the scroll container wrapping it may be unreadable, so nothing observable proves a box
+  // below such a host unreachable. Kept out of _scrollReachable, which answers a question about
+  // layout; this one is about what the walk can see.
+  const _unreadableRootHostAbove = (node) => {
+    for (let p = _layoutParentOf(node); p; p = _layoutParentOf(p)) {
+      try {
+        // Read through the prototype: a form exposes its named controls as its own properties, so an
+        // <input name="tagName"> between the control and the host would otherwise hide the host.
+        const tag = String(_tagNameOf.call(p) || '');
+        if (tag.includes('-') && !!customElements.get(_localNameOf.call(p)) && _shadowRootOf.call(p) === null) return true;
+      } catch (e) {
+        continue;
+      }
+    }
+    return false;
+  };
+  // Whether some scroll could bring box `b` of `node` into the viewport. Errs towards true: any
+  // scroll container with overflow above the node counts, whichever way it scrolls. A fixed box does
+  // not move with the ancestors above it unless one of them re-anchors it (any transform, filter,
+  // perspective or containment, including their will-change hints); otherwise the document scrolls
+  // to any box inside its scroll extent.
+  const _scrollReachable = (node, b) => {
+    let pinned = false;
+    for (let p = node; p; p = _layoutParentOf(p)) {
+      const cs = window.getComputedStyle(p);
+      if (pinned) {
+        const anchors = [cs.transform, cs.translate, cs.rotate, cs.scale, cs.perspective, cs.filter, cs.backdropFilter].some((v) => v && v !== 'none')
+          || /paint|layout|strict|content/.test(cs.contain || '') || cs.contentVisibility === 'auto'
+          || /transform|translate|rotate|scale|perspective|filter/.test(cs.willChange || '');
+        if (!anchors) continue;
+        pinned = false;
+      }
+      if (p !== node) {
+        if (_SCROLLS.test(cs.overflowY) && _scrollHeightOf.call(p) > _clientHeightOf.call(p)) return true;
+        if (_SCROLLS.test(cs.overflowX) && _scrollWidthOf.call(p) > _clientWidthOf.call(p)) return true;
+      }
+      if (cs.position === 'fixed') pinned = true;
+    }
+    if (pinned) return false;
+    const se = document.scrollingElement || document.documentElement;
+    return b.bottom + window.scrollY > 0 && b.top + window.scrollY < _scrollHeightOf.call(se)
+      && b.right + window.scrollX > 0 && b.left + window.scrollX < _scrollWidthOf.call(se);
   };
   // v1 isElementVisible (domUtils.js) force-marks a native form control inside an open shadow root
   // as visible even when CSS hides it: web-component libraries hide the native input via
@@ -6223,6 +6336,28 @@ async () => {
       phantomDropped++;
       continue;
     }
+    // An unnamed control no scroll can bring on screen is one the model can neither identify nor
+    // click: an action on it waits out the whole timeout. Named controls stay, off screen or not, and
+    // so does a file input, which takes files without being visible. Counted in every arm, so the
+    // exposed SET can be compared across arms; only the drop is gated. The per-call count cannot: a
+    // drop does not consume the element budget, so a truncating call in treatment examines further
+    // down the page than the same call in control.
+    if (ownGated && !hidden && unnamed && !_reportsState(el)
+        && !(el.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'file')
+        && gr.width !== 0 && gr.height !== 0 && _outsideViewport(gr) && !_scrollReachable(gateEl, gr)) {
+      // Kept, and counted apart from the exposed set: an exempt control is not at risk of a wrong
+      // drop, and a page that exempts every candidate must not read as a page that had none.
+      if (_unreadableRootHostAbove(gateEl)) {
+        offViewportUnnamedHostExempt++;
+      } else {
+        offViewportUnreachableUnnamed++;
+        if (_DROP_OFFVIEWPORT_UNNAMED) {
+          hiddenDropped++;
+          hiddenDroppedOffViewport++;
+          continue;
+        }
+      }
+    }
     let selector = naturalSelector(el);
     if (!selector) {
       // We do not write inside a shadow root. Setting a marker there is a mutation of the
@@ -6291,42 +6426,12 @@ async () => {
     // element line for a selector that does not exist.
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
-    // el.value on a <select multiple> is the FIRST selected option only: a control holding nine
-    // reads as holding one, so an overwrite and an accumulation look identical. Report the set
-    // instead -- the scalar is a false readout here, not a partial one. Single-select is untouched.
-    const _multiSelect = el.tagName === 'SELECT' && el.multiple === true;
-    if (secretValue) { if (el.value) rec.value = '(hidden)'; }
-    else if (_multiSelect) {
-      const _picked = Array.from(el.selectedOptions || []);
-      // Retained per item at the same width as the scalar branch below: this list rides in the
-      // persistent conversation prefix, so an uncapped label is paid for on every later turn.
-      rec.selectedOptions = _picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
-      // The size actually held, not the size retained. Python renders the truncation marker off
-      // this: a list that lost its tail silently reads as the whole selection.
-      rec.selectedTotal = _picked.length;
-    }
-    else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
-    // React-Select-style commit: the widget clears el.value and moves the label into its own surface
-    // (D3). Only when el.value is empty, so a field still holding its own text is never overridden.
-    else if (_isAutocomplete(el)) {
-      const sv = ownCommittedSurface(el);
-      if (sv) rec.value = String(sv).slice(0, _RETAIN_WIDTH);
-    }
-    // ARIA defines switch as a checkbox variant carrying the same aria-checked, so it belongs here.
-    if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
-    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
-      // Presence-gated like `selected` below: an absent aria-checked, or "mixed", is a state the
-      // page never stated, and reporting checked=False for an ON switch is the exact wrong-way
-      // toggle this enumeration exists to prevent.
-      const ck = el.getAttribute('aria-checked');
-      if (ck === 'true' || ck === 'false') rec.checked = ck === 'true';
-    }
-    const selected = el.getAttribute('aria-selected');
-    if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) rec.selected = selected === 'true';
-    if (role === 'spinbutton' && !secretValue) {
-      const now = el.getAttribute('aria-valuenow');
-      if (now !== null && !rec.value) rec.value = String(now).slice(0, _RETAIN_WIDTH);
-    }
+    // el.value on a <select multiple> is the FIRST selected option only, a React-Select commit moves
+    // the label off el.value into the widget's own surface, and a widget role carries its state in
+    // aria-checked / aria-selected / aria-valuenow. All of that lives in _stateFields, which the
+    // off-viewport gate asks the same question of. Retained at the scalar width per item: this rides
+    // in the persistent conversation prefix, so an uncapped label is paid for on every later turn.
+    Object.assign(rec, _stateFields(el));
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
     const isChoice = el.type === 'checkbox' || el.type === 'radio' || role === 'checkbox' || role === 'radio';
     // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
@@ -6912,7 +7017,7 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -6926,6 +7031,13 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     key = f'"__tv3el_{secrets.token_hex(8)}"'
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+        .replace(
+            "__OBSERVE_DROP_OFFVIEWPORT_UNNAMED__",
+            "true"
+            if run_arm_enabled(OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED)
+            else "false",
+            1,
+        )
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
     )
@@ -6942,6 +7054,8 @@ def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
     return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
 
 
+# Frozen at import, with no context, so the run-arm terms in it read off forever. Tests only: the
+# production path rebuilds the script per call. Never assert arm-sensitive behaviour against this.
 _OBSERVE_JS = observe_js()
 
 
@@ -7806,6 +7920,9 @@ _OBSERVE_SUMMED_KEYS = (
     "hiddenDroppedOffCanvas",
     "hiddenDroppedVisibility",
     "hiddenDroppedZeroRect",
+    "hiddenDroppedOffViewport",
+    "offViewportUnreachableUnnamed",
+    "offViewportUnnamedHostExempt",
     "phantomDropped",
     "markersMinted",
     "markersReused",
@@ -8604,6 +8721,9 @@ def build_browser_tools(
             "hidden_dropped_off_canvas": int(data.get("hiddenDroppedOffCanvas") or 0),
             "hidden_dropped_visibility": int(data.get("hiddenDroppedVisibility") or 0),
             "hidden_dropped_zero_rect": int(data.get("hiddenDroppedZeroRect") or 0),
+            "hidden_dropped_off_viewport": int(data.get("hiddenDroppedOffViewport") or 0),
+            "off_viewport_unreachable_unnamed": int(data.get("offViewportUnreachableUnnamed") or 0),
+            "off_viewport_unnamed_host_exempt": int(data.get("offViewportUnnamedHostExempt") or 0),
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
