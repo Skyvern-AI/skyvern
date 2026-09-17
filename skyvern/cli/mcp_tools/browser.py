@@ -96,6 +96,7 @@ from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.navigation import reported_nav_error_code
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -2132,6 +2133,7 @@ async def skyvern_press_key(
     Use `intent` or `selector` to focus a specific element before pressing.
     Without either, presses the key on the currently focused element.
     """
+    key = normalize_key_chord(key)
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
     try:

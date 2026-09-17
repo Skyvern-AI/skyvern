@@ -63,6 +63,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
+from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
@@ -9732,6 +9733,24 @@ def build_browser_tools(
             return True
         return False
 
+    async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> None:
+        # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
+        # A widget that hands the caret to another segment would take the keys there, so a caret that
+        # does not stay put re-raises the click's error; the caller must still prove the keystrokes landed.
+        if not focus_fallback or not _click_blocked_only_by_viewport(exc):
+            raise exc
+        # A field that commits a picked suggestion holds the raw query until blur, so a read-back could
+        # not tell a fill from a query; with no click to reach its rows, keep the error.
+        if await _declares_a_list(page, selector):
+            raise exc
+        try:
+            await page.focus(selector, timeout=15000)
+            held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
+        except Exception:
+            held = None
+        if held is not True:
+            raise exc
+
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
     ) -> tuple[bool, dict[str, Any] | None, bool]:
@@ -9753,7 +9772,13 @@ def build_browser_tools(
             # field that never moved. A navigation clears window, so a token planted on it answers
             # "is this still the same document" exactly -- the same technique the pre-snapshot uses.
             await page.evaluate("() => { window.__tv3_doc = 1; }")
-            await page.click(selector, timeout=15000, force=True)
+            try:
+                await page.click(selector, timeout=15000, force=True)
+            except Exception as exc:
+                # Force skips the hit-target check but not the viewport one, which rejects any box of
+                # at most one square pixel: a segment input kept sub-pixel under its own display layer.
+                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
+                return True, None, True
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=1000)
             except Exception:
@@ -9780,22 +9805,8 @@ def build_browser_tools(
             except Exception as exc:
                 # A segmented control can keep its real input off-viewport with tabindex=-1 under an
                 # aria-hidden display layer: the probe finds nothing on top of it, but the click's
-                # hit-test has no point to land on. focus() needs no hit target. A widget that hands the
-                # caret to another segment would take the keys there, so a caret that does not stay put
-                # keeps today's error; the caller must still prove the keystrokes landed.
-                if not focus_fallback or not _click_blocked_only_by_viewport(exc):
-                    raise
-                # A field that commits a picked suggestion holds the raw query until blur, so a read-back
-                # could not tell a fill from a query; with no click to reach its rows, keep the error.
-                if await _declares_a_list(page, selector):
-                    raise
-                try:
-                    await page.focus(selector, timeout=15000)
-                    held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
-                except Exception:
-                    held = None
-                if held is not True:
-                    raise
+                # hit-test has no point to land on.
+                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
                 focused_without_click = True
         try:
             focused = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
@@ -11668,7 +11679,7 @@ def build_browser_tools(
         page, error = await _resolve_page()
         if error is not None:
             return error
-        key = args["key"]
+        key = normalize_key_chord(args["key"])
         selector = args.get("selector")
         if selector:
             ambiguous = await _ambiguous_selector_error(page, selector)
@@ -12813,7 +12824,9 @@ def build_browser_tools(
         ),
         _spec(
             "press_key",
-            "Press a keyboard key (optionally focused on a selector), e.g. Enter, Escape, Tab.",
+            "Press a keyboard key or chord (optionally focused on a selector), e.g. Enter, Escape, Control+a. "
+            "Keys reach only the page, never the browser, so browser shortcuts (reload, back, forward) do "
+            "nothing; use navigate for those.",
             _obj({"key": {"type": "string"}, "selector": {"type": "string"}}, ["key"]),
             press_key,
         ),

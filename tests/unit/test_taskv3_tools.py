@@ -7780,6 +7780,31 @@ _SEGMENTED_DATE_EXPOSED_ECHO_HTML = """
 """
 
 
+# SKY-16451: the same control with its display layer painted OVER the inputs, which are kept sub-pixel.
+# The probe reads the layer as the field's own skin, so the click is forced -- and a forced click still
+# refuses a box of at most one square pixel as "outside of the viewport".
+_SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:240px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="year" type="text" role="spinbutton" aria-label="Year"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div id="year-display" aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">YYYY</div>
+  </div>
+  <div style="position:relative;width:40px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("input", () => {
+    document.getElementById("year-display").textContent = year.value || "YYYY";
+  });
+</script>
+"""
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -7800,11 +7825,16 @@ _SEGMENTED_DATE_EXPOSED_ECHO_HTML = """
     ],
     ids=["keys-land-in-sibling-segment", "keys-dropped", "cleared-after-typing", "trimmed"],
 )
-async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(misroute: str, text: str) -> None:
+@pytest.mark.parametrize(
+    "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
+)
+async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(
+    misroute: str, text: str, template: str
+) -> None:
     # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would
     # turn today's loud failure into a date that reads as filled and is not.
     # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
-    html = _SEGMENTED_DATE_HTML + f"<script>{misroute}</script>"
+    html = template + f"<script>{misroute}</script>"
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         try:
@@ -7867,6 +7897,15 @@ _UNCLICKABLE_BARE_TYPEAHEAD_HTML = """
 </script>
 """
 
+# The declared typeahead again, with its display layer over a sub-pixel input so the click is forced.
+_SKINNED_SUBPIXEL_TYPEAHEAD_HTML = _UNCLICKABLE_TYPEAHEAD_HTML.replace(
+    '<div aria-hidden="true" style="position:absolute;inset:0;background:#fff">City</div>',
+    '<div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">City</div>',
+).replace(
+    'style="position:absolute;left:-500px;top:0;width:200px;height:30px"',
+    'style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box"',
+)
+
 # A widget that renders BOTH: an echo of the keystrokes and a real list. Excluding the echo must not
 # excuse the list.
 _ECHO_SCRIPT = (
@@ -7896,6 +7935,12 @@ _ECHO_SCRIPT = (
         # Rows a pickability test can read nothing off, alone and beside an echo of the keystrokes.
         (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, ""),
         (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, _ECHO_SCRIPT),
+        (
+            _SKINNED_SUBPIXEL_TYPEAHEAD_HTML,
+            'role="combobox" aria-autocomplete="list" aria-controls="city-list" aria-expanded="false"',
+            2500,
+            "",
+        ),
     ],
     ids=[
         "declared-slow-rows",
@@ -7904,6 +7949,7 @@ _ECHO_SCRIPT = (
         "undeclared-rows-beside-an-echo",
         "bare-div-rows",
         "bare-div-rows-beside-an-echo",
+        "skinned-subpixel-declared-slow-rows",
     ],
 )
 async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
@@ -7929,8 +7975,13 @@ async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "html",
-    [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_REPLACED_ECHO_HTML, _SEGMENTED_DATE_EXPOSED_ECHO_HTML],
-    ids=["echo-mutated", "echo-replaced", "echo-exposed"],
+    [
+        _SEGMENTED_DATE_HTML,
+        _SEGMENTED_DATE_REPLACED_ECHO_HTML,
+        _SEGMENTED_DATE_EXPOSED_ECHO_HTML,
+        _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML,
+    ],
+    ids=["echo-mutated", "echo-replaced", "echo-exposed", "skinned-subpixel"],
 )
 async def test_type_fills_a_segment_input_the_click_cannot_reach(html: str) -> None:
     async with _content_page(html) as page:
@@ -25456,3 +25507,37 @@ def test_only_an_engine_minted_marker_value_is_folded_at_a_window_head() -> None
                 assert reported == closing - offset + 1, (value, offset, reported)
             else:
                 assert reported == 0, (value, offset, reported)
+
+
+_KEY_LOG_HTML = """
+<input id="field" value="text">
+<script>
+  window.__keys = [];
+  document.addEventListener("keydown", (e) => {
+    window.__keys.push((e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + e.key);
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_press_key_accepts_the_key_names_v1_accepts() -> None:
+    # Models write CTRL, ALT, left, HOME...: v1 maps these before pressing, and an unmapped name raises
+    # "Unknown key" and burns a round.
+    cases = [
+        ("CTRL+a", "Control+a"),
+        ("ALT+r", "Alt+r"),
+        ("left", "ArrowLeft"),
+        ("HOME", "Home"),
+        ("esc", "Escape"),
+        ("TAB", "Tab"),
+        ("enter", "Enter"),
+    ]
+    async with _content_page(_KEY_LOG_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for key, expected in cases:
+            await page.evaluate("window.__keys = []")
+            r = await _tool(tools, "press_key").handler({"key": key, "selector": "#field"})
+            assert r.status == "ok", (key, r.content)
+            assert expected in await page.evaluate("window.__keys"), key
