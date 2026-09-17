@@ -582,6 +582,8 @@ class Settings(BaseSettings):
     # Yutori Navigator
     ENABLE_YUTORI: bool = False
     YUTORI_API_KEY: str | None = None
+    SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
+    EXA_API_KEY: str | None = Field(default=None, repr=False)
     YUTORI_API_BASE: str = "https://api.yutori.com/v1"
     YUTORI_MODEL: str = "n1.5-latest"
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"

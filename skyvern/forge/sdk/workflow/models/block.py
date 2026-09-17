@@ -1487,7 +1487,7 @@ class Block(BaseModel, abc.ABC):
     async def _generate_workflow_run_block_description(
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
-        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
+        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
             return
         description = None
         try:
@@ -1634,7 +1634,11 @@ class Block(BaseModel, abc.ABC):
                 )
 
             # create a screenshot
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            browser_state = (
+                app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                if self.block_type != BlockType.WEB_SEARCH
+                else None
+            )
             if not browser_state:
                 LOG.info(
                     "No browser state found when creating workflow_run_block",
@@ -9526,6 +9530,7 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str | None = None,
         schema_validation_failure: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        data_sanitizer: Callable[[Any], Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         selected_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
@@ -9566,6 +9571,11 @@ class TextPromptBlock(Block):
             + "\n```\n\n"
         )
 
+        system_prompt = self.workflow_system_prompt
+        if data_sanitizer is not None:
+            prompt = data_sanitizer(prompt)
+            system_prompt = data_sanitizer(system_prompt)
+
         workflow_run_block = None
         artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
         if workflow_run_block_id:
@@ -9589,7 +9599,7 @@ class TextPromptBlock(Block):
                 response = await llm_api_handler(
                     prompt=prompt,
                     prompt_name="text-prompt",
-                    system_prompt=self.workflow_system_prompt,
+                    system_prompt=system_prompt,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
@@ -9602,7 +9612,7 @@ class TextPromptBlock(Block):
                         "TextPromptBlock LLM call failed after all retries",
                         block_label=self.label,
                         attempts=attempt + 1,
-                        error=str(e),
+                        error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                     )
                     raise
                 backoff_time = 0.2 * (2**attempt)
@@ -9612,9 +9622,12 @@ class TextPromptBlock(Block):
                     attempt=attempt + 1,
                     max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
                     backoff_time=backoff_time,
-                    error=str(e),
+                    error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                 )
                 await asyncio.sleep(backoff_time)
+
+        if data_sanitizer is not None:
+            response = data_sanitizer(response)
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -17741,6 +17754,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -17766,6 +17780,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    WebSearchBlock,
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,

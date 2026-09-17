@@ -112,7 +112,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.enforcement import (
     proxy_hop_failure_reason,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import _blocks_by_label, block_shape_hashes_by_label
+from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import frontier_dump_root, trust_snapshot, write_packet
 from skyvern.forge.sdk.copilot.narration import _TERMINAL_BLOCK_STATUSES, NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
@@ -1127,6 +1127,7 @@ _QUIET_BLOCK_TYPES: frozenset[str] = frozenset(
     {
         BlockType.WAIT.value,
         BlockType.TEXT_PROMPT.value,
+        BlockType.WEB_SEARCH.value,
         BlockType.HUMAN_INTERACTION.value,
         BlockType.FILE_DOWNLOAD.value,
         BlockType.FILE_UPLOAD.value,
@@ -1140,20 +1141,26 @@ _QUIET_BLOCK_TYPES: frozenset[str] = frozenset(
 def _any_quiet_block_requested(
     copilot_ctx: CopilotContext,
     labels: list[str] | None,
+    *,
+    workflow: Workflow | None = None,
 ) -> bool:
-    """Return True if any of ``labels`` refers to a block whose type is in
-    ``_QUIET_BLOCK_TYPES``. Reuses ``_blocks_by_label`` on the already-loaded
-    workflow definition — no DB call.
+    """Return True if a selected block or its descendants can run without DB updates.
+
+    Use the execution snapshot when supplied, including staged edits.
     """
     if not labels:
         return False
-    last_workflow = getattr(copilot_ctx, "last_workflow", None)
+    last_workflow = workflow if workflow is not None else getattr(copilot_ctx, "last_workflow", None)
     if last_workflow is None:
         return False
-    by_label = _blocks_by_label(getattr(last_workflow, "workflow_definition", None))
-    for label in labels:
-        block = by_label.get(label)
-        if block is None:
+    definition = getattr(last_workflow, "workflow_definition", None)
+    pending = [(block, False) for block in (getattr(definition, "blocks", None) or [])]
+    selected_labels = set(labels)
+    while pending:
+        block, parent_selected = pending.pop()
+        selected = parent_selected or getattr(block, "label", None) in selected_labels
+        pending.extend((child, selected) for child in _typed_child_blocks(block))
+        if not selected:
             continue
         block_type = getattr(block, "block_type", None)
         if block_type is None:
@@ -3709,7 +3716,7 @@ async def _run_blocks_and_collect_debug(
         # Quiet blocks (WAIT/TEXT_PROMPT/HUMAN_INTERACTION) legitimately have
         # DB-silent periods; disable stagnation for any invocation that includes
         # one. Safety ceiling still applies.
-        stagnation_enabled = not _any_quiet_block_requested(ctx, labels_to_execute)
+        stagnation_enabled = not _any_quiet_block_requested(ctx, labels_that_may_execute, workflow=runtime_workflow)
         budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
 
         # Mid-tool narrator bridge: feed block-status changes and step-level

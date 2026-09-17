@@ -49,6 +49,7 @@ from skyvern.schemas.workflows import (
     UrlBlockYAML,
     ValidationBlockYAML,
     WaitBlockYAML,
+    WebSearchBlockYAML,
     WhileLoopBlockYAML,
     WorkflowTriggerBlockYAML,
 )
@@ -76,6 +77,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.WAIT.value: WaitBlockYAML,
     BlockType.VALIDATION.value: ValidationBlockYAML,
     BlockType.HTTP_REQUEST.value: HttpRequestBlockYAML,
+    BlockType.WEB_SEARCH.value: WebSearchBlockYAML,
     BlockType.SEND_EMAIL.value: SendEmailBlockYAML,
     BlockType.FILE_DOWNLOAD.value: FileDownloadBlockYAML,
     BlockType.FILE_UPLOAD.value: FileUploadBlockYAML,
@@ -112,6 +114,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "wait": "Pause workflow execution for a specified duration",
     "validation": "Validate page state with complete/terminate criteria",
     "http_request": "Call an external HTTP API",
+    "web_search": "Search Google or Exa and optionally process the results with a prompt",
     "send_email": "Send an email notification via SMTP",
     "file_download": "Download a file from a page",
     "file_upload": "Upload a file from S3/Azure to a page element",

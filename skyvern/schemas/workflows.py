@@ -504,6 +504,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    WEB_SEARCH = "web_search"
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
@@ -1421,6 +1422,16 @@ class TaskV2BlockYAML(BlockYAML):
     disable_cache: bool = False
 
 
+class WebSearchBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WEB_SEARCH] = BlockType.WEB_SEARCH  # type: ignore
+    query: str = Field(min_length=1)
+    provider: Literal["auto", "google", "exa"] = "auto"
+    num_results: int = Field(default=10, ge=1, le=100, strict=True)
+    prompt: str | None = None
+    json_schema: dict[str, Any] | None = None
+    parameter_keys: list[str] | None = None
+
+
 class HttpRequestBlockYAML(BlockYAML):
     block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
 
@@ -1579,6 +1590,7 @@ BLOCK_YAML_SUBCLASSES = (
     | PDFParserBlockYAML
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
+    | WebSearchBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | PdfFillBlockYAML
