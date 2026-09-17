@@ -140,6 +140,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
     MultiFieldTotpAttempt,
     SkyvernContext,
     action_for_multi_field_totp_persistence,
+    canonical_url,
     redact_multi_field_totp_element_data,
 )
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -389,9 +390,18 @@ _TASKV3_TOOL_ACTION_TYPES = {
 }
 
 
-def _taskv3_row_intention(task: Task, round_action: RoundAction, secret_values: set[str]) -> str | None:
+def _taskv3_row_intention(
+    task: Task, round_action: RoundAction, secret_values: set[str], redacted_args: dict[str, Any]
+) -> str | None:
     """The persisted label for one v3 action. This is the only frame that holds the unfloored drop-check
     secrets, and a failure here is logged without exc_info, so no traceback renderer can print them."""
+    if round_action.tool == "navigate":
+        # A navigation names no element, so the element-label composer has nothing to say about it:
+        # the URL is the whole subject. Read from the already-redacted args, never the raw ones.
+        url = redacted_args.get("url")
+        if not isinstance(url, str) or not url:
+            return None
+        return f"Navigated to {url}" if round_action.succeeded else f"Tried to navigate to {url}"
     try:
         # Drop-only: this set decides whether to drop a page-supplied name and reaches no redaction path.
         label_secret_values = (
@@ -435,6 +445,36 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
 # Cap on the persisted turn text: actions is a high-traffic table and readers clamp far lower for
 # display; a runaway multi-paragraph turn must not become a per-row payload.
 _TASKV3_REASONING_MAX_CHARS = 1000
+# Same reason, for the outcome line: it can carry two page-supplied URLs (or, when the call reached no
+# page, the tool's own error text), and neither a URL nor a tool error has a length bound.
+_TASKV3_RESPONSE_MAX_CHARS = 500
+
+
+def _taskv3_row_response(outcome: dict[str, Any]) -> str | None:
+    """The persisted outcome of one v3 action: where it asked to go, where it landed, and what the page
+    answered. Reads only the keys it knows (see ACTION_OUTCOME_DATA_KEY), so a tool reporting something
+    else leaves the row's response empty rather than printing a shape nobody can read."""
+    requested = outcome.get("requested_url") if isinstance(outcome.get("requested_url"), str) else None
+    landed = outcome.get("url") if isinstance(outcome.get("url"), str) else None
+    where = requested or landed or ""
+    # Canonical comparison, the same identity the handler classified `page_transitioned` on, so a
+    # landing that only re-spells the requested URL (a trailing slash, an escape case) is not
+    # rendered as a move the row then calls "same page".
+    if requested and landed and canonical_url(landed) != canonical_url(requested):
+        where = f"{requested} -> {landed}"
+    notes: list[str] = []
+    status = outcome.get("http_status")
+    if isinstance(status, int):
+        notes.append(f"HTTP {status}")
+    if outcome.get("navigation_dead_end") is not None:
+        notes.append("dead end")
+    transitioned = outcome.get("page_transitioned")
+    if isinstance(transitioned, bool):
+        notes.append("page changed" if transitioned else "same page")
+    if not where:
+        return ", ".join(notes) or None
+    return f"{where} ({', '.join(notes)})" if notes else where
+
 
 # Block-engine to run-type labels for the "Task duration metrics" discriminator (SKY-15499):
 # workflow-block tasks have no task_runs row, so the block's resolved engine stands in.
@@ -2170,27 +2210,54 @@ class ForgeAgent:
                     # can be glued to adjacent alphanumerics — boundary anchoring would let it through.
                     turn_reasoning = redact_secrets_from_text(turn_reasoning, secret_values)
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
+            # A round that bills nothing claims no budget unit, so its rows ride the LAST consumed
+            # index (or the single Step's own order 0) the way the decision row below does: a fresh
+            # index nothing later claims would be a distinct (task_id, step_order) pair, and the
+            # workflow-run step budget counts those pairs.
+            billable_round = any(entry.billable for entry in round_actions)
+            row_step_order = v3_round_index if billable_round else max(v3_round_index - 1, 0)
             for round_action in round_actions:
                 name, args, succeeded = round_action.tool, round_action.args, round_action.succeeded
                 try:
                     tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
                     selector = tool_args.get("selector", "")
+                    row_response = _taskv3_row_response(round_action.outcome) if round_action.outcome else None
+                    if row_response is not None:
+                        # The outcome carries page-supplied URLs the arg redaction above never saw, and a
+                        # landing URL's query routinely holds the credential itself (a sign-in link's token).
+                        if secret_values:
+                            row_response = redact_secrets_from_text(
+                                row_response, secret_values, boundary_all_lengths=True
+                            )
+                    elif name == "navigate" and round_action.error:
+                        # A navigation the engine refused on purpose (the destructive same-URL reload
+                        # guard), or one that never loaded, reached no page and reports no outcome: the
+                        # tool's own error is all the row can say, and without it the customer reads a
+                        # failed navigation with no reason. Free-form prose, so it is matched the way the
+                        # turn text is rather than the way the URL line above is.
+                        row_response = round_action.error
+                        if secret_values:
+                            row_response = redact_secrets_from_text(row_response, secret_values)
+                    if row_response is not None:
+                        row_response = row_response[:_TASKV3_RESPONSE_MAX_CHARS]
                     action = _taskv3_action_for_tool_call(
                         name,
                         tool_args,
                         status=ActionStatus.completed if succeeded else ActionStatus.failed,
+                        response=row_response,
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
                         step_id=step.step_id,
-                        # Round index, not the single Step's order: makes each v3 action ROUND count
-                        # as one unit of the workflow-run step budget (distinct (task, order) pairs).
-                        step_order=v3_round_index,
+                        # Round index, not the single Step's order: makes each BILLABLE v3 action
+                        # ROUND count as one unit of the workflow-run step budget (distinct (task,
+                        # order) pairs).
+                        step_order=row_step_order,
                         action_order=len(v3_persisted_actions),
                         description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
                         reasoning=turn_reasoning,
-                        intention=_taskv3_row_intention(task, round_action, secret_values),
+                        intention=_taskv3_row_intention(task, round_action, secret_values, tool_args),
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(
@@ -2198,9 +2265,7 @@ class ForgeAgent:
                     )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
-            if any(entry.billable for entry in round_actions):
-                # Only billable rounds consume the budget unit; recordable-only rounds (navigate/
-                # scroll/wait) keep the current index so they never inflate the workflow-run count.
+            if billable_round:
                 v3_round_index += 1
 
         pre_submit_ring: PreSubmitCaptureRing | None = None
