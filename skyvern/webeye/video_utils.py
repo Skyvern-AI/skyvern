@@ -52,8 +52,11 @@ async def _run_ffmpeg_to_temp(
     timeout_seconds: float,
     operation: str,
     input_args: list[str] | None = None,
+    output_dir: str | None = None,
 ) -> str | None:
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as dst_tmp:
+    # ``output_dir`` places the temp output on a chosen filesystem so a caller can later swap it in
+    # with an atomic ``os.replace`` (same mount); ``None`` keeps the default system temp location.
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=output_dir) as dst_tmp:
         dst_path = dst_tmp.name
 
     keep_output = False
@@ -166,6 +169,30 @@ async def _remux_webm(src_path: str) -> str | None:
         output_args=output_args,
         timeout_seconds=FFMPEG_REMUX_TIMEOUT_SECONDS,
         operation="ffmpeg webm remux",
+    )
+
+
+async def remux_mp4_faststart(src_path: str) -> str | None:
+    """Stream-copy an MP4 into a non-fragmented, faststart (front-``moov``) layout.
+
+    Fragmented MP4s (``empty_moov`` + ``moof`` fragments, no ``sidx``) carry a
+    zero-duration init ``moov`` and no seek index, so a native ``<video>`` must
+    download and demux the whole file to read a duration or seek; a ``-c copy``
+    remux rewrites one front ``moov`` with real sample tables and duration. The
+    temp output is created beside the source so the caller can swap it in with an
+    atomic ``os.replace`` on the same mount. Returns a temp path, or ``None`` if
+    ffmpeg is missing or the remux fails.
+    """
+    if shutil.which(FFMPEG_BINARY) is None:
+        LOG.warning("ffmpeg binary not found on PATH, skipping mp4 faststart remux", src=src_path)
+        return None
+    return await _run_ffmpeg_to_temp(
+        src_path,
+        suffix=".mp4",
+        output_args=["-c", "copy", "-movflags", "+faststart"],
+        timeout_seconds=FFMPEG_REMUX_TIMEOUT_SECONDS,
+        operation="ffmpeg mp4 faststart remux",
+        output_dir=os.path.dirname(src_path) or None,
     )
 
 
