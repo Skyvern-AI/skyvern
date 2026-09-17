@@ -13,6 +13,7 @@ alongside `make_finish_tool()`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import io
 import json
@@ -194,6 +195,22 @@ _MARKER_ATTR_OPEN = 'data-tv3="'
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
 _MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
+
+_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
+
+# Containment is walked from the frame's host upward because the probe runs in an isolated world and
+# its shadow walk pierces only OPEN roots -- neither sees a widget iframe mounted inside a closed one.
+_COVER_ANCESTOR_WALK_LIMIT = 40
+_HOST_INSIDE_COVER_JS = r"""(host, limit) => {
+  let n = host;
+  for (let depth = 0; n && depth < limit; depth++) {
+    try {
+      if (n.nodeType === 1 && n.hasAttribute('data-tv3-cover')) return true;
+      n = n.parentElement || (n.getRootNode() || {}).host || null;
+    } catch (e) { return false; }
+  }
+  return false;
+}"""
 
 
 def _marker_head_fragment_len(content: str, offset: int) -> int:
@@ -3372,6 +3389,8 @@ _TYPE_TARGET_PROBE_JS = (
 """
     + _NATIVE_LABEL_JS
     + r"""
+  try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
+
   // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
   // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
   // exactly the controls that addressing made reachable. The executor resolves it; take its element.
@@ -4093,6 +4112,7 @@ _TYPE_TARGET_PROBE_JS = (
     // because that is where a footer actually lives.
     const truncated = allControls.length > 8;
     const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
+    try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
     out.occluder.layerKind = layerKind;
     // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
@@ -8732,9 +8752,9 @@ def build_browser_tools(
                 html = ""
         else:
             html = mask_otp_values_in_html(await page.content())
-        # The click/type reaction gate stamps data-tv3-pre on every visible element; internal bookkeeping
-        # that, left in place, costs a third of the truncation budget below in noise.
-        html = html.replace(' data-tv3-pre="1"', "")
+        # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
+        # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
+        html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
         # still on the page when this runs. It is a stable handle rather than a dangerous one -- the
         # token belongs to the element, not the number -- but it is ours, not the page's, and it
@@ -8796,11 +8816,15 @@ def build_browser_tools(
         return parts
 
     def _covered_branch(occluder: dict[str, Any] | None) -> CoveredBranch:
-        """Which of the three messages will render. The dispatch below branches on THIS, so the
+        """Which message will render. The dispatch below branches on THIS, so the
         recorded branch and the sentence the model got cannot disagree -- including after a new
         branch is added, which only has to be expressed here once."""
         if not occluder:
             return "unnamed"
+        # Ahead of `invisible`: a transparent wall holding a live challenge frame is not a leftover
+        # backdrop, and telling the model to press Escape on it abandons the verification.
+        if str(occluder.get("challengeFrame") or "").strip():
+            return "challenge"
         if occluder.get("invisible"):
             return "invisible"
         return "named"
@@ -8821,8 +8845,9 @@ def build_browser_tools(
         also = "" if verb == "clicked" else " — a person could not click it either"
         name = str((occluder or {}).get("name") or "").strip()
         layer_selector = (occluder or {}).get("selector")
-        # Recorded from here, above every return, because this helper is the single place all three
-        # messages are built: one call covers click, both typing paths and the two re-raises, and a
+        challenge_frame = str((occluder or {}).get("challengeFrame") or "").strip()
+        # Recorded from here, above every return, because this helper is the single place every
+        # message is built: one call covers click, both typing paths and the two re-raises, and a
         # branch added below cannot slip out un-recorded. The layer's NAME is deliberately not
         # recorded -- it is page text, and these names carry personal data.
         parts = _named_controls(occluder)
@@ -8864,6 +8889,12 @@ def build_browser_tools(
             controls_desc = "re-observe — no controls were found on it"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
+        if branch == "challenge":
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, which contains a challenge frame "
+                f"({challenge_frame}), so it cannot be {verb}{also}. Its controls: {controls_desc}.",
+                error_class="covered",
+            )
         return ToolResult.error(
             f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. "
             # The layer may be a general modal, not just a consent wall -- these are every control
@@ -9556,7 +9587,9 @@ def build_browser_tools(
                 # `ownLabel` (the field's own skin-sized label) is the one occluded case that is not a
                 # block; it falls through to the force-retry below.
                 if reach_probe and reach_probe.get("occluded") and not reach_probe.get("ownLabel"):
-                    return _covered_error(selector, reach_probe.get("occluder"), verb="clicked")
+                    occluder = reach_probe.get("occluder")
+                    await _annotate_challenge_frame(page, _current_page(), occluder)
+                    return _covered_error(selector, occluder, verb="clicked")
                 # A URL is the wrong question (pushState moves it without leaving the page); the token
                 # planted before the click answers "is this still the same document" exactly.
                 try:
@@ -9737,6 +9770,44 @@ def build_browser_tools(
         await page.hover(selector, timeout=15000)
         return ToolResult.ok(f"hovered {selector}")
 
+    async def _annotate_challenge_frame(realm: Any, top_page: Any, occluder: dict[str, Any] | None) -> None:
+        if not occluder:
+            return
+        try:
+            root = realm.main_frame if realm is top_page else realm
+            for frame in top_page.frames:
+                parsed = urlparse(frame.url or "")
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    continue
+                if not _CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
+                    continue
+                chain = [frame]
+                while chain[-1].parent_frame is not None and chain[-1].parent_frame is not root:
+                    chain.append(chain[-1].parent_frame)
+                if chain[-1].parent_frame is not root:
+                    continue
+                handles: list[Any] = []
+                try:
+                    # is_visible() judges an element only within its own document, so every iframe on the way
+                    # from the match up to the acting realm has to render for the challenge to be on screen.
+                    rendered = True
+                    for link in chain:
+                        handles.append(await link.frame_element())
+                        if not await handles[-1].is_visible():
+                            rendered = False
+                            break
+                    if rendered and await handles[-1].evaluate(_HOST_INSIDE_COVER_JS, _COVER_ANCESTOR_WALK_LIMIT):
+                        occluder["challengeFrame"] = parsed.hostname
+                        return
+                except Exception:
+                    LOG.debug("taskv3 could not place a challenge frame against the covering layer", exc_info=True)
+                finally:
+                    for handle in handles:
+                        with contextlib.suppress(Exception):
+                            await handle.dispose()
+        except Exception:
+            LOG.debug("taskv3 could not enumerate frames under the covering layer", exc_info=True)
+
     async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool, dict[str, Any] | None]:
         """(reachable, occluded, occluder). Raises when the field cannot accept typed text at all. Shared
         by both typing paths: fill() does no hit-testing, so without this a covered password or email
@@ -9753,6 +9824,7 @@ def build_browser_tools(
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):
+            await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
         # Reachable: a skinned own-popup is force-typed past, so there is no blocking occluder to
         # report. The probe still names it (the click path, which reads the probe directly, needs the

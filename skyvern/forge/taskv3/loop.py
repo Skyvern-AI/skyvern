@@ -108,11 +108,13 @@ ToolOkClass = Literal[
     "attached_no_activity",
 ]
 
-# Which of the three `covered` messages the model actually got. All three are one `tool_error_class`,
-# so without this the split is only recoverable by pulling step archives and classifying the prose.
+# Which `covered` message the model actually got. They are one `tool_error_class`, so without this
+# the split is only recoverable by pulling step archives and classifying the prose.
 CoveredBranch = Literal[
     # The layer was named and its controls enumerated into the message.
     "named",
+    # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
+    "challenge",
     # No layer to name: the message says only that something is on top of the field.
     "unnamed",
     # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
