@@ -4,7 +4,9 @@ A bounded, engine-agnostic ladder that detects a visible captcha challenge and d
 solver arms (DOM checkbox, reCAPTCHA anchor in-frame click, the solver extension, and the reCAPTCHA
 token route). Detection keys off DOM/iframe markers, so it sees the challenge even when the widget
 renders in a cross-origin iframe (the ``<iframe>`` element is a main-frame node a targeted locator can
-find); a caller that opts in with ``probe_child_frames`` also has visible child frames' documents probed.
+find), and a visible ``challenges.cloudflare.com`` frame counts too, since a Turnstile mounted under a closed
+shadow root is invisible to CSS locators; a caller that opts in with ``probe_child_frames`` also has visible
+child frames' documents probed.
 
 Solving routes through the ``AGENT_FUNCTION`` seam (``auto_solve_captchas`` / ``solve_recaptcha_token``),
 so this module stays OSS-clean: the OSS bases return False and the cloud overrides do the real solve.
@@ -21,6 +23,7 @@ import structlog
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Frame, Page
 
+from skyvern.config import settings
 from skyvern.forge import app
 
 if TYPE_CHECKING:
@@ -69,6 +72,7 @@ _RECAPTCHA_MARKER_SELECTOR = ", ".join(
 _RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]'
 _RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
 _RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
+_CLOUDFLARE_CHALLENGE_HOST = "challenges.cloudflare.com"
 _RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
 # The extension arm polls a solver over the network; the scout caller has no enclosing bound.
 _EXTENSION_ARM_TIMEOUT_SECONDS = 12
@@ -123,9 +127,29 @@ def _intersects_viewport(box: Any, viewport: Any) -> bool:
     )
 
 
-async def _frame_has_visible_match(frame: Any, selector: str, viewport: Any) -> bool:
+async def _frame_has_visible_match(
+    frame: Any, selector: str | None, viewport: Any, *, challenge_frames: bool = False
+) -> bool:
+    challenge_candidate = challenge_frames and (
+        _matches_cloudflare_challenge_host(frame.url) or frame.url in ("", "about:blank")
+    )
+    if selector is None and not challenge_candidate:
+        return False
     async with asyncio.timeout(1.0):
-        if not await (await frame.frame_element()).is_visible():
+        element = await frame.frame_element()
+        if not await element.is_visible():
+            return False
+        # A frame that has not committed its cross-origin navigation still reports the challenge host in the
+        # iframe element's `src`, so an uncommitted frame is judged on the attribute instead of `frame.url`.
+        if challenge_candidate and (
+            _matches_cloudflare_challenge_host(frame.url)
+            or _matches_cloudflare_challenge_host(await element.get_attribute("src"))
+        ):
+            # Turnstile's invisible mode mounts a 1x1 frame that `is_visible()` still accepts; there is nothing
+            # to solve in it, so only an on-screen frame with room for an interactive widget counts.
+            box = await element.bounding_box()
+            return box is not None and box["width"] > 1 and box["height"] > 1 and _intersects_viewport(box, viewport)
+        if selector is None:
             return False
         # Every match, not a prefix: stale hidden widgets can precede the live one; the timeout bounds the walk.
         matches = frame.locator(selector)
@@ -136,9 +160,13 @@ async def _frame_has_visible_match(frame: Any, selector: str, viewport: Any) -> 
     return False
 
 
-async def _visible_child_frame_match(page: Page | RecordingPage, selector: str) -> bool:
+async def _visible_child_frame_match(
+    page: Page | RecordingPage, selector: str | None, *, challenge_frames: bool = False
+) -> bool:
     """True when a visible child frame holds a visible `selector` match; each frame's probe is bounded, and a
-    frame that fails it (detached, wedged, no element) is skipped so one broken frame cannot blind the rest."""
+    frame that fails it (detached, wedged, no element) is skipped so one broken frame cannot blind the rest.
+    With ``challenge_frames``, a visible challenge-host frame counts on its own, by its committed URL or, before
+    that navigation commits, by its iframe ``src``."""
     # A frame probe must never be able to break the ladder: an unreadable page reads as "no nested challenge",
     # logged apart from a clean scan so a systematically blind page type stays countable.
     try:
@@ -150,10 +178,15 @@ async def _visible_child_frame_match(page: Page | RecordingPage, selector: str) 
         viewport = page.viewport_size
     except Exception:
         viewport = None
+    # A display-fitted `no_viewport` context reports None; without a size every off-screen frame would pass.
+    if not viewport:
+        viewport = {"width": settings.BROWSER_WIDTH, "height": settings.BROWSER_HEIGHT}
     # Frames are probed concurrently under one deadline, so the frame that matters is found regardless of
     # where it sits in frame order; a sequential walk let earlier wedged frames spend the budget first.
     probes = [
-        asyncio.ensure_future(_frame_has_visible_match(f, selector, viewport)) for f in frames if f is not main_frame
+        asyncio.ensure_future(_frame_has_visible_match(f, selector, viewport, challenge_frames=challenge_frames))
+        for f in frames
+        if f is not main_frame
     ]
     try:
         for probe in asyncio.as_completed(probes, timeout=_CHILD_FRAME_SCAN_BUDGET_SECONDS):
@@ -169,6 +202,16 @@ async def _visible_child_frame_match(page: Page | RecordingPage, selector: str) 
             probe.cancel()
         await asyncio.gather(*probes, return_exceptions=True)
     return False
+
+
+def _matches_cloudflare_challenge_host(frame_url: str | None) -> bool:
+    if not frame_url:
+        return False
+    try:
+        hostname = (urlparse(frame_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname == _CLOUDFLARE_CHALLENGE_HOST or hostname.endswith("." + _CLOUDFLARE_CHALLENGE_HOST)
 
 
 def _is_trusted_recaptcha_anchor_url(frame_url: str | None) -> bool:
@@ -207,8 +250,9 @@ async def solve_challenge_ladder(
 
     Thin public entry: it enters the ``AGENT_FUNCTION`` captcha-solver lifecycle scope exactly once
     around the ladder, so a deployment can bind a page-scoped solver lifecycle for the whole solve
-    (its self-heal/teardown owned by that scope). ``probe_child_frames`` opts a caller into also
-    detecting a challenge inside visible child frames; the default keeps the main-document-only check.
+    (its self-heal/teardown owned by that scope). ``probe_child_frames`` opts a caller into also probing
+    visible child frames' documents for markers; the default checks the main document plus a visible
+    ``challenges.cloudflare.com`` frame.
     """
     async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(page):
         return await _solve_challenge_ladder_impl(
@@ -245,9 +289,10 @@ async def _solve_challenge_ladder_impl(
     if (
         checkbox_count == 0
         and marker_count == 0
-        and not (
-            probe_child_frames
-            and await _visible_child_frame_match(page, f"{_CAPTCHA_CHECKBOX_SELECTOR}, {_CAPTCHA_MARKER_SELECTOR}")
+        and not await _visible_child_frame_match(
+            page,
+            f"{_CAPTCHA_CHECKBOX_SELECTOR}, {_CAPTCHA_MARKER_SELECTOR}" if probe_child_frames else None,
+            challenge_frames=True,
         )
     ):
         return False
