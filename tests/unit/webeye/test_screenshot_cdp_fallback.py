@@ -137,13 +137,11 @@ async def test_successful_capture_keeps_playwright_arguments_and_skips_cdp(mode:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["full_page", "firefox", "webkit", "unknown_browser", "skycdp"])
+@pytest.mark.parametrize("kind", ["full_page", "firefox", "webkit", "skycdp"])
 async def test_ineligible_captures_keep_animation_retry_and_never_attach(kind: str) -> None:
     page = _page()
     if kind in {"firefox", "webkit"}:
         page.context.browser.browser_type.name = kind
-    elif kind == "unknown_browser":
-        page.context.browser = None
     selection = None
     if kind == "skycdp":
         selection = SimpleNamespace(

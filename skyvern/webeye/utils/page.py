@@ -915,8 +915,11 @@ def _cdp_rescue_eligibility(
         return ScreenshotEligibility.INELIGIBLE_ENGINE
     if page.context is None:
         return ScreenshotEligibility.INELIGIBLE_BROWSER
+    # launch_persistent_context (the stealth-Chromium fleet) exposes no owning Browser, so
+    # context.browser is None; CDP still attaches through context.new_cdp_session. Only exclude a
+    # Browser that is present and explicitly non-Chromium.
     browser = page.context.browser
-    if browser is None or browser.browser_type.name != "chromium":
+    if browser is not None and browser.browser_type.name != "chromium":
         return ScreenshotEligibility.INELIGIBLE_BROWSER
     return ScreenshotEligibility.ELIGIBLE
 
