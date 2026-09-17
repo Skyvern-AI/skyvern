@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import textwrap
+from collections.abc import Callable
+
+import pytest
 
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps_in_yaml
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
@@ -267,6 +271,54 @@ def test_missing_code_steps_are_canonicalized_before_execution_fingerprinting() 
     accepted_shape = derive_code_block_steps_in_yaml(without_steps)
 
     assert workflow_block_fingerprints(without_steps) == workflow_block_fingerprints(accepted_shape)
+
+
+_READ_PRICE_BLOCK = """- block_type: code
+  label: read_price
+  code: |-
+    price = await page.locator('.price').inner_text()
+"""
+_OLD_WORDING_STEPS = """  steps:
+    - description: Extract information from the page
+      action_type: extract
+      line_start: 1
+"""
+_NEW_WORDING_STEPS = """  steps:
+    - description: Extract price
+      action_type: extract
+      line_start: 1
+      line_end: 1
+"""
+
+
+def _top_level(block: str) -> str:
+    return _workflow(textwrap.indent(block, "    "))
+
+
+def _inside_loop(block: str) -> str:
+    loop = "- block_type: for_loop\n  label: loop\n  loop_over_parameter_key: items\n  loop_blocks:\n"
+    return _workflow(textwrap.indent(loop + textwrap.indent(block, "    "), "    "))
+
+
+@pytest.mark.parametrize("wrap", [_top_level, _inside_loop])
+def test_tested_block_fingerprint_ignores_code_steps_at_every_depth(wrap: Callable[[str], str]) -> None:
+    old = wrap(_READ_PRICE_BLOCK + _OLD_WORDING_STEPS)
+    new = wrap(_READ_PRICE_BLOCK + _NEW_WORDING_STEPS)
+
+    assert workflow_block_fingerprints(old) == workflow_block_fingerprints(new)
+
+
+@pytest.mark.parametrize("wrap", [_top_level, _inside_loop])
+def test_projection_treats_old_wording_steps_as_unchanged(wrap: Callable[[str], str]) -> None:
+    persisted = wrap(_READ_PRICE_BLOCK + _OLD_WORDING_STEPS)
+    staged = wrap(_READ_PRICE_BLOCK)
+
+    projection = build_review_projection(persisted, staged, workflow_block_fingerprints(persisted))
+
+    assert projection is not None
+    assert [(block["change"], block["coverage"]) for block in projection["blocks"]] == [
+        ("unchanged", "current_source")
+    ] * len(projection["blocks"])
 
 
 def test_projection_retains_every_tested_version_when_a_block_reverts() -> None:

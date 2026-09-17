@@ -674,17 +674,26 @@ class FakeClearingBrowserContext:
         # Storage key the browser reports for a tab whose URL names no origin, as it does for a
         # window opened on about:blank. A tab absent from this list has an opaque origin and none.
         self.inherited_storage_keys: list[tuple[object, str]] = []
+        # (frame, page) pairs whose frame session is attached to the page's target, as raw-CDP attaches
+        # a same-process frame, so protocol calls on it answer for the page's document.
+        self.frames_attached_to_page_target: list[tuple[object, object]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
         if self.clear_cookies_error is not None:
             raise self.clear_cookies_error
 
+    async def _probe_storage(self, document: object) -> str:
+        return "unreachable" if document in self.frames_without_storage else "reachable"
+
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        if not hasattr(page, "evaluate"):
+            page.evaluate = lambda expression, document=page: self._probe_storage(document)  # type: ignore[attr-defined]
         if page in self.frames_without_own_session:
             raise PlaywrightError("This frame does not have a separate CDP session")
+        answering = next((held for frame, held in self.frames_attached_to_page_target if frame is page), page)
         session = FakeCdpSession(
-            storage_reachable=page not in self.frames_without_storage,
+            storage_reachable=answering not in self.frames_without_storage,
             origins_refusing_clear=tuple(self.origins_refusing_clear),
             origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
             refuses_clear=page in self.frames_refusing_clear,
