@@ -70,6 +70,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
+    ScrapingFailedBlankPage,
     ScreenshotTargetClosed,
     SkyvernException,
     SkyvernPageAnalysisTimeout,
@@ -223,6 +224,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
     ClickAction,
+    ClosePageAction,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
@@ -267,11 +269,16 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
+from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
 RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
+# Consecutive dead-blank recovery attempts allowed per task before falling through to terminal
+# failure. Incremented at injection (so a guard-declined close still consumes the cap) and reset on
+# any successful step-body scrape.
+EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -3831,6 +3838,10 @@ class ForgeAgent:
                 reuse_speculative_llm_response = json_response is not None
                 speculative_llm_metadata = speculative_plan.llm_metadata
                 prompt_name = speculative_plan.prompt_name
+                # A consumed speculative plan is backed by a successful survivor scrape, so it counts
+                # as a successful step-body scrape for the consecutive-attempt cap.
+                if context is not None:
+                    context.empty_page_recovery_attempts.pop(task.task_id, None)
                 await self._persist_scrape_artifacts(
                     task=task,
                     step=step,
@@ -3844,18 +3855,43 @@ class ForgeAgent:
                     )
                     prefetched_summary_task.add_done_callback(_discard_background_task_result)
 
-                step_prompt = await self.build_and_record_step_prompt(
-                    task,
-                    step,
-                    browser_state,
-                    engine,
-                )
-                scraped_page = step_prompt.scraped_page
-                extract_action_prompt = step_prompt.extract_action_prompt
-                use_caching = step_prompt.use_caching
-                prompt_name = step_prompt.prompt_name
-                without_page_information = step_prompt.without_page_information
-                json_response = None
+                try:
+                    step_prompt = await self.build_and_record_step_prompt(
+                        task,
+                        step,
+                        browser_state,
+                        engine,
+                    )
+                except ScrapingFailedBlankPage:
+                    # The working page is a dead blank after the scrape ladder. If a survivor exists,
+                    # recover by injecting a single ClosePageAction (no LLM); otherwise re-raise so
+                    # the existing terminal handler fails the task exactly as on main.
+                    recovery_actions = await self._empty_page_recovery_plan(task, step, browser_state)
+                    if recovery_actions is None:
+                        raise
+                    injected_actions = recovery_actions
+                    scraped_page = ScrapedPage(
+                        elements=[],
+                        element_tree=[],
+                        element_tree_trimmed=[],
+                        _browser_state=browser_state,
+                        _clean_up_func=None,
+                        _scrape_exclude=None,
+                    )
+                    extract_action_prompt = ""
+                    use_caching = False
+                    prompt_name = ""
+                    without_page_information = False
+                    json_response = None
+                else:
+                    scraped_page = step_prompt.scraped_page
+                    extract_action_prompt = step_prompt.extract_action_prompt
+                    use_caching = step_prompt.use_caching
+                    prompt_name = step_prompt.prompt_name
+                    without_page_information = step_prompt.without_page_information
+                    json_response = None
+                    if context is not None:
+                        context.empty_page_recovery_attempts.pop(task.task_id, None)
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
@@ -6093,6 +6129,59 @@ class ForgeAgent:
             allow_transient_ui_suppression=True,
         )
 
+    async def _empty_page_recovery_plan(
+        self, task: Task, step: Step, browser_state: BrowserState
+    ) -> list[Action] | None:
+        """Fail-closed eligibility for dead-blank recovery.
+
+        Returns a single internal-recovery ClosePageAction when the current working page is a dead
+        blank, holds no download-popup claim, a usable http/https survivor exists, and the per-task
+        attempt cap is not reached. Any uncertainty (or exception) returns None so the caller
+        re-raises the original blank exception and reproduces main's terminal behavior exactly.
+        """
+        try:
+            context = skyvern_context.current()
+            page = await browser_state.get_working_page()
+            if context is None or page is None or not page_is_dead_blank(page):
+                return None
+            if context.has_download_popup_claim(task.task_id, page):
+                return None
+            pages = await browser_state.list_valid_pages(max_pages=0)
+            if not any(p is not page and page_is_http_survivor(p) for p in pages):
+                return None
+            attempts = context.empty_page_recovery_attempts.get(task.task_id, 0)
+            if attempts >= EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS:
+                return None
+            context.empty_page_recovery_attempts[task.task_id] = attempts + 1
+            context.empty_page_recovery_step_id = step.step_id
+            # A pending reload must not substitute for the close inside the action loop.
+            context.refresh_working_page = False
+            LOG.info(
+                "Empty-page recovery: closing dead blank working page to fall back to a survivor",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                attempt=attempts + 1,
+            )
+            return [
+                ClosePageAction(
+                    is_internal_recovery=True,
+                    reasoning="Recovering from a dead blank working page by closing it.",
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=0,
+                )
+            ]
+        except Exception:
+            LOG.warning(
+                "Empty-page recovery plan failed; falling through to terminal handling",
+                exc_info=True,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return None
+
     @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
     async def build_and_record_step_prompt(
         self,
@@ -6190,6 +6279,7 @@ class ForgeAgent:
                     consecutive_timeouts=context.browser_health.consecutive_timeouts,
                     stuck_operations=stuck_operations,
                 )
+            blank_page_error: ScrapingFailedBlankPage | None = None
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
                 try:
                     scraped_page = await self._scrape_with_type(
@@ -6201,6 +6291,11 @@ class ForgeAgent:
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
+                    # A later rung reloading the uncommitted blank page can fail with
+                    # FailedToReloadPage; remember the blank evidence so exhaustion surfaces it
+                    # instead, keeping the recovery-eligible signature intact.
+                    if isinstance(e, ScrapingFailedBlankPage):
+                        blank_page_error = e
                     if idx < len(SCRAPE_TYPE_ORDER) - 1:
                         LOG.warning(
                             "Scrape attempt failed, will retry with next strategy",
@@ -6230,7 +6325,7 @@ class ForgeAgent:
                         step_order=step.order,
                         step_retry=step.retry_index,
                     )
-                    raise e
+                    raise blank_page_error or e
 
         if scraped_page is None:
             raise EmptyScrapePage()
@@ -8983,6 +9078,12 @@ class ForgeAgent:
         engine: RunEngine = RunEngine.skyvern_v1,
         complete_verification: bool = True,
     ) -> tuple[bool | None, Step | None, Step | None]:
+        # A step whose only action was an internal-recovery close must not complete the block or trip
+        # the max-steps failure by itself; the block's real action still runs on the next step. Read
+        # once here so the parallel-verification path (which carries its own unconditional max-step
+        # failure) is bypassed for recovery steps, not just the sequential path below.
+        recovery_context = skyvern_context.current()
+        recovery_only = recovery_context is not None and recovery_context.empty_page_recovery_step_id == step.step_id
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
         task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
@@ -8992,6 +9093,7 @@ class ForgeAgent:
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
             and not task_completes_on_download
+            and not recovery_only
             and (task.navigation_goal or task.complete_criterion)
         )
 
@@ -9095,7 +9197,7 @@ class ForgeAgent:
         )
 
         # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
-        if isinstance(task_block, ActionBlock) and step.is_success():
+        if isinstance(task_block, ActionBlock) and step.is_success() and not recovery_only:
             LOG.info(
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
@@ -9120,7 +9222,7 @@ class ForgeAgent:
             )
             return False, last_step, None
 
-        if step.order + 1 >= max_steps_per_run:
+        if step.order + 1 >= max_steps_per_run and not recovery_only:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",
                 step_order=step.order,

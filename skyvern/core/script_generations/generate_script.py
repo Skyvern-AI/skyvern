@@ -1570,6 +1570,10 @@ def _build_block_fn(
         )
     else:
         for act in actions:
+            # Internal-recovery closes are runtime-synthesized and have no ACTION_MAP entry; skip
+            # only the marked ones so user-authored close_page semantics are left untouched.
+            if act.get("is_internal_recovery"):
+                continue
             if act["action_type"] in [
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
