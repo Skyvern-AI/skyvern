@@ -100,6 +100,19 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   totp_type: "none",
   totp_identifier: "",
 };
+class AdditionalTwoFactorSaveError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("The additional two-factor method could not be saved.");
+    this.name = "AdditionalTwoFactorSaveError";
+    this.cause = cause;
+  }
+}
+
+type RunAdditionalTwoFactorSaveOptions = {
+  throwOnError?: boolean;
+};
 
 function createAdditionalTwoFactorStates(
   methods: CredentialAdditionalTwoFactorMethod[],
@@ -391,7 +404,9 @@ function CredentialsModal({
       )
     : undefined;
   const selectedAdditionalTwoFactorMethod = additionalTwoFactorMethods.find(
-    ({ value }) => value === passwordCredentialValues.totp_type,
+    ({ value, gate }) =>
+      value === passwordCredentialValues.totp_type &&
+      !(gate?.locked && value !== configuredAdditionalTwoFactorMethod?.value),
   );
   const supportsInlineTest =
     selectedAdditionalTwoFactorMethod?.supportsInlineTest !== false;
@@ -537,6 +552,7 @@ function CredentialsModal({
     proxyLocation: ProxyLocation | null;
     proxySessionId?: string | null;
     proxyPinChanged: boolean;
+    additionalTwoFactorSaveBeforeUpdate?: boolean;
     additionalTwoFactor?: {
       selectedValue?: string;
       configuredValue?: string;
@@ -555,7 +571,10 @@ function CredentialsModal({
   });
 
   const runAdditionalTwoFactorSave = useCallback(
-    async (credentialId: string): Promise<boolean> => {
+    async (
+      credentialId: string,
+      options: RunAdditionalTwoFactorSaveOptions = {},
+    ): Promise<boolean> => {
       const snapshot = saveIntentRef.current.additionalTwoFactor;
       if (!snapshot) {
         return true;
@@ -588,6 +607,9 @@ function CredentialsModal({
         }
         return true;
       } catch (error) {
+        if (options.throwOnError) {
+          throw error;
+        }
         reportCredentialSaveError(error, "Partial save");
         return false;
       }
@@ -1069,9 +1091,23 @@ function CredentialsModal({
 
   const updateCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
+      const credentialId = editingCredential?.credential_id;
+      if (
+        saveIntentRef.current.additionalTwoFactorSaveBeforeUpdate &&
+        credentialId
+      ) {
+        try {
+          await runAdditionalTwoFactorSave(credentialId, {
+            throwOnError: true,
+          });
+        } catch (error) {
+          throw new AdditionalTwoFactorSaveError(error);
+        }
+      }
+
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post(
-        `/credentials/${editingCredential?.credential_id}/update`,
+        `/credentials/${credentialId}/update`,
         request,
       );
       return response.data;
@@ -1126,10 +1162,11 @@ function CredentialsModal({
         }
       }
 
-      const additionalTwoFactorSaved = editingCredential?.credential_id
-        ? await runAdditionalTwoFactorSave(editingCredential.credential_id)
-        : true;
-
+      const additionalTwoFactorSaved =
+        !saveIntentRef.current.additionalTwoFactorSaveBeforeUpdate &&
+        editingCredential?.credential_id
+          ? await runAdditionalTwoFactorSave(editingCredential.credential_id)
+          : true;
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
@@ -1173,8 +1210,10 @@ function CredentialsModal({
         });
       }
     },
-    onError: (error: AxiosError) => {
-      reportCredentialSaveError(error);
+    onError: (error: unknown) => {
+      reportCredentialSaveError(
+        error instanceof AdditionalTwoFactorSaveError ? error.cause : error,
+      );
     },
   });
 
@@ -1437,6 +1476,10 @@ function CredentialsModal({
         editingGroups.values ||
         userContext.trim() !== (editingCredential?.user_context ?? "") ||
         testUrl.trim() !== (editingCredential?.tested_url ?? "");
+      const saveAdditionalTwoFactorBeforeUpdate =
+        isEditMode &&
+        Boolean(editingCredential?.credential_id) &&
+        selectedAdditionalTwoFactorMethod?.saveBeforeCredentialUpdate === true;
       saveIntentRef.current = {
         shouldTestAfterSave:
           supportsInlineTest &&
@@ -1453,6 +1496,8 @@ function CredentialsModal({
         proxyLocation: proxyPinPayload.proxy_location,
         proxySessionId: proxyPinPayload.proxy_session_id,
         proxyPinChanged,
+        additionalTwoFactorSaveBeforeUpdate:
+          saveAdditionalTwoFactorBeforeUpdate,
         additionalTwoFactor:
           selectedAdditionalTwoFactorMethod ||
           configuredAdditionalTwoFactorMethod
@@ -1489,14 +1534,15 @@ function CredentialsModal({
           username,
           ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
-          // When newly selecting an additional method, stage "none" so the dedicated endpoint sets type
-          // and material atomically; a rejection then can't leave a 2FA type with no material behind.
-          // For an already-configured replacement, keep the type so the old material survives a failure.
+          // Stage "none" for methods that attach after the base update. Methods
+          // that opt into attach-first keep their server-written type here.
           totp_type:
             selectedAdditionalTwoFactorMethod &&
             selectedAdditionalTwoFactorMethod.value !==
               configuredAdditionalTwoFactorMethod?.value
-              ? "none"
+              ? saveAdditionalTwoFactorBeforeUpdate
+                ? selectedAdditionalTwoFactorMethod.requestType
+                : "none"
               : toPasswordCredentialTotpType(
                   passwordCredentialValues.totp_type,
                   selectedAdditionalTwoFactorMethod,
