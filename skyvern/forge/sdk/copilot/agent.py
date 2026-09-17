@@ -257,6 +257,15 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_budget_expiry,
     with_copilot_code_mode_diagnostics,
 )
+from skyvern.forge.sdk.copilot.video_attachment import (
+    VideoAttachmentArtifact,
+    VideoAttachmentEvidence,
+    build_video_attachment_message,
+    create_video_evidence_artifacts,
+    is_video_attachment,
+    load_video_attachment_evidence,
+    screen_video_frames_for_copilot,
+)
 from skyvern.forge.sdk.copilot.work_plan import hydrate_work_plan, work_plan_prompt
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     redact_credentials_in_workflow_yaml,
@@ -276,6 +285,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_statu
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
+    CopilotVideoEvidenceArtifact,
     WorkflowCopilotChatHistoryMessage,
     chat_history_role,
 )
@@ -4197,7 +4207,7 @@ async def _run_agent_loop_with_surface(
     ctx: Any,
     stream: EventSourceStream,
     chat_id: str,
-    initial_input: str | list[dict[str, str]],
+    initial_input: str | list[dict[str, Any]],
     system_prompt: Callable[[object, object], str] | str,
     model_name: str,
     run_config: Any,
@@ -4907,6 +4917,11 @@ async def run_copilot_agent(
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
+    persist_unsafe_video_file_ids: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    persist_too_long_video_file_ids: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    persist_video_evidence_artifacts: (
+        Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
+    ) = None,
     persisted_workflow_yaml: str | None = None,
     untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
@@ -4955,6 +4970,9 @@ async def run_copilot_agent(
                     stored_completion_criteria=stored_completion_criteria,
                     prior_turn_outcome=prior_turn_outcome,
                     persist_canonical_user_message=persist_canonical_user_message,
+                    persist_unsafe_video_file_ids=persist_unsafe_video_file_ids,
+                    persist_too_long_video_file_ids=persist_too_long_video_file_ids,
+                    persist_video_evidence_artifacts=persist_video_evidence_artifacts,
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     untrusted_evidence=untrusted_evidence,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
@@ -5075,6 +5093,11 @@ async def _run_copilot_turn_impl(
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
+    persist_unsafe_video_file_ids: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    persist_too_long_video_file_ids: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    persist_video_evidence_artifacts: (
+        Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
+    ) = None,
     persisted_workflow_yaml: str | None = None,
     untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
@@ -5392,6 +5415,101 @@ async def _run_copilot_turn_impl(
     ctx.supports_vision = supports_vision
     output_guardrails = _build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
 
+    video_files = [attached_file for attached_file in attached_files if is_video_attachment(attached_file.filename)]
+    video_attachment_message: dict[str, Any] | None = None
+    if video_files:
+        known_unsafe_video_files = [
+            attached_file for attached_file in video_files if attached_file.video_safety_status == "unsafe"
+        ]
+        known_too_long_video_files = [
+            attached_file for attached_file in video_files if attached_file.video_processing_status == "too_long"
+        ]
+        video_files_to_inspect = [
+            attached_file
+            for attached_file in video_files
+            if attached_file.video_safety_status != "unsafe"
+            and attached_file.video_processing_status != "too_long"
+            and (not attached_file.available or attached_file.video_evidence is None)
+        ]
+        video_evidence = (
+            await load_video_attachment_evidence(
+                video_files_to_inspect,
+                organization_id=organization_id,
+            )
+            if video_files_to_inspect
+            else VideoAttachmentEvidence()
+        )
+        if video_evidence.too_long_file_ids and persist_too_long_video_file_ids is not None:
+            await persist_too_long_video_file_ids(frozenset(video_evidence.too_long_file_ids))
+        screen_verdict = await screen_video_frames_for_copilot(
+            video_evidence,
+            handler=raw_secret_safety_handler,
+            organization_id=organization_id,
+        )
+        if screen_verdict.unsafe_file_ids and persist_unsafe_video_file_ids is not None:
+            await persist_unsafe_video_file_ids(screen_verdict.unsafe_file_ids)
+        unsafe_video_file_ids = screen_verdict.withheld_file_ids
+        clean_video_evidence = VideoAttachmentEvidence(
+            frames=tuple(frame for frame in video_evidence.frames if frame.file_id not in unsafe_video_file_ids),
+            duration_seconds_by_file_id=tuple(
+                item for item in video_evidence.duration_seconds_by_file_id if item[0] not in unsafe_video_file_ids
+            ),
+        )
+        new_artifacts, perception_unavailable_ids = await create_video_evidence_artifacts(
+            clean_video_evidence,
+            handler=raw_secret_safety_handler,
+            organization_id=organization_id,
+        )
+        if new_artifacts and persist_video_evidence_artifacts is not None:
+            await persist_video_evidence_artifacts(new_artifacts)
+        filenames_by_id = {attached_file.file_id: attached_file.filename for attached_file in video_files_to_inspect}
+        video_evidence = VideoAttachmentEvidence(
+            artifacts=tuple(
+                [
+                    VideoAttachmentArtifact(file_id, filenames_by_id[file_id], artifact)
+                    for file_id, artifact in new_artifacts.items()
+                ]
+                + [
+                    VideoAttachmentArtifact(attached_file.file_id, attached_file.filename, attached_file.video_evidence)
+                    for attached_file in video_files
+                    if attached_file.available
+                    and attached_file.video_evidence is not None
+                    and attached_file.video_safety_status != "unsafe"
+                    and attached_file.video_processing_status != "too_long"
+                ]
+            ),
+            unavailable_filenames=video_evidence.unavailable_filenames,
+            too_long_filenames=tuple(
+                dict.fromkeys(
+                    [attached_file.filename for attached_file in known_too_long_video_files]
+                    + list(video_evidence.too_long_filenames)
+                )
+            ),
+            withheld_filenames=tuple(
+                dict.fromkeys(
+                    [attached_file.filename for attached_file in known_unsafe_video_files]
+                    + [
+                        attached_file.filename
+                        for attached_file in video_files_to_inspect
+                        if attached_file.file_id in unsafe_video_file_ids
+                    ]
+                )
+            ),
+        )
+        if perception_unavailable_ids:
+            video_evidence = VideoAttachmentEvidence(
+                artifacts=video_evidence.artifacts,
+                unavailable_filenames=tuple(
+                    dict.fromkeys(
+                        list(video_evidence.unavailable_filenames)
+                        + [filenames_by_id[file_id] for file_id in perception_unavailable_ids]
+                    )
+                ),
+                too_long_filenames=video_evidence.too_long_filenames,
+                withheld_filenames=video_evidence.withheld_filenames,
+            )
+        video_attachment_message = build_video_attachment_message(video_evidence)
+
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays(copilot_config.block_authoring_policy)
     registered_mcp_tools = (
@@ -5475,9 +5593,13 @@ async def _run_copilot_turn_impl(
         untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
     )
-    initial_input: str | list[dict[str, str]] = user_message
-    if direct_test_handoff is not None:
-        initial_input = [{"role": "user", "content": user_message}, *direct_test_handoff]
+    initial_input: str | list[dict[str, Any]] = user_message
+    if video_attachment_message is not None or direct_test_handoff is not None:
+        initial_input = [{"role": "user", "content": user_message}]
+        if video_attachment_message is not None:
+            initial_input.append(video_attachment_message)
+        if direct_test_handoff is not None:
+            initial_input.extend(direct_test_handoff)
 
     LOG.info(
         "Starting copilot agent loop",
