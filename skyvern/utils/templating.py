@@ -1,7 +1,7 @@
 import json
 import keyword
 import re
-from typing import Any
+from typing import Any, Callable
 
 from jinja2 import StrictUndefined, UndefinedError, meta, nodes
 from jinja2.sandbox import SandboxedEnvironment
@@ -9,6 +9,55 @@ from jinja2.sandbox import SandboxedEnvironment
 
 class Constants:
     MissingVariablePattern = var_pattern = r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_.\[\]'\"]*)\s*\}\}"
+
+
+_JINJA_TAG_CLOSERS = {"{%": "%}", "{#": "#}"}
+
+
+def _jinja_tag_spans(code: str) -> list[tuple[int, int]]:
+    """Leftmost non-overlapping `{% ... %}` / `{# ... #}` spans, found in one forward pass.
+
+    Once an opener has no closer after it, no later opener of that kind can close either, so that kind
+    is dropped; a regex search would instead rescan to the end from every later opener (quadratic)."""
+    spans: list[tuple[int, int]] = []
+    next_opener = {opener: code.find(opener) for opener in _JINJA_TAG_CLOSERS}
+    position = 0
+    while True:
+        for opener, index in list(next_opener.items()):
+            if index != -1 and index < position:
+                next_opener[opener] = code.find(opener, position)
+        open_kinds = {opener: index for opener, index in next_opener.items() if index != -1}
+        if not open_kinds:
+            return spans
+        opener = min(open_kinds, key=open_kinds.__getitem__)
+        start = open_kinds[opener]
+        end = code.find(_JINJA_TAG_CLOSERS[opener], start + len(opener))
+        if end == -1:
+            del next_opener[opener]
+            continue
+        position = end + len(_JINJA_TAG_CLOSERS[opener])
+        spans.append((start, position))
+
+
+def _replace_jinja_tags(code: str, replacement: Callable[[str], str]) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for start, end in _jinja_tag_spans(code):
+        parts.append(code[cursor:start])
+        parts.append(replacement(code[start:end]))
+        cursor = end
+    parts.append(code[cursor:])
+    return "".join(parts)
+
+
+def mask_jinja_control_blocks(code: str) -> str:
+    """Replace each `{% ... %}` block and `{# ... #}` comment in Python source with comment lines, keeping every line number."""
+    return _replace_jinja_tags(code, lambda tag: "\n".join("# __JINJA_BLOCK__" for _ in range(tag.count("\n") + 1)))
+
+
+def strip_jinja_control_blocks(code: str) -> str:
+    """Remove each `{% ... %}` block and `{# ... #}` comment from Python source, keeping its newlines so line numbers hold."""
+    return _replace_jinja_tags(code, lambda tag: "\n" * tag.count("\n"))
 
 
 def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
