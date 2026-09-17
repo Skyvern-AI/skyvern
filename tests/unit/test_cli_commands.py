@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -1178,6 +1179,42 @@ class TestCliRuntimeFlag:
         code = "import sys; import skyvern.cli; raise SystemExit(1 if 'skyvern.config' in sys.modules else 0)"
         completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
         assert completed.returncode == 0, completed.stderr
+
+
+class TestCliRuntimeResetFixture:
+    def test_reset_cli_runtime_entry_restores_process_and_env_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The autouse conftest fixture must undo everything a CLI entry leaves in the process.
+
+        prepare_cli_runtime flips _CLI_RUNTIME_PREPARED, and load_backend_env_files writes
+        SKYVERN_ENV_INTENT unconditionally plus SKYVERN_API_KEY / SKYVERN_BASE_URL when a .env
+        supplies them. config._settings_env_intent reads SKYVERN_ENV_INTENT for env precedence,
+        so leaking it past teardown steers a later cloud-client test in the same shard.
+        """
+        from skyvern import _cli_bootstrap
+        from tests.unit.conftest import reset_cli_runtime_entry
+
+        run_reset = reset_cli_runtime_entry.__wrapped__
+
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        monkeypatch.setenv("SKYVERN_ENV_INTENT", "auto")
+
+        teardown = run_reset()
+        next(teardown)
+
+        _cli_bootstrap._CLI_RUNTIME_PREPARED = True
+        os.environ["SKYVERN_API_KEY"] = "leaked-key"
+        os.environ["SKYVERN_BASE_URL"] = "https://leaked.example"
+        os.environ["SKYVERN_ENV_INTENT"] = "cloud"
+
+        with pytest.raises(StopIteration):
+            next(teardown)
+
+        assert _cli_bootstrap._CLI_RUNTIME_PREPARED is False
+        assert "SKYVERN_API_KEY" not in os.environ
+        assert "SKYVERN_BASE_URL" not in os.environ
+        assert os.environ["SKYVERN_ENV_INTENT"] == "auto"
 
 
 class TestCredentialsCommands:
