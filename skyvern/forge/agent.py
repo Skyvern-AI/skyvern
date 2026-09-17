@@ -498,7 +498,7 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # page change and resets the stall counter -- on a frozen page the model works through
     # mark after mark, which is precisely the run the stall detector exists to catch.
     # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
-    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
+    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
     " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
