@@ -4586,7 +4586,6 @@ class Credential(SimpleNamespace):
 
 
 class CodeBlockStep(BaseModel):
-    title: str | None = None
     description: str | None = None
     action_type: ActionType = ActionType.NULL_ACTION
     line_start: int | None = None
@@ -5451,12 +5450,12 @@ async def _dom_storage_session(context: BrowserContext, open_page: Page, frame: 
 
 
 _FRAME_STORAGE_REACHABLE_PROBE = (
-    "(() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } })()"
+    "() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } }"
 )
 
 
-async def _frame_storage_is_unreachable(session: CDPSession) -> bool:
-    """Whether the frame behind this session can reach web storage at all.
+async def _frame_storage_is_unreachable(target: Page | Frame) -> bool:
+    """Whether this frame's own document can reach web storage at all.
 
     A sandboxed or otherwise opaque frame has no storage area to address and nothing that outlives its
     document, so a clear that cannot find one has found nothing to clear. Asked only after the clear
@@ -5464,14 +5463,12 @@ async def _frame_storage_is_unreachable(session: CDPSession) -> bool:
     it can address, so a real addressing failure still surfaces.
     """
     try:
-        answer = await session.send(
-            "Runtime.evaluate", {"expression": _FRAME_STORAGE_REACHABLE_PROBE, "returnByValue": True}
-        )
+        answer = await target.evaluate(_FRAME_STORAGE_REACHABLE_PROBE)
     except Exception as exc:
         if not _is_browser_refusal(exc):
             raise
         return False
-    return answer.get("result", {}).get("value") == "unreachable"
+    return answer == "unreachable"
 
 
 async def _cleared_session_storage(context: BrowserContext, open_page: Page, frame: Frame, origin: str) -> bool:
@@ -5486,9 +5483,9 @@ async def _cleared_session_storage(context: BrowserContext, open_page: Page, fra
         await frame_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
         return True
     except Exception as exc:
-        # Only a frame holding a session of its own can be asked about its own storage, and a frame
-        # with nothing to clear is exactly that kind: it is opaque, so it has a target.
-        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame_session)):
+        # The frame is asked rather than its session: an engine can hand a frame sharing the page's
+        # renderer a session on the page's target, which answers for the page.
+        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame)):
             raise
         return False
     finally:
@@ -5514,7 +5511,7 @@ async def _cleared_inherited_session_storage(context: BrowserContext, open_page:
             # A frame with no storage key is one on an opaque origin, which has no storage area to
             # clear -- and which answers the probe as such. Any other refusal, a timeout among them,
             # would otherwise pass for a tab with nothing to clear and leave its session behind.
-            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(session):
+            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(open_page):
                 raise
             return ""
         storage_key = answer.get("storageKey")
@@ -6627,22 +6624,16 @@ async def wrapper({default_args}):
         return None
 
     def _static_url_from_goal(self) -> str:
-        # The goal is human free text (prompt + step descriptions), not code, so a URL regex is
-        # appropriate here (unlike the AST-only code scan). This is the authored destination the
-        # heal should reach when the block's own navigation rotted. Returns the first well-formed
-        # absolute http(s) URL, else "".
-        texts = [self.prompt or ""]
-        if self.steps:
-            texts.extend(step.description or "" for step in self.steps)
-        for text in texts:
-            match = re.search(r"https?://[^\s'\"<>)\]]+", text)
-            if not match:
-                continue
-            candidate = match.group(0).rstrip(".,;")
-            parsed = urlparse(candidate)
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
-                return candidate
-        return ""
+        # The prompt is human free text, not code, so a URL regex is appropriate here (unlike the
+        # AST-only code scan). Step descriptions are derived from the code, so an address there is
+        # the code's own possibly-rotted goto, never an authored destination. Returns the first
+        # well-formed absolute http(s) URL, else "".
+        match = re.search(r"https?://[^\s'\"<>)\]]+", self.prompt or "")
+        if not match:
+            return ""
+        candidate = match.group(0).rstrip(".,;")
+        parsed = urlparse(candidate)
+        return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
     def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
         code_lines = self.code.splitlines()

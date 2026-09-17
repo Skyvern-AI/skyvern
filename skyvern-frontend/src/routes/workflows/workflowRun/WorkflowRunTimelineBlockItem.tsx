@@ -739,9 +739,7 @@ function TimelineCodeStepRows({
     <div className="space-y-1 py-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div key={index} className="flex min-h-[24px] items-stretch text-xs">
@@ -810,9 +808,7 @@ function TimelineSkippedStepRows({
     <div className="space-y-1 pb-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div

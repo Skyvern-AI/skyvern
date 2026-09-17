@@ -596,12 +596,12 @@ describe("CodeBlockEditor for a block without a goal", () => {
     expect(screen.getByText(/No steps yet/)).toBeTruthy();
   });
 
-  test("opens on the steps when a goal-less block carries an outline", () => {
+  test("opens on the code even when a goal-less block carries derived steps", () => {
     node.data = { ...baseData, steps: codeFirstData.steps! };
     renderEditor();
 
-    expect(screen.getByText("Open the page")).toBeTruthy();
-    expect(screen.queryByTestId("code-editor")).toBeNull();
+    expect(screen.getByTestId("code-editor")).toBeTruthy();
+    expect(screen.queryByTitle("Open the page")).toBeNull();
   });
 
   test("treats a block missing the goal field entirely the same as null", () => {

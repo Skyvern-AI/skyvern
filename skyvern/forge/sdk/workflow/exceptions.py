@@ -184,14 +184,6 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
-class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
-    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
-        super().__init__(
-            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        )
-
-
 class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
     def __init__(self, block_label: str, original: BaseException) -> None:
         self.block_label = block_label

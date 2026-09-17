@@ -126,7 +126,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_wait": "7f9b8d8d39762eaa2c2962ab3b1e4b997454d9a1039ee2fee1b5aaa07019786a",
     "skyvern_wait_for_either_state": "b4b127498f91a7d9e1536d11a8993cb9d1cbf7b1557f9bec832afaa127ea1613",
     "skyvern_workflow_cancel": "0ee1a599421c3a116bf09906613574807b7f0a4e7f72b6a79adf6cfb84edb3d1",
-    "skyvern_workflow_create": "42dd751b5ba7607a6be052093eea1d986b03e14c02525b9741618865db666189",
+    # Re-frozen for SKY-16333: the description said a code block's `steps` outline is "derived from the code
+    # when omitted"; steps are now always rebuilt on save. Description text only; the schema is unchanged.
+    "skyvern_workflow_create": "f9062f485a05cc359f0a818ebe09b047a5b03aebc29024999188ba413e4bf692",
     "skyvern_workflow_delete": "4b8b6574f78122c5d6bf8ee12f5b3cedeb83832d08462445889259cfd0c8b861",
     "skyvern_workflow_get": "b9340c5d1cfa0db49431d4e914c0879f15e458d4c6d4879de0d0de653de842da",
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",

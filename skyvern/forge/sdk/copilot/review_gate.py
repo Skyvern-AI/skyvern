@@ -8,7 +8,6 @@ from typing import Any, Literal
 from jinja2 import Environment, nodes
 from typing_extensions import NotRequired, TypedDict
 
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps_in_yaml
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.services import google_drive_service
@@ -196,8 +195,18 @@ DESTINATION_ADAPTERS: dict[str, DestinationAdapter] = {
 }
 
 
+def _without_code_steps(value: Any) -> Any:
+    """Drop code-derived `steps` at every nesting depth; they are a projection of `code`, not execution identity."""
+    if isinstance(value, dict):
+        is_code = _block_type(value) == BlockType.CODE.value
+        return {key: _without_code_steps(item) for key, item in value.items() if not (is_code and key == "steps")}
+    if isinstance(value, list):
+        return [_without_code_steps(item) for item in value]
+    return value
+
+
 def _comparison_value(block: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in block.items() if key not in _IGNORED_COMPARISON_KEYS}
+    return {key: value for key, value in _without_code_steps(block).items() if key not in _IGNORED_COMPARISON_KEYS}
 
 
 def _workflow_execution_inputs(parsed: Mapping[str, Any]) -> dict[str, Any]:
@@ -230,7 +239,9 @@ def _block_fingerprint(block: Mapping[str, Any], workflow_execution_inputs: Mapp
     # Ignore only the indexed block's own label. Nested labels and control-flow
     # links remain part of the exact version that a run exercised.
     value = {
-        "block": {key: item for key, item in block.items() if key not in _IGNORED_FINGERPRINT_KEYS},
+        "block": {
+            key: item for key, item in _without_code_steps(block).items() if key not in _IGNORED_FINGERPRINT_KEYS
+        },
         "workflowExecutionInputs": workflow_execution_inputs,
     }
     serialized = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
@@ -258,7 +269,7 @@ def _next_common_label(
 def workflow_block_fingerprints(workflow_yaml: str) -> dict[str, set[str]]:
     if not isinstance(workflow_yaml, str):
         return {}
-    parsed = parse_workflow_yaml(derive_code_block_steps_in_yaml(workflow_yaml))
+    parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return {}
     indexed = _labeled_blocks(parsed)
@@ -333,8 +344,8 @@ def build_review_projection(
 ) -> NarrativeReviewProjection | None:
     if not isinstance(persisted_workflow_yaml, str) or not isinstance(staged_workflow_yaml, str):
         return None
-    persisted = parse_workflow_yaml(derive_code_block_steps_in_yaml(persisted_workflow_yaml))
-    staged = parse_workflow_yaml(derive_code_block_steps_in_yaml(staged_workflow_yaml))
+    persisted = parse_workflow_yaml(persisted_workflow_yaml)
+    staged = parse_workflow_yaml(staged_workflow_yaml)
     if not isinstance(persisted, dict) or not isinstance(staged, dict):
         return None
     persisted_index = _labeled_blocks(persisted)

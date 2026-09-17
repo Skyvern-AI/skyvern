@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -3188,17 +3188,28 @@ class TestClearBrowserDataHelperBinding:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("has_own_session", "reaches_storage", "skipped"),
+        ("has_own_session", "reaches_storage", "on_page_target", "skipped"),
         [
-            (True, False, True),
-            (True, True, False),
-            (False, False, False),
+            (True, False, False, True),
+            (True, True, False, False),
+            (False, False, False, False),
+            (True, False, True, True),
         ],
-        ids=["sandboxed_frame", "real_defect", "same_process_frame_cannot_be_classified"],
+        ids=[
+            "sandboxed_frame",
+            "real_defect",
+            "same_process_frame_cannot_be_classified",
+            "sandboxed_frame_whose_session_is_on_the_page_target",
+        ],
     )
     @pytest.mark.parametrize("refusal_error", [PlaywrightError, CdpError], ids=["playwright", "raw_cdp"])
     async def test_a_frame_whose_clear_fails_is_skipped_only_when_it_reports_no_storage_of_its_own(
-        self, has_own_session: bool, reaches_storage: bool, skipped: bool, refusal_error: type[BaseException]
+        self,
+        has_own_session: bool,
+        reaches_storage: bool,
+        on_page_target: bool,
+        skipped: bool,
+        refusal_error: type[BaseException],
     ) -> None:
         # A sandboxed iframe has no storage area to address, so a clear that cannot find one found
         # nothing to clear and the block carries on. A frame that CAN reach storage is an addressing
@@ -3221,6 +3232,8 @@ class TestClearBrowserDataHelperBinding:
             context.frames_without_storage = [page]
         elif not reaches_storage:
             context.frames_without_storage = [embedded]
+        if on_page_target:
+            context.frames_attached_to_page_target = [(embedded, page)]
 
         user_function = self._block().generate_async_user_function(
             'await clear_browser_data(page)\nreturn {"cleared": True}\n',
@@ -3334,7 +3347,6 @@ class TestClearBrowserDataHelperBinding:
                     [
                         ("Page.getFrameTree", None),
                         ("Storage.getStorageKeyForFrame", {"frameId": "frame-of-this-session"}),
-                        ("Runtime.evaluate", ANY),
                     ],
                 ),
             ]

@@ -11313,17 +11313,6 @@
       },
       "CodeBlockStep": {
         "properties": {
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
           "description": {
             "anyOf": [
               {
@@ -11367,17 +11356,6 @@
       },
       "CodeBlockStepYAML": {
         "properties": {
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
           "description": {
             "anyOf": [
               {
@@ -11529,7 +11507,7 @@
               }
             ],
             "title": "Steps",
-            "description": "Plain-language step outline mapped to code line ranges; derived from the code when omitted"
+            "description": "Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored"
           }
         },
         "type": "object",
