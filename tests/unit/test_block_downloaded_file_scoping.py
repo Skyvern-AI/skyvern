@@ -358,7 +358,11 @@ async def test_current_attempt_downloads_preserve_unknown_dates_and_include_star
 
     assert result == (files[2:] if attempt_number > 1 and started_at is not None else files)
     resolve_attempt.assert_awaited_once_with("o_1", "wr_child", attempt_number=None)
-    storage.get_downloaded_files.assert_awaited_once_with(organization_id="o_1", run_id="wr_child")
+    storage.get_downloaded_files.assert_awaited_once_with(
+        organization_id="o_1",
+        run_id="wr_child",
+        attempt_started_at=boundary if attempt_number > 1 and started_at else None,
+    )
 
 
 @pytest.mark.asyncio

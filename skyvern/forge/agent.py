@@ -70,6 +70,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
+    ScrapingFailedBlankPage,
     ScreenshotTargetClosed,
     SkyvernException,
     SkyvernPageAnalysisTimeout,
@@ -139,6 +140,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
     MultiFieldTotpAttempt,
     SkyvernContext,
     action_for_multi_field_totp_persistence,
+    canonical_url,
     redact_multi_field_totp_element_data,
 )
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -223,6 +225,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
     ClickAction,
+    ClosePageAction,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
@@ -267,11 +270,16 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
+from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
 RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
+# Consecutive dead-blank recovery attempts allowed per task before falling through to terminal
+# failure. Incremented at injection (so a guard-declined close still consumes the cap) and reset on
+# any successful step-body scrape.
+EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -382,9 +390,18 @@ _TASKV3_TOOL_ACTION_TYPES = {
 }
 
 
-def _taskv3_row_intention(task: Task, round_action: RoundAction, secret_values: set[str]) -> str | None:
+def _taskv3_row_intention(
+    task: Task, round_action: RoundAction, secret_values: set[str], redacted_args: dict[str, Any]
+) -> str | None:
     """The persisted label for one v3 action. This is the only frame that holds the unfloored drop-check
     secrets, and a failure here is logged without exc_info, so no traceback renderer can print them."""
+    if round_action.tool == "navigate":
+        # A navigation names no element, so the element-label composer has nothing to say about it:
+        # the URL is the whole subject. Read from the already-redacted args, never the raw ones.
+        url = redacted_args.get("url")
+        if not isinstance(url, str) or not url:
+            return None
+        return f"Navigated to {url}" if round_action.succeeded else f"Tried to navigate to {url}"
     try:
         # Drop-only: this set decides whether to drop a page-supplied name and reaches no redaction path.
         label_secret_values = (
@@ -428,6 +445,36 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
 # Cap on the persisted turn text: actions is a high-traffic table and readers clamp far lower for
 # display; a runaway multi-paragraph turn must not become a per-row payload.
 _TASKV3_REASONING_MAX_CHARS = 1000
+# Same reason, for the outcome line: it can carry two page-supplied URLs (or, when the call reached no
+# page, the tool's own error text), and neither a URL nor a tool error has a length bound.
+_TASKV3_RESPONSE_MAX_CHARS = 500
+
+
+def _taskv3_row_response(outcome: dict[str, Any]) -> str | None:
+    """The persisted outcome of one v3 action: where it asked to go, where it landed, and what the page
+    answered. Reads only the keys it knows (see ACTION_OUTCOME_DATA_KEY), so a tool reporting something
+    else leaves the row's response empty rather than printing a shape nobody can read."""
+    requested = outcome.get("requested_url") if isinstance(outcome.get("requested_url"), str) else None
+    landed = outcome.get("url") if isinstance(outcome.get("url"), str) else None
+    where = requested or landed or ""
+    # Canonical comparison, the same identity the handler classified `page_transitioned` on, so a
+    # landing that only re-spells the requested URL (a trailing slash, an escape case) is not
+    # rendered as a move the row then calls "same page".
+    if requested and landed and canonical_url(landed) != canonical_url(requested):
+        where = f"{requested} -> {landed}"
+    notes: list[str] = []
+    status = outcome.get("http_status")
+    if isinstance(status, int):
+        notes.append(f"HTTP {status}")
+    if outcome.get("navigation_dead_end") is not None:
+        notes.append("dead end")
+    transitioned = outcome.get("page_transitioned")
+    if isinstance(transitioned, bool):
+        notes.append("page changed" if transitioned else "same page")
+    if not where:
+        return ", ".join(notes) or None
+    return f"{where} ({', '.join(notes)})" if notes else where
+
 
 # Block-engine to run-type labels for the "Task duration metrics" discriminator (SKY-15499):
 # workflow-block tasks have no task_runs row, so the block's resolved engine stands in.
@@ -2163,27 +2210,54 @@ class ForgeAgent:
                     # can be glued to adjacent alphanumerics — boundary anchoring would let it through.
                     turn_reasoning = redact_secrets_from_text(turn_reasoning, secret_values)
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
+            # A round that bills nothing claims no budget unit, so its rows ride the LAST consumed
+            # index (or the single Step's own order 0) the way the decision row below does: a fresh
+            # index nothing later claims would be a distinct (task_id, step_order) pair, and the
+            # workflow-run step budget counts those pairs.
+            billable_round = any(entry.billable for entry in round_actions)
+            row_step_order = v3_round_index if billable_round else max(v3_round_index - 1, 0)
             for round_action in round_actions:
                 name, args, succeeded = round_action.tool, round_action.args, round_action.succeeded
                 try:
                     tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
                     selector = tool_args.get("selector", "")
+                    row_response = _taskv3_row_response(round_action.outcome) if round_action.outcome else None
+                    if row_response is not None:
+                        # The outcome carries page-supplied URLs the arg redaction above never saw, and a
+                        # landing URL's query routinely holds the credential itself (a sign-in link's token).
+                        if secret_values:
+                            row_response = redact_secrets_from_text(
+                                row_response, secret_values, boundary_all_lengths=True
+                            )
+                    elif name == "navigate" and round_action.error:
+                        # A navigation the engine refused on purpose (the destructive same-URL reload
+                        # guard), or one that never loaded, reached no page and reports no outcome: the
+                        # tool's own error is all the row can say, and without it the customer reads a
+                        # failed navigation with no reason. Free-form prose, so it is matched the way the
+                        # turn text is rather than the way the URL line above is.
+                        row_response = round_action.error
+                        if secret_values:
+                            row_response = redact_secrets_from_text(row_response, secret_values)
+                    if row_response is not None:
+                        row_response = row_response[:_TASKV3_RESPONSE_MAX_CHARS]
                     action = _taskv3_action_for_tool_call(
                         name,
                         tool_args,
                         status=ActionStatus.completed if succeeded else ActionStatus.failed,
+                        response=row_response,
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
                         step_id=step.step_id,
-                        # Round index, not the single Step's order: makes each v3 action ROUND count
-                        # as one unit of the workflow-run step budget (distinct (task, order) pairs).
-                        step_order=v3_round_index,
+                        # Round index, not the single Step's order: makes each BILLABLE v3 action
+                        # ROUND count as one unit of the workflow-run step budget (distinct (task,
+                        # order) pairs).
+                        step_order=row_step_order,
                         action_order=len(v3_persisted_actions),
                         description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
                         reasoning=turn_reasoning,
-                        intention=_taskv3_row_intention(task, round_action, secret_values),
+                        intention=_taskv3_row_intention(task, round_action, secret_values, tool_args),
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(
@@ -2191,9 +2265,7 @@ class ForgeAgent:
                     )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
-            if any(entry.billable for entry in round_actions):
-                # Only billable rounds consume the budget unit; recordable-only rounds (navigate/
-                # scroll/wait) keep the current index so they never inflate the workflow-run count.
+            if billable_round:
                 v3_round_index += 1
 
         pre_submit_ring: PreSubmitCaptureRing | None = None
@@ -3315,9 +3387,13 @@ class ForgeAgent:
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
-            # Fail the task if we can't navigate to the URL and send the response.
-            # Navigation failures are target-site/customer-caused and are surfaced on the run
-            # via failure_reason below, so this is expected-and-handled, not an error.
+            # Fail the task if we can't navigate to the URL and send the response. Who owns the
+            # failure is decided downstream from the driver's code, not from this text: Skyvern's
+            # own egress can fail here too.
+            if e.nav_error_code:
+                nav_context = skyvern_context.current()
+                if nav_context is not None:
+                    nav_context.task_nav_error_codes[task.task_id] = e.nav_error_code
             LOG.warning(
                 "Failed to navigate to URL, marking task as failed, and sending webhook response",
                 url=e.url,
@@ -3827,6 +3903,10 @@ class ForgeAgent:
                 reuse_speculative_llm_response = json_response is not None
                 speculative_llm_metadata = speculative_plan.llm_metadata
                 prompt_name = speculative_plan.prompt_name
+                # A consumed speculative plan is backed by a successful survivor scrape, so it counts
+                # as a successful step-body scrape for the consecutive-attempt cap.
+                if context is not None:
+                    context.empty_page_recovery_attempts.pop(task.task_id, None)
                 await self._persist_scrape_artifacts(
                     task=task,
                     step=step,
@@ -3840,18 +3920,43 @@ class ForgeAgent:
                     )
                     prefetched_summary_task.add_done_callback(_discard_background_task_result)
 
-                step_prompt = await self.build_and_record_step_prompt(
-                    task,
-                    step,
-                    browser_state,
-                    engine,
-                )
-                scraped_page = step_prompt.scraped_page
-                extract_action_prompt = step_prompt.extract_action_prompt
-                use_caching = step_prompt.use_caching
-                prompt_name = step_prompt.prompt_name
-                without_page_information = step_prompt.without_page_information
-                json_response = None
+                try:
+                    step_prompt = await self.build_and_record_step_prompt(
+                        task,
+                        step,
+                        browser_state,
+                        engine,
+                    )
+                except ScrapingFailedBlankPage:
+                    # The working page is a dead blank after the scrape ladder. If a survivor exists,
+                    # recover by injecting a single ClosePageAction (no LLM); otherwise re-raise so
+                    # the existing terminal handler fails the task exactly as on main.
+                    recovery_actions = await self._empty_page_recovery_plan(task, step, browser_state)
+                    if recovery_actions is None:
+                        raise
+                    injected_actions = recovery_actions
+                    scraped_page = ScrapedPage(
+                        elements=[],
+                        element_tree=[],
+                        element_tree_trimmed=[],
+                        _browser_state=browser_state,
+                        _clean_up_func=None,
+                        _scrape_exclude=None,
+                    )
+                    extract_action_prompt = ""
+                    use_caching = False
+                    prompt_name = ""
+                    without_page_information = False
+                    json_response = None
+                else:
+                    scraped_page = step_prompt.scraped_page
+                    extract_action_prompt = step_prompt.extract_action_prompt
+                    use_caching = step_prompt.use_caching
+                    prompt_name = step_prompt.prompt_name
+                    without_page_information = step_prompt.without_page_information
+                    json_response = None
+                    if context is not None:
+                        context.empty_page_recovery_attempts.pop(task.task_id, None)
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
@@ -6089,6 +6194,59 @@ class ForgeAgent:
             allow_transient_ui_suppression=True,
         )
 
+    async def _empty_page_recovery_plan(
+        self, task: Task, step: Step, browser_state: BrowserState
+    ) -> list[Action] | None:
+        """Fail-closed eligibility for dead-blank recovery.
+
+        Returns a single internal-recovery ClosePageAction when the current working page is a dead
+        blank, holds no download-popup claim, a usable http/https survivor exists, and the per-task
+        attempt cap is not reached. Any uncertainty (or exception) returns None so the caller
+        re-raises the original blank exception and reproduces main's terminal behavior exactly.
+        """
+        try:
+            context = skyvern_context.current()
+            page = await browser_state.get_working_page()
+            if context is None or page is None or not page_is_dead_blank(page):
+                return None
+            if context.has_download_popup_claim(task.task_id, page):
+                return None
+            pages = await browser_state.list_valid_pages(max_pages=0)
+            if not any(p is not page and page_is_http_survivor(p) for p in pages):
+                return None
+            attempts = context.empty_page_recovery_attempts.get(task.task_id, 0)
+            if attempts >= EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS:
+                return None
+            context.empty_page_recovery_attempts[task.task_id] = attempts + 1
+            context.empty_page_recovery_step_id = step.step_id
+            # A pending reload must not substitute for the close inside the action loop.
+            context.refresh_working_page = False
+            LOG.info(
+                "Empty-page recovery: closing dead blank working page to fall back to a survivor",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                attempt=attempts + 1,
+            )
+            return [
+                ClosePageAction(
+                    is_internal_recovery=True,
+                    reasoning="Recovering from a dead blank working page by closing it.",
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=0,
+                )
+            ]
+        except Exception:
+            LOG.warning(
+                "Empty-page recovery plan failed; falling through to terminal handling",
+                exc_info=True,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return None
+
     @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
     async def build_and_record_step_prompt(
         self,
@@ -6186,6 +6344,7 @@ class ForgeAgent:
                     consecutive_timeouts=context.browser_health.consecutive_timeouts,
                     stuck_operations=stuck_operations,
                 )
+            blank_page_error: ScrapingFailedBlankPage | None = None
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
                 try:
                     scraped_page = await self._scrape_with_type(
@@ -6197,6 +6356,11 @@ class ForgeAgent:
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
+                    # A later rung reloading the uncommitted blank page can fail with
+                    # FailedToReloadPage; remember the blank evidence so exhaustion surfaces it
+                    # instead, keeping the recovery-eligible signature intact.
+                    if isinstance(e, ScrapingFailedBlankPage):
+                        blank_page_error = e
                     if idx < len(SCRAPE_TYPE_ORDER) - 1:
                         LOG.warning(
                             "Scrape attempt failed, will retry with next strategy",
@@ -6226,7 +6390,7 @@ class ForgeAgent:
                         step_order=step.order,
                         step_retry=step.retry_index,
                     )
-                    raise e
+                    raise blank_page_error or e
 
         if scraped_page is None:
             raise EmptyScrapePage()
@@ -8979,6 +9143,12 @@ class ForgeAgent:
         engine: RunEngine = RunEngine.skyvern_v1,
         complete_verification: bool = True,
     ) -> tuple[bool | None, Step | None, Step | None]:
+        # A step whose only action was an internal-recovery close must not complete the block or trip
+        # the max-steps failure by itself; the block's real action still runs on the next step. Read
+        # once here so the parallel-verification path (which carries its own unconditional max-step
+        # failure) is bypassed for recovery steps, not just the sequential path below.
+        recovery_context = skyvern_context.current()
+        recovery_only = recovery_context is not None and recovery_context.empty_page_recovery_step_id == step.step_id
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
         task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
@@ -8988,6 +9158,7 @@ class ForgeAgent:
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
             and not task_completes_on_download
+            and not recovery_only
             and (task.navigation_goal or task.complete_criterion)
         )
 
@@ -9091,7 +9262,7 @@ class ForgeAgent:
         )
 
         # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
-        if isinstance(task_block, ActionBlock) and step.is_success():
+        if isinstance(task_block, ActionBlock) and step.is_success() and not recovery_only:
             LOG.info(
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
@@ -9116,7 +9287,7 @@ class ForgeAgent:
             )
             return False, last_step, None
 
-        if step.order + 1 >= max_steps_per_run:
+        if step.order + 1 >= max_steps_per_run and not recovery_only:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",
                 step_order=step.order,

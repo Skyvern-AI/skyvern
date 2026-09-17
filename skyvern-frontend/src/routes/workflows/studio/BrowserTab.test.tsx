@@ -625,7 +625,11 @@ describe("BrowserTab view machine", () => {
     });
     renderBrowserPane(STUDIO_PATH);
 
-    fireEvent.click(screen.getByRole("button", { name: "Record browser" }));
+    const recordTaskButton = screen.getByRole("button", {
+      name: "Record task",
+    });
+    expect(recordTaskButton.textContent).toContain("Record task");
+    fireEvent.click(recordTaskButton);
 
     expect(startRecording).toHaveBeenCalledOnce();
   });
@@ -722,7 +726,7 @@ describe("BrowserTab pills and selection sync", () => {
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
     for (const name of [
-      "Record browser",
+      "Record task",
       "Reconnect browser stream",
       "Open browser in new tab",
       "Turn off browser",
@@ -803,18 +807,8 @@ describe("BrowserTab pills and selection sync", () => {
   });
 });
 
-describe("stream-mode badge dev gating", () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it("shows the transport badge in dev builds (vitest runs as dev)", () => {
-    renderBrowserPane(STUDIO_PATH);
-    expect(screen.queryByTestId("stream-mode-badge")).not.toBeNull();
-  });
-
-  it("hides the transport badge outside dev builds", () => {
-    vi.stubEnv("DEV", false);
+describe("stream-mode badge", () => {
+  it("does not show the transport badge in the browser pane", () => {
     renderBrowserPane(STUDIO_PATH);
     expect(screen.queryByTestId("stream-mode-badge")).toBeNull();
   });

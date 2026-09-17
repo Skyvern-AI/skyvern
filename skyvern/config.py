@@ -341,7 +341,7 @@ class Settings(BaseSettings):
 
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
-    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
@@ -582,6 +582,8 @@ class Settings(BaseSettings):
     # Yutori Navigator
     ENABLE_YUTORI: bool = False
     YUTORI_API_KEY: str | None = None
+    SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
+    EXA_API_KEY: str | None = Field(default=None, repr=False)
     YUTORI_API_BASE: str = "https://api.yutori.com/v1"
     YUTORI_MODEL: str = "n1.5-latest"
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"

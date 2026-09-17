@@ -1,11 +1,5 @@
 import type { Node } from "@xyflow/react";
-import {
-  EMAIL_BLOCK_SENDER,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
-} from "../../constants";
+import { EMAIL_BLOCK_SENDER } from "../../constants";
 import { NodeBaseData } from "../types";
 import {
   type EmailBodyFormat,
@@ -22,10 +16,6 @@ export type HumanInteractionNodeData = NodeBaseData & {
   body: string;
   bodyFormat: EmailBodyFormat;
   sender: string;
-  smtpHostSecretParameterKey?: string;
-  smtpPortSecretParameterKey?: string;
-  smtpUsernameSecretParameterKey?: string;
-  smtpPasswordSecretParameterKey?: string;
 };
 
 export type HumanInteractionNode = Node<
@@ -46,10 +36,6 @@ export const humanInteractionNodeDefaultData: HumanInteractionNodeData = {
   editable: true,
   label: "",
   sender: EMAIL_BLOCK_SENDER,
-  smtpHostSecretParameterKey: SMTP_HOST_PARAMETER_KEY,
-  smtpPortSecretParameterKey: SMTP_PORT_PARAMETER_KEY,
-  smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
-  smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
   continueOnFailure: false,
   model: null,
 } as const;

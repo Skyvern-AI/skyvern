@@ -195,9 +195,7 @@ describe("NodeAdderNode", () => {
     fireEvent.mouseEnter(busyControl!);
 
     expect(screen.getAllByText("Processing...").length).toBeGreaterThan(0);
-    expect(
-      screen.queryAllByText("Stop recording & generate blocks"),
-    ).toHaveLength(0);
+    expect(screen.queryAllByText("Stop & generate workflow")).toHaveLength(0);
 
     fireEvent.click(busyControl!.firstElementChild!);
     expect(useRecordingStore.getState()).toMatchObject({

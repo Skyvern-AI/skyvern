@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     OriginRunRedactionRegistry,
     bound_call_browser_session,
     effective_browser_session_id,
+    record_sensitive_origin_run_taint,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
@@ -1274,7 +1275,14 @@ def test_runtime_authoring_repair_context_ignores_policy_verdict_but_respects_st
             "data": {
                 "workflow_run_id": "wr_stop",
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
     )
@@ -2301,7 +2309,14 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
             "ok": False,
             "data": {
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
         ctx=stop_ctx,
@@ -5309,3 +5324,111 @@ def test_a_run_that_fails_many_blocks_cannot_grow_the_contract_row_list() -> Non
     )
     assert len(contract.diagnosis_input.failed_block_labels) <= _MAX_ITEMS
     assert contract.diagnosis_input.failed_block_labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_signed_in_by_an_earlier_run", [False, True])
+async def test_a_post_run_frame_is_withheld_when_the_run_browser_carries_a_sign_in(
+    monkeypatch: pytest.MonkeyPatch, browser_signed_in_by_an_earlier_run: bool
+) -> None:
+    # This run fills no credential, so its own blocks say nothing is sensitive. A frame's pixels
+    # cannot be scrubbed, so what decides is whether the browser it read was signed in by any run.
+    # The clean case is the control: without it a withheld frame could not be told from a stub
+    # that never reached the queue.
+    ctx = _ctx()
+    if browser_signed_in_by_an_earlier_run:
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id="run_session")
+
+    frame = SimpleNamespace(
+        b64="cGl4ZWxz",
+        captured_url="https://example.test/account",
+        browser_session_id="run_session",
+        dispatch_url=None,
+        dispatch_browser_session_id=None,
+        producer_browser_session_id=None,
+        session_binding=None,
+        captured_at=None,
+    )
+    evidence = {"workflow_run_id": "wr_suffix", "observed_after_workflow_run": True}
+
+    async def read_page(_ctx: CopilotContext, *, run_session_id: str, current_url: str) -> tuple:
+        return evidence, run_session_id, None, frame
+
+    enqueued: list[str] = []
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read_page)
+    monkeypatch.setattr(run_execution_module, "repair_page_evidence_is_admissible", lambda _e: True)
+    monkeypatch.setattr(run_execution_module, "store_post_run_page_evidence", lambda *_a, **_k: (None, False))
+    monkeypatch.setattr(run_execution_module, "_same_run_page_evidence_for_result", lambda *_a: evidence)
+    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", lambda _ctx, b64, **_k: enqueued.append(b64))
+
+    await run_execution_module._capture_and_store_post_run_page(
+        ctx, run_session_id="run_session", run_id="wr_suffix", current_url="https://example.test/account"
+    )
+
+    assert enqueued == ([] if browser_signed_in_by_an_earlier_run else ["cGl4ZWxz"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_signed_in_by_an_earlier_run", [False, True])
+async def test_a_dispatched_run_frame_is_withheld_when_the_run_browser_carries_a_sign_in(
+    monkeypatch: pytest.MonkeyPatch, browser_signed_in_by_an_earlier_run: bool
+) -> None:
+    # The worker-dispatch path applies the same rule as the inline capture. The clean case is the
+    # control that shows the frame would otherwise reach the queue.
+    ctx = _ctx()
+    if browser_signed_in_by_an_earlier_run:
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id="run_session")
+
+    frame = SimpleNamespace(
+        b64="cGl4ZWxz",
+        captured_url="https://example.test/account",
+        browser_session_id="run_session",
+        dispatch_url=None,
+        dispatch_browser_session_id=None,
+        producer_browser_session_id=None,
+        session_binding=None,
+        captured_at=None,
+    )
+    evidence = {"workflow_run_id": "wr_suffix", "observed_after_workflow_run": True}
+
+    async def read_page(_ctx: CopilotContext, *, run_session_id: str, current_url: str) -> tuple:
+        return evidence, run_session_id, None, frame
+
+    enqueued: list[str] = []
+    monkeypatch.setattr(run_execution_module, "_pre_run_baseline_is_provenance_valid", lambda _e: False)
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read_page)
+    monkeypatch.setattr(run_execution_module, "_dispatched_terminal_page_evidence_is_usable", lambda _e: True)
+    monkeypatch.setattr(run_execution_module, "store_post_run_page_evidence", lambda *_a, **_k: (None, False))
+    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", lambda _ctx, b64, **_k: enqueued.append(b64))
+
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx,
+        run_id="wr_suffix",
+        run_session_id="run_session",
+        organization_id="o",
+        current_url="https://example.test/account",
+    )
+
+    assert enqueued == ([] if browser_signed_in_by_an_earlier_run else ["cGl4ZWxz"])
+
+
+@pytest.mark.parametrize(
+    ("tainted_session", "run_session_id", "chat_session", "withheld"),
+    [
+        # The run's own browser carries a sign-in: withhold.
+        ("pbs_run", "pbs_run", "pbs_chat", True),
+        # The chat's browser is signed in but this run used a clean one of its own: keep the
+        # diagnostics. Checking the chat's browser here stripped every clean run's evidence.
+        ("pbs_chat", "pbs_run", "pbs_chat", False),
+        # No browser named for the run: fall back to the browser the call acts in.
+        ("pbs_chat", None, "pbs_chat", True),
+    ],
+)
+def test_sign_in_taint_is_read_from_the_browser_the_run_used(
+    tainted_session: str, run_session_id: str | None, chat_session: str, withheld: bool
+) -> None:
+    ctx = _ctx()
+    ctx.browser_session_id = chat_session
+    record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id=tainted_session)
+
+    assert run_execution_module._run_browser_carries_a_sign_in(ctx, run_session_id) is withheld

@@ -1,11 +1,11 @@
 import textwrap
+import timeit
 
 import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.code_block_steps import (
     analyze_code_actions,
-    apply_derived_code_block_steps,
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
@@ -126,8 +126,7 @@ def test_derive_steps_empty_code_is_empty():
     assert derive_code_block_steps("x = 1\n") == []
 
 
-@pytest.mark.asyncio
-async def test_apply_sets_steps_on_code_blocks_and_leaves_others_untouched():
+def test_derive_in_yaml_sets_steps_on_code_blocks_and_leaves_others_untouched():
     src = {
         "workflow_definition": {
             "blocks": [
@@ -151,18 +150,13 @@ async def test_apply_sets_steps_on_code_blocks_and_leaves_others_untouched():
             ]
         }
     }
-    out = yaml.safe_load(await apply_derived_code_block_steps(yaml.safe_dump(src)))
+    out = yaml.safe_load(derive_code_block_steps_in_yaml(yaml.safe_dump(src)))
     blocks = out["workflow_definition"]["blocks"]
     assert blocks[0]["steps"] == [
         {"description": "Open https://x.com/", "action_type": "goto_url", "line_start": 2, "line_end": 2}
     ]
     assert "steps" not in blocks[1]  # non-code block untouched
     assert blocks[2]["loop_blocks"][0]["steps"][0]["action_type"] == "click"  # nested code block annotated
-
-
-@pytest.mark.asyncio
-async def test_apply_is_noop_on_unparseable_yaml():
-    assert await apply_derived_code_block_steps("::not yaml::") == "::not yaml::"
 
 
 def test_derive_in_yaml_fills_steps_when_absent():
@@ -180,10 +174,8 @@ def test_derive_in_yaml_fills_steps_when_absent():
     assert [s["action_type"] for s in steps] == ["goto_url", "click"]
 
 
-def test_derive_in_yaml_preserves_existing_steps():
-    # An LLM-refined steps list must survive untouched; deterministic derivation
-    # is a fallback only when steps are absent.
-    refined = [{"description": "Open the homepage", "action_type": "goto_url", "line_start": 1, "line_end": 1}]
+def test_derive_in_yaml_rebuilds_stale_steps_from_code():
+    stale = [{"description": "Open the homepage", "action_type": "click", "line_start": 4, "line_end": 9}]
     src = {
         "workflow_definition": {
             "blocks": [
@@ -191,13 +183,15 @@ def test_derive_in_yaml_preserves_existing_steps():
                     "block_type": "code",
                     "label": "block_1",
                     "code": "await page.goto('https://x.com/')\n",
-                    "steps": refined,
+                    "steps": stale,
                 }
             ]
         }
     }
     out = yaml.safe_load(derive_code_block_steps_in_yaml(yaml.safe_dump(src)))
-    assert out["workflow_definition"]["blocks"][0]["steps"] == refined
+    assert out["workflow_definition"]["blocks"][0]["steps"] == [
+        {"description": "Open https://x.com/", "action_type": "goto_url", "line_start": 1, "line_end": 1}
+    ]
 
 
 def test_derive_in_yaml_noop_on_unparseable():
@@ -411,27 +405,6 @@ async def test_process_workflow_yaml_binds_a_parameter_the_code_names():
     assert [parameter.key for parameter in block.parameters] == ["site_login"]
 
 
-@pytest.mark.asyncio
-async def test_apply_derived_steps_on_copilot_yaml_shape():
-    # Mirrors the _copilot_yaml payload that apply-proposed-workflow reads from
-    # the stashed proposal. Steps must be populated so manual-accept persists them.
-    copilot_yaml = (
-        "title: Search\n"
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "  - block_type: code\n"
-        "    label: do_search\n"
-        "    code: |\n"
-        "      await page.goto('https://example.com/')\n"
-        "      await page.get_by_label('Query').fill(str(query))\n"
-    )
-    enriched = yaml.safe_load(await apply_derived_code_block_steps(copilot_yaml))
-    steps = enriched["workflow_definition"]["blocks"][0]["steps"]
-    assert len(steps) == 2
-    assert steps[0]["action_type"] == "goto_url"
-    assert steps[1]["action_type"] == "input_text"
-
-
 def test_multiline_call_span_covers_all_lines():
     code = "async def run(page):\n    await page.get_by_label('Email').fill(\n        str(email)\n    )\n"
     spans = analyze_code_actions(code)
@@ -483,11 +456,186 @@ def test_page_extract_is_not_a_code_block_step():
     assert derive_code_block_steps(code) == []
 
 
-def test_goto_with_non_literal_url_outside_a_loop_describes_a_linked_page():
-    code = "async def run(page, target_url):\n    await page.goto(target_url)\n"
+def test_goto_on_a_parameter_names_the_variable():
+    code = "async def run(page, product_url):\n    await page.goto(product_url)\n"
     steps = derive_code_block_steps(code)
     assert steps[0]["action_type"] == "goto_url"
-    assert steps[0]["description"] == "Open the linked page"
+    assert steps[0]["description"] == "Open the product url"
+
+
+@pytest.mark.parametrize(
+    ("code", "description"),
+    [
+        ("await page.goto(url='https://example.com/a')\n", "Open https://example.com/a"),
+        ("async def run(page, product_url):\n    await page.goto(url=product_url)\n", "Open the product url"),
+        ("url = 'https://example.com/a'\nawait page.goto(url=url, wait_until='load')\n", "Open https://example.com/a"),
+    ],
+)
+def test_goto_with_url_keyword_is_labeled_like_the_positional_form(code, description):
+    assert derive_code_block_steps(code)[0]["description"] == description
+
+
+def test_goto_on_a_variable_bound_once_to_an_address_shows_the_address():
+    code = "async def run(page):\n    url = 'https://example.com/a'\n    await page.goto(url)\n"
+    assert derive_code_block_steps(code)[0]["description"] == "Open https://example.com/a"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        (
+            "async def run(page):\n    url = 'https://example.com/a'\n"
+            "    url = 'https://example.com/b'\n    await page.goto(url)\n"
+        ),
+        "async def run(page, url='https://example.com/a'):\n    await page.goto(url)\n",
+        "async def run(page):\n    url = 'https://example.com/a'\n    url += '/b'\n    await page.goto(url)\n",
+        "async def run(page):\n    await page.goto(url)\n    url = 'https://example.com/a'\n",
+        "async def run(page):\n    url = build('https://example.com/a')\n    await page.goto(url)\n",
+        "async def run(page, flag):\n    if flag:\n        url = 'https://example.com/a'\n    await page.goto(url)\n",
+        "def helper():\n    url = 'https://example.com/a'\n\nasync def run(page):\n    await page.goto(url)\n",
+    ],
+)
+def test_goto_on_a_variable_without_a_single_fixed_address_names_the_variable(code):
+    assert derive_code_block_steps(code)[0]["description"] == "Open the url"
+
+
+def test_goto_address_shows_a_plain_http_address_unchanged():
+    code = "url = 'https://example.com:8443/a/b'\nawait page.goto(url)\n"
+    assert derive_code_block_steps(code)[0]["description"] == "Open https://example.com:8443/a/b"
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://user:pass@example.com/a",
+        "admin:hunter2@example.com/login",
+        "{{ start_url }}",
+        "https://example.com/{{ path }}",
+        "https://example.com/a?token=abc",
+        "https://example.com/a#frag",
+        "ftp://example.com/a",
+        "https://example.com:99999/a",
+    ],
+)
+def test_goto_address_that_is_not_a_plain_http_address_names_the_variable(address):
+    code = f"url = {address!r}\nawait page.goto(url)\n"
+    assert derive_code_block_steps(code)[0]["description"] == "Open the url"
+
+
+def _derive_seconds(code: str) -> float:
+    # timeit pauses the garbage collector, and the best of three drops scheduler noise on shared CI runners.
+    return min(timeit.repeat(lambda: derive_code_block_steps(code), number=1, repeat=3))
+
+
+def test_many_gotos_on_variables_derive_in_linear_time():
+    def gotos(count: int) -> str:
+        return "".join(f"url_{i} = 'https://example.com/{i}'\nawait page.goto(url_{i})\n" for i in range(count))
+
+    assert derive_code_block_steps(gotos(2000))[-1]["description"] == "Open https://example.com/1999"
+    # Quadratic growth makes 4x the gotos take ~16x as long; linear stays near 4x.
+    assert _derive_seconds(gotos(2000)) < 8 * _derive_seconds(gotos(500))
+
+
+def test_unclosed_template_openers_derive_in_linear_time():
+    def commented(count: int) -> str:
+        return "await page.goto('https://example.com/a')\n" + "x = 1  # {# note {% here\n" * count
+
+    assert derive_code_block_steps(commented(2000))[0]["description"] == "Open https://example.com/a"
+    # Quadratic growth makes 4x the lines take ~16x as long; linear stays near 4x.
+    assert _derive_seconds(commented(2000)) < 8 * _derive_seconds(commented(500))
+
+
+def test_reads_chained_in_one_expression_derive_in_linear_time():
+    def chained(count: int) -> str:
+        return "total = " + " + ".join(f"await page.locator('#p{i}').inner_text()" for i in range(count)) + "\n"
+
+    # Python 3.11's parser rejects much longer chains, which would return [] and pass vacuously.
+    assert derive_code_block_steps(chained(2000))[0]["description"] == "Extract total"
+    # Quadratic growth makes 4x the reads take ~16x as long; linear stays near 4x.
+    assert _derive_seconds(chained(2000)) < 8 * _derive_seconds(chained(500))
+
+
+def test_code_too_deep_for_the_parser_derives_no_steps():
+    assert derive_code_block_steps("x = " + "-" * 200000 + "1\n") == []
+
+
+def test_goto_on_a_loop_variable_keeps_the_open_each_wording():
+    code = (
+        "async def run(page):\n    url = 'https://example.com/a'\n    for url in urls:\n        await page.goto(url)\n"
+    )
+    assert derive_code_block_steps(code)[0]["description"] == "Open each url"
+
+
+def test_goto_on_an_expression_keeps_the_vague_wording():
+    code = "async def run(page):\n    await page.goto(links[0])\n"
+    assert derive_code_block_steps(code)[0]["description"] == "Open the linked page"
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("price = await page.locator('.p').inner_text()\n", "Extract price"),
+        ("price = (await page.locator('.p').inner_text()).strip()\n", "Extract price"),
+        ("status = (await page.locator('.s').text_content() or '').strip()\n", "Extract status"),
+        ("first_link = (await page.locator('a').all_text_contents())[0]\n", "Extract first link"),
+        ("price = await page.get_by_role('cell', name='Price').inner_text()\n", 'Extract price from "Price"'),
+        ("await page.get_by_label('Price').inner_text()\n", 'Extract "Price"'),
+        ("await page.get_by_label(text='Price').inner_text()\n", 'Extract "Price"'),
+        ("total = await page.get_by_text(text='Total').inner_text()\n", 'Extract total from "Total"'),
+        ("results.append(await page.locator('.row').inner_text())\n", "Extract results"),
+        ("row = {'title': await page.locator('.t').inner_text()}\n", "Extract title"),
+    ],
+)
+def test_read_is_named_from_where_the_code_stores_it_or_the_element_it_cites(code, expected):
+    assert [s["description"] for s in derive_code_block_steps(code)] == [expected]
+
+
+def test_template_control_blocks_keep_steps_and_their_line_numbers():
+    code = "{% if enabled %}\nawait page.goto('https://example.com/a')\n{% endif %}\nprice = await page.locator('.p').inner_text()\n"
+    assert [(s["description"], s["line_start"]) for s in derive_code_block_steps(code)] == [
+        ("Open https://example.com/a", 2),
+        ("Extract price", 4),
+    ]
+
+
+def test_template_comment_does_not_cost_the_block_its_steps():
+    code = "{# optional note #}\nprice = await page.locator('.p').inner_text()\n"
+    assert [(s["description"], s["line_start"]) for s in derive_code_block_steps(code)] == [("Extract price", 2)]
+
+
+@pytest.mark.parametrize(
+    ("code", "line"),
+    [
+        ("{% if enabled %}await page.goto('https://example.com/a'){% endif %}\n", 1),
+        ("{# note #}await page.goto('https://example.com/a')\n", 1),
+        ("{% set x =\n  1 %}\nawait page.goto('https://example.com/a')\n", 3),
+        ("{% if f %}value = 1{% else %}value = 2{% endif %}\nawait page.goto('https://example.com/a')\n", 2),
+    ],
+)
+def test_python_sharing_a_line_with_a_template_tag_keeps_its_step(code, line):
+    assert [(s["description"], s["line_start"]) for s in derive_code_block_steps(code)] == [
+        ("Open https://example.com/a", line)
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "if await page.locator('.price-box').inner_text():\n    pass\n",
+        "async def run(page):\n    return await page.locator('.price-box').inner_text()\n",
+        "price = parse(await page.locator('.price-box').inner_text())\n",
+        "await page.locator('.price-box').inner_text()\n",
+    ],
+)
+def test_read_without_a_name_in_the_code_keeps_the_vague_wording(code):
+    assert [s["description"] for s in derive_code_block_steps(code)] == ["Extract information from the page"]
+
+
+def test_fill_value_bound_to_a_literal_never_appears_in_the_label():
+    code = "async def run(page):\n    v = 'secret'\n    await page.fill('#x', v)\n    await page.type('#y', v)\n"
+    descriptions = [s["description"] for s in derive_code_block_steps(code)]
+    assert descriptions == ["Type into the element", "Type into the element"]
+    assert not any("secret" in d for d in descriptions)
 
 
 def test_prompt_kwarg_is_preferred_as_step_copy_for_interactions():
@@ -529,23 +677,39 @@ def test_raw_dom_reads_surface_as_an_extraction_step_not_just_navigation():
         "        results.append({'title': title, 'href': href})\n"
     )
     steps = derive_code_block_steps(code)
-    assert [s["action_type"] for s in steps] == ["goto_url", "extract"]
-    assert steps[1]["description"] == "Extract information from the page"
+    assert [(s["action_type"], s["description"]) for s in steps] == [
+        ("goto_url", "Open https://example.com/"),
+        ("extract", "Extract title"),
+        ("extract", "Extract href"),
+    ]
 
 
-def test_consecutive_dom_reads_collapse_into_one_extraction_step():
-    # A scrape reads many fields; surfacing one step per read is noise. Collapse a
-    # run of adjacent reads into a single step spanning their combined line range.
+def test_consecutive_unnamed_dom_reads_collapse_into_one_extraction_step():
     code = (
         "async def run(page):\n"
-        "    a = await page.locator('#a').text_content()\n"
-        "    b = await page.locator('#b').inner_text()\n"
-        "    c = await page.locator('#c').get_attribute('value')\n"
+        "    await page.locator('#a').text_content()\n"
+        "    await page.locator('#b').inner_text()\n"
+        "    await page.locator('#c').get_attribute('value')\n"
     )
     steps = derive_code_block_steps(code)
-    assert [s["action_type"] for s in steps] == ["extract"]
-    assert steps[0]["line_start"] == 2
-    assert steps[0]["line_end"] == 4
+    assert [(s["description"], s["line_start"], s["line_end"]) for s in steps] == [
+        ("Extract information from the page", 2, 4)
+    ]
+
+
+def test_consecutive_reads_with_different_names_stay_separate_steps():
+    code = (
+        "async def run(page):\n"
+        "    heading = await page.locator('h1').inner_text()\n"
+        "    price = (\n"
+        "        await page.locator('.price').inner_text()\n"
+        "    ).strip()\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [(s["description"], s["line_start"], s["line_end"]) for s in steps] == [
+        ("Extract heading", 2, 2),
+        ("Extract price", 4, 4),
+    ]
 
 
 def test_dom_reads_separated_by_an_action_are_distinct_steps():

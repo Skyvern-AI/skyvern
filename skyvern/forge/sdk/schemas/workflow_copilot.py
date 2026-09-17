@@ -402,6 +402,10 @@ class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
+class WorkflowCopilotDisableAutoAcceptRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat whose auto-accept should be turned off")
+
+
 class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="The chat whose proposed workflow should be applied")
     auto_accept: bool = Field(

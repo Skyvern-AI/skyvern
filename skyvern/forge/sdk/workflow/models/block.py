@@ -106,6 +106,7 @@ from skyvern.exceptions import (
     UnexpectedTaskStatus,
     UnresolvableHost,
     WorkflowNotFound,
+    WorkflowRunContextNotInitialized,
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
@@ -310,6 +311,7 @@ from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnos
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import (
     default_navigation_settle,
+    driver_nav_error_code,
     is_egress_attributable_navigation_failure,
     navigate_with_retry,
     redact_url_secrets,
@@ -813,6 +815,9 @@ def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str
         "failure_reason": reasoning,
         "errors": [error.model_dump(mode="json")],
         "failure_category": user_defined_failure_category(error),
+        # Names the code as the author's own, so a reader deciding who owns a failure can tell it
+        # from one a driver reported. Both land in the block's error_codes.
+        "declared_error_code": error_code,
     }
 
 
@@ -1482,7 +1487,7 @@ class Block(BaseModel, abc.ABC):
     async def _generate_workflow_run_block_description(
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
-        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
+        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
             return
         description = None
         try:
@@ -1629,7 +1634,11 @@ class Block(BaseModel, abc.ABC):
                 )
 
             # create a screenshot
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            browser_state = (
+                app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                if self.block_type != BlockType.WEB_SEARCH
+                else None
+            )
             if not browser_state:
                 LOG.info(
                     "No browser state found when creating workflow_run_block",
@@ -1747,13 +1756,28 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_id, current_index, include_missing_value_guard=True
             )
 
+            error_codes = self.get_failure_error_codes()
+            # The driver's verdict, carried as a code rather than left only in failure_reason: that
+            # text can be model-authored, so a consumer reading it cannot tell a real browser error
+            # from a sentence describing one.
+            if isinstance(e, FailedToNavigateToUrl) and e.nav_error_code:
+                # Looked up inside the failure handler, so a run torn down while this block awaited
+                # must not raise here and lose the failure being reported. Without the run's secrets
+                # the code cannot be cleared for reporting, so it is left off.
+                try:
+                    nav_run_context = self.get_workflow_run_context(workflow_run_id)
+                except WorkflowRunContextNotInitialized:
+                    nav_run_context = None
+                if nav_run_context is not None and not is_registered_secret(e.nav_error_code, nav_run_context):
+                    error_codes = [*error_codes, e.nav_error_code]
+
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+                error_codes=error_codes or None,
             )
 
     @abc.abstractmethod
@@ -2471,6 +2495,10 @@ class BaseTaskBlock(Block):
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # A task that terminates right after a failed navigation ends on that failure.
+                    error_codes=None
+                    if success
+                    else _recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                 )
             elif updated_task.status == TaskStatus.canceled:
                 LOG.info(
@@ -2584,6 +2612,7 @@ class BaseTaskBlock(Block):
                         status=block_status_mapping[updated_task.status],
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        error_codes=_recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                     )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
@@ -2597,7 +2626,20 @@ class BaseTaskBlock(Block):
             ),
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=(
+                _recorded_task_nav_error_codes(current_running_task.task_id, workflow_run_context)
+                if current_running_task
+                else None
+            ),
         )
+
+
+def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
+    context = skyvern_context.current()
+    code = context.task_nav_error_codes.get(task_id) if context is not None else None
+    if not code or is_registered_secret(code, workflow_run_context):
+        return None
+    return [code]
 
 
 class TaskBlock(BaseTaskBlock):
@@ -4548,7 +4590,6 @@ class Credential(SimpleNamespace):
 
 
 class CodeBlockStep(BaseModel):
-    title: str | None = None
     description: str | None = None
     action_type: ActionType = ActionType.NULL_ACTION
     line_start: int | None = None
@@ -4707,6 +4748,16 @@ def _code_block_safe_print(
     print(app.AGENT_FUNCTION.redact_codeblock_parameter_values(rendered.getvalue(), parameters), end="", flush=flush)
 
 
+def is_registered_secret(value: str, workflow_run_context: WorkflowRunContext) -> bool:
+    """Whether this exact string is one of the run's registered secret values.
+
+    A driver code is kept through masking, because an ordinary value occurring inside one ("net")
+    would otherwise cut the verdict out of it, and a workflow may legitimately hold a code-shaped
+    literal. A code that *is* a secret is the one case where reporting it would store that secret.
+    """
+    return value in Block._registered_secret_values(workflow_run_context)
+
+
 def _redact_codeblock_failure_text(
     value: str | None,
     parameters: dict[str, Any],
@@ -4724,8 +4775,65 @@ def _redact_codeblock_failure_text(
     return redacted
 
 
+# Bounded like the runner's own walk rather than recursive: this runs inside failure handling, where
+# a raise would replace the failure being reported.
+_PARAMETER_STRING_WALK_LIMIT = 10_000
+
+
+def parameter_strings(parameters: object) -> set[str] | None:
+    """Every string a parameter carries, keys included, or None when the walk did not finish.
+
+    An unfinished walk cannot answer whether a code is one of those strings, and answering from a
+    partial set would preserve a code that should have been masked.
+    """
+    strings: set[str] = set()
+    stack: list[object] = [parameters]
+    visited = 0
+    while stack:
+        if visited >= _PARAMETER_STRING_WALK_LIMIT:
+            return None
+        node = stack.pop()
+        visited += 1
+        if isinstance(node, str):
+            strings.add(node)
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend(node)
+    return strings
+
+
+def _declared_error_code_of(result: BlockResult) -> str | None:
+    """The code this block's author declared, which is theirs to spell and so never preserved."""
+    output = result.output_parameter_value
+    declared = output.get("declared_error_code") if isinstance(output, dict) else None
+    return declared if isinstance(declared, str) and declared else None
+
+
 def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
+    # A driver code survives masking whole: a parameter value occurring inside one ("net") would cut
+    # the verdict out of it, and the code carries nothing of its own to mask. A code that *is* a
+    # parameter value is left to the mask, which is the one case where keeping it would disclose.
+    carried_strings = parameter_strings(parameters)
+    declared = _declared_error_code_of(result)
+    preserved = (
+        {}
+        if carried_strings is None
+        else {
+            index: code
+            for index, code in enumerate(result.error_codes or [])
+            if isinstance(code, str)
+            and driver_nav_error_code(code) == code
+            and code != declared
+            and code not in carried_strings
+        }
+    )
     redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(result.error_codes, parameters)
+    if isinstance(redacted_error_codes, list):
+        for index, code in preserved.items():
+            if index < len(redacted_error_codes):
+                redacted_error_codes[index] = code
     return replace(
         result,
         failure_reason=_redact_codeblock_failure_text(result.failure_reason, parameters),
@@ -5346,12 +5454,12 @@ async def _dom_storage_session(context: BrowserContext, open_page: Page, frame: 
 
 
 _FRAME_STORAGE_REACHABLE_PROBE = (
-    "(() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } })()"
+    "() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } }"
 )
 
 
-async def _frame_storage_is_unreachable(session: CDPSession) -> bool:
-    """Whether the frame behind this session can reach web storage at all.
+async def _frame_storage_is_unreachable(target: Page | Frame) -> bool:
+    """Whether this frame's own document can reach web storage at all.
 
     A sandboxed or otherwise opaque frame has no storage area to address and nothing that outlives its
     document, so a clear that cannot find one has found nothing to clear. Asked only after the clear
@@ -5359,14 +5467,12 @@ async def _frame_storage_is_unreachable(session: CDPSession) -> bool:
     it can address, so a real addressing failure still surfaces.
     """
     try:
-        answer = await session.send(
-            "Runtime.evaluate", {"expression": _FRAME_STORAGE_REACHABLE_PROBE, "returnByValue": True}
-        )
+        answer = await target.evaluate(_FRAME_STORAGE_REACHABLE_PROBE)
     except Exception as exc:
         if not _is_browser_refusal(exc):
             raise
         return False
-    return answer.get("result", {}).get("value") == "unreachable"
+    return answer == "unreachable"
 
 
 async def _cleared_session_storage(context: BrowserContext, open_page: Page, frame: Frame, origin: str) -> bool:
@@ -5381,9 +5487,9 @@ async def _cleared_session_storage(context: BrowserContext, open_page: Page, fra
         await frame_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
         return True
     except Exception as exc:
-        # Only a frame holding a session of its own can be asked about its own storage, and a frame
-        # with nothing to clear is exactly that kind: it is opaque, so it has a target.
-        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame_session)):
+        # The frame is asked rather than its session: an engine can hand a frame sharing the page's
+        # renderer a session on the page's target, which answers for the page.
+        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame)):
             raise
         return False
     finally:
@@ -5409,7 +5515,7 @@ async def _cleared_inherited_session_storage(context: BrowserContext, open_page:
             # A frame with no storage key is one on an opaque origin, which has no storage area to
             # clear -- and which answers the probe as such. Any other refusal, a timeout among them,
             # would otherwise pass for a tab with nothing to clear and leave its session behind.
-            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(session):
+            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(open_page):
                 raise
             return ""
         storage_key = answer.get("storageKey")
@@ -6522,22 +6628,16 @@ async def wrapper({default_args}):
         return None
 
     def _static_url_from_goal(self) -> str:
-        # The goal is human free text (prompt + step descriptions), not code, so a URL regex is
-        # appropriate here (unlike the AST-only code scan). This is the authored destination the
-        # heal should reach when the block's own navigation rotted. Returns the first well-formed
-        # absolute http(s) URL, else "".
-        texts = [self.prompt or ""]
-        if self.steps:
-            texts.extend(step.description or "" for step in self.steps)
-        for text in texts:
-            match = re.search(r"https?://[^\s'\"<>)\]]+", text)
-            if not match:
-                continue
-            candidate = match.group(0).rstrip(".,;")
-            parsed = urlparse(candidate)
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
-                return candidate
-        return ""
+        # The prompt is human free text, not code, so a URL regex is appropriate here (unlike the
+        # AST-only code scan). Step descriptions are derived from the code, so an address there is
+        # the code's own possibly-rotted goto, never an authored destination. Returns the first
+        # well-formed absolute http(s) URL, else "".
+        match = re.search(r"https?://[^\s'\"<>)\]]+", self.prompt or "")
+        if not match:
+            return ""
+        candidate = match.group(0).rstrip(".,;")
+        parsed = urlparse(candidate)
+        return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
     def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
         code_lines = self.code.splitlines()
@@ -8423,6 +8523,10 @@ async def wrapper({default_args}):
                             secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
+                            if secure_failure.nav_error_code and not is_registered_secret(
+                                secure_failure.nav_error_code, workflow_run_context
+                            ):
+                                secure_error_codes.append(secure_failure.nav_error_code)
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
                             if secure_failure_page_state:
                                 failure_output["failure_page_state"] = secure_failure_page_state
@@ -8877,6 +8981,14 @@ async def wrapper({default_args}):
                 ),
             )
 
+            # ``e`` is unbound once the except block exits, so the driver's code is captured here
+            # rather than read inside the deferred closure below. It comes from the recorder, never
+            # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
+            inline_nav_code = recording_page.failure_nav_error_code(e)
+            if inline_nav_code and is_registered_secret(inline_nav_code, workflow_run_context):
+                inline_nav_code = None
+            driver_nav_codes = [inline_nav_code] if inline_nav_code else None
+
             async def build_legacy_failure_result() -> BlockResult:
                 failure_output = None
                 if inline_failure_page_state:
@@ -8911,6 +9023,10 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # This block catches its own failures, so the driver's code never reaches the
+                    # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
+                    # real browser error from a sentence describing one.
+                    error_codes=driver_nav_codes,
                 )
 
             return await self._resolve_failure_with_heal(
@@ -9414,6 +9530,7 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str | None = None,
         schema_validation_failure: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        data_sanitizer: Callable[[Any], Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         selected_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
@@ -9454,6 +9571,11 @@ class TextPromptBlock(Block):
             + "\n```\n\n"
         )
 
+        system_prompt = self.workflow_system_prompt
+        if data_sanitizer is not None:
+            prompt = data_sanitizer(prompt)
+            system_prompt = data_sanitizer(system_prompt)
+
         workflow_run_block = None
         artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
         if workflow_run_block_id:
@@ -9477,7 +9599,7 @@ class TextPromptBlock(Block):
                 response = await llm_api_handler(
                     prompt=prompt,
                     prompt_name="text-prompt",
-                    system_prompt=self.workflow_system_prompt,
+                    system_prompt=system_prompt,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
@@ -9490,7 +9612,7 @@ class TextPromptBlock(Block):
                         "TextPromptBlock LLM call failed after all retries",
                         block_label=self.label,
                         attempts=attempt + 1,
-                        error=str(e),
+                        error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                     )
                     raise
                 backoff_time = 0.2 * (2**attempt)
@@ -9500,9 +9622,12 @@ class TextPromptBlock(Block):
                     attempt=attempt + 1,
                     max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
                     backoff_time=backoff_time,
-                    error=str(e),
+                    error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                 )
                 await asyncio.sleep(backoff_time)
+
+        if data_sanitizer is not None:
+            response = data_sanitizer(response)
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -17629,6 +17754,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -17654,6 +17780,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    WebSearchBlock,
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,

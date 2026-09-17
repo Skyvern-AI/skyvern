@@ -71,6 +71,8 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
@@ -199,6 +201,12 @@ import {
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
+import {
+  applySopResultAtCurrentAppend,
+  resolveAppendInsertionPoint,
+  resolveWorkspaceAuthoringActionAvailability,
+} from "./workspaceAuthoringActions";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
@@ -629,6 +637,9 @@ function Workspace({
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
+  const finallyBlockLabel = useWorkflowSettingsStore(
+    (state) => state.finallyBlockLabel,
+  );
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -1450,21 +1461,47 @@ function Workspace({
   // Stable action ref (vs the whole-store `recordingStore` object, which gets a
   // new reference on every store write and would re-register the launcher).
   const setIsRecording = useRecordingStore((s) => s.setIsRecording);
-  const startRecordingAtEnd = useCallback(() => {
-    const currentNodes = getNodes() as Array<AppNode>;
-    const currentEdges = getEdges();
-    const trailingAdder = currentNodes.find(
-      (node) => node.type === "nodeAdder" && !node.parentId,
+  const setRecordedBlocks = useRecordedBlocksStore((s) => s.setRecordedBlocks);
+  const getAppendInsertionPoint = useCallback(() => {
+    return resolveAppendInsertionPoint(
+      getNodes() as Array<AppNode>,
+      getEdges(),
     );
-    const incomingEdge = trailingAdder
-      ? currentEdges.find((edge) => edge.target === trailingAdder.id)
-      : undefined;
+  }, [getEdges, getNodes]);
+  const sopToBlocksMutation = useSopToBlocksMutation({
+    onSuccess: (result) => {
+      applySopResultAtCurrentAppend({
+        result,
+        getNodes: () => getNodes() as Array<AppNode>,
+        getEdges,
+        setRecordedBlocks,
+      });
+    },
+  });
+  const authoringActionAvailability =
+    resolveWorkspaceAuthoringActionAvailability({
+      browserReady: copilotLiveBrowserReady,
+      isGlobalWorkflow,
+      isWorkflowDeleted: Boolean(workflow.deleted_at),
+      hasActiveRun: Boolean(viewerState?.active_run_session_id),
+      isComparing: Boolean(workflowPanelState.data?.showComparison),
+      isEditingYaml: yamlEditorActive,
+      hasFinallyBlock: Boolean(finallyBlockLabel),
+      isRecording:
+        recordingStore.isRecording ||
+        recordingStore.finishRequested ||
+        recordingStore.isCommitting,
+      isUploadingSOP: sopToBlocksMutation.isPending,
+    });
+  const startRecordingAtEnd = useCallback(() => {
+    if (!authoringActionAvailability.canRecordTask) return;
+    const insertionPoint = getAppendInsertionPoint();
     setWorkflowPanelState({
       active: false,
       content: "nodeLibrary",
       data: {
-        previous: incomingEdge?.source ?? null,
-        next: trailingAdder?.id ?? null,
+        previous: insertionPoint.previous,
+        next: insertionPoint.next,
         parent: undefined,
         connectingEdgeType: "default",
       },
@@ -1474,20 +1511,34 @@ function Workspace({
       browserSessionId: debugBrowserSessionId,
     });
   }, [
-    getNodes,
-    getEdges,
+    getAppendInsertionPoint,
     setWorkflowPanelState,
     setIsRecording,
     workflowPermanentId,
     debugBrowserSessionId,
+    authoringActionAvailability.canRecordTask,
   ]);
+  const uploadSOPAtEnd = useCallback(
+    (file: File) => {
+      if (!authoringActionAvailability.canUploadSOP) return;
+      sopToBlocksMutation.mutate(file);
+    },
+    [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
+  );
   useEffect(() => {
     if (!embedded) {
       return;
     }
-    setStartRecordingAtEnd(startRecordingAtEnd);
+    setStartRecordingAtEnd(
+      authoringActionAvailability.canRecordTask ? startRecordingAtEnd : null,
+    );
     return () => setStartRecordingAtEnd(null);
-  }, [embedded, startRecordingAtEnd, setStartRecordingAtEnd]);
+  }, [
+    authoringActionAvailability.canRecordTask,
+    embedded,
+    startRecordingAtEnd,
+    setStartRecordingAtEnd,
+  ]);
 
   // Listen for conditional branch changes to trigger re-layout
   useEffect(() => {
@@ -2963,6 +3014,14 @@ function Workspace({
         initialMessage={initialCopilotMessage ?? undefined}
         initialAction={initialCopilotAction ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
+        onUploadSOP={uploadSOPAtEnd}
+        canUploadSOP={authoringActionAvailability.canUploadSOP}
+        isUploadingSOP={sopToBlocksMutation.isPending}
+        onRecordTask={startRecordingAtEnd}
+        canRecordTask={authoringActionAvailability.canRecordTask}
+        authoringUnavailableReason={
+          authoringActionAvailability.unavailableReason
+        }
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
             (node.data as { label?: string } | undefined)?.label === blockLabel;

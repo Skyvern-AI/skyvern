@@ -781,7 +781,10 @@ class WorkflowRunContext:
                     result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
-            return {k: self.mask_secrets_in_data(v, mask) for k, v in data.items()}
+            # Keys are masked as well as values: authored code is free to build {code: True}, and a
+            # key carrying a secret is as readable in stored output as a value carrying one. Two keys
+            # that both mask to the same string collapse into one entry, which is preferred to leaking.
+            return {self.mask_secrets_in_data(k, mask): self.mask_secrets_in_data(v, mask) for k, v in data.items()}
         elif isinstance(data, list):
             return [self.mask_secrets_in_data(item, mask) for item in data]
         return data

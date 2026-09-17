@@ -790,6 +790,8 @@ class TestMCPToolOverlayCompleteness:
             "get_workflow_knowledge",
             "get_block_schema",
             "validate_block",
+            "list_org_workflows",
+            "get_org_workflow",
             "navigate_browser",
             "get_browser_screenshot",
             "evaluate",
@@ -806,6 +808,8 @@ class TestMCPToolOverlayCompleteness:
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
+        assert "skyvern_workflow_run_list" not in alias_map.values()
+        assert "query" in tools_module._build_skyvern_mcp_overlays()["list_org_workflows"].hide_params
 
     def test_every_alias_has_overlay(self) -> None:
         from skyvern.forge.sdk.copilot.tools import (

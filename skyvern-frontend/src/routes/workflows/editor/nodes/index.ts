@@ -44,6 +44,8 @@ import { Taskv2Node } from "./Taskv2Node/types";
 import { Taskv2Node as Taskv2NodeComponent } from "./Taskv2Node/Taskv2Node";
 import { URLNode } from "./URLNode/types";
 import { URLNode as URLNodeComponent } from "./URLNode/URLNode";
+import type { WebSearchNode } from "./WebSearchNode/types";
+import { WebSearchNode as WebSearchNodeComponent } from "./WebSearchNode/WebSearchNode";
 import { HttpRequestNode } from "./HttpRequestNode/types";
 import { HttpRequestNode as HttpRequestNodeComponent } from "./HttpRequestNode/HttpRequestNode";
 import { HumanInteractionNode } from "./HumanInteractionNode/types";
@@ -93,6 +95,7 @@ export type WorkflowBlockNode =
   | Taskv2Node
   | URLNode
   | HttpRequestNode
+  | WebSearchNode
   | PrintPageNode
   | WorkflowTriggerNode
   | EmailInboxNode
@@ -158,6 +161,7 @@ export const nodeTypes = {
   taskv2: wrapBlock(Taskv2NodeComponent),
   url: wrapBlock(URLNodeComponent),
   http_request: wrapBlock(HttpRequestNodeComponent),
+  web_search: wrapBlock(WebSearchNodeComponent),
   printPage: wrapBlock(PrintPageNodeComponent),
   workflowTrigger: wrapBlock(WorkflowTriggerNodeComponent),
   emailInbox: wrapBlock(EmailInboxNodeComponent),

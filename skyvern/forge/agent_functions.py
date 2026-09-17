@@ -250,6 +250,9 @@ class CodeBlockEngineFailure:
     final_url: str | None = None
     page_title: str | None = None
     covering_element: str | None = None
+    # Read by the worker from the driver's own error, so a consumer can tell a real browser verdict
+    # from a sentence describing one.
+    nav_error_code: str | None = None
 
 
 @dataclass(frozen=True)

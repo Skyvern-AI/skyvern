@@ -738,7 +738,7 @@ class RealBrowserManager(BrowserManager):
                         exc_info=True,
                     )
                 raise
-            return RealBrowserState(
+            state = RealBrowserState(
                 pw=pw,
                 browser_context=browser_context,
                 page=None,
@@ -748,6 +748,10 @@ class RealBrowserManager(BrowserManager):
                 engine_selection=selection,
                 browser_context_route_policy_url=url,
             )
+            # The proxy this context was actually built with. A reader naming the hop that failed
+            # cannot recover it from anywhere else once the context exists.
+            state.built_with_proxy_location = proxy_location
+            return state
 
         # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
         # classical boot fallback before any usable context; the classical has none, so it then propagates.

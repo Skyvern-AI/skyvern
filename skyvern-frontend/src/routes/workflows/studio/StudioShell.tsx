@@ -71,7 +71,10 @@ import {
 } from "./panes";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
-import { panesAfterRecordingTransition } from "./recordingPaneLifecycle";
+import {
+  advanceRecordingStopLifecycle,
+  panesAfterRecordingTransition,
+} from "./recordingPaneLifecycle";
 import {
   StudioPaneCompactContext,
   StudioShellContext,
@@ -919,9 +922,20 @@ function StudioStage(props: StudioWorkspaceProps) {
     finishRequested || isCommitting || recordedBlocksPending;
   const prevIsRecordingRef = useRef(false);
   const prevProcessingRef = useRef(false);
+  const finishWasRequestedRef = useRef(false);
   useEffect(() => {
     const wasRecording = prevIsRecordingRef.current;
     const wasProcessing = prevProcessingRef.current;
+    const stopLifecycle = advanceRecordingStopLifecycle(
+      finishWasRequestedRef.current,
+      {
+        isRecording,
+        wasRecording,
+        finishRequested,
+        processingRecording,
+      },
+    );
+    finishWasRequestedRef.current = stopLifecycle.finishWasRequested;
     if (processingRecording && !wasProcessing) {
       restoreExpandedPane();
       if (finishRequested || isCommitting || wasRecording) {
@@ -934,10 +948,12 @@ function StudioStage(props: StudioWorkspaceProps) {
       // Recording → live browser + Copilot guidance.
       restoreExpandedPane();
       setOpenPanes(panesAfterRecordingTransition(panes, "started"));
-    } else if (!isRecording && wasRecording && !processingRecording) {
-      // Discarded recording → restore the canvas without closing Browser.
+    } else if (stopLifecycle.transition !== null) {
+      // Done removes Browser; Discard restores the canvas without closing it.
       restoreExpandedPane();
-      setOpenPanes(panesAfterRecordingTransition(panes, "ended"));
+      setOpenPanes(
+        panesAfterRecordingTransition(panes, stopLifecycle.transition),
+      );
     }
     prevIsRecordingRef.current = isRecording;
     prevProcessingRef.current = processingRecording;

@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -27,6 +28,7 @@ from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
@@ -196,6 +198,25 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     yield
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+@pytest.fixture(autouse=True)
+def reset_cli_runtime_entry() -> Iterator[None]:
+    """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
+
+    Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
+    against the default production URL in any later test that builds a cloud client. The env
+    load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
+    """
+    entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
+    yield
+    cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    for name, value in loaded.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)
@@ -653,17 +674,26 @@ class FakeClearingBrowserContext:
         # Storage key the browser reports for a tab whose URL names no origin, as it does for a
         # window opened on about:blank. A tab absent from this list has an opaque origin and none.
         self.inherited_storage_keys: list[tuple[object, str]] = []
+        # (frame, page) pairs whose frame session is attached to the page's target, as raw-CDP attaches
+        # a same-process frame, so protocol calls on it answer for the page's document.
+        self.frames_attached_to_page_target: list[tuple[object, object]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
         if self.clear_cookies_error is not None:
             raise self.clear_cookies_error
 
+    async def _probe_storage(self, document: object) -> str:
+        return "unreachable" if document in self.frames_without_storage else "reachable"
+
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        if not hasattr(page, "evaluate"):
+            page.evaluate = lambda expression, document=page: self._probe_storage(document)  # type: ignore[attr-defined]
         if page in self.frames_without_own_session:
             raise PlaywrightError("This frame does not have a separate CDP session")
+        answering = next((held for frame, held in self.frames_attached_to_page_target if frame is page), page)
         session = FakeCdpSession(
-            storage_reachable=page not in self.frames_without_storage,
+            storage_reachable=answering not in self.frames_without_storage,
             origins_refusing_clear=tuple(self.origins_refusing_clear),
             origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
             refuses_clear=page in self.frames_refusing_clear,

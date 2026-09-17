@@ -1620,12 +1620,15 @@ def _normalize_failure_reason(failure_reason: str | None) -> str:
 
 _FAILURE_FOLLOW_UP = {
     "NAVIGATION_FAILURE": " Can you confirm the URL is correct?",
-    "PROXY_ERROR": " Want me to retry with a different proxy location?",
+    "PROXY_ERROR": " Want me to re-test?",
     "PAGE_LOAD_TIMEOUT": " Can you confirm the URL and try again in a moment?",
-    "ANTI_BOT_DETECTION": " Want me to retry with a different proxy location?",
+    "ANTI_BOT_DETECTION": " Want me to retry?",
     "AUTH_FAILURE": " The site rejected the login — is the stored password still valid?",
     "CREDENTIAL_ERROR": " I couldn't find a credential to use — can you link one in Settings?",
 }
+# A chat affirmative re-tests on the browser session the turn already holds, so neither offer may
+# promise a different proxy node.
+_SKYVERN_EGRESS_FOLLOW_UP = " That failure was in Skyvern's own proxy hop — want me to re-test?"
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
@@ -1675,9 +1678,15 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
                 f"Nothing was executed, so the draft is unverified.{keep_draft_affordance}"
             )
 
-        failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
+        raw_failure_reason = ctx.last_test_failure_reason
+        failure_summary = _normalize_failure_reason(raw_failure_reason)
         if not failure_summary.endswith("..."):
             failure_summary = failure_summary.rstrip(".")
+        follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
+        # Only the predicate tells Skyvern's own hop apart from a page that says "proxy error"; the
+        # classifier category on its own gets the target-neutral ask.
+        if raw_failure_reason and ctx.last_test_proxy_owned_failure:
+            follow_up = _SKYVERN_EGRESS_FOLLOW_UP
         contract = ctx.latest_diagnosis_repair_contract
         recorded_run = f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}."
         if contract is not None and (contract.challenge is not None or contract.levers):
@@ -1688,9 +1697,7 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             model_reply = user_response.strip()
             if model_reply:
                 return f"{recorded_run} {model_reply}".rstrip() + keep_draft_affordance
-            follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
             return f"{recorded_run}{follow_up}{keep_draft_affordance}"
-        follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
         return f"{recorded_run}{follow_up}{keep_draft_affordance}"
 
     if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
@@ -3365,27 +3372,16 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
     return _build_wip_exit_result(ctx, global_llm_context, cancelled=True)
 
 
-_PROXY_TRANSPORT_NAV_ERROR_CODES = (
-    "net::ERR_TUNNEL_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
-)
-
-
 def _non_retriable_nav_reply(error_message: str) -> str:
     _, separator, machine_error = error_message.rpartition(". Error message: ")
     classification_source = machine_error if separator else error_message
-    # Ahead of the proxy-transport branch: a dead domain reaches us wearing a proxy error code, and
-    # answering it with "contact Skyvern Support" sends the user to us over a URL only they can fix.
+    # A dead domain reaches us wearing a proxy error code (a proxied browser delegates resolution to
+    # the proxy), and answering it with "contact Skyvern Support" sends the user to us over a URL
+    # only they can fix. This marker is driver-emitted, never model- or page-authored.
     if NO_ADDRESS_RECORD_NAV_ERROR_MARKER in classification_source:
         return (
             f"The site's domain has no DNS record, so it cannot be reached from any network. "
             f"Error: {error_message}. Please check the URL for a typo, or confirm the site is still online."
-        )
-    if any(code in classification_source for code in _PROXY_TRANSPORT_NAV_ERROR_CODES):
-        return (
-            f"The site could not be reached through Skyvern's browser network. Error: {error_message}. "
-            "Please try again later, or contact Skyvern Support if the problem continues."
         )
     return f"The target URL could not be reached. Error: {error_message}. Please verify the URL and try again."
 

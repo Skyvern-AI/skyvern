@@ -28,6 +28,7 @@ from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
+    OPAQUE_URL_GUIDANCE,
     SYSTEM_PROMPT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
@@ -42,7 +43,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     _ProgressEvidence,
 )
-from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import (
@@ -871,6 +872,79 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_a_resolvable_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A workflow template renders a file parameter into the goal, the system guidance and the block URL,
+    # with no payload carrying it. Each must get the same treatment as the payload: token in, real URL out.
+    signature = "f1e2d3c4b5a697887766554433221100aabbccddeeff00112233445566778899"
+    cover_signature = "99887766554433221100ffeeddccbbaa00112233445566778899aabbccddeeff"
+    query = "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260824T000000Z&X-Amz-Expires=2700&X-Amz-SignedHeaders=host"
+    signed_url = f"https://files.example.test/uploads/0123456789abcdef/resume.pdf{query}&X-Amz-Signature={signature}"
+    cover_url = (
+        f"https://files.example.test/uploads/0123456789abcdef/cover.pdf{query}&X-Amz-Signature={cover_signature}"
+    )
+    start_signature = "00112233445566778899aabbccddeeff99887766554433221100ffeeddccbbaa"
+    start_url = f"https://files.example.test/uploads/O'Brien/posting.pdf{query}&X-Amz-Signature={start_signature}"
+    plain_url = "https://portfolio.example.test/jo"
+    goal = f"Fill out the application.\n\nresume: {signed_url}\nportfolio: {plain_url}.\n"
+    # Distinct URLs, so each token can only resolve through the refs minted from its own text.
+    token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(signed_url)
+    cover_token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(cover_url)
+    # The apostrophe is a legal path character that ends a prose URL match.
+    start_token = OpaqueUrlRefs(masked=None, refs={}).derive(start_url)
+    assert len({token, cover_token, start_token}) == 3 and cover_token.startswith("opaque_url_")
+
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    captured_sources: list[str] = []
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        captured_sources.append(source)
+        request_info = aiohttp.RequestInfo(url=yarl.URL(source), method="GET", headers={}, real_url=yarl.URL(source))
+        raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
+
+    import skyvern.forge.sdk.api.files as files_module
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+
+    caller = _ScriptedCaller(
+        [
+            [("file_upload", {"selector": "#cv", "file": token})],
+            [("file_upload", {"selector": "#cover", "file": cover_token})],
+            [("navigate", {"url": start_token})],
+            [("finish", {"status": "failed", "reason": "upload rejected"})],
+        ]
+    )
+    page = _FakePage()
+    skyvern_context.set(SkyvernContext(task_id="tsk_goal"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal=goal,
+            parameters=None,
+            starting_url=start_url,
+            extra_system_guidance=f"Always attach the cover letter at {cover_url}",
+        )
+    finally:
+        skyvern_context.reset()
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert f"resume: {token}\n" in user_prompt
+    assert f"You start on: {start_token}" in user_prompt
+    assert f"portfolio: {plain_url}." in user_prompt  # nosemgrep: incomplete-url-substring-sanitization
+    system_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "system")
+    assert f"Always attach the cover letter at {cover_token}" in system_prompt
+    assert OPAQUE_URL_GUIDANCE in system_prompt
+    transcript = json.dumps(outcome.messages)
+    assert all(sig not in transcript for sig in (signature, cover_signature, start_signature))
+    assert captured_sources == [signed_url, cover_url]
+    assert page.url == start_url
+
+
+@pytest.mark.asyncio
 async def test_business_identifier_value_under_a_non_signing_key_stays_readable() -> None:
     # A token-shaped VALUE under an ordinary business KEY (order id, not a signing param) must never be
     # tokenized: neither in the payload nor in ordinary page content the model reads.
@@ -927,21 +1001,21 @@ async def test_hash_route_job_url_is_not_masked() -> None:
 
 @pytest.mark.asyncio
 async def test_page_free_mode_does_not_mask_signed_urls() -> None:
-    # Page-free mode has no tools to resolve an opaque_url_ token, so the payload stays verbatim.
+    # Page-free mode has no tools to resolve an opaque_url_ token, so every model-facing URL stays verbatim.
     signed_url = "https://files.example.test/uploads/x?token=eyJhbGciOiJIUzI1NiJ9c2lnbmVkQ29ycmVjdEhvcnNl"
     caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]])
     outcome = await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),  # never consulted: page_free has no tools
         llm_caller=caller,
-        goal="assess",
+        goal=f"assess {signed_url}",
+        starting_url=signed_url,
         page_free=True,
         parameters={"u": signed_url},
         max_turns=4,
     )
     user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
-    assert (
-        signed_url in user_message and "opaque_url_" not in user_message
-    )  # nosemgrep: incomplete-url-substring-sanitization
+    assert f"assess {signed_url}" in user_message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in user_message
 
 
 @pytest.mark.asyncio
@@ -1372,6 +1446,26 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
         )
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert terminal[0]["block_type"] is None  # bare task: no block context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_type", "refused_count"), [("extraction", 1), ("task", 0), ("navigation", 0), (None, 0)]
+)
+async def test_entry_is_refused_only_in_an_extraction_block(block_type: str | None, refused_count: int) -> None:
+    script = [
+        [("type", {"selector": "#q", "text": "Jane Doe"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type=block_type,
+        )
+    refused = [e for e in logs if e.get("event") == "taskv3 loop extraction entry refused"]
+    assert len(refused) == refused_count
 
 
 @pytest.mark.asyncio

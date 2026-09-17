@@ -37,6 +37,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
     ACTION_LOOP_TERMINATE_AFTER,
+    ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -3095,7 +3096,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_on_round)
     assert outcome.status == "completed"
-    assert rounds == [[RoundAction("click", {}, False, billable=True)]]
+    assert rounds == [[RoundAction("click", {}, False, billable=True, error="tool_error: RuntimeError: boom")]]
     assert outcome.billable_actions == []  # billing still counts successes only
 
 
@@ -3122,9 +3123,10 @@ def _assistant_turn(*ids: str) -> dict[str, Any]:
 
 
 def test_compact_transcript_elides_superseded_perception() -> None:
-    # Keep the newest snapshot of each tracked tool; elide older ones' content (never remove the message),
-    # and leave untracked results untouched. Round 2 (after the last assistant) supersedes round 1's
-    # observe/get_html. `snapshot_indices` names the successful-perception message indices the loop records.
+    # Keep the newest snapshot of each tracked READ; elide older ones' content (never remove the message),
+    # and leave untracked results untouched. Round 2 (after the last assistant) re-takes round 1's two
+    # reads with the same arguments, so it supersedes them. `snapshot_keys` maps the successful-perception
+    # message indices the loop records to each read's (args) identity.
     from skyvern.forge.taskv3.loop import _compact_transcript
 
     messages = [
@@ -3138,7 +3140,8 @@ def test_compact_transcript_elides_superseded_perception() -> None:
         _tool_msg("d", "observe", "OBSERVE_2 latest " + "z" * 300),  # idx 7
         _tool_msg("e", "get_html", "HTML_2 latest " + "w" * 300),  # idx 8
     ]
-    snapshots = {3, 4, 7, 8}  # the observe/get_html successes; the click (5) is not a snapshot
+    # The observe/get_html successes keyed by their args; the click (5) is not a snapshot at all.
+    snapshots = {3: "{}", 4: '{"selector": "#rows"}', 7: "{}", 8: '{"selector": "#rows"}'}
     _compact_transcript(messages, snapshots)
     by_id = {m["tool_call_id"]: m["content"] for m in messages if m.get("role") == "tool"}
     assert by_id["a"].startswith("[superseded observe")  # older observe elided
@@ -3146,7 +3149,9 @@ def test_compact_transcript_elides_superseded_perception() -> None:
     assert by_id["c"] == "clicked #x"  # untracked result untouched
     assert by_id["d"].startswith("OBSERVE_2 latest")  # newest observe kept intact
     assert by_id["e"].startswith("HTML_2 latest")  # newest get_html kept intact
-    assert snapshots == {7, 8}  # elided indices are dropped so a re-run can't re-anchor them
+    assert set(snapshots) == {7, 8}  # elided indices are dropped so a re-run can't re-anchor them
+    # The placeholder names the read it dropped, so the model can re-take it deliberately.
+    assert by_id["b"] == "[superseded get_html(selector=#rows) output elided to bound context]"
 
     # Idempotent: a second pass over the (now-reduced) index set changes nothing.
     snapshot = [m.get("content") for m in messages]
@@ -3166,7 +3171,7 @@ def test_compact_transcript_keeps_unread_latest_round() -> None:
         _tool_msg("a", "get_html", "HTML_A " + "a" * 300),  # idx 2
         _tool_msg("b", "get_html", "HTML_B " + "b" * 300),  # idx 3
     ]
-    _compact_transcript(messages, {2, 3})
+    _compact_transcript(messages, {2: '{"selector": "#a"}', 3: '{"selector": "#a"}'})
     assert messages[2]["content"].startswith("HTML_A")  # both unread → neither elided
     assert messages[3]["content"].startswith("HTML_B")
 
@@ -3184,7 +3189,7 @@ def test_compact_transcript_skip_stub_does_not_shadow_real_snapshot() -> None:
         _tool_msg("c1", "click", "tool_error: TimeoutError: click failed"),  # idx 3
         _tool_msg("o2", "observe", "skipped: earlier tool call in this batch failed"),  # idx 4 (not tracked)
     ]
-    _compact_transcript(messages, {1})
+    _compact_transcript(messages, {1: "{}"})
     assert messages[1]["content"].startswith("REAL_OBSERVE")  # real snapshot preserved as the live view
     assert messages[4]["content"].startswith("skipped:")  # skip stub left as-is, never elided or promoted
 
@@ -3193,7 +3198,7 @@ def test_compact_transcript_noop_without_tracked_snapshots() -> None:
     from skyvern.forge.taskv3.loop import _compact_transcript
 
     messages = [_assistant_turn("a"), _tool_msg("a", "observe", "big " + "x" * 500)]
-    _compact_transcript(messages, set())
+    _compact_transcript(messages, {})
     assert messages[1]["content"].startswith("big ")  # nothing elided when nothing is tracked
 
 
@@ -4436,6 +4441,154 @@ async def test_navigate_resets_action_counters() -> None:
     assert len(clicks) == 10
 
 
+_NAV_URL = "https://forms.example.test/contact-us"
+
+
+def _recordable_navigate(sink: list[tuple[str, dict[str, Any]]], *, outcome: dict[str, Any] | None = None) -> ToolSpec:
+    """The production navigate shape (SKY-16374): recordable so the navigation persists as an action
+    row with the round's screenshot, never billable, and carrying the outcome the caller writes onto
+    that row."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("navigate", args))
+        data: dict[str, Any] = {"page_state_changed": True}
+        if outcome is not None:
+            data[ACTION_OUTCOME_DATA_KEY] = outcome
+            if outcome.get("navigation_dead_end") is not None:
+                # As the real handler does: the top-level flag is what the loop's dead-end verdict
+                # reads, the outcome's copy is what the persisted row carries.
+                data["navigation_dead_end"] = outcome["navigation_dead_end"]
+        return ToolResult.ok("navigated", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="n",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        recordable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_reaches_the_round_with_its_outcome_and_costs_no_budget() -> None:
+    # The customer must see a URL the model typed itself, so navigate enters the action round like a
+    # click — carrying what the navigation achieved, not just the verb. It stays unbilled and unbudgeted:
+    # a navigation is not a page-mutating step, and a recorded row must never start metering.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    nav_outcome = {"requested_url": _NAV_URL, "url": _NAV_URL, "http_status": 200, "page_transitioned": True}
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "completed", "reason": "read it"})]]
+    outcome, _ = await _run(
+        script, [_recordable_navigate(navs, outcome=nav_outcome), make_finish_tool()], on_action_round=_on_round
+    )
+    assert outcome.status == "completed"
+    assert rounds == [[RoundAction("navigate", {"url": _NAV_URL}, True, None, None, False, nav_outcome)]]
+    assert outcome.billable_actions == []
+    assert outcome.action_steps == 0
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_action() -> None:
+    # A 404 landing stays a ToolResult.ok — the model reads the status and decides what to do, and that
+    # transcript must not change. The ROW is the customer's view, and a navigation onto a dead page has
+    # to read as a failed one there, or a run that died on a 404 shows a terminate out of nowhere.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    nav_outcome = {"requested_url": _NAV_URL, "url": _NAV_URL, "http_status": 404, "navigation_dead_end": 404}
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "completed", "reason": "should not win"})]]
+    outcome, _ = await _run(
+        script, [_recordable_navigate(navs, outcome=nav_outcome), make_finish_tool()], on_action_round=_on_round
+    )
+    assert [action.succeeded for round_actions in rounds for action in round_actions] == [False]
+    assert [action.outcome for round_actions in rounds for action in round_actions] == [nav_outcome]
+    # The dead-end verdict still ends the run (the row explains it; it does not replace it), and the
+    # model still read the tool's own ok result.
+    assert outcome.status == "terminated" and outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert [m["content"] for m in outcome.messages if m.get("name") == "navigate"] == ["navigated"]
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_call_that_failed_carries_its_error_text_to_the_round() -> None:
+    # A navigation that reached no page -- a load timeout, or the destructive-reload guard's deliberate
+    # refusal -- has no outcome to report, so the tool's own error is the only thing its persisted row
+    # can say about it. The caller has no other view of the call, and a failed row that explains
+    # nothing reads as a navigation that broke for no reason.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "failed", "reason": "never loaded"})]]
+    await _run(
+        script,
+        [_erroring_tool("navigate", navs, recordable=True), make_finish_tool()],
+        on_action_round=_on_round,
+    )
+    assert [(a.succeeded, a.outcome, a.error) for round_actions in rounds for a in round_actions] == [
+        (False, None, "navigate failed")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_navigations_to_one_url_are_recorded_without_arming_the_action_loop_guard() -> None:
+    # CONTRACT (deliberate exclusion): the action-loop terminator keys on BILLABLE calls, and a
+    # navigation is recorded but not billable, so repeating one is not treated like repeating a click.
+    # The guard exists to stop a run burning its action-step budget on an action that cannot progress,
+    # and a navigation spends none of it; and a successful navigate is itself page-change evidence,
+    # which clears the streak ledger, so counting navigations could never reach the verdict anyway.
+    # Recording a row must not change what ends a run.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    repeats = ACTION_LOOP_TERMINATE_AFTER + 2
+    script = [[("navigate", {"url": _NAV_URL})] for _ in range(repeats)]
+    script.append([("finish", {"status": "completed", "reason": "found the page in the end"})])
+    outcome, _ = await _run(
+        script,
+        [_recordable_navigate(navs), make_finish_tool()],
+        on_action_round=_on_round,
+        max_turns=200,
+        max_tool_calls=500,
+    )
+    assert outcome.status == "completed"
+    assert len(navs) == repeats  # never cut short by the action-loop verdict
+    assert len(rounds) == repeats  # and every one of them persisted as its own round
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_does_not_arm_the_finish_gate_failure_evidence() -> None:
+    # navigate now enters the same round branch that arms the failure-evidence trigger, which exists
+    # for actions that may have SUBMITTED something. A navigation has not, so arming it would make the
+    # finish gate hold verdicts on runs whose last action merely changed page.
+    nav_activity = ActivityRecency(turn=0, turns_remaining=5, tool_calls_remaining=10)
+    navs: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "failed", "reason": "no contact form"})]]
+    await _run(script, [_recordable_navigate(navs), make_finish_tool()], activity=nav_activity)
+    assert nav_activity.last_trigger_turn is None
+
+    # Control: a click on the same path does arm it, so the None above is a live assertion.
+    click_activity = ActivityRecency(turn=0, turns_remaining=5, tool_calls_remaining=10)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click_script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "no contact form"})],
+    ]
+    await _run(click_script, [_billable_tool("click", clicks), make_finish_tool()], activity=click_activity)
+    assert click_activity.last_trigger_turn is not None
+
+
 def _captcha_tool(results: list[str]) -> ToolSpec:
     """solve_captcha fake: recordable, non-billable, returns each result as a tool ERROR (the
     tri-state's not-solved arm) — the arm the false-negative verdicts followed in production."""
@@ -5534,19 +5687,22 @@ async def test_actions_that_name_no_control_never_arm_the_pending_gate() -> None
         assert asked == [], (tool_name, asked)
 
 
+@pytest.mark.parametrize("recordable", [False, True])
 @pytest.mark.asyncio
-async def test_navigating_away_clears_the_recorded_control() -> None:
+async def test_navigating_away_clears_the_recorded_control(recordable: bool) -> None:
     # The run left the page deliberately; the control it clicked went with it, so a marker found at
-    # that selector on the new page belongs to something the run never submitted. `navigate` is
-    # neither billable nor recordable in the production tool set, so the clear has to be reachable
-    # from a plain tool.
+    # that selector on the new page belongs to something the run never submitted. The clear is keyed on
+    # the tool NAME and sits outside the billable/recordable branch, so it must fire whatever navigate's
+    # spec flags say: `recordable=True` is the production shape (SKY-16374), `False` the shape before it.
     probe, asked = _pending_probe(_PENDING)
     watch = SubmitWatch()
     clicks: list[tuple[str, dict[str, Any]]] = []
     navigations: list[tuple[str, dict[str, Any]]] = []
+    navigate = _recording_tool("navigate", navigations)
+    navigate.recordable = recordable
     tools = [
         _billable_tool("click", clicks),
-        _recording_tool("navigate", navigations),
+        navigate,
         make_finish_tool(pending_marker=probe, submit_watch=watch),
     ]
     script = [
@@ -9762,3 +9918,368 @@ async def test_every_click_row_carries_a_hit_class_and_no_other_tool_does() -> N
     unregistered = [e for e in logs if e["event"] == "taskv3 tool call finished"]
     assert any(e["tool"] == "unknown_tool" for e in unregistered)
     assert all("hit_class" not in e for e in unregistered)
+
+
+def _get_html_tool() -> ToolSpec:
+    """A get_html whose answer is a function of its arguments — disjoint reads return disjoint bytes."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"HTML[{args.get('selector') or 'page'}@{args.get('offset', 0)}] " + "y" * 300)
+
+    spec = ToolSpec(
+        name="get_html",
+        description="get_html",
+        # Declared, like the real spec: the supersession key is built from a tool's DECLARED arguments,
+        # so a fixture that declares none would collapse every read onto one key.
+        parameters={"type": "object", "properties": {"selector": {"type": "string"}, "offset": {"type": "integer"}}},
+        handler=handler,
+    )
+    spec.compactable = True
+    return spec
+
+
+@pytest.mark.asyncio
+async def test_loop_keeps_reads_of_disjoint_regions_readable_together() -> None:
+    # SKY-16330. A document too large for one read is gathered in parts, and the parts have to be
+    # readable AT THE SAME TIME or the model never holds the whole thing. Supersession is about a read
+    # going stale, and a read of region B does not make a read of region A stale — they answer
+    # different questions. Eliding A on B's arrival leaves the model with half the evidence it asked
+    # for and no way to get the other half back except by re-reading, forever.
+    script = [
+        [("get_html", {"selector": "#part-1"})],
+        [("get_html", {"selector": "#part-2"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [_get_html_tool(), make_finish_tool()])
+    assert outcome.status == "completed"
+    reads = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "get_html"]
+    assert len(reads) == 2
+    assert reads[0].startswith("HTML[#part-1"), reads[0]  # the first region survives the second read
+    assert reads[1].startswith("HTML[#part-2"), reads[1]
+
+
+@pytest.mark.asyncio
+async def test_loop_still_elides_a_re_read_of_the_same_region() -> None:
+    # The other half of the same rule, and the reason the rule exists: re-reading the SAME region IS
+    # a supersession — the older copy is a stale view of the same bytes — so context stays bounded on
+    # a run that hammers one read.
+    script = [
+        [("get_html", {"selector": "#part-1"})],
+        [("get_html", {"selector": "#part-1"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [_get_html_tool(), make_finish_tool()])
+    reads = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "get_html"]
+    assert len(reads) == 2
+    assert reads[0].startswith("[superseded get_html"), reads[0]
+    assert reads[1].startswith("HTML[#part-1")
+
+
+@pytest.mark.asyncio
+async def test_loop_bounds_how_many_distinct_reads_it_retains() -> None:
+    # Accumulation is bounded, not unbounded: retaining every distinct read would let a run that
+    # walks 300 selectors carry 300 snapshots. The oldest distinct reads elide once the retention
+    # window is full, so the ceiling stays a constant times the per-read cap.
+    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN
+
+    n = PERCEPTION_SNAPSHOT_RETAIN + 2
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("get_html", {"selector": f"#p{i}"})] for i in range(n)]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [_get_html_tool(), make_finish_tool()], max_turns=n + 5, max_tool_calls=n + 5)
+    reads = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "get_html"]
+    assert len(reads) == n
+    intact = [r for r in reads if r.startswith("HTML[")]
+    # The retention window, plus the latest round — which is protected as unread and does not spend a
+    # window slot, so one read per turn leaves RETAIN + 1 standing.
+    expected = PERCEPTION_SNAPSHOT_RETAIN + 1
+    assert len(intact) == expected, [r[:30] for r in reads]
+    # The window keeps the NEWEST reads, which are the ones the model is working from.
+    assert [r.split("@")[0] for r in intact] == [f"HTML[#p{i}" for i in range(n - expected, n)]
+
+
+@pytest.mark.asyncio
+async def test_loop_retention_window_does_not_widen_observe() -> None:
+    # observe takes no arguments, so every observe is a read of the same thing: the whole page as it
+    # is now. Exactly one survives, as before — the window can only widen a tool whose reads differ.
+    script = [
+        [("observe", {})],
+        [("observe", {})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [_big_observe_tool(), make_finish_tool()])
+    obs = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "observe"]
+    assert len([o for o in obs if o.startswith("OBSERVE ")]) == 1
+    assert len([o for o in obs if o.startswith("[superseded ")]) == 2
+
+
+def test_compact_transcript_batched_turn_does_not_evict_every_earlier_read() -> None:
+    # SKY-16330. The prompt asks the model to batch aggressively, so a single turn routinely lands
+    # several reads. Counting the still-unread round against the retention window would let one
+    # batched turn evict every earlier read and make accumulation a no-op on exactly that behaviour.
+    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN, _compact_transcript
+
+    messages: list[dict[str, Any]] = [
+        _assistant_turn("a"),
+        _tool_msg("a", "get_html", "WINDOW@0 " + "a" * 300),  # idx 1
+        _assistant_turn("b", "c", "d"),  # latest round, batched
+        _tool_msg("b", "get_html", "WINDOW@20000 " + "b" * 300),  # idx 3
+        _tool_msg("c", "get_html", "WINDOW@40000 " + "c" * 300),  # idx 4
+        _tool_msg("d", "get_html", "WINDOW@60000 " + "d" * 300),  # idx 5
+    ]
+    keys = {
+        1: "{}",
+        3: '{"offset": 20000}',
+        4: '{"offset": 40000}',
+        5: '{"offset": 60000}',
+    }
+    _compact_transcript(messages, keys)
+    assert PERCEPTION_SNAPSHOT_RETAIN >= 1
+    assert messages[1]["content"].startswith("WINDOW@0")  # the earlier read survives the batch
+    for idx in (3, 4, 5):
+        assert messages[idx]["content"].startswith("WINDOW@")  # the unread round is untouched
+
+
+def test_compact_transcript_unread_round_still_supersedes_its_own_earlier_read() -> None:
+    # The other half: not spending a retention slot must not turn into not superseding. A read the
+    # latest round has just re-taken is a stale view of the same bytes and still elides.
+    from skyvern.forge.taskv3.loop import _compact_transcript
+
+    messages: list[dict[str, Any]] = [
+        _assistant_turn("a"),
+        _tool_msg("a", "get_html", "OLD@0 " + "a" * 300),  # idx 1
+        _assistant_turn("b"),
+        _tool_msg("b", "get_html", "NEW@0 " + "b" * 300),  # idx 3, same read, re-taken
+    ]
+    keys = {1: "{}", 3: "{}"}
+    _compact_transcript(messages, keys)
+    assert messages[1]["content"] == "[superseded get_html output elided to bound context]"
+    assert messages[3]["content"].startswith("NEW@0")
+    assert set(keys) == {3}
+
+
+def test_canonicalization_drops_a_windowed_reads_own_cut_notice_and_head_fragment() -> None:
+    # SKY-16330. A windowed read's digest must depend on the WINDOW, not on the rest of the document.
+    # The cut notice carries the document's total size, which moves when bytes outside the window
+    # change; an offset window can also open on a marker fragment the tail patterns cannot see.
+    # Either one left in would make a frozen window read as fresh ground on every look, which is how
+    # a page that has stopped responding hides from the perception-stall guard.
+    from skyvern.forge.taskv3.loop import _canonical_perception_content
+
+    frozen = "<div>frozen body</div>"
+    # `read_cut` is the tool's own report that it appended this notice; without it the fold does not
+    # run at all, because page text can imitate a notice.
+    grew = _canonical_perception_content(
+        frozen + "…[truncated at 20000 of 60000 chars - call get_html again]", notice_at=len(frozen)
+    )
+    grew_more = _canonical_perception_content(
+        frozen + "…[truncated at 20000 of 60123 chars - call get_html again]", notice_at=len(frozen)
+    )
+    assert grew == grew_more  # a tail that changed outside the window does not move the digest
+
+    # A marker re-minted across a window boundary does not move it either — but only where the
+    # fragment still carries marker characters. A boundary landing inside the bare digits is
+    # indistinguishable from page text that opens with a number, and is deliberately left alone;
+    # see test_head_fragment_normalization_leaves_ordinary_leading_numbers_alone.
+    head_a = _canonical_perception_content('t100" class=x>' + frozen, head_fragment_len=len('t100"'))
+    head_b = _canonical_perception_content('t4567" class=x>' + frozen, head_fragment_len=len('t4567"'))
+    assert head_a == head_b
+
+    # It still discriminates a change INSIDE the window, which is the whole point of the digest.
+    moved = "<div>moved body</div>"
+    assert _canonical_perception_content(moved + "…[truncated at 1 of 2 chars]", notice_at=len(moved)) != grew
+
+
+@pytest.mark.asyncio
+async def test_loop_undeclared_argument_cannot_split_an_argumentless_tools_key() -> None:
+    # A tool's result can depend on an argument it DECLARES and on nothing else, and the specs are not
+    # emitted strict — so a provider adding one to `look` must not make two calls look like distinct
+    # reads. For `look` that is not merely wasted context: each call disposes the old handles, clears
+    # the mark manifest and renumbers, so a retained older legend addresses controls that have moved,
+    # and a click following it acts on the wrong one. It fails open, because the stale legend looks
+    # valid. Exactly one look snapshot survives, whatever arrives on the call.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("LEGEND " + "x" * 300)
+
+    spec = ToolSpec(name="look", description="look", parameters={"type": "object", "properties": {}}, handler=handler)
+    spec.compactable = True
+    script = [
+        [("look", {})],
+        [("look", {"reason": "checking the form"})],
+        [("look", {"reason": "checking again"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [spec, make_finish_tool()])
+    assert outcome.status == "completed"
+    looks = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "look"]
+    assert len(looks) == 3
+    assert len([lk for lk in looks if lk.startswith("LEGEND ")]) == 1, [lk[:30] for lk in looks]
+
+
+def test_declared_args_key_ignores_what_the_spec_does_not_declare() -> None:
+    from skyvern.forge.taskv3.loop import _declared_args_key
+
+    argumentless = ToolSpec(
+        name="observe", description="o", parameters={"type": "object", "properties": {}}, handler=make_finish_tool
+    )
+    assert _declared_args_key(argumentless, {}) == _declared_args_key(argumentless, {"reason": "why"})
+
+    reading = ToolSpec(
+        name="get_html",
+        description="g",
+        parameters={"type": "object", "properties": {"selector": {}, "offset": {}}},
+        handler=make_finish_tool,
+    )
+    # Declared arguments still separate genuinely different reads — the whole point of the key.
+    assert _declared_args_key(reading, {"offset": 0}) != _declared_args_key(reading, {"offset": 20000})
+    # ...and an undeclared one rides along without changing the read's identity.
+    assert _declared_args_key(reading, {"selector": "#a"}) == _declared_args_key(reading, {"selector": "#a", "z": 1})
+
+
+@pytest.mark.asyncio
+async def test_rendered_text_never_folds_a_head_however_far_into_the_page_it_starts() -> None:
+    # Rendered text carries no start tags of the page's own, so nothing in it is ever a marker of
+    # ours — at ANY offset. Folding its head can only fold REAL visible text, and this is what that
+    # costs: a page whose leading identifier is genuinely changing digests identically every read,
+    # the perception-stall guard sees a frozen page, and it TERMINATES a run still making progress.
+    #
+    # Asserted through the guard rather than by calling the canonicalizer, because the canonicalizer
+    # defaults to not folding — a direct call would pass whatever the loop decides and prove nothing.
+    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX, PERCEPTION_STALL_TERMINATE_AFTER
+
+    reads = PERCEPTION_STALL_TERMINATE_AFTER + 3
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        handler.n += 1  # type: ignore[attr-defined]
+        # Only the leading identifier moves; everything after it is frozen, which is exactly the
+        # shape the fold would collapse.
+        return ToolResult.ok(f't{handler.n * 100}" balance ' + "x" * 300, data={"rendered_text": True})  # type: ignore[attr-defined]
+
+    handler.n = 0  # type: ignore[attr-defined]
+    spec = ToolSpec(
+        name="get_html",
+        description="get_html",
+        parameters={"type": "object", "properties": {"offset": {"type": "integer"}, "format": {"type": "string"}}},
+        handler=handler,
+    )
+    spec.compactable = True
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("get_html", {"format": "text", "offset": 20000})] for _ in range(reads)
+    ]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [spec, make_finish_tool()], max_turns=reads + 5, max_tool_calls=reads + 5)
+
+    assert not (outcome.reason or "").startswith(PERCEPTION_STALL_REASON_PREFIX), outcome.reason
+    assert outcome.status == "completed", (outcome.status, outcome.reason)
+
+
+def test_a_marker_head_is_folded_by_its_reported_length_not_by_its_shape() -> None:
+    # Every prefix of the marker attribute is also legal page text — `123"`, `t123"`, `="t123"` — so
+    # nothing about a fragment's SHAPE distinguishes a marker the cut opened from a page that merely
+    # starts that way. Folding page text that genuinely differs makes it read as frozen, and the
+    # perception-stall guard TERMINATES on that, ending a run that was progressing.
+    #
+    # The tool reports the exact length it cut open, so the fold needs no recognition at all.
+    from skyvern.forge.taskv3.loop import _canonical_perception_content as canon
+
+    for a, b in (('123" items', '456" items'), ('t123" items', 't456" items'), ('="t1" x', '="t9" x')):
+        assert canon(a) != canon(b), (a, b)  # unreported: page text, folded by nothing
+
+    # A marker the tool says it cut open folds, however much of the attribute survived — the length
+    # is the fragment through its closing quote, which only the tool can know.
+    rest = " rest"
+    for frag_a, frag_b in (('t100"', 't9000"'), ('="t100"', '="t9000"'), ('a-tv3="t100"', 'a-tv3="t9000"')):
+        folded_a = canon(frag_a + rest, head_fragment_len=len(frag_a))
+        folded_b = canon(frag_b + rest, head_fragment_len=len(frag_b))
+        assert folded_a == folded_b, (frag_a, frag_b, folded_a, folded_b)
+
+
+@pytest.mark.asyncio
+async def test_page_authored_notice_shaped_text_never_folds_into_a_frozen_verdict() -> None:
+    # The cut notice is folded out of the digest because it carries the document's TOTAL, which moves
+    # when bytes OUTSIDE the window change. Folded unconditionally that also reaches page-authored
+    # text that merely LOOKS like a notice — in `observe` and `look` as well as inside a `get_html`
+    # window — and a page whose notice-shaped numbers are genuinely changing then digests identically
+    # on every read. The stall guard reads that as frozen and TERMINATES a run still making progress.
+    #
+    # Asserted through the guard, not against the canonicalizer: a direct call passes whatever the
+    # loop decides to hand it and would go green under the broken version.
+    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX, PERCEPTION_STALL_TERMINATE_AFTER
+
+    reads = PERCEPTION_STALL_TERMINATE_AFTER + 3
+
+    async def handler(_args: dict[str, Any]) -> ToolResult:
+        handler.n += 1  # type: ignore[attr-defined]
+        # The page's OWN text, shaped like our notice, with only its numbers moving. The observe
+        # appends no notice and reports no boundary, so there is nothing for the fold to act on.
+        return ToolResult.ok(f"rows …[truncated at 10 of {handler.n * 100} chars] more " + "x" * 300)  # type: ignore[attr-defined]
+
+    handler.n = 0  # type: ignore[attr-defined]
+    spec = ToolSpec(
+        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=handler
+    )
+    spec.compactable = True
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(reads)]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [spec, make_finish_tool()], max_turns=reads + 5, max_tool_calls=reads + 5)
+
+    assert not (outcome.reason or "").startswith(PERCEPTION_STALL_REASON_PREFIX), outcome.reason
+    assert outcome.status == "completed", (outcome.status, outcome.reason)
+
+
+_FILL_CALLS = {
+    "type": {"selector": "#q", "text": "Jane Doe"},
+    "select_option": {"selector": "#s", "value": "a"},
+    "select_combobox": {"selector": "#c", "value": "a"},
+    "file_upload": {"selector": "#f", "file_url": "https://example.com/a.pdf"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", [True, False])
+@pytest.mark.parametrize("fill_tool", sorted(_FILL_CALLS))
+async def test_extraction_entry_guard_refuses_every_fill_tool_but_not_click(fill_tool: str, refuse: bool) -> None:
+    assert set(_FILL_CALLS) == loop_module.FILL_TOOLS
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool(fill_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [(fill_tool, _FILL_CALLS[fill_tool])],
+        [("click", {"selector": "#tab"})],
+        [("finish", {"status": "completed", "reason": "read"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, refuse_input_entry=refuse)
+
+    assert outcome.status == "completed"
+    dispatched = [name for name, _ in calls]
+    refusals = [e for e in logs if e["event"] == loop_module.EXTRACTION_ENTRY_REFUSED_EVENT]
+    if refuse:
+        assert dispatched == ["click"]
+        assert [e["tool"] for e in refusals] == [fill_tool]
+        fill_results = [m for m in caller.message_history if m.get("role") == "tool" and m["name"] == fill_tool]
+        assert [m["content"].split(":")[0] for m in fill_results] == ["refused"]
+    else:
+        assert dispatched == [fill_tool, "click"]
+        assert refusals == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fill_tool", sorted(_FILL_CALLS))
+async def test_refused_fill_call_stops_the_rest_of_its_batch(fill_tool: str) -> None:
+    # A completed verdict batched behind a refused fill was written as if the fill had landed.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool(fill_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [
+            (fill_tool, _FILL_CALLS[fill_tool]),
+            ("click", {"selector": "#search"}),
+            ("finish", {"status": "completed", "reason": "searched and read"}),
+        ],
+        [("finish", {"status": "failed", "reason": "the value is not on the page"})],
+    ]
+    outcome, caller = await _run(script, tools, refuse_input_entry=True)
+
+    assert calls == []
+    assert outcome.status == "failed", outcome.reason
+    batch_results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"][:3]
+    assert batch_results == ["refused", "skipped", "skipped"]

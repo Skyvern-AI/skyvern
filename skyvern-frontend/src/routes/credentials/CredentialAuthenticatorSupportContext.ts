@@ -19,8 +19,18 @@ type CredentialAdditionalTwoFactorMethod = {
   icon?: ReactNode;
   flagName?: string;
   supportsInlineTest?: boolean;
+  saveBeforeCredentialUpdate?: boolean;
   removalConfirmation?: string;
   initialState?: CredentialAdditionalTwoFactorState;
+  gate?: {
+    locked: boolean;
+    badgeLabel: string;
+    description: ReactNode;
+    cta: {
+      label: string;
+      href: string;
+    };
+  };
   renderFields: (props: {
     state: CredentialAdditionalTwoFactorState;
     setState: (next: CredentialAdditionalTwoFactorState) => void;

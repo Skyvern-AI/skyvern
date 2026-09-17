@@ -46,6 +46,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
+    ACTION_OUTCOME_DATA_KEY,
+    FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
     REF_SELECTOR_RE,
@@ -62,6 +64,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
+from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
@@ -118,20 +121,200 @@ HTML_MAX_CHARS = 20000
 
 # Nothing in these may vary between two reads of an unchanged page: get_html's content is hashed
 # into the loop's perception digests, which decide whether the run has returned to known ground.
-# No quote character may appear in either notice: loop._TV3_MARKER_CUT_RE recognizes a marker the cut
+# `total` is a property of the page and `next_offset` of the call, so both are stable under a re-read
+# of unchanged bytes at the same offset — which is the whole of what the digest requires.
+# No quote character may appear in any notice: loop._TV3_MARKER_CUT_RE recognizes a marker the cut
 # left open only while no quote follows it, and the notice is what follows. Only the whole-page read
 # is steered toward text — a cut element read already has the element it asked about.
-_MARKUP_CUT = f"…[truncated at {HTML_MAX_CHARS} chars]"
-_PAGE_MARKUP_CUT = (
-    f"…[truncated at {HTML_MAX_CHARS} chars - for the visible text instead of markup, call get_html with format=text]"
-)
-# ponytail: text past the cap stays unreachable; add an offset argument if a real page needs it.
-# Component text is appended after the light DOM (_PAGE_TEXT_JS walks document first), so it is what
-# a cut drops first — hence naming the component read here rather than only a generic selector.
-_RENDERED_TEXT_CUT = (
-    f"…[rendered text truncated at {HTML_MAX_CHARS} chars - text inside components is appended last "
-    "and is cut first; read one region with get_html and a selector, or call observe]"
-)
+
+
+def _continuation_args(next_offset: int, *, scoped: bool, text: bool) -> str:
+    """How to spell the call that continues this read.
+
+    Every argument that identifies WHICH read this is has to be named, because tool arguments do not
+    carry over between calls: an omitted `format` defaults to markup and an omitted `selector` widens
+    to the whole page, so either one missing sends a model that follows the notice literally to the
+    same integer offset of a DIFFERENT string.
+
+    The selector is described, never echoed. It is model-authored and may contain a quote character,
+    and no notice may carry one — `loop._TV3_MARKER_CUT_RE` recognizes a marker the cut left open
+    only while no quote follows it, and the notice is what follows.
+    """
+    parts = ["the same selector"] if scoped else []
+    if text:
+        parts.append("format=text")
+    parts.append(f"offset={next_offset}")
+    return ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1]
+
+
+def _markup_cut(next_offset: int, total: int, *, scoped: bool) -> str:
+    """The notice a cut markup read ends with: where it stopped, how much there is, how to continue.
+
+    The offsets of the two formats are NOT interchangeable — they index different strings — so the
+    steer toward text says restart, never `or`, which reads as one call carrying both.
+    """
+    steer = "" if scoped else " Markup not what you want? format=text is a separate read, from its own offset 0."
+    args = _continuation_args(next_offset, scoped=scoped, text=False)
+    return f"…[truncated at {next_offset} of {total} chars - call get_html again with {args} for the next part.{steer}]"
+
+
+def _rendered_text_cut(next_offset: int, total: int, *, scoped: bool) -> str:
+    # Component text is appended after the light DOM (_PAGE_TEXT_JS walks document first), so it is what
+    # a cut drops first — hence naming the component read here rather than only a generic selector.
+    # A read that already carries a selector is not told to use one.
+    steer = (
+        ""
+        if scoped
+        else " Text inside components is appended last and is cut first, so a selector read or observe reaches one region directly."
+    )
+    args = _continuation_args(next_offset, scoped=scoped, text=True)
+    return (
+        f"…[rendered text truncated at {next_offset} of {total} chars - call get_html again with "
+        f"{args} for the next part.{steer}]"
+    )
+
+
+def _past_end_error(total: int) -> ToolResult:
+    """A read that starts past the content. An ERROR, not an empty ok result, for two reasons: the
+    empty string is what an empty page legitimately returns, and an ok result carrying a constant
+    string would let a run page past the end forever — identical content under a fresh (tool, args)
+    key every call, which is the one shape the perception-stall guard cannot witness."""
+    return ToolResult.error(
+        f"offset is past the end of this read, which is {total} chars - pass an offset below that",
+        error_class="offset_past_end",
+    )
+
+
+_MARKER_ATTR_OPEN = 'data-tv3="'
+# The value shape this engine mints, and the same test `MINTED_MARKER_RE` applies in the observe JS
+# before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
+# is what separates ours from theirs.
+_MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
+
+
+def _marker_head_fragment_len(content: str, offset: int) -> int:
+    """How many characters at `offset` are the tail of a marker attribute the cut opened, or 0.
+
+    Computed from the boundary itself rather than by recognizing the fragment's SHAPE. Every prefix
+    of the attribute is also legal page text — `123"`, `t123"`, `="t123"` — so a pattern cannot tell
+    a split marker from a page that merely starts that way, and folding page text that differs makes
+    it read as frozen, which the perception-stall guard terminates on.
+    """
+    if offset <= 0:
+        return 0
+    # The opener may STRADDLE the boundary — a window can begin `a-tv3="t123"` — so the search admits
+    # any occurrence starting before `offset`, not only ones ending before it. Bounded at `0, offset`
+    # it misses every cut that lands inside the attribute's own name, and the marker value then goes
+    # unfolded: an unchanged window gets a fresh digest whenever a remount re-mints it, which is how
+    # a frozen page evades the stall guard instead of tripping it.
+    opened = content.rfind(_MARKER_ATTR_OPEN, 0, offset + len(_MARKER_ATTR_OPEN) - 1)
+    if opened < 0 or opened >= offset:
+        return 0
+    closed = content.find('"', opened + len(_MARKER_ATTR_OPEN))
+    if closed < offset:
+        # A boundary at or past the closing quote left nothing open.
+        return 0
+    # The VALUE decides, and by here the whole of it is in hand — which is why this is not the
+    # shape-matching the fragment forbids. A prefix is ambiguous (`123"`, `t123"` are also legal page
+    # text); a complete value is not. A page may author `data-tv3` itself, and folding a
+    # page-authored value that is changing makes the window read as frozen, which the
+    # perception-stall guard terminates on. Same test the observe JS applies before it will trust one
+    # of these as a selector.
+    if not _MINTED_MARKER_VALUE_RE.match(content[opened + len(_MARKER_ATTR_OPEN) : closed]):
+        return 0
+    return closed - offset + 1
+
+
+def _window(content: str, offset: int, cut: Callable[[int, int], str]) -> tuple[str, int, int | None] | ToolResult:
+    """`content` from `offset`, capped, ending in `cut` when bytes remain after it.
+
+    Redacts BEFORE it cuts. The loop hides `model_hidden_values` from tool output by whole-substring
+    replacement, and it runs on what this returns — so a secret straddling a window boundary matches
+    neither half and both halves reach the model in the clear. Before offsets existed the tail was
+    simply unreachable; making it reachable is what turns a truncated prefix into the whole value,
+    delivered in two pieces. Redacting the whole string first means a boundary can only ever split
+    the placeholder. The loop's own pass still runs and is then a no-op on this content.
+    """
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        content = ctx.hide_from_model(content)
+    total = len(content)
+    if offset >= total:
+        # An unasked-for offset on an empty read is not a read that ran off the end: an empty page is
+        # an ordinary answer and must stay the empty string, or every blank page reads as a paging
+        # mistake. Only a read the model deliberately advanced can overshoot.
+        return ("", 0, None) if offset == 0 else _past_end_error(total)
+    head = _marker_head_fragment_len(content, offset)
+    end = offset + HTML_MAX_CHARS
+    if end >= total:
+        return content[offset:], head, None
+    # The exact BOUNDARIES, not a flag. The loop canonicalizes our notice out of the perception
+    # digest because it carries the document's TOTAL, which moves when bytes outside the window
+    # change — and it must fold OUR notice and never text that merely looks like one. Both the page
+    # (a forged unterminated prefix) and the server (a download filename) control text that can wear
+    # that shape, so no pattern and no match-selection rule can tell them apart. This function put
+    # the notice there and knows where; carrying the index is the only answer that stays correct.
+    windowed = content[offset:end]
+    return windowed + cut(end, total), head, len(windowed)
+
+
+def _normalize_read_args(args: dict[str, Any]) -> None:
+    """Rewrite the arguments that name WHICH read this is to the single form the handler will act on,
+    dropping any that mean "not supplied". Mutates `args`, which is what the loop hashes into this
+    call's identity.
+
+    A non-strict provider spells an absent optional argument in several ways — omitted, `null`, or
+    the empty string — and the handler treats all of them as the whole-page HTML read. Left as sent
+    they are several identities for one read, and with a two-snapshot window duplicates of the head
+    can fill it and evict the different region the window exists to hold.
+    """
+    # Absent or empty only — never whitespace. `if selector:` treats "   " as a real address, so the
+    # handler reports a stale_selector naming what the model typed; dropping it here would turn that
+    # into a silent WHOLE-PAGE read, which is the context blow-up this change exists to stop. A
+    # whitespace `format` likewise reaches the handler's unknown-format error rather than defaulting.
+    for name in ("selector", "format"):
+        if args.get(name) is None or args.get(name) == "":
+            args.pop(name, None)
+    fmt = args.get("format")
+    if isinstance(fmt, str):
+        # An unrecognized spelling is left as typed, so the handler's error names what the model wrote.
+        normalized = fmt.strip().lower()
+        if normalized == "html":
+            del args["format"]
+        elif normalized == "text":
+            args["format"] = normalized
+
+
+def _read_offset(args: dict[str, Any]) -> int | str:
+    """The requested offset, or an error message. A model that sends a bad offset must be told, not
+    silently re-served the head — it would read the same window as a fresh document.
+
+    The accepted value is written back over `args`, and an offset of 0 is removed outright. `args` is
+    what the loop hashes into this call's identity, which decides both what supersedes what in the
+    transcript and what counts as the same probe to the stall guard. Without this, `{}`,
+    `{offset: 0}` and `{offset: "0"}` are three identities for one read of the same bytes.
+
+    MUST run outside `_with_selector_guard`, which hands the handler a COPY of `args` whenever a
+    selector is present — a write-back inside it reaches nothing the loop will hash.
+    """
+    raw = args.pop("offset", None)
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, (int, str, float)):
+        return f"offset must be a whole number of characters, not {raw!r}"
+    # Integrality is checked, never coerced: int(20000.9) is 20000, which would execute and record a
+    # DIFFERENT read from the one asked for, under a handler that promises to reject a non-whole count.
+    if isinstance(raw, float) and not raw.is_integer():
+        return f"offset must be a whole number of characters, not {raw!r}"
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return f"offset must be a whole number of characters, not {raw!r}"
+    if value < 0:
+        return f"offset must not be negative, got {value}"
+    if value:
+        args["offset"] = value
+    return value
 
 
 def _escape_tags_in_text(text: str) -> str:
@@ -305,6 +488,35 @@ class CommitStatus(str, Enum):
 
 def _has_committable_state(state: dict[str, Any] | None) -> bool:
     return isinstance(state, dict) and any(state.get(k) is not None for k in _COMMIT_STATE_KEYS)
+
+
+def _option_str_list(raw: Any) -> list[str] | None:
+    """The string options of a declared array, or None when the caller declared no usable array.
+
+    An empty string is a real option value -- `<option value="">` is selectable -- so it is kept, and
+    an empty array is a declared request to hold nothing, so it wins over a scalar like any other
+    array. Only an array with nothing usable in it falls through as undeclared.
+    """
+    if not isinstance(raw, list):
+        return None
+    items = [x for x in raw if isinstance(x, str)]
+    return items if items or not raw else None
+
+
+# select_option's readback names the options a control holds, and the page chooses that text. The
+# result is not compacted, so both the count and each option are bounded -- and marked when cut.
+SELECTION_REPORT_MAX_OPTIONS = 20
+SELECTION_REPORT_OPTION_WIDTH = 80
+
+
+def _selection_report(options: list[str]) -> str:
+    shown = [
+        o[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(o) > SELECTION_REPORT_OPTION_WIDTH else o
+        for o in options[:SELECTION_REPORT_MAX_OPTIONS]
+    ]
+    if len(shown) < len(options):
+        return f"{shown!r} (showing {len(shown)} of {len(options)})"
+    return repr(shown)
 
 
 def _classify_commit(
@@ -3967,6 +4179,7 @@ _SELECT_VISIBILITY_JS = (
       visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden',
       disabled: !!el.disabled,
       proxied: !!_nativeProxy(el),
+      multiple: el.multiple === true,
     };
   } catch (e) { return { exists: false, visible: false }; }
 }"""
@@ -4032,8 +4245,18 @@ _SELECT_READBACK_JS = (
     if (!el) return null;
     const idx = el.selectedIndex;
     const opt = idx >= 0 ? el.options[idx] : null;
+    // el.value and el.selectedIndex both name only the FIRST selected option, so on a
+    // <select multiple> they report a set of many as one. The set is the only honest readout.
+    const picked = Array.from(el.selectedOptions || []);
     // Playwright matches label= against option.label (whitespace-collapsed), not raw text.
-    return { value: el.value, selectedIndex: idx, selectedLabel: opt ? opt.label : null };
+    return {
+      value: el.value,
+      selectedIndex: idx,
+      selectedLabel: opt ? opt.label : null,
+      multiple: el.multiple === true,
+      selectedLabels: picked.map((o) => o.label),
+      selectedValues: picked.map((o) => o.value),
+    };
   } catch (e) { return null; }
 }"""
 )
@@ -4909,6 +5132,10 @@ OBSERVE_DISPLAY_WIDTHS = {
 # call so the longest payload-minted URL fits whole after the widest display window.
 OBSERVE_RETAIN_WIDTH_MIN = 2000
 OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
+# Width the whole selected-options list may occupy on one rendered line, repr and all. A set-valued
+# control holds an unbounded number of options and each carries a label, so capping only the count
+# still lets one control take the digest over.
+OBSERVE_SELECTED_OPTIONS_TOTAL_CAP = 600
 
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
@@ -5781,6 +6008,10 @@ async () => {
   // Candidates the visibility gates below drop. Those drops are silent, so a page whose whole app
   // shell is behind a boot gate renders exactly like an empty one; this is what tells the two apart.
   let hiddenDropped = 0;
+  // hiddenDropped split by the gate that dropped the control; each gate is a different fix.
+  let hiddenDroppedOffCanvas = 0;
+  let hiddenDroppedVisibility = 0;
+  let hiddenDroppedZeroRect = 0;
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
@@ -5897,12 +6128,12 @@ async () => {
     // like v1 (whose center_x check is only reached for a non-zero rect), so the zero-size
     // skinned-proxy carve-out below still runs for an off-screen-positioned skinned control.
     const centerX = (gr.left + gr.width) / 2 + window.scrollX;
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { hiddenDropped++; continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
     // v1's isElementStyleVisibilityVisible (domUtils.js) drops a control whose own computed
     // visibility is not 'visible'. Scoped to non-zero-rect elements so the zero-size skinned-proxy
     // carve-out below still runs; visibility is read per-element, so a visibility:visible child of a
     // hidden ancestor is kept. A native checkbox/radio judges the parent here instead of itself.
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { hiddenDropped++; continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { hiddenDropped++; hiddenDroppedVisibility++; continue; }
     let hidden = false;
     if (r.width === 0 || r.height === 0) {
       // Design systems skin a native SELECT/checkbox/radio/file input at zero size behind a styled
@@ -5924,6 +6155,7 @@ async () => {
         // all-hidden, or all-off-canvas host is a phantom.
       } else {
         hiddenDropped++;
+        hiddenDroppedZeroRect++;
         continue;
       }
     }
@@ -6030,7 +6262,21 @@ async () => {
     // element line for a selector that does not exist.
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
-    if (secretValue) { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    // el.value on a <select multiple> is the FIRST selected option only: a control holding nine
+    // reads as holding one, so an overwrite and an accumulation look identical. Report the set
+    // instead -- the scalar is a false readout here, not a partial one. Single-select is untouched.
+    const _multiSelect = el.tagName === 'SELECT' && el.multiple === true;
+    if (secretValue) { if (el.value) rec.value = '(hidden)'; }
+    else if (_multiSelect) {
+      const _picked = Array.from(el.selectedOptions || []);
+      // Retained per item at the same width as the scalar branch below: this list rides in the
+      // persistent conversation prefix, so an uncapped label is paid for on every later turn.
+      rec.selectedOptions = _picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
+      // The size actually held, not the size retained. Python renders the truncation marker off
+      // this: a list that lost its tail silently reads as the whole selection.
+      rec.selectedTotal = _picked.length;
+    }
+    else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
     // React-Select-style commit: the widget clears el.value and moves the label into its own surface
     // (D3). Only when el.value is empty, so a field still holding its own text is never overridden.
     else if (_isAutocomplete(el)) {
@@ -6635,7 +6881,7 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -6875,16 +7121,58 @@ def _newly_rendered_lines(before: str, after: str) -> list[str]:
     return [line.strip() for line in after.splitlines() if line.strip() and line.strip() not in seen]
 
 
-async def _input_holds_file(el: Any) -> bool:
+async def _input_holds_file(el: Any) -> bool | None:
     """Playwright-layer readback that set_input_files populated the control — proves the file attached to
-    the input element, not that the site registered it. Fail-open: an unreadable control must never turn a
-    real upload into a false negative."""
+    the input element, not that the site registered it. None when the control is unreadable, which must
+    never turn a real upload into a false negative, nor count as confirmation."""
     try:
         count = await el.evaluate("e => (e && e.files) ? e.files.length : 0")
         return bool(count) and int(count) > 0
     except Exception:
-        LOG.info("taskv3 file-input populate readback failed, assuming populated", exc_info=True)
-        return True
+        LOG.info("taskv3 file-input populate readback failed", exc_info=True)
+        return None
+
+
+# Where a file_upload target's file goes, answered as v1's upload handler does: the target itself when
+# it is a file input, its control when it is a <label> for one, else the single file input inside it,
+# open shadow roots included. More than one inside is ambiguous and yields nothing. The control, not
+# the label, because the populate readback reads `.files` off whatever this returns.
+_FILE_INPUT_FOR_JS = (
+    r"""(e) => {
+  const _shadowRoots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  const isFile = (n) => !!n && n.tagName === 'INPUT' && String(n.type || '').toLowerCase() === 'file';
+  if (isFile(e)) return e;
+  if (e.tagName === 'LABEL' && isFile(e.control)) return e.control;
+  const starts = [e];
+  if (e.shadowRoot && e.shadowRoot.nodeType === 11) starts.push(e.shadowRoot);
+  const found = new Set();
+  for (const root of starts.flatMap(_shadowRoots)) {
+    try { for (const n of root.querySelectorAll('input')) if (isFile(n)) found.add(n); } catch (err) {}
+  }
+  return found.size === 1 ? found.values().next().value : null;
+}"""
+)
+
+# `type` is `submit` on a typeless <button> too, so this covers the implicit default button of a form.
+_SUBMITS_FORM_JS = "e => !!e.form && (e.tagName === 'BUTTON' || e.tagName === 'INPUT') && ['submit', 'image'].includes(String(e.type).toLowerCase())"
+
+_FILE_CHOOSER_TIMEOUT_MS = 3000
+
+
+async def _file_input_for(el: Any) -> Any | None:
+    """The element to set files on, or None when no file input is associated with `el`. An unreadable
+    target keeps `el`, so the driver's own error still reports it."""
+    try:
+        handle = await el.evaluate_handle(_FILE_INPUT_FOR_JS)
+    except Exception:
+        LOG.info("taskv3 file_upload file-input resolution failed, using the target as given", exc_info=True)
+        return el
+    target = handle.as_element()
+    if target is None:
+        await handle.dispose()
+    return target
 
 
 # Counts fields holding in-progress state a reload would discard, piercing shadow roots. Unlike the
@@ -7484,6 +7772,9 @@ _OBSERVE_SUMMED_KEYS = (
     "rootCount",
     "hiddenListed",
     "hiddenDropped",
+    "hiddenDroppedOffCanvas",
+    "hiddenDroppedVisibility",
+    "hiddenDroppedZeroRect",
     "phantomDropped",
     "markersMinted",
     "markersReused",
@@ -8202,6 +8493,24 @@ def build_browser_tools(
                 extra += f" placeholder={_field(e['placeholder'], OBSERVE_DISPLAY_WIDTHS['placeholder'])!r}"
             if e.get("options"):
                 extra += f" options={e['options']}"
+            if e.get("selectedOptions") is not None:
+                held = e["selectedOptions"]
+                raw_total = e.get("selectedTotal")
+                total = len(held) if raw_total is None else int(raw_total)
+                shown: list[str] = []
+                for option in held:
+                    text = _field(option, OBSERVE_DISPLAY_WIDTHS["value"])
+                    # Measured on the RENDERED list, not the raw strings: the line is emitted through
+                    # repr, whose quotes and separators add about a third the budget charges for.
+                    if len(repr([*shown, text])) > OBSERVE_SELECTED_OPTIONS_TOTAL_CAP:
+                        break
+                    shown.append(text)
+                extra += f" selected_options={shown}"
+                # A capped selection must say it was capped. Showing 60 of 75 with no marker reads as
+                # the complete set, and the model then reasons about a selection it believes it can
+                # see whole -- the same false-readout failure the set replaced el.value to fix.
+                if len(shown) < total:
+                    extra += f" (showing {len(shown)} of {total} selected)"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
             if e.get("selected") is not None:
@@ -8261,6 +8570,9 @@ def build_browser_tools(
             "text_dropped": text_dropped,
             "hidden_listed": hidden_kept,
             "hidden_dropped": hidden_dropped,
+            "hidden_dropped_off_canvas": int(data.get("hiddenDroppedOffCanvas") or 0),
+            "hidden_dropped_visibility": int(data.get("hiddenDroppedVisibility") or 0),
+            "hidden_dropped_zero_rect": int(data.get("hiddenDroppedZeroRect") or 0),
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
@@ -8306,7 +8618,7 @@ def build_browser_tools(
         # is untouched. url= is already masked before truncation above; re-masking a token is a no-op.
         return ToolResult.ok(_mask_refs("\n".join(lines)), data={"count": len(elements), "summary": summary})
 
-    async def _rendered_text_result(page: Any, selector: str | None) -> ToolResult:
+    async def _rendered_text_result(page: Any, selector: str | None, offset: int) -> ToolResult:
         # rendered_text marks this result as prose rather than markup, which is what tells a reader
         # of `data` that its content carries no start tags of the page's own.
         target = page
@@ -8322,9 +8634,20 @@ def build_browser_tools(
             # another document's text to it would answer a different question than the one asked.
             text += await _child_frame_text(page)
         body = _escape_tags_in_text(_mask_refs(text))
-        if len(body) > HTML_MAX_CHARS:
-            body = body[:HTML_MAX_CHARS] + _RENDERED_TEXT_CUT
-        return ToolResult.ok(body, data={"rendered_text": True})
+        # Windowed AFTER masking and escaping, never before: both rewrite lengths, so an offset taken
+        # against the raw text would address a different character in the text the model is handed.
+        scoped = bool(selector)
+        windowed = _window(body, offset, lambda end, total: _rendered_text_cut(end, total, scoped=scoped))
+        if isinstance(windowed, ToolResult):
+            return windowed
+        text, head, notice_at = windowed
+        # Present only when non-zero. Adding a key to every result would widen a `data` shape other
+        # tests pin exactly, for no reader that needs it: the loop uses `.get`, so absent and the
+        # inert value are the same answer. A rendered-text read has no markup and so no head fragment.
+        data: dict[str, Any] = {"rendered_text": True}
+        if notice_at is not None:
+            data["notice_at"] = notice_at
+        return ToolResult.ok(text, data=data)
 
     async def _child_frame_text(page: Any) -> str:
         """Each readable child frame's rendered text, labelled, appended to the page's own.
@@ -8376,9 +8699,11 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args.get("selector")
+        # Already parsed, normalized and validated by `_with_read_offset`, outside the selector guard.
+        offset = int(args.get("offset") or 0)
         fmt = str(args.get("format") or "html").strip().lower()
         if fmt == "text":
-            return await _rendered_text_result(page, selector)
+            return await _rendered_text_result(page, selector, offset)
         if fmt != "html":
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
@@ -8405,10 +8730,18 @@ def build_browser_tools(
         # costs truncation budget the model needs for real markup.
         html = _ACT_ATTR_RE.sub("", html)
         html = _mask_refs(html)
-        if len(html) > HTML_MAX_CHARS:
-            cut = _MARKUP_CUT if selector else _PAGE_MARKUP_CUT
-            return ToolResult.ok(html[:HTML_MAX_CHARS] + cut)
-        return ToolResult.ok(html)
+        scoped = bool(selector)
+        windowed = _window(html, offset, lambda end, total: _markup_cut(end, total, scoped=scoped))
+        if isinstance(windowed, ToolResult):
+            return windowed
+        markup, head, notice_at = windowed
+        # Same rule as the text read: a markup read with nothing to report carries no `data` at all.
+        report: dict[str, Any] = {}
+        if head:
+            report["head_fragment_len"] = head
+        if notice_at is not None:
+            report["notice_at"] = notice_at
+        return ToolResult.ok(markup, data=report or None)
 
     async def _unreachable_error(selector: str) -> ToolResult:
         # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
@@ -9401,6 +9734,24 @@ def build_browser_tools(
             return True
         return False
 
+    async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> None:
+        # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
+        # A widget that hands the caret to another segment would take the keys there, so a caret that
+        # does not stay put re-raises the click's error; the caller must still prove the keystrokes landed.
+        if not focus_fallback or not _click_blocked_only_by_viewport(exc):
+            raise exc
+        # A field that commits a picked suggestion holds the raw query until blur, so a read-back could
+        # not tell a fill from a query; with no click to reach its rows, keep the error.
+        if await _declares_a_list(page, selector):
+            raise exc
+        try:
+            await page.focus(selector, timeout=15000)
+            held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
+        except Exception:
+            held = None
+        if held is not True:
+            raise exc
+
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
     ) -> tuple[bool, dict[str, Any] | None, bool]:
@@ -9422,7 +9773,13 @@ def build_browser_tools(
             # field that never moved. A navigation clears window, so a token planted on it answers
             # "is this still the same document" exactly -- the same technique the pre-snapshot uses.
             await page.evaluate("() => { window.__tv3_doc = 1; }")
-            await page.click(selector, timeout=15000, force=True)
+            try:
+                await page.click(selector, timeout=15000, force=True)
+            except Exception as exc:
+                # Force skips the hit-target check but not the viewport one, which rejects any box of
+                # at most one square pixel: a segment input kept sub-pixel under its own display layer.
+                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
+                return True, None, True
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=1000)
             except Exception:
@@ -9449,22 +9806,8 @@ def build_browser_tools(
             except Exception as exc:
                 # A segmented control can keep its real input off-viewport with tabindex=-1 under an
                 # aria-hidden display layer: the probe finds nothing on top of it, but the click's
-                # hit-test has no point to land on. focus() needs no hit target. A widget that hands the
-                # caret to another segment would take the keys there, so a caret that does not stay put
-                # keeps today's error; the caller must still prove the keystrokes landed.
-                if not focus_fallback or not _click_blocked_only_by_viewport(exc):
-                    raise
-                # A field that commits a picked suggestion holds the raw query until blur, so a read-back
-                # could not tell a fill from a query; with no click to reach its rows, keep the error.
-                if await _declares_a_list(page, selector):
-                    raise
-                try:
-                    await page.focus(selector, timeout=15000)
-                    held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
-                except Exception:
-                    held = None
-                if held is not True:
-                    raise
+                # hit-test has no point to land on.
+                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
                 focused_without_click = True
         try:
             focused = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
@@ -11212,6 +11555,8 @@ def build_browser_tools(
         selector = args["selector"]
         label = args.get("label")
         value = args.get("value")
+        label_list = _option_str_list(args.get("labels"))
+        value_list = _option_str_list(args.get("values"))
         ambiguous = await _ambiguous_selector_error(page, selector)
         if ambiguous is not None:
             return ambiguous
@@ -11235,7 +11580,15 @@ def build_browser_tools(
         # momentarily fails is never misrouted into typing.
         probe_node = str(probe.get("nodeName") or "") if isinstance(probe, dict) and probe.get("exists") else None
         if probe_node is not None and probe_node != "select":
-            chosen = label if label is not None else value
+            # A custom combobox commits one picked suggestion at a time; it has no set-valued
+            # commit path, so a requested set cannot be honoured in one call here.
+            requested = label_list or value_list
+            if requested is not None and len(requested) > 1:
+                return ToolResult.error(
+                    f"{selector} is not a native <select>, so a set of options cannot be committed in "
+                    "one call — select one option per call"
+                )
+            chosen = requested[0] if requested else (label if label is not None else value)
             if not isinstance(chosen, str) or not chosen:
                 return ToolResult.error("select_option needs a label or value to choose")
             return await _commit_custom_combobox(page, selector, _resolve_text(chosen))
@@ -11244,11 +11597,28 @@ def build_browser_tools(
         force = bool(isinstance(probe, dict) and probe.get("exists") and not probe.get("visible"))
         if force and not probe.get("proxied"):
             return await _unreachable_error(selector)
-        if label is not None:
+        # A <select multiple> discards its whole selection on every call, so a set must travel as one
+        # call; the driver takes a list natively.
+        is_multi = bool(isinstance(probe, dict) and probe.get("multiple"))
+        # What the readback is checked against comes off the SAME chain that selects, in the same
+        # order. Derived separately, `values` plus a scalar `label` selected by value and verified by
+        # label, so a call that did exactly what was asked reported `asked for ['Gamma'], it now
+        # holds ['Alpha']` and told the model to re-pass a set it had never asked for.
+        if label_list is not None:
+            by_label, asked = True, label_list
+            await page.select_option(selector, label=label_list, timeout=15000, force=force)
+        elif value_list is not None:
+            by_label, asked = False, value_list
+            await page.select_option(selector, value=value_list, timeout=15000, force=force)
+        elif label is not None:
+            by_label, asked = True, [label]
             await page.select_option(selector, label=label, timeout=15000, force=force)
         else:
+            by_label, asked = False, ([value] if isinstance(value, str) else [])
             await page.select_option(selector, value=value, timeout=15000, force=force)
-        if not force:
+        # A set-valued control is read back whether or not it was forced: without it a call that
+        # discarded every prior selection reports the same bare success as one that added to them.
+        if not force and not is_multi:
             return ToolResult.ok(f"selected on {selector}")
         try:
             readback = await page.evaluate(_SELECT_READBACK_JS, await _probe_arg(page, selector))
@@ -11257,13 +11627,35 @@ def build_browser_tools(
         value_read: Any = None
         post: dict[str, Any] | None = None
         committed_value: bool | None = None
+        expected: list[str] = []
+        held: list[str] = []
         if isinstance(readback, dict):
             value_read = readback.get("value")
-            post = {"value": value_read}
-            committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
+            if is_multi:
+                # Compare the SET, never `selectedLabel`/`el.value`: both name only the first selected
+                # option, so they read a nine-option selection and a one-option one identically.
+                expected = asked
+                key = "selectedLabels" if by_label else "selectedValues"
+                held = [x for x in (readback.get(key) or []) if isinstance(x, str)]
+                post = {"value": value_read, "selected": held}
+                # Multiplicity on the HELD side, deduped on the asked side: a page handler that also
+                # selects a duplicate-valued sibling leaves the control holding two options the form
+                # will submit twice, and comparing two sets reports that exact. Asking for the same
+                # option twice is still one request, so the ask is deduped rather than both sides.
+                committed_value = sorted(held) == sorted(set(expected))
+            else:
+                post = {"value": value_read}
+                committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
         matches = await _post_match_count(page, selector)
         verdict = _classify_commit(None, matches, post, committed_value=committed_value)
         if verdict is CommitStatus.DID_NOT_COMMIT:
+            if is_multi:
+                return ToolResult.error(
+                    f"select on {selector} did NOT commit the requested set: asked for "
+                    f"{_selection_report(expected)}, it now holds {_selection_report(held)} — one call "
+                    "REPLACES the whole selection, so pass every option "
+                    "you want held in a single call via `values` or `labels`"
+                )
             return ToolResult.error(
                 f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
                 "widget may not sync from its hidden control; re-observe and act on the visible proxy instead"
@@ -11278,13 +11670,17 @@ def build_browser_tools(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
             )
+        if is_multi:
+            return ToolResult.ok(
+                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
+            )
         return ToolResult.ok(f"selected on {selector} (hidden native select, set directly)")
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
             return error
-        key = args["key"]
+        key = normalize_key_chord(args["key"])
         selector = args.get("selector")
         if selector:
             ambiguous = await _ambiguous_selector_error(page, selector)
@@ -11414,6 +11810,16 @@ def build_browser_tools(
         # terminated (v1's behavior) rather than defaulting the outcome to failed.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
             data["navigation_dead_end"] = response.status
+        # What the persisted action row says happened. The requested URL is the model's own argument
+        # (a placeholder or payload ref must not be unwrapped into a row), and the dead-end status is
+        # repeated from the loop's signal above because the row never sees that one.
+        outcome: dict[str, Any] = {"requested_url": requested, "url": landed}
+        if response is not None:
+            outcome["http_status"] = response.status
+        outcome["page_transitioned"] = landed_canonical != pre_nav_canonical
+        if "navigation_dead_end" in data:
+            outcome["navigation_dead_end"] = data["navigation_dead_end"]
+        data[ACTION_OUTCOME_DATA_KEY] = outcome
         return ToolResult.ok(f"navigated to {landed}{status}", data=data)
 
     async def file_upload(args: dict[str, Any]) -> ToolResult:
@@ -11451,6 +11857,16 @@ def build_browser_tools(
                 {**staged, "page_state_changed": True},
                 error_class="stale_selector",
             )
+        file_input = await _file_input_for(el)
+        if file_input is None and await el.evaluate(_SUBMITS_FORM_JS) is True:
+            # v1 would click it and hope for a file picker; a click here can send the form instead.
+            return ToolResult(
+                "error",
+                f"{selector} is not a file input and clicking it would submit the form, so nothing was "
+                f"clicked — target the file input or the control that opens the file picker",
+                staged,
+                error_class="submits_form",
+            )
         # Verify the upload took EFFECT, not just that set_input_files did not raise. Watch upload-like
         # network dispatches across the set_input_files + settle window (the window we already dwell in,
         # so this adds no latency); a genuine upload dispatches at least one, a silent no-op none.
@@ -11470,8 +11886,28 @@ def build_browser_tools(
         text_before = await _whole_page_text(_current_page())
         probe.start()
         try:
-            await el.set_input_files([local_path])
-            populated = await _input_holds_file(el)
+            if file_input is None:
+                # A styled dropzone or button with no file input inside it: click it and fill the
+                # picker it opens, as v1 does. The picker belongs to the page, whichever frame opened it.
+                try:
+                    async with _current_page().expect_file_chooser(timeout=_FILE_CHOOSER_TIMEOUT_MS) as chooser_info:
+                        await el.click(timeout=_FILE_CHOOSER_TIMEOUT_MS)
+                    chooser = await chooser_info.value
+                except Exception as exc:
+                    if not is_driver_timeout_error(exc):
+                        raise
+                    return ToolResult(
+                        "error",
+                        f"{selector} is not a file input, holds no single file input, and clicking it opened "
+                        f"no file picker — target the file input or the control that opens the file picker",
+                        {**staged, "page_state_changed": True},
+                        error_class="no_file_input",
+                    )
+                await chooser.set_files([local_path])
+                file_input = chooser.element
+            else:
+                await file_input.set_input_files([local_path])
+            populated = await _input_holds_file(file_input)
             # Settle + a small randomized delay so the upload and a following submit are not dispatched
             # in the same instant, matching v1's upload cadence (the engine that clears this step reliably).
             # Page-level too: it reuses v1's network-idle/DOM-stability wait, which describes the whole
@@ -11480,7 +11916,11 @@ def build_browser_tools(
             await _upload_submit_delay()
         finally:
             probe.stop()
-        if not populated:
+        if populated is not False and not probe.saw_upload():
+            # With no request seen, the readback alone decides the ok, so it must describe the input as it
+            # is now: a change handler can clear or reject the file during the settle.
+            populated = await _input_holds_file(file_input)
+        if populated is False:
             # A consume-and-clear dropzone reads the file on change, uploads it and resets the input, so
             # an empty control after a genuine upload is normal there. Confirming it needs every signal
             # a silent no-op cannot fake at once: the file's own name newly rendered on the page AND an
@@ -11504,6 +11944,7 @@ def build_browser_tools(
                     return ToolResult.ok(
                         f"uploaded 1 file to {selector} (the site consumed the file and now shows it: {said!r})",
                         staged,
+                        ok_class="consumed_shown",
                     )
                 LOG.info(
                     "taskv3 file_upload input cleared after attach; page names the file without confirming it",
@@ -11516,18 +11957,27 @@ def build_browser_tools(
                     staged,
                 )
             return ToolResult("error", f"file did not attach to {selector} — re-observe the field", staged)
-        if not probe.saw_upload():
-            # The file is on the input but the site never reacted: report a recoverable error (not a
-            # confident OK) so the loop re-verifies before submitting. A submit-time-upload form lands
-            # here too and costs one re-plan turn, never a lost file.
+        if probe.saw_upload():
+            return ToolResult.ok(f"uploaded 1 file to {selector}", staged, ok_class="upload_seen")
+        if populated is None:
             return ToolResult(
                 "error",
-                f"attached the file to {selector} but observed no upload activity — re-observe the field "
-                f"to confirm the file is shown before submitting; if the form uploads on submit this may "
-                f"be expected",
+                f"set the file on {selector} but could neither read the input back nor see an upload "
+                f"request — re-observe the field to confirm the file is shown before submitting",
                 staged,
+                error_class="attach_unconfirmed",
             )
-        return ToolResult.ok(f"uploaded 1 file to {selector}", staged)
+        # The tool's postcondition is the file on the input, and the readback confirmed it; whether the
+        # page sends it now or with the submit is the form's behaviour. An unwired change handler also
+        # lands here: the recoverable error this used to be drew no retry from the model either.
+        return ToolResult.ok(
+            f"uploaded 1 file to {selector}: the input holds it, and the site sent no upload request yet — "
+            f"normal for a form that sends the file when it is submitted. A hidden file input does not show "
+            f"in observe, so re-checking it will not show the file; look instead for an upload error or a "
+            f"still-required file field on the page",
+            staged,
+            ok_class="attached_no_activity",
+        )
 
     async def select_combobox(args: dict[str, Any]) -> ToolResult:
         # Explicit typeahead fill (type() also drives this automatically). Routes through the shared
@@ -12095,7 +12545,6 @@ def build_browser_tools(
 
     # Which tools leave work a reload would discard, and which leave something that may still be in
     # flight. The loop decides what counts as a submit; this only records WHERE the click landed.
-    _LEDGER_FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
     _LEDGER_SUBMIT_TOOLS = frozenset({"click", "press_key"})
 
     async def _note_frame_work(tool_name: str, realm: Any, selector: Any, result: ToolResult) -> None:
@@ -12106,13 +12555,13 @@ def build_browser_tools(
         """
         if realm is None or not isinstance(selector, str) or not selector:
             return
-        kind = "filled" if tool_name in _LEDGER_FILL_TOOLS else "submitted" if tool_name in _LEDGER_SUBMIT_TOOLS else ""
+        kind = "filled" if tool_name in FILL_TOOLS else "submitted" if tool_name in _LEDGER_SUBMIT_TOOLS else ""
         if not kind:
             return
         # A FILL is recorded whether or not the VERDICT was ok, because mutating the control and
-        # returning an error are independent outcomes. `file_upload` reports an error with the file
-        # ALREADY on the input when it sees no upload activity -- the ordinary submit-time-upload form --
-        # and a typeahead commit can fail with the text typed. Gated on the verdict, that work is
+        # returning an error are independent outcomes. `file_upload` can report an error after the file
+        # was set (an unreadable input with no upload request seen), and a typeahead commit can fail with
+        # the text typed. Gated on the verdict, that work is
         # invisible to the reload guard and a same-url `navigate()` discards it, the file included.
         #
         # Recording an attempt that changed nothing is the benign direction: it costs one recoverable
@@ -12134,6 +12583,30 @@ def build_browser_tools(
             # A ledger write that fails must not fail the action the model just took successfully; the
             # guards then see less than they could, which is the pre-existing behaviour.
             LOG.info("taskv3 could not record frame work", exc_info=True)
+
+    def _with_read_identity(handler: ToolHandler) -> ToolHandler:
+        """Normalize the arguments that name WHICH read this is, on the ORIGINAL args dict.
+
+        Outermost of get_html's wrappers by necessity: `_with_selector_guard` rebuilds `args` as a
+        copy whenever a selector is present, and the loop hashes the caller's dict, not the copy. A
+        normalization applied any further in is invisible to the call identity it exists to unify.
+
+        Spellings the handler treats as identical must not survive as different keys. The handler
+        strips and lowercases `format` and defaults it to html, so `{}`, `{format: html}` and
+        `{format: " HTML "}` are one read — left raw they are three keys, and with a retention window
+        of two, duplicates of one region can fill it and evict the different region the window exists
+        to hold. An unrecognized spelling is left untouched for the handler to reject, so its error
+        still names what the model actually typed.
+        """
+
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            offset = _read_offset(args)
+            if isinstance(offset, str):
+                return ToolResult.error(offset, error_class="invalid_offset")
+            _normalize_read_args(args)
+            return await handler(args)
+
+        return wrapped
 
     def _with_ref_resolution(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
@@ -12256,7 +12729,8 @@ def build_browser_tools(
             "get_html",
             "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe), or "
             'with format "text" its rendered visible text instead - what a user sees, no markup. Both '
-            f"are capped at {HTML_MAX_CHARS} chars and say when they were cut.",
+            f"are capped at {HTML_MAX_CHARS} chars per call; a cut result reports the total size and the "
+            "offset that continues the read, so a page larger than one call is read in parts.",
             _obj(
                 {
                     "selector": {
@@ -12267,6 +12741,13 @@ def build_browser_tools(
                         "type": "string",
                         "enum": ["html", "text"],
                         "description": 'Default "html". "text" returns the visible text instead of markup.',
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "Character to start this read at; default 0. Pass the offset a previous cut "
+                            "result named to read the next part of the same page."
+                        ),
                     },
                 }
             ),
@@ -12327,9 +12808,19 @@ def build_browser_tools(
         ),
         _spec(
             "select_option",
-            "Choose an option in a <select> by value or visible label.",
+            "Choose an option in a <select> by value or visible label. For a control observe reports as "
+            "`select-multiple`, pass ALL the options you want held in ONE call via `values` or `labels` "
+            "-- a second call does not add to the selection, it REPLACES it. The result reports the "
+            "resulting selection set, so you can tell an accumulation from an overwrite.",
             _obj(
-                {"selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}}, ["selector"]
+                {
+                    "selector": {"type": "string"},
+                    "value": {"type": "string"},
+                    "label": {"type": "string"},
+                    "values": {"type": "array", "items": {"type": "string"}},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                },
+                ["selector"],
             ),
             select_option,
         ),
@@ -12344,7 +12835,9 @@ def build_browser_tools(
         ),
         _spec(
             "press_key",
-            "Press a keyboard key (optionally focused on a selector), e.g. Enter, Escape, Tab.",
+            "Press a keyboard key or chord (optionally focused on a selector), e.g. Enter, Escape, Control+a. "
+            "Keys reach only the page, never the browser, so browser shortcuts (reload, back, forward) do "
+            "nothing; use navigate for those.",
             _obj({"key": {"type": "string"}, "selector": {"type": "string"}}, ["key"]),
             press_key,
         ),
@@ -12376,7 +12869,8 @@ def build_browser_tools(
         _spec("navigate", "Navigate the browser to a URL.", _obj({"url": {"type": "string"}}, ["url"]), navigate),
         _spec(
             "file_upload",
-            "Upload a file (local path or URL) into a file input by its observe ref (e.g. ref=12) or a CSS selector.",
+            "Upload a file (local path or URL) into a file input, or into the upload button/dropzone that "
+            "holds or opens one, by its observe ref (e.g. ref=12) or a CSS selector.",
             _obj({"selector": {"type": "string"}, "file": {"type": "string"}}, ["selector", "file"]),
             file_upload,
         ),
@@ -12397,6 +12891,11 @@ def build_browser_tools(
             "file_upload",
         ):
             _tool_spec.billable = True
+        if _tool_spec.name == "navigate":
+            # Recordable, not billable: a URL the model typed itself is an action the customer needs
+            # to see (one action row + the round's screenshot), but it mutates no page, so it must not
+            # consume the action-step budget or meter like one that does.
+            _tool_spec.recordable = True
         if _tool_spec.name in ("observe", "get_html", "look"):
             # Large perception dumps: only the latest snapshot is relevant, so let the loop elide older
             # ones from the re-sent transcript (bounds context on perception-heavy pages). look's legend
@@ -12415,6 +12914,9 @@ def build_browser_tools(
             _tool_spec.handler = _with_ref_resolution(
                 _tool_spec.name, _with_selector_guard(_tool_spec.handler, diagnose)
             )
+        if _tool_spec.name == "get_html":
+            # After the selector-guard block above, so this sits OUTSIDE it and sees the caller's dict.
+            _tool_spec.handler = _with_read_identity(_tool_spec.handler)
         if _tool_spec.name in ("click", "type"):
             # OUTERMOST wrapper: resolve mark=N to a selector before preflight builds its action from
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
@@ -12585,6 +13087,7 @@ class BlankWorkingPageGuard:
         file a previous block downloaded is not this block's.
         """
         armed = False
+        attempts: int | None = None
         if self._download_attempts is not None:
             try:
                 attempts = self._download_attempts()
@@ -12609,8 +13112,16 @@ class BlankWorkingPageGuard:
                 # stop. The invariant is one close per DOWNLOAD, which means per identity.
                 identities = {_download_signal_identity(name) for name in names}
                 new = identities - self._seen_downloads
+                # Refreshed on EVERY scan, including while the counter is authoritative. Skipping the
+                # listing entirely would let it go stale, and the first scan after the counter stops
+                # being available -- a reconnect drops `browser_context`, and the interceptor is
+                # attached per context -- would see the whole run's directory as new and arm.
                 self._seen_downloads = identities
-                if self._baselined and new:
+                # Only the ARMING is gated: the listing is a fallback, not a second opinion. Allowed
+                # to arm alongside the counter, one download arms twice -- once when the counter moves
+                # and again when the file's identity first appears here -- and identity cannot dedupe
+                # that, because the counter carries none.
+                if attempts is None and self._baselined and new:
                     armed = True
         if not self._baselined:
             self._baselined = True

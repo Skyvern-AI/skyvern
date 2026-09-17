@@ -337,6 +337,56 @@ async def ensure_attempt_row(
     return True
 
 
+async def fail_run_without_attempt_row(
+    workflow_run_id: str,
+    failure_reason: str,
+    *,
+    api_key: str | None = None,
+    need_call_webhook: bool = True,
+    cascade_children: bool = False,
+) -> bool:
+    """Fail a queued run that no recovery sweep can see. Returns False when an attempt row exists."""
+    if await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id):
+        return False
+    try:
+        workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+            workflow_run_id=workflow_run_id,
+            failure_reason=failure_reason,
+            cascade_children=cascade_children,
+        )
+    except Exception as finalization_error:
+        try:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
+        except Exception:
+            LOG.warning(
+                "Failed to re-read workflow run after a finalization error; leaving the run recoverable",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            raise finalization_error
+        if workflow_run is not None and not workflow_run.status.is_final():
+            raise
+        LOG.warning(
+            "Workflow run is terminal after initialization failure despite a finalization error",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        if workflow_run is not None and (
+            workflow_run.status != WorkflowRunStatus.failed or workflow_run.failure_reason != failure_reason
+        ):
+            workflow_run = None
+    if workflow_run is not None and need_call_webhook:
+        try:
+            await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, claim_kind=None)
+        except Exception:
+            LOG.warning(
+                "Failed to deliver workflow webhook after initialization failure",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+    return True
+
+
 async def queue_initial_attempt(workflow_run_id: str, attempt_number: int) -> bool:
     """Queue a new run's durable rows before its dispatch, retrying a failed write.
 

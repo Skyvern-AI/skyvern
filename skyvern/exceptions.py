@@ -764,9 +764,13 @@ class WorkflowParameterNotFound(SkyvernHTTPException):
 
 
 class FailedToNavigateToUrl(SkyvernException):
-    def __init__(self, url: str, error_message: str) -> None:
+    def __init__(self, url: str, error_message: str, nav_error_code: str | None = None) -> None:
         self.url = url
         self.error_message = error_message
+        # The driver's own error code, read where the driver raised it. Downstream layers flatten
+        # this exception into a sentence, and a sentence cannot say who wrote it; carrying the code
+        # as a field is what lets a consumer attribute the failure without parsing prose.
+        self.nav_error_code = nav_error_code
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
@@ -785,6 +789,12 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
 # error code stays in the message and would otherwise classify the failure as ours.
 NO_ADDRESS_RECORD_NAV_ERROR_MARKER = "has no DNS address record"
 
+# Shaped like a driver code on purpose: the scrub/restore/preservation pipeline in
+# nav_attribution.py and block.py pattern-matches `net::ERR_[A-Z0-9_]+`, and this rides that same
+# path rather than needing its own case in every one of those gates. It is not a real Chromium
+# error, so no driver or page text can ever produce it; only UnresolvableNavigationHost sets it.
+NO_ADDRESS_RECORD_NAV_ERROR_CODE = "net::ERR_SKYVERN_UNRESOLVABLE_HOST"
+
 
 class UnresolvableNavigationHost(FailedToNavigateToUrl):
     """The navigation target's host has no DNS address record, so no egress of ours can reach it.
@@ -800,6 +810,7 @@ class UnresolvableNavigationHost(FailedToNavigateToUrl):
         super().__init__(
             url=url,
             error_message=f"{host} {NO_ADDRESS_RECORD_NAV_ERROR_MARKER}: {error_message}",
+            nav_error_code=NO_ADDRESS_RECORD_NAV_ERROR_CODE,
         )
 
 

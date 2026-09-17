@@ -9,7 +9,6 @@ import {
   type TurnNarrativeState,
 } from "../narrativeState";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { derivePhases } from "../copilotPhases";
 import { ReviewGateCard, getReviewGateVerdict } from "./ReviewGateCard";
 
 const failedBlock = {
@@ -149,15 +148,13 @@ describe("getReviewGateVerdict", () => {
     expect(getReviewGateVerdict(undefined, proposal)).toBe(null);
   });
 
-  it("never reports tested while the turn's own rail computes a failed test phase", () => {
+  it("never reports tested for a turn with a failed test block", () => {
     const failedTurn = turn({
       proposalDisposition: "review_tested",
+      turnFacts: coveredFacts,
       blocks: [failedBlock],
     });
 
-    expect(
-      derivePhases(failedTurn).find((row) => row.id === "test")?.status,
-    ).toBe("fail");
     expect(getReviewGateVerdict(failedTurn, null)).not.toBe("tested");
   });
 });

@@ -6889,9 +6889,10 @@ def test_a_selector_argument_built_at_runtime_cannot_prove_removal() -> None:
 async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A mid-workflow block is the route that runs in the chat's browser; a head start mints its own.
     harness = await install_run_blocks_harness(
         monkeypatch,
-        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
         polled_status="running",
         dispatch_to_worker=True,
     )
@@ -6930,7 +6931,7 @@ async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_
     ctx.staged_workflow = harness["workflow"]
     ctx.workflow_copilot_chat_id = "wcc_mine"
 
-    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
 
     workflow_service_module.prepare_workflow.assert_not_awaited()
     harness["worker_execute"].assert_not_awaited()

@@ -32,6 +32,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_TAKEOVER_SECONDS,
     RetryDecision,
+    fail_run_without_attempt_row,
     finalize_abandoned_attempt,
     get_recorded_decision,
     latest_attempt_awaiting_preparation,
@@ -44,6 +45,8 @@ from skyvern.services import script_service, task_v2_service
 from skyvern.utils.files import initialize_skyvern_state_file
 
 LOG = structlog.get_logger()
+
+INITIALIZER_FAILURE_BUDGET = 3
 
 
 async def _run_with_own_context(
@@ -77,6 +80,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         self._scheduled_retry_resumes: set[tuple[str, int]] = set()
         self._retry_resumes_needing_recovery: set[tuple[str, int]] = set()
         self._retry_dispatches_needing_recovery: dict[tuple[str, int], tuple[Any, dict[str, Any]]] = {}
+        self._initializer_failures: dict[tuple[str, int], int] = {}
 
     async def recover_pending_retries(self) -> None:
         # The lifespan only logs a failed initial pass; the periodic sweep must start regardless.
@@ -594,14 +598,37 @@ class BackgroundTaskExecutor(AsyncExecutor):
             if execution_kwargs.get("prepared_attempt_claimed") and not await self._retry_dispatch_claim_is_current(
                 attempt
             ):
+                self._initializer_failures.pop(key, None)
                 self._retry_resumes_needing_recovery.discard(key)
                 return
-            # Initialization belongs to the dispatch: a failure here is re-dispatched by the sweep, whereas a
-            # created attempt that never reached the dispatch matches no recovery predicate.
-            await initialize_skyvern_state_file(
-                workflow_run_id=attempt.workflow_run_id, organization_id=attempt.organization_id
-            )
-            await prepare_org_llm_runtime(app.DATABASE, attempt.organization_id, execution_kwargs.get("organization"))
+            try:
+                await initialize_skyvern_state_file(
+                    workflow_run_id=attempt.workflow_run_id, organization_id=attempt.organization_id
+                )
+                await prepare_org_llm_runtime(
+                    app.DATABASE, attempt.organization_id, execution_kwargs.get("organization")
+                )
+            except Exception as exc:
+                failures = self._initializer_failures.get(key, 0) + 1
+                self._initializer_failures[key] = failures
+                if failures < INITIALIZER_FAILURE_BUDGET:
+                    raise
+                if await fail_run_without_attempt_row(
+                    attempt.workflow_run_id,
+                    f"Workflow run initialization failed before execution: {type(exc).__name__}: {exc}",
+                    api_key=execution_kwargs.get("api_key"),
+                    need_call_webhook=execution_kwargs.get("need_call_webhook", True),
+                ):
+                    self._initializer_failures.pop(key, None)
+                    self._retry_resumes_needing_recovery.discard(key)
+                    LOG.warning(
+                        "Workflow run initialization failed without an attempt row; run is terminal",
+                        workflow_run_id=attempt.workflow_run_id,
+                        exc_info=True,
+                    )
+                    return
+                raise
+            self._initializer_failures.pop(key, None)
             await app.WORKFLOW_SERVICE.execute_workflow_with_retries(
                 **execution_kwargs, on_execution_start=on_execution_start
             )
@@ -740,6 +767,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
         try:
             attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+            attempt_rows_known = True
         except Exception:
             # Attempt lookup only selects the retry-aware attempt number. The owner repeats the
             # lookup, and a dispatch that fails before execution is retried by the recovery sweep.
@@ -749,6 +777,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 exc_info=True,
             )
             attempt_rows = []
+            attempt_rows_known = False
         attempt_number = max((row.attempt_number for row in attempt_rows), default=1)
         if block_labels or block_outputs:
             # Scoped inputs live only in this process. The marker must be durable before the queued write
@@ -777,15 +806,44 @@ class BackgroundTaskExecutor(AsyncExecutor):
                             workflow_run_id=workflow_run_id,
                             browser_session_id=workflow_run.browser_session_id,
                         )
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
-                workflow_run_id=workflow_run_id,
-                failure_reason=(
-                    "Sequential credential execution is unavailable in the background executor; "
-                    "the run failed closed before execution."
-                ),
-                cascade_children=True,
+            failure_reason = (
+                "Sequential credential execution is unavailable in the background executor; "
+                "the run failed closed before execution."
             )
-            if attempt_rows:
+            rows_present = bool(attempt_rows)
+            if not rows_present:
+                try:
+                    rows_present = not await fail_run_without_attempt_row(
+                        workflow_run_id, failure_reason, api_key=api_key, cascade_children=True
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to fail the rejected run through the attempt-less path; writing the failure directly",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+                    failed_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=workflow_run_id,
+                        failure_reason=failure_reason,
+                        cascade_children=True,
+                    )
+                    if attempt_rows_known and failed_run is not None:
+                        try:
+                            await app.WORKFLOW_SERVICE.execute_workflow_webhook(
+                                failed_run, api_key=api_key, claim_kind=None
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to deliver workflow webhook after rejecting a sequential credential run",
+                                workflow_run_id=workflow_run_id,
+                                exc_info=True,
+                            )
+            if rows_present:
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                    cascade_children=True,
+                )
                 terminal_run = await app.DATABASE.workflow_runs.get_workflow_run(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization.organization_id,

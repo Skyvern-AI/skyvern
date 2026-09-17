@@ -59,6 +59,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
     ClickAction,
+    GotoUrlAction,
     HoverAction,
     InputTextAction,
     KeypressAction,
@@ -893,6 +894,229 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
     assert [a.reasoning for a in persisted] == [round_texts[0], round_texts[0], round_texts[1]]
     assert [a.intention for a in persisted] == ["Clicked an element", "Typed into a text field", "Clicked an element"]
     assert all(a.response is None for a in persisted)
+
+
+_GOTO_OUTCOME = {
+    "requested_url": "https://forms.example.test/contact-us",
+    "url": "https://forms.example.test/contact",
+    "http_status": 200,
+    "page_transitioned": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_navigation_as_a_goto_url_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-16374: a URL the model typed itself is an action on a par with a click, so it persists as a
+    # `goto_url` row carrying the outcome -- where it asked to go, where it landed, what the page
+    # answered. It must not meter: nothing billable, and the round does not advance the workflow-run
+    # step index (so a navigation cannot inflate a workflow's step budget).
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    rounds = [
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME)],
+        [RoundAction("click", {"selector": "#send"}, True, billable=True)],
+    ]
+    step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        action_round_texts=["the contact link 404s, typing the contact URL instead", "sending the form"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    navigation, click = persisted[0], persisted[1]
+    assert navigation.action_type == ActionType.GOTO_URL
+    assert isinstance(navigation, GotoUrlAction) and navigation.url == _GOTO_OUTCOME["requested_url"]
+    assert navigation.status == ActionStatus.completed
+    assert navigation.intention == f"Navigated to {_GOTO_OUTCOME['requested_url']}"
+    assert navigation.reasoning == "the contact link 404s, typing the contact URL instead"
+    assert navigation.screenshot_artifact_id == "artifact-1"  # the round's own screenshot
+    assert navigation.response is not None
+    assert _GOTO_OUTCOME["url"] in navigation.response and "HTTP 200" in navigation.response
+    # Recorded, never metered: the navigation round leaves the step index where it was, so the click
+    # that follows it is still round 0, and only the click bills.
+    assert (navigation.step_order, click.step_order) == (0, 0)
+    assert len(step.output.actions_and_results) == 1
+
+
+def test_a_navigation_row_calls_a_move_a_move_by_the_same_identity_the_page_was_judged_by() -> None:
+    # The row renders "requested -> landed" and "page changed / same page" out of the SAME outcome, so
+    # the two have to agree. The handler judged the transition on CANONICAL URLs, so comparing the raw
+    # strings here made a browser re-spelling (the model types a bare host, the page reports it with
+    # the root slash) read as a move the very next clause calls "same page".
+    same_page = {
+        "requested_url": "https://forms.example.test",
+        "url": "https://forms.example.test/",
+        "http_status": 200,
+        "page_transitioned": False,
+    }
+    assert agent_module._taskv3_row_response(same_page) == "https://forms.example.test (HTTP 200, same page)"
+    moved = dict(same_page, url="https://forms.example.test/thanks", page_transitioned=True)
+    assert agent_module._taskv3_row_response(moved) == (
+        "https://forms.example.test -> https://forms.example.test/thanks (HTTP 200, page changed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_keeps_a_trailing_navigation_off_the_step_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The workflow-run step budget counts DISTINCT (task_id, step_order) pairs across steps and
+    # round-stamped action rows (get_total_unique_progress_round_count_by_task_ids), so a round that
+    # bills nothing must never open a pair of its own. A navigation BEFORE a billable round shares
+    # the index that round goes on to claim; one AFTER the last billable round has nobody left to
+    # share with, so it has to step back onto the index already spent -- the way the decision row does.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    async def _persisted(rounds: list[list[RoundAction]]) -> set[int | None]:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            action_rounds=rounds,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+        calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+        return {call.kwargs["action"].step_order for call in calls}
+
+    click_round: list[RoundAction] = [RoundAction("click", {"selector": "#send"}, True, billable=True)]
+    nav_round: list[RoundAction] = [
+        RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME)
+    ]
+    assert await _persisted([click_round]) == {0}
+    # Same run, one navigation appended: the budget the run spends must be identical.
+    assert await _persisted([click_round, nav_round]) == {0}
+    # And a run whose only action is a navigation spends the one unit the Step row already occupies.
+    assert await _persisted([nav_round]) == {0}
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_dead_end_navigation_as_a_failed_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The live shape this exists for: two navigations the model typed, the second landing on a hard 404,
+    # then the loop's dead-end terminate. The 404 must read as a FAILED goto_url row carrying the status,
+    # with the terminate row still following it -- not a terminate out of nowhere.
+    from skyvern.forge import agent as agent_mod
+
+    dead_end = {
+        "requested_url": "https://forms.example.test/get-in-touch",
+        "url": "https://forms.example.test/get-in-touch",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="navigation_dead_end: navigate landed on a dead page (HTTP 404)",
+        billable_actions=[],
+    )
+    rounds = [
+        [
+            RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME),
+            RoundAction("navigate", {"url": dead_end["requested_url"]}, False, None, None, False, dead_end),
+        ]
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [a.action_type for a in persisted] == [ActionType.GOTO_URL, ActionType.GOTO_URL, ActionType.TERMINATE]
+    live, dead, terminate = persisted
+    assert (live.status, dead.status) == (ActionStatus.completed, ActionStatus.failed)
+    assert dead.response is not None and "HTTP 404" in dead.response and "dead end" in dead.response
+    assert live.intention == f"Navigated to {_GOTO_OUTCOME['requested_url']}"
+    assert dead.intention == f"Tried to navigate to {dead_end['requested_url']}"
+    assert terminate.reasoning == outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_failed_navigation_with_the_reason_it_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A navigate whose tool call errored (a load timeout, the destructive-reload refusal the engine
+    # issues on purpose) reached no page, so it reports no outcome -- but a failed row with an empty
+    # response reads as a navigation that broke for no reason, which is worse than not showing it. The
+    # tool's own error is what the row has to say, and it is scrubbed like every other persisted text.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    refusal = (
+        "already on this page and it has filled fields (including any attached file); reloading it "
+        "would discard them. Act on the current page instead. token=sk4829137765"
+    )
+    outcome = LoopOutcome(status="failed", reason="could not load the page", billable_actions=[])
+    rounds = [
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, False, None, None, False, None, refusal)],
+        # ...and a failure the tool said nothing about still leaves the response empty rather than
+        # inventing one.
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, False)],
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    refused, silent = persisted[0], persisted[1]
+    assert refused.action_type == ActionType.GOTO_URL
+    assert refused.status == ActionStatus.failed
+    assert refused.intention == f"Tried to navigate to {_GOTO_OUTCOME['requested_url']}"
+    assert refused.response is not None and refused.response.startswith("already on this page")
+    assert "sk4829137765" not in refused.response and REDACTED_SECRET_PLACEHOLDER in refused.response
+    assert silent.response is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_a_secret_out_of_a_navigation_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A landed URL is page-supplied and its query routinely carries the credential itself (a sign-in
+    # link's token). It reaches a persisted, displayed row for the first time here, so it goes through
+    # the same scrub the row's args already get -- in the intention AND in the outcome line.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    landed = {
+        "requested_url": "https://forms.example.test/login?token=sk4829137765",
+        "url": "https://forms.example.test/account?session=sk4829137765",
+        "http_status": 200,
+        "page_transitioned": True,
+    }
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    rounds = [[RoundAction("navigate", {"url": landed["requested_url"]}, True, None, None, False, landed)]]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    navigation = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    assert "sk4829137765" not in (navigation.response or "")
+    assert "sk4829137765" not in (navigation.intention or "")
+    assert "sk4829137765" not in navigation.url
+    assert REDACTED_SECRET_PLACEHOLDER in (navigation.response or "")
 
 
 def test_every_tool_that_pays_for_a_name_has_something_to_say_about_it() -> None:
@@ -3616,7 +3840,8 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # navigate/scroll/wait persist as action rows with screenshots (artifact parity) but never
-    # consume a workflow-run budget unit: their rows keep the current round index.
+    # consume a workflow-run budget unit: their rows share the step_order of the billable round
+    # nearest them, ahead OR behind, so they open no (task_id, step_order) pair of their own.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
     rounds = [
         [RoundAction("navigate", {"url": "https://a.test"}, True)],
@@ -3633,7 +3858,9 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
     assert stamped == [
         (ActionType.GOTO_URL, 0),
         (ActionType.CLICK, 0),
-        (ActionType.SCROLL, 1),
+        # The trailing scroll rides the index the click already spent: a fresh one would be a second
+        # distinct pair for the budget to count, charging the run a step nothing billable claimed.
+        (ActionType.SCROLL, 0),
     ]
 
 

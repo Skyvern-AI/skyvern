@@ -20,10 +20,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { data: workflowRun } = useWorkflowRunQuery();
   const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
-  const blockTitle = getCodeBlockTitle({
-    prompt: data.prompt,
-    steps: data.steps,
-  });
+  const blockTitle = getCodeBlockTitle({ prompt: data.prompt });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =

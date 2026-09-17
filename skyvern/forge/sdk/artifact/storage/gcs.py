@@ -677,7 +677,9 @@ class GcsStorage(BaseStorage):
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)
 
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         # Artifact-first — see s3.py::get_downloaded_files for rationale. When
         # the keyring isn't configured (OSS default) or no artifact rows exist
         # (legacy run) we fall back to the legacy listing path so
@@ -687,7 +689,9 @@ class GcsStorage(BaseStorage):
             download_artifacts = await self._list_download_artifacts_safe(
                 organization_id=organization_id, run_id=run_id
             )
-            download_artifacts = dedupe_run_scoped_download_artifacts(download_artifacts)
+            download_artifacts = dedupe_run_scoped_download_artifacts(
+                download_artifacts, attempt_started_at=attempt_started_at
+            )
             if download_artifacts:
                 return await _file_infos_from_download_artifacts(download_artifacts)
 

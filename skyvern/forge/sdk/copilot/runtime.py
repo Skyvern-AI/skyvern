@@ -55,6 +55,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.webeye.browser_errors import (
     BrowserCdpAcquisitionError,
     BrowserCdpConnectionError,
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
 
@@ -460,6 +462,10 @@ class AgentContext:
     # Set by the planner when it proved a resume against the browser above; the next run is
     # threaded into that browser instead of the chat's. Consumed and cleared by that run.
     frontier_resume_session_id: str | None = None
+    # Set by the planner for a mid-workflow start it cannot bind to a browser: its verified prefix
+    # cannot be resumed, the stored order is not the run order, or it refills credentials. The
+    # chat's browser is not a safe target for any of those. Consumed and cleared by that run.
+    frontier_requires_own_browser: bool = False
     # Where the planned run starts from, stamped once per plan and consumed by that run. Only a
     # non-``unanchored`` start can credit its labels as composition-verified.
     frontier_start_provenance: FrontierStartProvenance | None = None
@@ -510,7 +516,7 @@ class AgentContext:
     last_test_non_retriable_nav_error: str | None = None
     last_infrastructure_tool_error: str | None = None
     workflow_persisted: bool = False
-    last_workflow: Any | None = None
+    last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
@@ -528,7 +534,16 @@ class AgentContext:
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
-    effective_workflow_proxy_location: Any | None = None
+    effective_workflow_proxy_location: ProxyLocationInput = None
+    # The proxy the last dispatched run acted through, which is the attached session's whenever it
+    # declares one. Kept apart from the declared location above, which the repair levers read.
+    last_run_proxy_location: ProxyLocationInput = None
+    # The run attached a browser session, so last_run_proxy_location is that session's answer and
+    # the workflow's declared proxy must not stand in for it.
+    last_run_proxy_from_session: bool = False
+    # Whether the driver's own codes on the last run named Skyvern's proxy hop. Computed once
+    # from the run result's error_codes so no later reader has to re-decide it from prose.
+    last_test_proxy_owned_failure: bool = False
 
     copilot_run_start_monotonic: float | None = None
 
@@ -721,6 +736,13 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
             error_code = error.get("code")
             if isinstance(error_code, str) and error_code:
                 result["error_code"] = error_code
+            # The message is flattened to a string here, which loses everything a reader needs to
+            # tell a real driver verdict from a sentence describing one. The driver's own navigation
+            # code is lifted out of details so it survives as a value rather than as prose.
+            details = error.get("details")
+            nav_error_code = details.get("nav_error_code") if isinstance(details, dict) else None
+            if isinstance(nav_error_code, str) and nav_error_code:
+                result["nav_error_code"] = nav_error_code
         else:
             result["error"] = str(error)
 

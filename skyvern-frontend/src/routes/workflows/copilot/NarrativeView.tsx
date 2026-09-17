@@ -36,6 +36,7 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
+const MAX_DRAFTING_LABELS = 6;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
 const OUTCOME_NOT_CONFIRMED_REASON =
   "the run finished without showing the goal was met";
@@ -1265,6 +1266,29 @@ function FActivityLogRow({
 
   const lineContent =
     soloBlock || last === undefined ? null : entryLine(last, row.label);
+  // These arrive as the raw authored identifiers (`open_page`), so they get the
+  // same humanizing every other surface applies — otherwise a block reads
+  // `open_page` here and "Open Page" in its own card a second later. The
+  // backend caps its own list at 50; a chat pane this narrow reads about three
+  // labels to a line, so capping the head keeps already-read text still while
+  // only the tail counts up.
+  const draftingLine =
+    row.draftingLabels === undefined ? null : (
+      <>
+        <span>Writing the workflow code</span>
+        {row.draftingLabels.length === 0 ? null : (
+          <span className="text-muted-foreground dark:text-slate-500">
+            {` · ${row.draftingLabels
+              .slice(0, MAX_DRAFTING_LABELS)
+              .map(humanizeBlockLabel)
+              .join(", ")}`}
+            {row.draftingLabels.length > MAX_DRAFTING_LABELS
+              ? ` +${row.draftingLabels.length - MAX_DRAFTING_LABELS} more`
+              : ""}
+          </span>
+        )}
+      </>
+    );
   // A mark reports an outcome, so only a step that returned can carry one — a
   // call still in flight has no outcome yet. Beyond that, a browse or write
   // step that worked says so in its own sentence, so only a run's result and
@@ -1372,7 +1396,7 @@ function FActivityLogRow({
       onClick={hasDetail ? onToggle : undefined}
       expanded={hasDetail ? open : undefined}
     >
-      {lineContent?.content}
+      {draftingLine ?? lineContent?.content}
       {mark === null ? null : (
         <span
           className={

@@ -62,9 +62,7 @@ function truncateTitle(value: string): string {
 
 export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
   return truncateTitle(
-    normalizeTitle(source.prompt) ??
-      normalizeTitle(source.steps?.[0]?.title) ??
-      CODE_BLOCK_FALLBACK_TITLE,
+    normalizeTitle(source.prompt) ?? CODE_BLOCK_FALLBACK_TITLE,
   );
 }
 
@@ -94,6 +92,7 @@ export const workflowBlockTitle: {
   task_v2: "Browser Task v2",
   goto_url: "Go to URL",
   http_request: "HTTP Request",
+  web_search: "Web Search",
   print_page: "Print Page",
   workflow_trigger: "Agent Trigger",
   email_inbox: "Email Inbox",

@@ -216,6 +216,15 @@ def scrub_all_registered_from_text(text: str) -> str:
     return text
 
 
+def is_registered_scrub_value(ctx: AgentContext, value: object) -> bool:
+    """True when this exact string is one of the values registered for scrubbing.
+
+    A caller that preserves a machine token across a scrub asks this first: the token itself may be
+    the secret, and writing it back would undo the scrub for the one value that needed it.
+    """
+    return isinstance(value, str) and value in _registered_scrub_values(ctx)
+
+
 def scrub_secrets_from_structure(ctx: AgentContext, obj: Any) -> Any:
     return _scrub_structure(_registered_scrub_values(ctx), obj)
 

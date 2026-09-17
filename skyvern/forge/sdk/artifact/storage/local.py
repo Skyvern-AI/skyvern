@@ -564,7 +564,9 @@ class LocalStorage(BaseStorage):
         live_uri = f"file://{Path(get_download_dir(run_id=parts[1])) / file_info.filename}"
         return [to_downloaded_file_signature(file_info.model_copy(update={"url": live_uri}))]
 
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         download_dir = get_download_dir(run_id=run_id)
         artifacts_by_uri: dict[str, Artifact] = {}
         if run_id is not None:

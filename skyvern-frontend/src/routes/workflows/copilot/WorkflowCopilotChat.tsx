@@ -23,6 +23,7 @@ import {
   ArrowUpIcon,
   Pencil1Icon,
   FileIcon,
+  UploadIcon,
   PlusIcon,
   ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
@@ -63,6 +64,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -78,6 +80,7 @@ import {
   CopilotProductAction,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { AutoAcceptChip } from "./AutoAcceptChip";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -88,7 +91,6 @@ import {
   resolveSendAction,
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
-import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
@@ -164,6 +166,30 @@ const MAX_TURN_SNAPSHOTS = 20;
 // A stream that closes with no terminal frame is usually a lost client
 // connection while the server handler runs on to persist the real reply, so the
 // ladder is sized to the server's own turn budget rather than to a short wait.
+// How long Turn off waits for a chat's in-flight Accepts before giving up and reporting failure, so an
+// apply that never answers cannot leave that chat's gate without its Accept actions. Accept p95 is ~11s.
+export const ACCEPT_SETTLE_CEILING_MS = 30_000;
+
+async function settledWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const RECOVERY_POLL_DELAYS_MS = [2_000, 3_000, 5_000, 8_000, 12_000, 20_000];
 const RECOVERY_POLL_STEADY_MS = 30_000;
 // The server's RECONCILE_ABANDON_AFTER_SECONDS is 1_320_000ms. The margin holds
@@ -673,6 +699,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotCodegenProgressUpdate
   | WorkflowCopilotTitleUpdate
   | WorkflowCopilotCredentialRequiredUpdate
   | WorkflowCopilotQuestionRequired
@@ -899,6 +926,12 @@ interface WorkflowCopilotChatProps {
   initialMessage?: string;
   initialAction?: CopilotProductAction;
   onInitialMessageConsumed?: () => void;
+  onUploadSOP?: (file: File) => void;
+  canUploadSOP?: boolean;
+  isUploadingSOP?: boolean;
+  onRecordTask?: () => void;
+  canRecordTask?: boolean;
+  authoringUnavailableReason?: string | null;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
   // Render frameless — no border, background, or title; the header keeps only
@@ -999,10 +1032,21 @@ export function WorkflowCopilotChat({
   initialMessage,
   initialAction,
   onInitialMessageConsumed,
+  onUploadSOP,
+  canUploadSOP = true,
+  isUploadingSOP = false,
+  onRecordTask,
+  canRecordTask = false,
+  authoringUnavailableReason,
   docked = false,
   chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
+  const sopFileInputRef = useRef<HTMLInputElement>(null);
+  const recordingAuthoringActive = useRecordingStore(
+    (state) => state.isRecording || state.finishRequested || state.isCommitting,
+  );
+  const authoringInProgress = isUploadingSOP || recordingAuthoringActive;
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
   const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
   const codeBlockModeEnabled =
@@ -1055,6 +1099,29 @@ export function WorkflowCopilotChat({
     new Set(),
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
+  // A running turn's stream handler reads this, so Turn off reaches the turn already in flight.
+  const autoAcceptRef = useRef(autoAccept);
+  useEffect(() => {
+    autoAcceptRef.current = autoAccept;
+  }, [autoAccept]);
+  // Counts the user's own auto-accept writes, so a chat-row read that started before one cannot undo it.
+  const autoAcceptWrites = useRef(0);
+  // Accepts still running, per chat. Each apply writes its chat's auto_accept when it lands, so that chat's
+  // Turn off must go after it; another chat's Accept cannot write it and must not hold it back.
+  const acceptsInFlight = useRef(new Map<string, Promise<void>>());
+  // How many Turn offs are in flight per chat. Their review gates offer no Accept until every one finishes, so
+  // no Accept can start after a disable and write auto_accept back on. Counted, not a flag: one chat's Turn off
+  // must not free another's, and a chip that remounts on a chat switch must not free the request still running.
+  const [turningOffCounts, setTurningOffCounts] = useState<
+    ReadonlyMap<string, number>
+  >(() => new Map());
+  const noteAutoAcceptWrite = () => {
+    autoAcceptWrites.current += 1;
+  };
+  const setAutoAcceptFromWrite = (value: boolean) => {
+    noteAutoAcceptWrite();
+    setAutoAccept(value);
+  };
   const [inputValue, setInputValue] = useState("");
   const [attachments, setAttachments] = useState<CopilotAttachedFile[]>([]);
   // A file returned to the tray after a failed send may already be saved on that message, so
@@ -1713,27 +1780,6 @@ export function WorkflowCopilotChat({
     },
     [respondToCredentialPause, continueAfterTerminalConnect],
   );
-  // Explore/Draft boundary is unobservable (the LLM writes code with no
-  // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
-  // run, assume Draft has started. Re-arms per narrative update; the reducer
-  // guard makes a stale or double-fired timer a no-op.
-  const DRAFTING_GAP_MS = 8000;
-  useEffect(() => {
-    if (!shouldArmDraftingGapTimer(narrative)) return;
-    const wait = Math.max(
-      0,
-      DRAFTING_GAP_MS - (Date.now() - narrative.lastActivityAtMs!),
-    );
-    const t = setTimeout(
-      () =>
-        applyStoredNarrativeEvent({
-          type: "client_phase_hint",
-          hintedAtMs: Date.now(),
-        }),
-      wait,
-    );
-    return () => clearTimeout(t);
-  }, [narrative, applyStoredNarrativeEvent]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -1870,6 +1916,7 @@ export function WorkflowCopilotChat({
     setMessages([]);
     discardQueuedPrompt();
     setWorkflowCopilotChatId(null);
+    workflowCopilotChatIdRef.current = null;
     setProposedWorkflow(null);
     setPendingProposalMetadata(null);
     setPendingProposalRun(null);
@@ -1897,6 +1944,8 @@ export function WorkflowCopilotChat({
         messageId: string;
         status: RecordingRefinementStatus;
       },
+      // Pass for a re-read of the chat on screen; a chat switch or first load always takes the row's value.
+      autoAcceptWritesAtRead?: number,
     ) => {
       setRecoveredPauseFrames(data.pending_credential_requests ?? []);
       setQuestionInteractions(data.question_interactions ?? []);
@@ -2056,7 +2105,12 @@ export function WorkflowCopilotChat({
       setPendingProposalTurnId(
         data.proposed_workflow ? restoredPendingProposalTurnId : null,
       );
-      setAutoAccept(data.auto_accept ?? false);
+      if (
+        autoAcceptWritesAtRead === undefined ||
+        autoAcceptWritesAtRead === autoAcceptWrites.current
+      ) {
+        setAutoAccept(data.auto_accept ?? false);
+      }
       setWorkPlan(data.work_plan ?? []);
     },
     // Only stable state setters and refs are referenced, so the callback never needs to change.
@@ -2183,6 +2237,7 @@ export function WorkflowCopilotChat({
           return;
         }
         const sendEpochBeforeRead = sendEpoch.current;
+        const autoAcceptWritesBeforeRead = autoAcceptWrites.current;
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           const controller = new AbortController();
@@ -2333,6 +2388,7 @@ export function WorkflowCopilotChat({
                       status: recoveredStatus,
                     }
                   : undefined,
+                autoAcceptWritesBeforeRead,
               );
               setIsLoading(false);
             }
@@ -2582,11 +2638,36 @@ export function WorkflowCopilotChat({
     setPendingProposalTurnId(null);
   };
 
-  const handleAcceptWorkflow = async (
+  const handleAcceptWorkflow = (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
   ) => {
+    const chatKey = workflowCopilotChatIdRef.current?.trim() ?? "";
+    const accepting = acceptWorkflow(workflow, alwaysAccept);
+    // Chain rather than replace: a second click must not let Turn off skip the first apply.
+    acceptsInFlight.current.set(
+      chatKey,
+      Promise.allSettled([
+        acceptsInFlight.current.get(chatKey),
+        accepting,
+      ]).then(() => undefined),
+    );
+    return accepting;
+  };
+
+  const acceptWorkflow = async (
+    workflow: WorkflowApiResponse,
+    alwaysAccept: boolean,
+  ) => {
     let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    // The pane can move to another chat, or to a blank New chat, while this runs. Their proposal and
+    // auto-accept are their own, so the per-chat state below is skipped unless the pane still shows the chat
+    // this accept began on (null included: a pane that had no chat id yet still does not).
+    const startedOnChatId = chatId;
+    const stillOnAcceptedChat = () => {
+      const shown = workflowCopilotChatIdRef.current?.trim() || null;
+      return shown === startedOnChatId || shown === chatId;
+    };
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -2612,14 +2693,18 @@ export function WorkflowCopilotChat({
       if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      setPendingProposalMetadata(null);
-      setPendingProposalRun(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
+      if (stillOnAcceptedChat()) {
+        markProposalAccepted();
+        setProposedWorkflow(null);
+        setPendingProposalMetadata(null);
+        setPendingProposalRun(null);
+        if (alwaysAccept) {
+          setAutoAcceptFromWrite(true);
+        }
+        // This accept never resolved a chat id, so it has none to name. Only attempt the best-effort clear
+        // while the pane still has none either: any id it holds now is one this accept cannot claim.
+        await clearProposedWorkflow(alwaysAccept);
       }
-      void clearProposedWorkflow(alwaysAccept);
       return;
     }
 
@@ -2640,12 +2725,22 @@ export function WorkflowCopilotChat({
       ) {
         return;
       }
+      if (!stillOnAcceptedChat()) {
+        return;
+      }
       markProposalAccepted();
       setProposedWorkflow(null);
       setPendingProposalMetadata(null);
       setPendingProposalRun(null);
       if (alwaysAccept) {
-        setAutoAccept(true);
+        setAutoAcceptFromWrite(true);
+      } else {
+        // A plain Accept writes auto_accept=false on the row, so reads taken before it are stale too.
+        noteAutoAcceptWrite();
+      }
+      if (alwaysAccept !== autoAcceptRef.current) {
+        // Apply writes auto-accept best-effort after creating the version, so show what the chat row kept.
+        void resyncProposalFromChatRow();
       }
     } catch (applyError) {
       if (getErrorStatus(applyError) === 409) {
@@ -2683,14 +2778,17 @@ export function WorkflowCopilotChat({
         });
         return;
       }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      setPendingProposalMetadata(null);
-      setPendingProposalRun(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
+      if (stillOnAcceptedChat()) {
+        markProposalAccepted();
+        setProposedWorkflow(null);
+        setPendingProposalMetadata(null);
+        setPendingProposalRun(null);
+        if (alwaysAccept) {
+          setAutoAcceptFromWrite(true);
+        }
       }
-      void clearProposedWorkflow(alwaysAccept);
+      // The row write belongs to the accepted chat even if the pane has moved on.
+      await clearProposedWorkflow(alwaysAccept, chatId ?? undefined);
     }
   };
 
@@ -3026,18 +3124,26 @@ export function WorkflowCopilotChat({
     if (!chatId) {
       return;
     }
+    const writesAtRead = autoAcceptWrites.current;
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.get<WorkflowCopilotChatHistoryResponse>(
         "/workflow/copilot/chat-history",
         { params: { workflow_copilot_chat_id: chatId } },
       );
+      // The read can outlive a switch to another chat, whose pane this row does not describe.
+      if (workflowCopilotChatIdRef.current?.trim() !== chatId) {
+        return;
+      }
       const nextProposal = response.data.proposed_workflow ?? null;
       setProposedWorkflow(nextProposal);
       setPendingProposalMetadata(
         response.data.proposed_workflow_metadata ?? null,
       );
       setPendingProposalRun(response.data.proposed_workflow_run ?? null);
+      if (autoAcceptWrites.current === writesAtRead) {
+        setAutoAccept(response.data.auto_accept ?? false);
+      }
       setPendingProposalTurnId((currentTurnId) =>
         nextProposal
           ? (response.data.proposed_workflow_metadata?.owner_turn_id ??
@@ -3052,8 +3158,15 @@ export function WorkflowCopilotChat({
 
   const clearProposedWorkflow = async (
     autoAcceptValue: boolean,
+    // The chat this clear belongs to. Passed by a caller whose chat may no longer be the one on screen,
+    // so the write still lands on the right row; omitted, it clears the chat the pane shows.
+    forChatId?: string,
   ): Promise<boolean> => {
-    const clearProposalByChatId = async (chatId: string) => {
+    // Resolves false when the pane switched to a chat this write did not touch, so callers leave it alone.
+    // A pane still resolving its chat id reads null, or either id, until the next render; that is no switch.
+    const startingChatId =
+      forChatId?.trim() || workflowCopilotChatIdRef.current?.trim() || null;
+    const clearProposalByChatId = async (chatId: string): Promise<boolean> => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
         "/workflow/copilot/clear-proposed-workflow",
@@ -3064,9 +3177,15 @@ export function WorkflowCopilotChat({
           revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotClearProposedWorkflowRequest,
       );
+      const shownChatId = workflowCopilotChatIdRef.current?.trim() || null;
+      if (shownChatId !== chatId && shownChatId !== startingChatId) {
+        return false;
+      }
+      setAutoAcceptFromWrite(autoAcceptValue);
+      return true;
     };
 
-    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    let chatId = startingChatId;
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -3084,16 +3203,16 @@ export function WorkflowCopilotChat({
     }
 
     try {
-      await clearProposalByChatId(chatId);
-      return true;
+      return await clearProposalByChatId(chatId);
     } catch (error) {
       const status = getErrorStatus(error);
-      if (status === 404) {
+      // A caller that named its chat has no fallback target: the latest chat is someone else's row,
+      // and clearing it would delete that chat's pending review.
+      if (status === 404 && !forChatId) {
         try {
           const refreshedChatId = await fetchLatestChatId();
           if (refreshedChatId && refreshedChatId !== chatId) {
-            await clearProposalByChatId(refreshedChatId);
-            return true;
+            return await clearProposalByChatId(refreshedChatId);
           }
         } catch (retryError) {
           console.error("Retry to clear proposed workflow failed:", retryError);
@@ -3570,6 +3689,7 @@ export function WorkflowCopilotChat({
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
+      if (authoringInProgress) return;
       const candidate = messageOverride ?? inputValue;
       const pendingQuestion = questionInteractions.find(
         (item) => item.status === "pending",
@@ -4357,11 +4477,7 @@ export function WorkflowCopilotChat({
             : null;
           if (
             response.updated_workflow &&
-            shouldAutoApplyWorkflowResponse(
-              response,
-              autoAccept,
-              userCancelledThisTurn,
-            )
+            shouldAutoApplyWorkflowResponse(response, userCancelledThisTurn)
           ) {
             applyWorkflowUpdate(response.updated_workflow, { applied: true });
             // This turn's auto-commit already moved canonical past any earlier
@@ -4685,6 +4801,7 @@ export function WorkflowCopilotChat({
               }
               case "design_start":
               case "design_end":
+              case "codegen_progress":
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {
@@ -4850,7 +4967,7 @@ export function WorkflowCopilotChat({
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       armStop,
-      autoAccept,
+      authoringInProgress,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       credentialGetter,
@@ -5022,7 +5139,7 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    if (!queuedPrompt || hasPendingQuestion) {
+    if (!queuedPrompt || hasPendingQuestion || authoringInProgress) {
       return;
     }
     // isLoading (reactive state) is the in-flight signal here so the effect
@@ -5082,6 +5199,7 @@ export function WorkflowCopilotChat({
       console.error("Queued send failed:", error);
     });
   }, [
+    authoringInProgress,
     codeBlockModeEnabled,
     codeBlockRequestOverride,
     handleSend,
@@ -5404,6 +5522,11 @@ export function WorkflowCopilotChat({
   // restore, so gate actions wait for idle.
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
+  const turningOffThisChat =
+    workflowCopilotChatId !== null &&
+    (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
+  // Only the two accepts wait for Turn off; Review and Reject write no auto_accept.
+  const gateAcceptsEnabled = !turningOffThisChat;
   // A staged attachment counts as content: with only a file in the tray the button would
   // otherwise read as Stop during a turn, and clicking Send would cancel the turn instead.
   const hasComposerText =
@@ -5436,26 +5559,29 @@ export function WorkflowCopilotChat({
   );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
+  const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
   // Sent, no frame yet: the control reports the wait rather than an action, and
   // cancelSend's own guard is what makes a press in this window issue no cancel.
   const turnPendingFirstFrame =
     isLoading && !turnObservablyRunning && narrative.terminal === null;
   const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
-  const morphButtonLabel = isStopping
-    ? "Stopping…"
-    : waitingOnQueueOnly
-      ? "Send disabled — waiting for live browser"
-      : morphButtonPending
-        ? "Starting…"
-        : queuedPrompt && hasComposerText
-          ? "Replace queued message"
-          : !turnObservablyRunning
-            ? isLoading
-              ? "Queue for next turn"
-              : "Send"
-            : hasComposerText
-              ? "Queue for next turn"
-              : "Stop";
+  const morphButtonLabel = authoringBlocksComposerAction
+    ? "Send disabled — finish the current authoring action"
+    : isStopping
+      ? "Stopping…"
+      : waitingOnQueueOnly
+        ? "Send disabled — waiting for live browser"
+        : morphButtonPending
+          ? "Starting…"
+          : queuedPrompt && hasComposerText
+            ? "Replace queued message"
+            : !turnObservablyRunning
+              ? isLoading
+                ? "Queue for next turn"
+                : "Send"
+              : hasComposerText
+                ? "Queue for next turn"
+                : "Stop";
   // Shared between the composer treatments so the two Build implementations
   // never drift.
   const modeMenuItems = (
@@ -5516,6 +5642,9 @@ export function WorkflowCopilotChat({
       onAnswer={(response) => void handleQuestionAnswer(interaction, response)}
     />
   );
+
+  const uploadSOPDisabled = !onUploadSOP || !canUploadSOP || isUploadingSOP;
+  const recordTaskDisabled = !onRecordTask || !canRecordTask || isUploadingSOP;
 
   const content = (
     <div
@@ -5599,24 +5728,110 @@ export function WorkflowCopilotChat({
         <div ref={scrollRef} className="h-full overflow-y-auto p-4">
           <div className="space-y-3">
             {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
-                <p className="font-semibold text-foreground">
-                  Start a new chat
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Ask the copilot to draft or edit your agent. Provide a goal,
-                  the target site, and any credentials it should use.
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Example: "Build an agent to find the top post on hackernews
-                  today"
-                </p>
-                {/* The only in-product pointer to this: the newer composer
-                    placeholder dropped the "or paste recorded steps" clause, so
-                    without it here the affordance is undiscoverable. */}
-                <p className="mt-2 text-muted-foreground">
-                  Already recorded this with another agent? Copy that workflow's
-                  prompt text and paste it here.
+              <div className="flex flex-col gap-5 rounded-lg border border-border bg-slate-elevation2 p-5 text-sm text-muted-foreground">
+                <div>
+                  <p className="text-base font-semibold text-foreground">
+                    Start a new chat
+                  </p>
+                  <p className="mt-2 leading-relaxed text-muted-foreground">
+                    Ask Copilot to draft or edit your agent. Provide a goal, the
+                    target site, and any credentials it should use.
+                  </p>
+                  <p className="mt-3 border-l-2 border-border bg-slate-elevation3 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                    Example: “Build an agent to find the top post on Hacker News
+                    today.”
+                  </p>
+                </div>
+
+                <div className="[container-name:copilot-actions] [container-type:inline-size]">
+                  <p className="font-semibold text-foreground">
+                    Or start from an existing process
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    Give Copilot the source material instead of describing it
+                    from scratch.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          uploadSOPDisabled
+                            ? (authoringUnavailableReason ??
+                              "SOP upload is not available right now")
+                            : "Upload a procedure as a PDF"
+                        }
+                        blocked={uploadSOPDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Upload an SOP"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={uploadSOPDisabled}
+                          onClick={() => sopFileInputRef.current?.click()}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
+                            <UploadIcon className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              {isUploadingSOP
+                                ? "Uploading SOP…"
+                                : "Upload an SOP"}
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Turn an existing procedure into workflow steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          recordTaskDisabled
+                            ? (authoringUnavailableReason ??
+                              "Record task is available when the browser is ready")
+                            : "Demonstrate the task in the browser"
+                        }
+                        blocked={recordTaskDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Record task"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={recordTaskDisabled}
+                          onClick={onRecordTask}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-red-500/40 bg-red-500/10">
+                            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              Record task
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Demonstrate it in the browser and create workflow
+                              steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+                    Complete the task in the browser. Skyvern captures the
+                    browser view and your clicks, typing, and navigation, then
+                    turns them into workflow steps.
+                  </p>
+                </div>
+
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Already recorded this with another agent? Copy that
+                  workflow&apos;s prompt text and paste it here.
                 </p>
               </div>
             ) : null}
@@ -5785,6 +6000,7 @@ export function WorkflowCopilotChat({
                                   : null
                             }
                             actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
                             onAccept={() =>
                               proposedWorkflow &&
                               handleAcceptWorkflow(proposedWorkflow)
@@ -5955,6 +6171,7 @@ export function WorkflowCopilotChat({
                             )}
                             settled={null}
                             actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
                             onAccept={() =>
                               proposedWorkflow &&
                               handleAcceptWorkflow(proposedWorkflow)
@@ -5991,6 +6208,7 @@ export function WorkflowCopilotChat({
                   verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
                   settled={null}
                   actionsEnabled={gateActionable}
+                  acceptsEnabled={gateAcceptsEnabled}
                   onAccept={() => handleAcceptWorkflow(proposedWorkflow)}
                   onAlwaysAccept={() =>
                     handleAcceptWorkflow(proposedWorkflow, true)
@@ -6145,58 +6363,119 @@ export function WorkflowCopilotChat({
       {/* Input */}
       <div className="border-t border-border p-3">
         {codeOptionAvailable ? (
-          <div className="mb-2">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  title="Switch mode"
-                  aria-label="Switch mode"
-                  className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {codeOptionAvailable ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ModeGlyph glow={codeStateActive} />
+                    <span className="text-foreground">
+                      {codeStateActive ? "Build with code" : "Build"}
+                    </span>
+                    <ChevronDownIcon className="h-3 w-3" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  side="top"
+                  align="start"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
                 >
-                  <span>Mode:</span>
-                  <ModeGlyph glow={codeStateActive} />
-                  <span className="text-foreground">
-                    {codeStateActive ? "Build with code" : "Build"}
-                  </span>
-                  <ChevronDownIcon className="h-3 w-3" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                side="top"
-                align="start"
-                className="w-[272px] p-1.5"
-                onCloseAutoFocus={(event) => event.preventDefault()}
-              >
-                {modeMenuItems}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {modeMenuItems}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
           </div>
         ) : null}
-        {proposedWorkflow &&
-        pendingProposalTurnId &&
-        (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
-          <button
-            type="button"
-            onClick={() => {
-              if (!pendingProposalTurnId) return;
-              document
-                .getElementById(`copilot-gate-${pendingProposalTurnId}`)
-                ?.scrollIntoView({ behavior: "smooth", block: "center" });
-              if (gateFlashTimer.current !== null) {
-                clearTimeout(gateFlashTimer.current);
-              }
-              setGateFlashTurnId(pendingProposalTurnId);
-              gateFlashTimer.current = setTimeout(() => {
-                setGateFlashTurnId(null);
-                gateFlashTimer.current = null;
-              }, 1100);
-            }}
-            className="mb-2 flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-[10.5px] text-muted-foreground hover:bg-slate-elevation3"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />1 proposal
-            pending · Review
-          </button>
+        {(proposedWorkflow &&
+          pendingProposalTurnId &&
+          (gateOwnerIndex !== lastTurnIndex || isLoading)) ||
+        (autoAccept && workflowCopilotChatId) ? (
+          // One status strip: what Copilot is doing, separate from the mode control above it.
+          <div className="mb-2 flex items-center gap-2 border-t border-border/60 pt-1.5 text-[10.5px] text-muted-foreground">
+            {proposedWorkflow &&
+            pendingProposalTurnId &&
+            (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!pendingProposalTurnId) return;
+                  document
+                    .getElementById(`copilot-gate-${pendingProposalTurnId}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  if (gateFlashTimer.current !== null) {
+                    clearTimeout(gateFlashTimer.current);
+                  }
+                  setGateFlashTurnId(pendingProposalTurnId);
+                  gateFlashTimer.current = setTimeout(() => {
+                    setGateFlashTurnId(null);
+                    gateFlashTimer.current = null;
+                  }, 1100);
+                }}
+                className="flex min-w-0 items-center gap-1.5 rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400"
+                  aria-hidden="true"
+                />
+                <span className="truncate">1 proposal pending</span>
+                <span className="shrink-0 text-foreground underline underline-offset-2">
+                  Review
+                </span>
+              </button>
+            ) : null}
+            {autoAccept && workflowCopilotChatId ? (
+              <div className="ml-auto flex min-w-0 items-center">
+                <AutoAcceptChip
+                  key={workflowCopilotChatId}
+                  chatId={workflowCopilotChatId}
+                  pendingFromChat={turningOffThisChat}
+                  waitForAccept={async (turnOffChatId) => {
+                    // An Accept clicked while Turn off waits joins the chain, so wait until it stops growing.
+                    const deadline = Date.now() + ACCEPT_SETTLE_CEILING_MS;
+                    let settled: Promise<void> | undefined;
+                    do {
+                      settled = acceptsInFlight.current.get(turnOffChatId);
+                      if (
+                        settled &&
+                        !(await settledWithin(settled, deadline - Date.now()))
+                      ) {
+                        throw new Error("Accept is still running");
+                      }
+                    } while (
+                      settled !== acceptsInFlight.current.get(turnOffChatId)
+                    );
+                  }}
+                  onPendingChange={(pendingChatId, pending) =>
+                    setTurningOffCounts((current) => {
+                      const next = new Map(current);
+                      const count =
+                        (next.get(pendingChatId) ?? 0) + (pending ? 1 : -1);
+                      if (count > 0) {
+                        next.set(pendingChatId, count);
+                      } else {
+                        next.delete(pendingChatId);
+                      }
+                      return next;
+                    })
+                  }
+                  onTurnedOff={(turnedOffChatId) => {
+                    // The request can land after a switch to a chat whose setting it did not change.
+                    if (turnedOffChatId !== workflowCopilotChatIdRef.current) {
+                      return;
+                    }
+                    setAutoAcceptFromWrite(false);
+                    textareaRef.current?.focus();
+                  }}
+                />
+              </div>
+            ) : null}
+          </div>
         ) : null}
         {showWorkingRow ? (
           <CopilotWorkingStatus
@@ -6330,6 +6609,7 @@ export function WorkflowCopilotChat({
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
+            disabled={authoringInProgress}
             rows={1}
             className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
@@ -6350,16 +6630,40 @@ export function WorkflowCopilotChat({
               if (file) void uploadAttachment(file);
             }}
           />
+          <input
+            ref={sopFileInputRef}
+            type="file"
+            accept=".pdf,application/pdf"
+            aria-label="Choose an SOP PDF"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              if (!file.name.toLowerCase().endsWith(".pdf")) {
+                toast({
+                  variant: "destructive",
+                  title: "Invalid file type",
+                  description: "Please select a PDF file",
+                });
+                event.target.value = "";
+                return;
+              }
+              onUploadSOP?.(file);
+              event.target.value = "";
+            }}
+          />
           <button
             type="button"
             onClick={() => attachmentInputRef.current?.click()}
             // An answer to a pending question is sent through the question flow, which carries
             // no files, so offering the control here would stage a file nothing can send.
-            disabled={hasPendingQuestion}
+            disabled={hasPendingQuestion || authoringInProgress}
             title={
-              hasPendingQuestion
-                ? "Answer the pending question before attaching a file"
-                : "Attach a file"
+              authoringInProgress
+                ? "Finish the current authoring action before attaching a file"
+                : hasPendingQuestion
+                  ? "Answer the pending question before attaching a file"
+                  : "Attach a file"
             }
             aria-label="Attach a file"
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
@@ -6370,6 +6674,7 @@ export function WorkflowCopilotChat({
             isSupported={isSpeechSupported}
             isListening={isSpeechListening}
             isHearingSpeech={isSpeechHearing}
+            disabled={authoringInProgress && !isSpeechListening}
             onToggle={toggleSpeech}
             className="h-8 w-8 rounded-full border-0 bg-transparent"
             iconClassName="h-3.5 w-3.5"
@@ -6377,11 +6682,15 @@ export function WorkflowCopilotChat({
           <TooltipProvider>
             <ControlTooltip
               content={morphButtonLabel}
-              blocked={waitingOnQueueOnly}
+              blocked={waitingOnQueueOnly || authoringBlocksComposerAction}
             >
               <button
                 type="button"
-                disabled={waitingOnQueueOnly || isStopping}
+                disabled={
+                  waitingOnQueueOnly ||
+                  isStopping ||
+                  authoringBlocksComposerAction
+                }
                 aria-busy={isStopping}
                 onClick={() =>
                   turnObservablyRunning && !hasComposerText

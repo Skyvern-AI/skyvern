@@ -108,6 +108,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotCredentialResponseRequest,
+    WorkflowCopilotDisableAutoAcceptRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotQuestionResponseRequest,
     WorkflowCopilotStreamErrorUpdate,
@@ -1213,7 +1214,7 @@ async def _persist_interrupted_turn(
     narrative_payload = _with_terminal_narrative_metadata(
         _make_error_narrative_payload(turn_id, None, message),
         # An interrupted turn halted; it did not fail. The FE reads this flag to
-        # keep the row out of failure treatment (derivePhases, copilotPhases.ts).
+        # keep the row out of failure treatment.
         cancelled=True,
         proposal_disposition=_proposal_disposition(None),
     )
@@ -1452,6 +1453,19 @@ async def _persist_cancel_turn(
         )
 
 
+async def _honor_auto_accept_turned_off_mid_turn(chat: Any) -> None:
+    # ``chat`` was read when the turn started. Only a switch to off is honored: a turn that staged for
+    # review told the model so, and a mid-turn opt-in must not apply that draft unseen.
+    if chat.auto_accept is not True:
+        return
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    if current_chat is not None and current_chat.auto_accept is not True:
+        chat.auto_accept = current_chat.auto_accept
+
+
 async def _finalise_normal_turn(
     stream: EventSourceStream,
     chat: Any,
@@ -1493,6 +1507,7 @@ async def _finalise_normal_turn(
     # panel state below stays gated on auto_accept — the frontend
     # applies proposals via applyWorkflowUpdate when auto-accept is
     # on.
+    await _honor_auto_accept_turned_off_mid_turn(chat)
     restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
     restore_failed = False
     if restored:
@@ -3406,6 +3421,23 @@ async def workflow_copilot_clear_proposed_workflow(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     except CopilotProposalConflictError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
+
+
+@base_router.post(
+    "/workflow/copilot/disable-auto-accept", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
+)
+async def workflow_copilot_disable_auto_accept(
+    disable_request: WorkflowCopilotDisableAutoAcceptRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    # Settings-only write: the clear route would also discard a pending review the user has not answered.
+    chat = await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+        organization_id=organization.organization_id,
+        workflow_copilot_chat_id=disable_request.workflow_copilot_chat_id,
+        auto_accept=False,
+    )
+    if chat is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)

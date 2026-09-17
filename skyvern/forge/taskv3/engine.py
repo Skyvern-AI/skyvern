@@ -51,13 +51,14 @@ from skyvern.forge.taskv3.loop import (
     make_finish_tool,
     run_agent_tool_loop,
 )
-from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     PageProvider,
     apply_blank_page_guard,
     build_browser_tools,
 )
+from skyvern.schemas.workflows import BlockType
 
 LOG = structlog.get_logger()
 
@@ -102,7 +103,7 @@ How to work:
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. Act on what that error tells you rather than substituting a value of your own: this field commits only the suggestions the page itself offers, and those are often coarser than the value you hold.
-- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER call it twice for the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is.
+- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Only your last couple of reads stay in this conversation, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
@@ -115,7 +116,7 @@ Rules:
 
 OPAQUE_URL_GUIDANCE = """
 
-Some values in the data provided are shown as `opaque_url_xxxxxxxx` instead of a real URL: these are references to URLs from the task data, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
+Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
 This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
@@ -228,7 +229,19 @@ async def run_task_v3_agent_loop(
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
     # tools to resolve a token with, so the payload stays verbatim for the model to judge directly.
-    refs = mask_opaque_urls(parameters) if not page_free else OpaqueUrlRefs(masked=parameters, refs={})
+    # Workflow templates render a file parameter straight into the goal, the system guidance and the
+    # block URL, so every model-facing text is minted into the same refs as the payload.
+    model_starting_url = starting_url
+    if page_free:
+        refs = OpaqueUrlRefs(masked=parameters, refs={})
+        model_goal = goal
+    else:
+        refs = mask_opaque_urls(parameters)
+        model_goal = refs.mint_in_text(goal)
+        extra_system_guidance = refs.mint_in_text(extra_system_guidance)
+        # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
+        if starting_url and is_signed_url(starting_url):
+            model_starting_url = refs.derive(starting_url)
     # The single model-facing masking boundary reads these off the task context (the chokepoint
     # hide_from_model already runs on every tool result), so a resolved ref echoed by any tool —
     # success or error — is rewritten to its token by membership, without each tool opting in. Set
@@ -377,7 +390,7 @@ async def run_task_v3_agent_loop(
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=build_user_prompt(goal, refs.masked, starting_url),
+            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -405,6 +418,7 @@ async def run_task_v3_agent_loop(
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
+            refuse_input_entry=block_type == BlockType.EXTRACTION,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire

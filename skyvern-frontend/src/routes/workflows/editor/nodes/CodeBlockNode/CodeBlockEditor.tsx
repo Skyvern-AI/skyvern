@@ -69,10 +69,9 @@ function CodeBlockEditorBody({
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
   const steps = data.steps ?? [];
-  // A block with neither a goal nor a generated outline is hand-written, so open
-  // it on its code rather than on an empty Steps card.
+  // Steps are derived from any saved code, so only a goal marks a block as code-first.
   const [view, setView] = useState<CodeBlockView>(
-    data.prompt == null && steps.length === 0 ? "code" : "plain",
+    data.prompt == null ? "code" : "plain",
   );
   const [stepsOpen, setStepsOpen] = useState(true);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);

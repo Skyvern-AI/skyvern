@@ -1,7 +1,6 @@
 import abc
 import ast
 import functools
-import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass, field
@@ -9,7 +8,16 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
-from pydantic import BaseModel, Field, StrictInt, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
@@ -28,7 +36,7 @@ from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
-from skyvern.utils.templating import replace_jinja_reference
+from skyvern.utils.templating import mask_jinja_control_blocks, replace_jinja_reference
 
 LOG = structlog.get_logger()
 
@@ -496,6 +504,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    WEB_SEARCH = "web_search"
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
@@ -906,7 +915,6 @@ class ConditionalBlockYAML(BlockYAML):
 
 
 class CodeBlockStepYAML(BaseModel):
-    title: str | None = None
     description: str | None = None
     # str (not ActionType) so this module does not import skyvern.webeye; the converter coerces to the enum.
     action_type: str = "null_action"
@@ -997,12 +1005,7 @@ def _validate_code_block_error_code_mapping(mapping: Any) -> None:
 
 
 def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
-    sanitized = re.sub(
-        r"\{%.*?%\}",
-        lambda match: "\n".join("# __JINJA_BLOCK__" for _ in range(match.group().count("\n") + 1)),
-        textwrap.dedent(code),
-        flags=re.DOTALL,
-    )
+    sanitized = mask_jinja_control_blocks(textwrap.dedent(code))
     try:
         tree = ast.parse(sanitized)
     except SyntaxError as exc:
@@ -1082,7 +1085,7 @@ class CodeBlockYAML(BlockYAML):
     )
     steps: list[CodeBlockStepYAML] | None = Field(
         default=None,
-        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+        description="Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored",
     )
 
     @model_validator(mode="before")
@@ -1097,7 +1100,16 @@ class CodeBlockYAML(BlockYAML):
             )
         if isinstance(data, dict):
             _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
+            # Saves rebuild steps from the code, so malformed submitted steps must not reject valid code.
+            if data.get("steps") is not None:
+                try:
+                    _CODE_BLOCK_STEPS_ADAPTER.validate_python(data["steps"])
+                except ValidationError:
+                    data = {**data, "steps": None}
         return data
+
+
+_CODE_BLOCK_STEPS_ADAPTER = TypeAdapter(list[CodeBlockStepYAML])
 
 
 class TextPromptBlockYAML(BlockYAML):
@@ -1410,6 +1422,16 @@ class TaskV2BlockYAML(BlockYAML):
     disable_cache: bool = False
 
 
+class WebSearchBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WEB_SEARCH] = BlockType.WEB_SEARCH  # type: ignore
+    query: str = Field(min_length=1)
+    provider: Literal["auto", "google", "exa"] = "auto"
+    num_results: int = Field(default=10, ge=1, le=100, strict=True)
+    prompt: str | None = None
+    json_schema: dict[str, Any] | None = None
+    parameter_keys: list[str] | None = None
+
+
 class HttpRequestBlockYAML(BlockYAML):
     block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
 
@@ -1568,6 +1590,7 @@ BLOCK_YAML_SUBCLASSES = (
     | PDFParserBlockYAML
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
+    | WebSearchBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | PdfFillBlockYAML

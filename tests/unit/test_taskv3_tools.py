@@ -39,11 +39,12 @@ from skyvern.forge.taskv3.code_surface import (
     apply_surface,
     configured_surface,
 )
-from skyvern.forge.taskv3.loop import CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
+from skyvern.forge.taskv3.loop import ACTION_OUTCOME_DATA_KEY, CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
 from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
+    OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
     _annotate_screenshot,
@@ -1474,6 +1475,34 @@ async def test_select_option_diverts_custom_combobox_to_shared_commit(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_select_option_refuses_a_set_on_a_custom_combobox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A custom combobox commits one picked suggestion at a time, so a requested set cannot be
+    # honoured here. It must refuse and name the remedy rather than commit element [0] and report
+    # success -- the whole point of the set-valued path is that a partial commit never reads as done.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text",
+        node_name="input",
+        suggestion={"text": "Analytics", "score": 2},
+        committed="Analytics",
+        match_count=1,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "labels": ["Analytics", "Finance"]})
+    assert r.status == "error", r.content
+    assert "not a native <select>" in r.content and "select one option per call" in r.content
+    assert not page.clicked_suggestion  # nothing was committed
+    assert not any(c[0] == "select_option" for c in page.calls)
+
+    # One option in the array is still a single commit, not a refusal.
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "labels": ["Analytics"]})
+    assert r.status == "ok", r.content
+    assert page.clicked_suggestion
+
+
+@pytest.mark.asyncio
 async def test_select_option_native_select_uses_native_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real <select> (nodeName == 'select') keeps the native path — dispatch page.select_option, no typing.
     import asyncio as _a
@@ -1779,6 +1808,9 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "text_dropped",
         "hidden_listed",
         "hidden_dropped",
+        "hidden_dropped_off_canvas",
+        "hidden_dropped_visibility",
+        "hidden_dropped_zero_rect",
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
@@ -2780,6 +2812,244 @@ async def test_observe_renders_text_digest_and_pressed_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_observe_selection_readout_distinguishes_partial_from_whole() -> None:
+    # A truncated list that reads as the whole set is the same false readout the selection set
+    # replaced el.value to fix: the model reasons about a selection it believes it can see entire.
+    held = [f"v{i:02d}|Option {i:02d}" for i in range(60)]
+    # The cap is on the RENDERED line, so the boundary sits where repr stops fitting -- quotes and
+    # separators, not just the raw strings.
+    fits = 35
+    assert len(repr(held[:fits])) <= OBSERVE_SELECTED_OPTIONS_TOTAL_CAP < len(repr(held[: fits + 1]))
+
+    class _SelectionPage(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps(
+                {
+                    "url": self.url,
+                    "title": "Skills",
+                    "elements": [
+                        {
+                            "i": 0,
+                            "tag": "select",
+                            "type": "select-multiple",
+                            "selector": "#whole",
+                            "label": "Whole",
+                            "selectedOptions": ["a|Alpha", "b|Beta"],
+                            "selectedTotal": 2,
+                        },
+                        {
+                            "i": 1,
+                            "tag": "select",
+                            "type": "select-multiple",
+                            "selector": "#partial",
+                            "label": "Partial",
+                            "selectedOptions": held,
+                            "selectedTotal": 75,
+                        },
+                    ],
+                }
+            )
+
+    tools = build_browser_tools(_fixed_page_provider(_SelectionPage()))
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    whole, partial = (ln for ln in r.content.splitlines() if "selected_options=" in ln)
+    # A complete readout names every option held and claims nothing about a cap.
+    assert "selected_options=['a|Alpha', 'b|Beta']" in whole, whole
+    assert "showing" not in whole, whole
+    # A partial one says so, and says how much of the selection it is: both the prefix it shows and
+    # the size actually held, so the two readouts can never be read the same way.
+    assert f"selected_options={held[:fits]} (showing {fits} of 75 selected)" in partial, partial
+    assert 0 < fits < len(held)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_bounds_each_selected_option_and_reports_the_whole_count() -> None:
+    # The digest rides in the persistent conversation prefix, so a set-valued control holding long
+    # labels is paid for on every later turn. Cap the item like the scalar branch caps el.value --
+    # but keep the true count, which is what makes a capped readout self-disclosing downstream.
+    options = "".join(f'<option value="v{i}" selected>{"L" * 3000}-{i}</option>' for i in range(75))
+    html_doc = f'<!doctype html><html><body><select multiple id="skills" size="4">{options}</select></body></html>'
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    sel = next(e for e in data["elements"] if e["tag"] == "select")
+    assert sel["selectedTotal"] == 75
+    assert len(sel["selectedOptions"]) == 60
+    assert max(len(o) for o in sel["selectedOptions"]) <= taskv3_tools.OBSERVE_RETAIN_WIDTH_MIN
+    # el.value would have named exactly one of the 75, which is the readout this replaced.
+    assert "value" not in sel, sel.get("value")
+
+
+_EMPTY_VALUE_SELECT = (
+    "<!doctype html><html><body>"
+    '<select multiple id="s" size="4">'
+    '<option value="">(none specified)</option><option value="x">Ex</option>'
+    '<option value="y">Why</option>'
+    "</select></body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_keeps_an_empty_option_value_in_the_requested_set() -> None:
+    # `<option value="">` is a real selectable value. Dropping it narrowed the request -- and the
+    # expected set the readback verifies against is built from the SAME narrowed list, so the check
+    # agreed with itself and reported committed a set the control never held.
+    async with _content_page(_EMPTY_VALUE_SELECT) as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+
+        async def _run(args: dict[str, Any]) -> tuple[str, str, list[str]]:
+            await page.set_content(_EMPTY_VALUE_SELECT)
+            r = await handler(args)
+            held = await page.evaluate(
+                "() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)"
+            )
+            return r.status, r.content, held
+
+        status, report, held = await _run({"selector": "#s", "values": ["", "x"]})
+        assert (status, held) == ("ok", ["", "x"])
+        assert "holds 2 option(s): ['', 'x']" in report, report
+
+        status, report, held = await _run({"selector": "#s", "values": [""]})
+        assert (status, held) == ("ok", [""])
+        assert "holds 1 option(s): ['']" in report, report
+
+        # A declared-but-empty array asks for no option and must stay distinguishable from an array
+        # that names the empty value -- the two collapsed together before. It is still a DECLARED
+        # array, so it wins over a scalar exactly as a non-empty one does.
+        assert (await _run({"selector": "#s", "values": [], "value": "x"}))[::2] == ("ok", [])
+        assert await _run({"selector": "#s", "values": []}) == (
+            "ok",
+            "selected on #s — it now holds 0 option(s): []",
+            [],
+        )
+
+        # Non-strings are still not options.
+        status, _, held = await _run({"selector": "#s", "values": [None, "x"]})
+        assert (status, held) == ("ok", ["x"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_reports_a_page_added_duplicate_as_uncommitted() -> None:
+    # Two SETS lose multiplicity. A change handler that also selects a duplicate-VALUED sibling
+    # leaves the control holding an option the form submits twice, and a set comparison called that
+    # the requested selection exactly. Only the HELD side carries multiplicity: asking for the same
+    # option twice is still one request, so the ask is deduped rather than both sides.
+    dup_value = (
+        '<select multiple id="s" size="4">'
+        '<option value="x">Alpha</option><option value="x">Beta</option>'
+        '<option value="y">Gamma</option></select>'
+    )
+    dup_label = (
+        '<select multiple id="s" size="4">'
+        '<option value="v1">Alpha</option><option value="v2">Alpha</option>'
+        '<option value="v3">Gamma</option></select>'
+    )
+    unique = (
+        '<select multiple id="s" size="4"><option value="x">Alpha</option><option value="y">Gamma</option></select>'
+    )
+    page_adds_dup = dup_value + (
+        "<script>document.getElementById('s').addEventListener('change', () => {"
+        " const o = document.getElementById('s').options;"
+        " if (o[0].selected) o[1].selected = true; });</script>"
+    )
+
+    async with _content_page("<!doctype html><html><body></body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+
+        async def _run(markup: str, args: dict[str, Any]) -> tuple[str, str, int]:
+            await page.set_content(f"<!doctype html><html><body>{markup}</body></html>")
+            r = await handler(args)
+            n = await page.evaluate("() => document.getElementById('s').selectedOptions.length")
+            return r.status, r.content, n
+
+        # The driver picks ONE option per requested value/label, so a duplicate in the DOM alone
+        # never over-selects -- these are the cases a multiplicity check must NOT start rejecting.
+        assert (await _run(dup_value, {"selector": "#s", "values": ["x"]}))[::2] == ("ok", 1)
+        assert (await _run(dup_label, {"selector": "#s", "labels": ["Alpha"]}))[::2] == ("ok", 1)
+        # The same option asked for twice is one request, not two.
+        assert (await _run(unique, {"selector": "#s", "values": ["x", "x"]}))[::2] == ("ok", 1)
+
+        status, report, n = await _run(page_adds_dup, {"selector": "#s", "values": ["x"]})
+        assert (status, n) == ("error", 2), (status, n, report)
+        assert "did NOT commit the requested set" in report, report
+        assert "it now holds ['x', 'x']" in report, report
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_verifies_against_the_key_it_selected_by() -> None:
+    # The action chain is labels -> values -> label -> value. Deriving the verification separately let
+    # `values` plus a stray scalar `label` select by value and check by label, so a call that did
+    # exactly what was asked reported `asked for ['Gamma'], it now holds ['Alpha']`.
+    markup = (
+        '<select multiple id="s" size="4"><option value="x">Alpha</option><option value="y">Gamma</option></select>'
+    )
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "values": ["x"], "label": "Gamma"})
+        held = await page.evaluate("() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)")
+        assert (r.status, held) == ("ok", ["x"]), r.content
+        assert "holds 1 option(s): ['x']" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_bounds_the_selection_it_reports() -> None:
+    # The readback names options the PAGE chose the text of, in a tool result that is never
+    # compacted. Both the count and each option are bounded, and a cut is marked, so a truncated
+    # report cannot be read as the whole selection.
+    long_text = "L" * 500
+    options = "".join(f'<option value="v{i:02d}">{long_text}{i:02d}</option>' for i in range(30))
+    markup = f'<select multiple id="s" size="4">{options}</select>'
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "values": [f"v{i:02d}" for i in range(30)]})
+    assert r.status == "ok", r.content[:300]
+    shown = [f"v{i:02d}" for i in range(taskv3_tools.SELECTION_REPORT_MAX_OPTIONS)]
+    assert r.content == (
+        f"selected on #s — it now holds 30 option(s): {shown!r} "
+        f"(showing {taskv3_tools.SELECTION_REPORT_MAX_OPTIONS} of 30)"
+    )
+
+    # Selected by label, each item is the page's own text and is cut at the width, marked.
+    async with _content_page(f"<!doctype html><html><body>{markup}</body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        r = await handler({"selector": "#s", "labels": [f"{long_text}00", f"{long_text}01"]})
+    width = taskv3_tools.SELECTION_REPORT_OPTION_WIDTH
+    assert r.status == "ok", r.content[:300]
+    assert r.content == f"selected on #s — it now holds 2 option(s): {['L' * width + '…'] * 2!r}"
+    assert long_text not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_label_readback_agrees_with_the_driver_across_whitespace_forms() -> None:
+    # `option.label` is stripped and collapsed by the UA, which is the same normalisation Playwright
+    # matches `label=` under -- so asking for the collapsed form commits AND verifies. Read the raw
+    # `textContent` here instead and the verifier starts REJECTING selections that did commit.
+    forms = ["New   York", "  Boston", "Chicago  ", "San\t\nJose"]
+    async with _content_page("<!doctype html><html><body></body></html>") as page:
+        handler = _tool(build_browser_tools(_fixed_page_provider(page)), "select_option").handler
+        for dom_text in forms:
+            asked = " ".join(dom_text.split())
+            await page.set_content(
+                f'<!doctype html><html><body><select multiple id="s" size="2">'
+                f'<option value="v1">{dom_text}</option><option value="v2">Other</option>'
+                "</select></body></html>"
+            )
+            r = await handler({"selector": "#s", "labels": [asked]})
+            held = await page.evaluate(
+                "() => Array.from(document.getElementById('s').selectedOptions).map((o) => o.value)"
+            )
+            assert held == ["v1"], (dom_text, held)
+            assert r.status == "ok", (dom_text, r.content)
+            assert "did NOT commit" not in r.content, (dom_text, r.content)
+
+
+@pytest.mark.asyncio
 async def test_get_html_falls_back_to_outer_html_for_empty_leaf() -> None:
     # inner_html of a void/leaf element ("", e.g. <input>) used to return ok("") — no signal at all.
     # The element's own tag+attributes are the useful answer for a leaf.
@@ -2810,7 +3080,7 @@ async def test_get_html_marks_truncation_explicitly() -> None:
     r = await _tool(tools, "get_html").handler({"selector": "#big"})
     assert r.status == "ok"
     assert len(r.content) < 30000
-    assert r.content.endswith(taskv3_tools._MARKUP_CUT)
+    assert r.content.endswith(taskv3_tools._markup_cut(taskv3_tools.HTML_MAX_CHARS, 30000, scoped=True))
 
 
 # A branch-local witness, not captured production DOM: a stylesheet larger than get_html's whole
@@ -2848,8 +3118,9 @@ async def test_get_html_text_format_returns_the_record_a_style_prefix_hides_from
 
     markup = await _tool(tools, "get_html").handler({})
     assert markup.status == "ok" and _STYLE_PREFIX_RECORD not in markup.content
-    assert markup.content.endswith(taskv3_tools._PAGE_MARKUP_CUT), markup.content[-200:]
-    assert "format=text" in taskv3_tools._PAGE_MARKUP_CUT and '"' not in taskv3_tools._PAGE_MARKUP_CUT
+    page_cut = taskv3_tools._markup_cut(taskv3_tools.HTML_MAX_CHARS, len(_STYLE_PREFIX_DOC), scoped=False)
+    assert markup.content.endswith(page_cut), markup.content[-200:]
+    assert "format=text" in page_cut and '"' not in page_cut
 
     text = await _tool(tools, "get_html").handler({"format": "text"})
     assert text.status == "ok", text.content
@@ -2862,7 +3133,10 @@ async def test_get_html_text_format_names_a_real_continuation_when_over_bound() 
     tools = build_browser_tools(_fixed_page_provider(_FakeTextPage(_STYLE_PREFIX_DOC, "Statement line\n" * 3000)))
     r = await _tool(tools, "get_html").handler({"format": "text"})
     assert r.status == "ok"
-    assert r.content.endswith(taskv3_tools._RENDERED_TEXT_CUT), r.content[-300:]
+    text_total = len("Statement line\n" * 3000)
+    assert r.content.endswith(taskv3_tools._rendered_text_cut(taskv3_tools.HTML_MAX_CHARS, text_total, scoped=False)), (
+        r.content[-300:]
+    )
     assert {"get_html", "observe"} <= {spec.name for spec in tools}
 
 
@@ -2931,6 +3205,50 @@ async def test_navigate_reports_http_status(monkeypatch: pytest.MonkeyPatch) -> 
     r = await _tool(tools, "navigate").handler({"url": "https://example.test/apply"})
     assert r.status == "ok"
     assert "HTTP 400" in r.content
+
+
+@pytest.mark.asyncio
+async def test_navigate_is_recordable_and_reports_the_outcome_of_the_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-16374: a URL the model typed itself is an action the customer must see, so navigate is
+    # recordable (one action row + that round's screenshot) while staying out of billing and the
+    # action-step budget. The row is only worth having if it says what HAPPENED, so the handler
+    # reports where it asked to go, where it landed, what the page answered, and whether the page
+    # moved -- the facts the caller persists on the row.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+
+    class _RedirectTo404(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+            self.calls.append(("goto", {"url": url}))
+            self.url = "https://example.test/not-found"
+            return SimpleNamespace(status=404)
+
+    tools = build_browser_tools(_fixed_page_provider(_RedirectTo404()))
+    navigate = _tool(tools, "navigate")
+    assert (navigate.recordable, navigate.billable) == (True, False)
+    r = await navigate.handler({"url": "https://example.test/contact-us"})
+    assert r.status == "ok", r.content
+    assert (r.data or {}).get(ACTION_OUTCOME_DATA_KEY) == {
+        "requested_url": "https://example.test/contact-us",
+        "url": "https://example.test/not-found",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
+
+    # A navigation that landed back where it started reports no transition, and a page that answered
+    # no response carries no status at all rather than a fabricated one.
+    page, same_page_tools = _reload_guard_tools(monkeypatch, filled=0)
+    r2 = await _tool(same_page_tools, "navigate").handler({"url": page.url})
+    assert r2.status == "ok", r2.content
+    assert (r2.data or {}).get(ACTION_OUTCOME_DATA_KEY) == {
+        "requested_url": page.url,
+        "url": page.url,
+        "page_transitioned": False,
+    }
 
 
 @_skip_no_browser
@@ -4630,6 +4948,11 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
         [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
         [("finish", {"status": "completed", "reason": "should not win"})],
     ]
+    rounds: list[list[Any]] = []
+
+    async def _on_round(round_actions: list[Any], _turn_text: str | None) -> None:
+        rounds.append(round_actions)
+
     outcome = await run_agent_tool_loop(
         llm_caller=_ScriptedCaller(script),
         system_prompt="sys",
@@ -4637,9 +4960,23 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
         tools=all_tools,
         max_turns=10,
         max_tool_calls=20,
+        on_action_round=_on_round,
     )
 
     assert outcome.status == "terminated"
+    # ...and the whole production chain behind the row the customer reads: the real spec is recordable,
+    # so the navigation reaches the caller as its own round; the real handler's outcome rides it; and a
+    # 404 landing is flagged as a FAILED action even though the tool honestly returned ok (SKY-16374).
+    assert [(a.tool, a.succeeded, a.billable) for round_actions in rounds for a in round_actions] == [
+        ("navigate", False, False)
+    ]
+    assert rounds[0][0].outcome == {
+        "requested_url": "https://jobs.example.test/acme/closed",
+        "url": "https://jobs.example.test/acme/closed",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
 
 
 # --- Commit-verified click-open dropdown selection. The staging specimen: a click-open
@@ -7506,6 +7843,31 @@ _SEGMENTED_DATE_EXPOSED_ECHO_HTML = """
 """
 
 
+# SKY-16451: the same control with its display layer painted OVER the inputs, which are kept sub-pixel.
+# The probe reads the layer as the field's own skin, so the click is forced -- and a forced click still
+# refuses a box of at most one square pixel as "outside of the viewport".
+_SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:240px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="year" type="text" role="spinbutton" aria-label="Year"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div id="year-display" aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">YYYY</div>
+  </div>
+  <div style="position:relative;width:40px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("input", () => {
+    document.getElementById("year-display").textContent = year.value || "YYYY";
+  });
+</script>
+"""
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -7526,11 +7888,16 @@ _SEGMENTED_DATE_EXPOSED_ECHO_HTML = """
     ],
     ids=["keys-land-in-sibling-segment", "keys-dropped", "cleared-after-typing", "trimmed"],
 )
-async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(misroute: str, text: str) -> None:
+@pytest.mark.parametrize(
+    "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
+)
+async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(
+    misroute: str, text: str, template: str
+) -> None:
     # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would
     # turn today's loud failure into a date that reads as filled and is not.
     # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
-    html = _SEGMENTED_DATE_HTML + f"<script>{misroute}</script>"
+    html = template + f"<script>{misroute}</script>"
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         try:
@@ -7593,6 +7960,15 @@ _UNCLICKABLE_BARE_TYPEAHEAD_HTML = """
 </script>
 """
 
+# The declared typeahead again, with its display layer over a sub-pixel input so the click is forced.
+_SKINNED_SUBPIXEL_TYPEAHEAD_HTML = _UNCLICKABLE_TYPEAHEAD_HTML.replace(
+    '<div aria-hidden="true" style="position:absolute;inset:0;background:#fff">City</div>',
+    '<div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">City</div>',
+).replace(
+    'style="position:absolute;left:-500px;top:0;width:200px;height:30px"',
+    'style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box"',
+)
+
 # A widget that renders BOTH: an echo of the keystrokes and a real list. Excluding the echo must not
 # excuse the list.
 _ECHO_SCRIPT = (
@@ -7622,6 +7998,12 @@ _ECHO_SCRIPT = (
         # Rows a pickability test can read nothing off, alone and beside an echo of the keystrokes.
         (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, ""),
         (_UNCLICKABLE_BARE_TYPEAHEAD_HTML, "", 0, _ECHO_SCRIPT),
+        (
+            _SKINNED_SUBPIXEL_TYPEAHEAD_HTML,
+            'role="combobox" aria-autocomplete="list" aria-controls="city-list" aria-expanded="false"',
+            2500,
+            "",
+        ),
     ],
     ids=[
         "declared-slow-rows",
@@ -7630,6 +8012,7 @@ _ECHO_SCRIPT = (
         "undeclared-rows-beside-an-echo",
         "bare-div-rows",
         "bare-div-rows-beside-an-echo",
+        "skinned-subpixel-declared-slow-rows",
     ],
 )
 async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
@@ -7655,8 +8038,13 @@ async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "html",
-    [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_REPLACED_ECHO_HTML, _SEGMENTED_DATE_EXPOSED_ECHO_HTML],
-    ids=["echo-mutated", "echo-replaced", "echo-exposed"],
+    [
+        _SEGMENTED_DATE_HTML,
+        _SEGMENTED_DATE_REPLACED_ECHO_HTML,
+        _SEGMENTED_DATE_EXPOSED_ECHO_HTML,
+        _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML,
+    ],
+    ids=["echo-mutated", "echo-replaced", "echo-exposed", "skinned-subpixel"],
 )
 async def test_type_fills_a_segment_input_the_click_cannot_reach(html: str) -> None:
     async with _content_page(html) as page:
@@ -14576,31 +14964,45 @@ def _patch_upload_download(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_file_upload_no_upload_activity_returns_actionable_error_not_false_ok(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("input_state", ["holds_file", "unreadable", "cleared_during_settle"])
+async def test_file_upload_with_no_upload_activity_is_ok_only_when_the_input_confirms_the_file(
+    monkeypatch: pytest.MonkeyPatch, input_state: str
 ) -> None:
-    # The core fix: set_input_files can populate the control at the Playwright layer yet the site
-    # register nothing (post-navigation the change handler is not wired) — zero upload requests
-    # dispatched. file_upload must return a recoverable non-OK there, not a confident OK that makes the
-    # agent submit with no file. A submit-time-upload form lands here too as an accepted false-negative.
-    # RED against pre-fix code, which returned "uploaded 1 file" regardless of activity.
+    # A form that sends the file with the submit dispatches nothing at attach time. The input holding
+    # the file when the tool returns is its postcondition, so that is an ok; an unreadable input, or one
+    # a change handler emptied while the page settled, confirms nothing and stays an error.
     import skyvern.forge.taskv3.tools as tools_module
 
     page = _FakePage()
-    page.element.emit_upload_on_set = False  # file lands in the input, but the site never reacts
+    page.element.emit_upload_on_set = False
+    if input_state == "unreadable":
+
+        async def _unreadable(_js: str, _arg: Any = None) -> Any:
+            raise RuntimeError("Execution context was destroyed")
+
+        monkeypatch.setattr(page.element, "evaluate", _unreadable)
     _patch_upload_dwell(monkeypatch, tools_module)
+    if input_state == "cleared_during_settle":
+
+        async def _settle_clears(_page: Any) -> None:
+            page.element._files = []
+
+        monkeypatch.setattr(tools_module, "_settle_after_upload", _settle_clears)
     _patch_upload_download(monkeypatch)
 
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
 
-    assert r.status == "error", r.content
-    assert "no upload activity" in r.content
-    assert "uploaded 1 file" not in r.content
-    # The file was still attached at the Playwright layer, so the staged-download key must persist so
-    # the download-signal wrapper still suppresses the staged file.
+    if input_state == "holds_file":
+        assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
+        assert "sent no upload request" in r.content
+    elif input_state == "unreadable":
+        assert (r.status, r.error_class) == ("error", "attach_unconfirmed"), r.content
+    else:
+        assert r.status == "error", r.content
+        assert "did not attach" in r.content
+    # The staged-download key must persist so the download-signal wrapper still suppresses the file.
     assert (r.data or {}).get("staged_download") == "cv.pdf"
-    # The request listener must be removed after the call — no leaked/accumulating listeners.
     assert page._request_listeners == []
 
 
@@ -14944,9 +15346,93 @@ async def test_file_upload_ignores_non_upload_network_noise(monkeypatch: pytest.
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
 
-    assert r.status == "error", r.content
-    assert "no upload activity" in r.content
+    assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
     assert page._request_listeners == []
+
+
+_UPLOAD_TARGETS_HTML = """<!doctype html><html><body>
+<form id="apply" onsubmit="event.preventDefault(); window.__submitted = true;">
+  <div id="dropzone" style="border:1px dashed;padding:20px">Drop your resume
+    <input id="inner" type="file" style="display:none">
+  </div>
+  <input id="picker-input" type="file" style="display:none">
+  <input id="labelled-input" type="file" style="display:none">
+  <label id="choose" for="labelled-input">Choose file</label>
+  <button id="attach" type="button" onclick="document.getElementById('picker-input').click()">Attach</button>
+  <div id="inert" style="padding:10px">Nothing to click</div>
+  <button id="send">Send application</button>
+</form>
+<input id="formless-input" type="file" style="display:none">
+<button id="formless-attach" onclick="document.getElementById('formless-input').click()">Select resume</button>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "receiving_input"),
+    [
+        ("#dropzone", "#inner"),
+        ("#attach", "#picker-input"),
+        ("#choose", "#labelled-input"),
+        # A typeless button outside any form submits nothing, so it is clicked.
+        ("#formless-attach", "#formless-input"),
+    ],
+)
+async def test_file_upload_on_an_upload_control_that_is_not_the_input_lands_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selector: str, receiving_input: str
+) -> None:
+    # The model targets the visible control, since observe does not list a hidden file input. The
+    # driver refuses a non-input ("Node is not an HTMLInputElement"); v1 sets the file on the input
+    # inside the control, or clicks it and fills the picker it opens.
+    import skyvern.forge.sdk.api.files as files_module
+    import skyvern.forge.taskv3.tools as tools_module
+
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 synthetic")
+
+    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return str(cv)
+
+    monkeypatch.setattr(files_module, "download_file", _fake_download)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    async with _content_page(_UPLOAD_TARGETS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "file_upload").handler({"selector": selector, "file": "resume.pdf"})
+
+        assert (r.status, r.ok_class) == ("ok", "attached_no_activity"), r.content
+        assert await page.eval_on_selector(receiving_input, "e => e.files.length") == 1
+        assert not await page.evaluate("() => !!window.__submitted")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "error_class"),
+    [("#inert", "no_file_input"), ("#send", "submits_form")],
+)
+async def test_file_upload_on_a_control_with_no_file_input_reports_it_without_submitting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selector: str, error_class: str
+) -> None:
+    import skyvern.forge.sdk.api.files as files_module
+    import skyvern.forge.taskv3.tools as tools_module
+
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 synthetic")
+
+    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return str(cv)
+
+    monkeypatch.setattr(files_module, "download_file", _fake_download)
+    monkeypatch.setattr(tools_module, "_FILE_CHOOSER_TIMEOUT_MS", 300)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    async with _content_page(_UPLOAD_TARGETS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "file_upload").handler({"selector": selector, "file": "resume.pdf"})
+
+        assert not await page.evaluate("() => !!window.__submitted"), r.content
+        assert r.status == "error", r.content
+        assert r.error_class == error_class, r.content
 
 
 @pytest.mark.asyncio
@@ -21864,6 +22350,8 @@ async def test_observe_discloses_that_a_populated_page_was_dropped_whole_by_the_
     assert "(0 interactive elements)" in r.content, r.content
     assert "note: the page has 5 control(s) that are present but not visible" in r.content, r.content
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 5
+    assert r.data["summary"]["hidden_dropped_off_canvas"] == 1, r.data["summary"]
+    assert r.data["summary"]["hidden_dropped_visibility"] == 4, r.data["summary"]
 
 
 @_skip_no_browser
@@ -21886,6 +22374,105 @@ async def test_observe_stays_silent_about_hidden_chrome_when_it_can_still_see_th
     assert "(1 interactive elements)" in r.content, r.content
     assert "present but not visible" not in r.content, r.content
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 1
+
+
+_HIDDEN_DROP_BUCKETS = ("hidden_dropped_off_canvas", "hidden_dropped_visibility", "hidden_dropped_zero_rect")
+
+
+def _hidden_drop_split(summary: dict[str, Any]) -> dict[str, int]:
+    return {bucket: summary[bucket] for bucket in _HIDDEN_DROP_BUCKETS}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("controls", "bucket"),
+    [
+        (
+            '<button style="position:absolute;left:-9999px">A</button>'
+            '<a href="#b" style="position:absolute;left:-9999px">B</a>',
+            "hidden_dropped_off_canvas",
+        ),
+        (
+            '<button style="visibility:hidden">A</button><input style="visibility:hidden" placeholder="B">',
+            "hidden_dropped_visibility",
+        ),
+        (
+            '<button style="display:none">A</button>'
+            '<button style="display:inline-block;width:0;height:0;padding:0;border:0;overflow:hidden">B</button>',
+            "hidden_dropped_zero_rect",
+        ),
+    ],
+)
+async def test_observe_attributes_each_hidden_drop_to_the_gate_that_dropped_it(controls: str, bucket: str) -> None:
+    # The three gates are three different fixes (a viewport assumption, a visibility predicate, a
+    # layout edge), and the pooled count cannot say which one blinded a page.
+    html = f"<!doctype html><html><head><title>Portal</title></head><body>{controls}</body></html>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok" and r.data is not None, r.content
+    summary = r.data["summary"]
+    assert _hidden_drop_split(summary) == {b: (2 if b == bucket else 0) for b in _HIDDEN_DROP_BUCKETS}, summary
+    assert summary["hidden_dropped"] == 2, summary
+    assert "note: the page has 2 control(s) that are present but not visible" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_splits_a_mixed_blind_page_by_gate_and_the_pooled_count_is_their_sum() -> None:
+    # Distinct counts per gate, so a drop charged to the wrong bucket cannot still add up.
+    html = (
+        "<!doctype html><html><head><title>Portal</title></head><body>"
+        '<button style="position:absolute;left:-9999px">Off</button>'
+        '<button style="visibility:hidden">Vis1</button><button style="visibility:hidden">Vis2</button>'
+        '<div style="display:none"><button>Z1</button><button>Z2</button><a href="#z">Z3</a></div>'
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok" and r.data is not None, r.content
+    summary = r.data["summary"]
+    assert _hidden_drop_split(summary) == {
+        "hidden_dropped_off_canvas": 1,
+        "hidden_dropped_visibility": 2,
+        "hidden_dropped_zero_rect": 3,
+    }, summary
+    assert summary["hidden_dropped"] == 6, summary
+    assert "note: the page has 6 control(s) that are present but not visible" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each realm counts its own drops; a split counter left out of the frame merge would report only the
+    # main frame's share while the pooled count reported the page's.
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    frame = (
+        "<button style='position:absolute;left:-9999px'>FOff</button>"
+        "<button style='visibility:hidden'>FVis</button>"
+        "<button style='display:none'>FZ1</button><button style='display:none'>FZ2</button>"
+        "<button>Frame Live</button>"
+    )
+    html = (
+        '<button style="display:none">MainZ</button><button>Main Live</button>'
+        f'<iframe srcdoc="{frame}" width="300" height="120"></iframe>'
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        merged = await _tool(tools, "observe").handler({})
+
+    assert merged.data is not None, merged.content
+    summary = merged.data["summary"]
+    assert _hidden_drop_split(summary) == {
+        "hidden_dropped_off_canvas": 1,
+        "hidden_dropped_visibility": 1,
+        "hidden_dropped_zero_rect": 3,
+    }, summary
+    assert summary["hidden_dropped"] == 5, summary
 
 
 # The shape SKY-15662 was diagnosed on: many live, visible per-row controls whose accessible name is
@@ -24517,3 +25104,503 @@ def test_an_out_of_range_port_does_not_escape_the_origin_helper() -> None:
 
     assert _url_origin("https://site.test:99999/a") == "unparseable"
     assert _url_origin("https://site.test:8443/a") == "https://site.test:8443"
+
+
+@pytest.mark.asyncio
+async def test_the_counter_and_the_directory_do_not_each_arm_the_same_download(tmp_path: Path) -> None:
+    # The two sources observe ONE download at different moments: the interceptor counts it on one
+    # scan, its filename appears in the listing on a later one. Unioned, that is two arming events for
+    # one download, and the second has no tab-opening behind it -- the same defect the rename
+    # normalisation removed, which identity cannot dedupe because the counter carries none. The
+    # directory is therefore a fallback used only when no counter is available.
+    pages: list[Any] = []
+    popup = _DownloadFakePage(tmp_path)
+    popup.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, popup)
+    pages.append(opener)
+
+    attempts = [3]
+    provider = _newest_open(pages)
+
+    async def _restore(page: Any, url: str) -> None:
+        return None
+
+    guard = BlankWorkingPageGuard(
+        provider, _restore, downloads_dir=str(tmp_path), download_attempts=lambda: attempts[0]
+    )
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "get_html").handler({})  # baseline
+    attempts[0] += 1  # the interceptor counts the download
+    await _tool(tools, "click").handler({"selector": "#dl"})  # arms once, opens the tab
+    await _tool(tools, "get_html").handler({})
+    assert popup.is_closed()
+
+    # The same download's file now appears in the listing. It must not arm a second time.
+    (tmp_path / "statement.pdf").write_bytes(b"x" * 500)
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    pages.append(later_tab)
+    await guard.ensure_live()
+
+    assert not later_tab.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_does_not_arm_on_everything_when_the_counter_goes_away(tmp_path: Path) -> None:
+    # The HANDOVER, which neither source alone exercises. The interceptor is attached per browser
+    # context, so a reconnect drops it and the counter starts returning None mid-run. If the listing
+    # had been skipped while the counter was authoritative, its baseline would be stale and the first
+    # scan after the handover would see the whole run's directory as new and arm a close window.
+    pages: list[Any] = []
+    later_tab = _DownloadFakePage(tmp_path)
+    later_tab.url = "about:blank"
+    opener = _PopupDownloadPage(tmp_path, pages, later_tab)
+    pages.append(opener)
+
+    attempts: list[int | None] = [5]
+    provider = _newest_open(pages)
+
+    async def _restore(page: Any, url: str) -> None:
+        return None
+
+    guard = BlankWorkingPageGuard(
+        provider, _restore, downloads_dir=str(tmp_path), download_attempts=lambda: attempts[0]
+    )
+    tools = build_browser_tools(provider, downloads_dir=str(tmp_path))
+    apply_blank_page_guard(tools, guard)
+
+    await _tool(tools, "get_html").handler({})  # baseline, counter available
+    # Downloads land while the counter is the authority. The listing must still track them.
+    for name in ("statement.pdf", "invoice.pdf", "receipt.pdf"):
+        (tmp_path / name).write_bytes(b"x" * 100)
+    attempts[0] += 1
+    # Let that (legitimate) arming decay fully on a live page, so what follows isolates the handover
+    # rather than tripping the ordinary close window.
+    for _ in range(4):
+        await _tool(tools, "get_html").handler({})
+
+    attempts[0] = None  # reconnect: the interceptor is gone, the listing becomes the authority
+    await _tool(tools, "click").handler({"selector": "#link"})  # opens a blank tab
+    await guard.ensure_live()
+
+    # Nothing new has landed since the handover, so nothing may arm -- and the tab the model opened
+    # must survive.
+    assert not later_tab.is_closed()
+
+
+# SKY-16330. A document whose ONE record sits past the markup cap, in markup and in rendered text
+# alike, so no single read of either format can contain it. Branch-local witness, not captured DOM.
+_PAST_CAP_RECORD = "Statement STMT-9182 issued 2026-03-02"
+_PAST_CAP_TEXT = "filler row\n" * 5000 + _PAST_CAP_RECORD
+_PAST_CAP_DOC = "<html><body><main>" + _PAST_CAP_TEXT + "</main></body></html>"
+
+
+def _past_cap_tools() -> list[Any]:
+    assert len(_PAST_CAP_TEXT) > 2 * taskv3_tools.HTML_MAX_CHARS
+    assert _PAST_CAP_RECORD not in _PAST_CAP_TEXT[: taskv3_tools.HTML_MAX_CHARS]
+    return build_browser_tools(_fixed_page_provider(_FakeTextPage(_PAST_CAP_DOC, _PAST_CAP_TEXT)))
+
+
+@pytest.mark.asyncio
+async def test_get_html_can_resume_a_read_past_the_cap() -> None:
+    # The cap bounds ONE result; it must not bound what the page can ever say. Without a way to
+    # advance the read, everything past the first 20000 chars is unreachable by any argument the
+    # model can pass, and the only remaining move is to guess at selectors for a region it cannot see.
+    tools = _past_cap_tools()
+    first = await _tool(tools, "get_html").handler({"format": "text"})
+    assert first.status == "ok" and _PAST_CAP_RECORD not in first.content
+
+    seen = first.content
+    offset = taskv3_tools.HTML_MAX_CHARS
+    for _ in range(5):
+        nxt = await _tool(tools, "get_html").handler({"format": "text", "offset": offset})
+        assert nxt.status == "ok", nxt.content
+        assert nxt.content != seen, "offset returned the same window — the read never advanced"
+        seen = nxt.content
+        if _PAST_CAP_RECORD in nxt.content:
+            break
+        offset += taskv3_tools.HTML_MAX_CHARS
+    assert _PAST_CAP_RECORD in seen, "the record past the cap was never reachable"
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_reports_how_much_it_did_not_return() -> None:
+    # A cut that says only THAT it happened leaves the model unable to tell a page it has nearly read
+    # from one it has barely started. The size it did not return, and the offset that continues the
+    # read, are effects of the read the tool knows and the model cannot infer.
+    tools = _past_cap_tools()
+    markup = await _tool(tools, "get_html").handler({})
+    assert markup.status == "ok"
+    assert str(len(_PAST_CAP_DOC)) in markup.content, markup.content[-300:]
+    assert f"offset={taskv3_tools.HTML_MAX_CHARS}" in markup.content, markup.content[-300:]
+
+    text = await _tool(tools, "get_html").handler({"format": "text"})
+    assert str(len(_PAST_CAP_TEXT)) in text.content, text.content[-300:]
+    assert f"offset={taskv3_tools.HTML_MAX_CHARS}" in text.content, text.content[-300:]
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_is_declared_so_the_model_can_use_it() -> None:
+    # An argument the handler honours but the spec never advertises is an argument no model passes.
+    tools = _past_cap_tools()
+    props = _tool(tools, "get_html").parameters["properties"]
+    assert "offset" in props and props["offset"]["type"] == "integer"
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_past_the_end_errors_rather_than_reading_as_empty() -> None:
+    # An empty string is what an empty page returns, so a read that ran off the end must not be one.
+    # It is an ERROR and not an ok result for a second reason: an ok result carrying a constant
+    # string would let a run page past the end forever under a fresh (tool, args) key every call —
+    # identical content the perception-stall guard cannot witness, because `live` takes the MINIMUM
+    # of the per-tool and per-probe counters and the per-probe one never leaves zero.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({"format": "text", "offset": 10 * len(_PAST_CAP_TEXT)})
+    assert r.status == "error"
+    assert r.error_class == "offset_past_end"
+    assert str(len(_PAST_CAP_TEXT)) in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_normalizes_offset_so_one_read_has_one_identity() -> None:
+    # `args` is what the loop hashes into the call's identity, which decides what supersedes what in
+    # the transcript AND what counts as the same probe to the stall guard. Three spellings of a read
+    # of the same bytes must not be three identities.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    bare: dict[str, Any] = {"format": "text"}
+    zero: dict[str, Any] = {"format": "text", "offset": 0}
+    stringy: dict[str, Any] = {"format": "text", "offset": "20000"}
+    assert (await handler(bare)).content == (await handler(zero)).content
+    await handler(stringy)
+    assert bare == zero == {"format": "text"}  # a zero offset is removed, not carried as a variant
+    assert stringy == {"format": "text", "offset": 20000}  # and a parsed one is written back as int
+
+
+@pytest.mark.asyncio
+async def test_get_html_rejects_an_unusable_offset_instead_of_re_serving_the_head() -> None:
+    # Silently falling back to offset 0 would hand the model the window it already has, labelled as
+    # the one it asked for. Infinity is reachable: json.loads accepts the literal by default.
+    tools = _past_cap_tools()
+    for bad in (-1, "abc", float("inf"), True, {"a": 1}):
+        r = await _tool(tools, "get_html").handler({"format": "text", "offset": bad})
+        assert r.status == "error", (bad, r.content[:80])
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_notice_does_not_read_as_one_call_carrying_both_formats() -> None:
+    # The two formats index DIFFERENT strings, so an offset is not portable between them. A steer
+    # joined by `or` reads as a conjunction, and a model that sends {offset: N, format: text} lands
+    # at character N of a different, usually much shorter, document.
+    markup_cut = taskv3_tools._markup_cut(20000, 60000, scoped=False)
+    assert "format=text" in markup_cut and " or format=text" not in markup_cut
+    # A read that already carries a selector is not told to go FIND one — but it is told to repeat
+    # the one it has, which is a continuation instruction rather than advice.
+    scoped_text = taskv3_tools._rendered_text_cut(20000, 60000, scoped=True)
+    assert "a selector read or observe reaches one region directly" not in scoped_text
+    assert "the same selector" in scoped_text
+
+
+@pytest.mark.asyncio
+async def test_get_html_cut_notices_stay_stable_across_two_reads_of_one_page() -> None:
+    # get_html's content is hashed into the loop's perception digests, which decide whether a run has
+    # returned to known ground. A notice carrying anything call-scoped and varying would make an
+    # unchanged page read as fresh ground on every look.
+    tools = _past_cap_tools()
+    a = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000})
+    b = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000})
+    assert a.content == b.content
+    # No quote character in any notice: loop._TV3_MARKER_CUT_RE reads a marker the cut left open only
+    # while no quote follows it, and the notice is what follows.
+    assert '"' not in taskv3_tools._markup_cut(0, 1, scoped=False)
+    assert '"' not in taskv3_tools._markup_cut(0, 1, scoped=True)
+    assert '"' not in taskv3_tools._rendered_text_cut(0, 1, scoped=False)
+    assert '"' not in taskv3_tools._rendered_text_cut(0, 1, scoped=True)
+
+
+@pytest.mark.asyncio
+async def test_get_html_redacts_a_hidden_secret_before_a_window_boundary_can_split_it() -> None:
+    # SKY-16330. The loop hides model_hidden_values by whole-substring replacement, on what the tool
+    # returns. A secret straddling a window boundary matches neither half, so both halves would reach
+    # the model in the clear — and offsets are what make the second half reachable at all.
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    secret = "MAGICLINKTOKEN-" + "S" * 60
+    boundary = taskv3_tools.HTML_MAX_CHARS - 20  # the secret starts 20 chars before the cut
+    text = "f" * boundary + secret + "t" * taskv3_tools.HTML_MAX_CHARS
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        tools = build_browser_tools(_fixed_page_provider(_FakeTextPage("<html></html>", text)))
+        first = await _tool(tools, "get_html").handler({"format": "text"})
+        second = await _tool(tools, "get_html").handler({"format": "text", "offset": taskv3_tools.HTML_MAX_CHARS})
+        assert first.status == "ok" and second.status == "ok", (first.content[:80], second.content[:80])
+        joined = first.content + second.content
+        assert secret not in joined
+        # Neither HALF survives either: a split placeholder is harmless, a split secret is the bug.
+        assert secret[:20] not in joined, first.content[-120:]
+        assert secret[-20:] not in joined, second.content[:120]
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_get_html_offset_normalization_survives_the_selector_guards_arg_copy() -> None:
+    # `_with_selector_guard` hands the handler a COPY of args whenever a selector is present, and the
+    # loop hashes the CALLER's dict into the call identity. A normalization applied inside that copy
+    # would unify nothing for exactly the reads most likely to be repeated.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    zero: dict[str, Any] = {"selector": "body", "offset": 0}
+    stringy: dict[str, Any] = {"selector": "body", "offset": "20000"}
+    await handler(zero)
+    await handler(stringy)
+    assert zero == {"selector": "body"}
+    assert stringy == {"selector": "body", "offset": 20000}
+
+
+@pytest.mark.asyncio
+async def test_a_cut_read_reports_where_it_put_its_notice() -> None:
+    # The loop folds the notice out of the perception digest at the index reported here — there is no
+    # pattern and no wording coupling left, which is what makes the fold immune to page- and
+    # server-authored text wearing the same shape. The contract is that the index is exact.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({})
+    assert r.status == "ok"
+    at = (r.data or {}).get("notice_at")
+    assert isinstance(at, int), r.data
+    assert r.content[at:].startswith("…["), r.content[at : at + 40]
+    assert r.content[at:].endswith("]")
+    # And the part before it is exactly one window of the document, notice excluded.
+    assert len(r.content[:at]) == taskv3_tools.HTML_MAX_CHARS
+
+    # A read that was NOT cut reports no boundary, so nothing is folded for it.
+    tail = await _tool(tools, "get_html").handler({"offset": len(_PAST_CAP_DOC) - 10})
+    assert tail.status == "ok"
+    assert (tail.data or {}).get("notice_at") is None, tail.data
+
+
+@pytest.mark.asyncio
+async def test_get_html_rejects_a_fractional_offset_rather_than_reading_a_different_window() -> None:
+    # int(20000.9) is 20000, so truncating would execute and record a DIFFERENT read from the one
+    # asked for, under a handler that promises to reject a non-whole character count.
+    tools = _past_cap_tools()
+    r = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000.9})
+    assert r.status == "error" and r.error_class == "invalid_offset", r.content
+    # A whole-valued float is still a whole number of characters and is accepted.
+    ok = await _tool(tools, "get_html").handler({"format": "text", "offset": 20000.0})
+    assert ok.status == "ok", ok.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_equivalent_format_spellings_are_one_read_identity() -> None:
+    # The handler strips, lowercases and defaults `format`, so these are all one read. `args` is what
+    # the loop hashes into the call identity, and with a retention window of two, duplicates of one
+    # region would fill it and evict the different region the window exists to hold.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+    # Including the spellings a non-strict provider reaches for when an optional argument is absent:
+    # omitted, null, and empty. The handler reads all of these as the whole-page HTML read.
+    spellings: list[dict[str, Any]] = [
+        {},
+        {"format": "html"},
+        {"format": " HTML "},
+        {"format": ""},
+        {"format": None},
+        {"selector": None},
+        {"selector": ""},
+    ]
+    for args in spellings:
+        await handler(args)
+    assert spellings == [{}] * 7
+
+    # Whitespace is NOT one of them. It is not "absent" — the handler acts on it and reports what the
+    # model typed, and collapsing it here would turn a named error into a silent whole-page read.
+    kept: list[dict[str, Any]] = [{"selector": "   "}, {"format": "  "}]
+    for args in kept:
+        await handler(args)
+    assert kept == [{"selector": "   "}, {"format": "  "}]
+
+    texts: list[dict[str, Any]] = [{"format": "text"}, {"format": " Text "}]
+    for args in texts:
+        await handler(args)
+    assert texts == [{"format": "text"}, {"format": "text"}]
+
+    # An unrecognized spelling is left as typed so the handler's error names what the model wrote.
+    bad: dict[str, Any] = {"format": "txt"}
+    r = await handler(bad)
+    assert r.status == "error" and "txt" in r.content
+    assert bad == {"format": "txt"}
+
+
+@pytest.mark.asyncio
+async def test_following_a_text_cut_literally_continues_the_text_not_the_markup() -> None:
+    # `get_html` defaults format to html, so a cut TEXT read whose notice names only an offset sends
+    # the model to that character of the MARKUP — a different string, the same integer, and a
+    # continuation from a meaningless position it cannot detect.
+    #
+    # Asserted as an EQUIVALENCE, not as "the notice mentions format": the arguments the notice
+    # prescribes must produce the same read as spelling the format out. A containment check on the
+    # string passes for the wrong reason.
+    tools = _past_cap_tools()
+    handler = _tool(tools, "get_html").handler
+
+    first = await handler({"format": "text"})
+    assert first.status == "ok" and first.content.endswith("]"), first.content[-120:]
+
+    prescribed: dict[str, Any] = {}
+    for token in first.content.rsplit("…[", 1)[-1].replace("]", " ").split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            if key in ("offset", "format"):
+                prescribed[key] = int(value) if key == "offset" else value
+    assert prescribed.get("offset"), first.content[-200:]
+
+    followed = await handler(dict(prescribed))
+    spelled_out = await handler({"format": "text", "offset": prescribed["offset"]})
+    assert followed.status == "ok", followed.content
+    assert followed.content == spelled_out.content, "following the notice read a different string"
+    # And it is genuinely the text continuation, not markup starting at the same integer.
+    assert "<" not in followed.content[:200], followed.content[:200]
+
+
+def test_a_cut_notice_names_every_argument_that_identifies_the_read() -> None:
+    # Tool arguments do not carry between calls, so a notice that omits one sends a model following
+    # it literally to the same integer offset of a DIFFERENT string: an omitted `format` defaults to
+    # markup, an omitted `selector` widens to the whole page. Both are silent.
+    for scoped in (False, True):
+        for cut in (taskv3_tools._markup_cut, taskv3_tools._rendered_text_cut):
+            notice = cut(20000, 60000, scoped=scoped)
+            assert "offset=20000" in notice, notice
+            assert ("the same selector" in notice) is scoped, notice
+            assert ("format=text and offset" in notice) is (cut is taskv3_tools._rendered_text_cut), notice
+            # The selector is DESCRIBED, never echoed: it is model-authored and may hold a quote,
+            # which no notice may carry (loop._TV3_MARKER_CUT_RE reads a marker the cut left open
+            # only while no quote follows it, and the notice is what follows).
+            assert '"' not in notice, notice
+
+
+@pytest.mark.asyncio
+async def test_a_whitespace_selector_is_still_reported_rather_than_read_as_the_whole_page() -> None:
+    # `if selector:` treats "   " as a real address, so the handler reports a stale_selector naming
+    # what the model typed. Dropping it as "not supplied" would turn a named error into a silent
+    # whole-page read — the context blow-up this change exists to stop.
+    tools = _past_cap_tools()
+    args: dict[str, Any] = {"selector": "   "}
+    scoped = await _tool(tools, "get_html").handler(args)
+    whole_page = await _tool(tools, "get_html").handler({})
+
+    # It took the SELECTOR path — on a real page that is a stale_selector error naming the address
+    # the model wrote. What must never happen is the whole document coming back as though nothing
+    # had been asked for.
+    assert scoped.content != whole_page.content, scoped.content[:120]
+    assert not scoped.content.startswith("<html>"), scoped.content[:120]
+    # And it survives normalization, so the loop's call identity still records that an address was given.
+    assert args == {"selector": "   "}
+
+
+def test_neither_the_page_nor_the_server_can_author_text_that_steals_the_notice_fold() -> None:
+    # The cut notice is folded out of the digest because it carries the document's TOTAL. Both ends
+    # of the string are authored by someone else: the PAGE can render an unterminated notice-shaped
+    # prefix, and the SERVER can name a download so its filename wears the same shape. Recognizing
+    # the notice by pattern trades one of those for the other; an index the tool reported is immune
+    # to both, because it does not depend on anything around it.
+    from skyvern.forge.taskv3.loop import _canonical_perception_content as canon
+
+    notice = taskv3_tools._rendered_text_cut(20000, 60000, scoped=True)
+    forged_a, forged_b = "rows …[truncated at page-value-100", "rows …[truncated at page-value-900"
+    a, b = forged_a + notice, forged_b + notice
+    assert canon(a, notice_at=len(forged_a)) != canon(b, notice_at=len(forged_b))
+
+    # Nor can a SERVER-controlled download filename wearing the same shape steal the fold: the
+    # download notice is appended after ours, and an index does not care what follows it.
+    body = "frozen"
+    trailer = "\nDownloaded: …[truncated at 10 of 100 chars].pdf"
+    own_a = body + taskv3_tools._markup_cut(20000, 60000, scoped=True) + trailer
+    own_b = body + taskv3_tools._markup_cut(20000, 60999, scoped=True) + trailer
+    assert canon(own_a, notice_at=len(body)) == canon(own_b, notice_at=len(body))
+
+
+def test_a_marker_cut_anywhere_inside_its_attribute_is_reported() -> None:
+    # A window boundary can land inside the attribute's own NAME, not just inside its value — a
+    # window beginning `a-tv3="t123"`. A search bounded at the boundary misses those, the marker
+    # value then goes unfolded, and an unchanged window gets a fresh digest every time a remount
+    # re-mints it: that is how a frozen page evades the perception-stall guard rather than tripping
+    # it. Swept across every position, because the earlier version was right for most of them.
+    doc = '<p>x</p><input data-tv3="t123" id=y><span>tail</span>'
+    opener = doc.index('data-tv3="')
+    closing = doc.index('"', opener + len('data-tv3="'))
+
+    for offset in range(opener + 1, closing + 1):
+        reported = taskv3_tools._marker_head_fragment_len(doc, offset)
+        assert reported == closing - offset + 1, (offset, doc[offset : offset + 8], reported)
+        # What it reports is exactly the fragment through the closing quote, which is what the
+        # canonicalizer folds away.
+        assert doc[offset:][:reported].endswith('"')
+
+    # A boundary with nothing open at it reports nothing.
+    assert taskv3_tools._marker_head_fragment_len(doc, opener) == 0
+    assert taskv3_tools._marker_head_fragment_len(doc, closing + 1) == 0
+    assert taskv3_tools._marker_head_fragment_len(doc, 0) == 0
+
+
+def test_only_an_engine_minted_marker_value_is_folded_at_a_window_head() -> None:
+    # A page can author `data-tv3` itself — it is an ordinary attribute — so matching the opener and
+    # the closing quote is not enough. Folding a page-authored value that is genuinely changing makes
+    # the window read as frozen, and the perception-stall guard TERMINATES on that.
+    #
+    # This is not the shape-matching a FRAGMENT forbids: by the time the closing quote is found the
+    # whole value is in hand, and a complete value is unambiguous where a prefix is not. It is the
+    # same test `MINTED_MARKER_RE` applies in the observe JS before trusting one as a selector.
+    minted = ("t123", "t0", "t123-4")
+    foreign = ("balance-100", "", "t1a", "T123", "t", "123", "t123 ", "t-1", "t 1")
+
+    for value in minted + foreign:
+        doc = f'<i data-tv3="{value}" x><b>tail</b>'
+        opener = doc.index('data-tv3="')
+        closing = doc.index('"', opener + len('data-tv3="'))
+        # Sweep every boundary inside the attribute, name and value alike.
+        for offset in range(opener + 1, closing + 1):
+            reported = taskv3_tools._marker_head_fragment_len(doc, offset)
+            if value in minted:
+                assert reported == closing - offset + 1, (value, offset, reported)
+            else:
+                assert reported == 0, (value, offset, reported)
+
+
+_KEY_LOG_HTML = """
+<input id="field" value="text">
+<script>
+  window.__keys = [];
+  document.addEventListener("keydown", (e) => {
+    window.__keys.push((e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + e.key);
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_press_key_accepts_the_key_names_v1_accepts() -> None:
+    # Models write CTRL, ALT, left, HOME...: v1 maps these before pressing, and an unmapped name raises
+    # "Unknown key" and burns a round.
+    cases = [
+        ("CTRL+a", "Control+a"),
+        ("ALT+r", "Alt+r"),
+        ("left", "ArrowLeft"),
+        ("HOME", "Home"),
+        ("esc", "Escape"),
+        ("TAB", "Tab"),
+        ("enter", "Enter"),
+    ]
+    async with _content_page(_KEY_LOG_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for key, expected in cases:
+            await page.evaluate("window.__keys = []")
+            r = await _tool(tools, "press_key").handler({"key": key, "selector": "#field"})
+            assert r.status == "ok", (key, r.content)
+            assert expected in await page.evaluate("window.__keys"), key

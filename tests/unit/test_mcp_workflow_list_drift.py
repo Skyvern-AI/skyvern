@@ -42,6 +42,15 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
         block["file_url"] = "{{ source_pdf }}"
         block["prompt"] = "Fill the PDF using the payload."
         block["payload"] = {"name": "{{ applicant.name }}"}
+    elif block_type == "web_search":
+        block.update(
+            query="site:example.com {{ terms }}",
+            provider="auto",
+            num_results=100,
+            prompt="Return the relevant links.",
+            json_schema={"type": "array", "items": {"type": "string"}},
+            parameter_keys=["terms"],
+        )
     elif block_type == "navigation":
         block["url"] = "https://example.com"
         block["navigation_goal"] = "do the thing"
@@ -96,6 +105,7 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
         _make_workflow_dict("wpid_ok", "navigation"),
         _make_workflow_dict("wpid_sheets", "google_sheets_read"),
         _make_workflow_dict("wpid_pdf_fill", "pdf_fill"),
+        _make_workflow_dict("wpid_search", "web_search"),
     ]
     request_mock = _patch_skyvern_list_response(monkeypatch, payload=payload)
 
@@ -103,10 +113,10 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
 
     assert result["ok"] is True, result
     data = result["data"]
-    assert data["count"] == 3
+    assert data["count"] == 4
     assert data["page"] == 1
     ids = {wf["workflow_permanent_id"] for wf in data["workflows"]}
-    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill"}
+    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill", "wpid_search"}
 
     request_mock.assert_awaited_once()
     call = request_mock.await_args
@@ -117,6 +127,17 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
     assert params["page"] == 1
     assert params["page_size"] == 10
     assert params["only_workflows"] is False
+
+
+def test_web_search_fields_survive_mcp_definition_normalization() -> None:
+    workflow = _make_workflow_dict("wpid_search", "web_search")
+    workflow["workflow_definition"]["parameters"] = [
+        {"parameter_type": "workflow", "key": "terms", "workflow_parameter_type": "string", "default_value": "example"}
+    ]
+    normalized = mcp_workflow._normalize_json_definition(workflow)
+    block = normalized["workflow_definition"]["blocks"][0]
+    expected = workflow["workflow_definition"]["blocks"][0]
+    assert {key: block[key] for key in expected} == expected
 
 
 @pytest.mark.asyncio

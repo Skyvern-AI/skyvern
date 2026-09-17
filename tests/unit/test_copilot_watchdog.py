@@ -788,6 +788,7 @@ async def test_non_success_watchdog_result_types_selected_failed_block_locators(
     observe = AsyncMock(return_value=[{"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}])
     monkeypatch.setattr(run_execution, "_observe_authored_locators", observe)
     monkeypatch.setattr(run_execution, "RUN_BLOCKS_STAGNATION_WINDOW_SECONDS", 0)
+    monkeypatch.setattr(run_execution, "_any_quiet_block_requested", lambda *_args, **_kwargs: False)
     ctx = make_copilot_ctx(browser_session_id="pbs_chat")
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
@@ -878,6 +879,105 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
     assert "failure_categories" not in result["data"]
     harness["worker_execute"].assert_awaited_once()
     harness["cooperative_cancel"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("_repeat", range(3))
+@pytest.mark.parametrize("layout", ["direct", "loop", "nested", "finally"])
+async def test_web_search_finishes_after_silent_period_without_watchdog_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    _repeat: int,
+    layout: str,
+) -> None:
+    workflow_yaml = """
+title: web search example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: web_search
+      label: search
+      query: site:example.com docs
+"""
+    selected_label = "search"
+    if layout in {"loop", "nested"}:
+        workflow_yaml = """
+title: web search loop
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: items
+      workflow_parameter_type: json
+      default_value: [1]
+  blocks:
+    - block_type: for_loop
+      label: loop
+      loop_over_parameter_key: items
+      loop_blocks:
+        - block_type: web_search
+          label: search
+          query: site:example.com docs
+"""
+        selected_label = "search" if layout == "nested" else "loop"
+    elif layout == "finally":
+        workflow_yaml = """
+title: web search cleanup
+workflow_definition:
+  parameters: []
+  finally_block_label: search
+  blocks:
+    - block_type: navigation
+      label: navigate
+      url: https://example.com
+      navigation_goal: Open the page.
+    - block_type: web_search
+      label: search
+      query: site:example.com docs
+"""
+        selected_label = "navigate"
+    output = {"query": "site:example.com docs", "results": [], "total_count": 0, "prompt_output": None}
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=workflow_yaml,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            WorkflowRunBlock(
+                label="search",
+                block_type=BlockType.WEB_SEARCH,
+                status="completed",
+                output=output,
+                workflow_run_block_id="wrb_terminal",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 2, 30, tzinfo=UTC),
+            )
+        ],
+    )
+    elapsed = 0.0
+    progress = iter(((0.0, "running"), (120.0, "running"), (150.0, "completed")))
+    marker = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime, datetime]:
+        nonlocal elapsed
+        elapsed, status = next(progress)
+        return _fake_run(status=status, modified_at=marker), marker, marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": [selected_label], "parameters": {}}, ctx)
+
+    assert elapsed == 150.0
+    assert result["ok"] is True, result
+    assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["blocks"][0]["output"] == output
+    harness["worker_execute"].assert_awaited_once()
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
 
 
 @pytest.mark.asyncio

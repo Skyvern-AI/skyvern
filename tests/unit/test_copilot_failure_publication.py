@@ -400,7 +400,9 @@ async def test_cancel_capture_joins_owned_task_before_preserving_caller_cancella
 async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+    )
     healed = BlockResult(
         success=True,
         output_parameter=block.output_parameter,
@@ -459,7 +461,9 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
     still reach the caller."""
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+    )
     staging_entered = asyncio.Event()
     published: list[str] = []
     screenshot_attempts = 0
@@ -536,7 +540,9 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     heal proceeds without a frame."""
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+    )
     heal_reached = asyncio.Event()
 
     async def stalled_screenshot(**_: object) -> bytes:
@@ -590,7 +596,9 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+    )
     failed = BlockResult(
         success=False,
         failure_reason="specific healed-attempt failure",

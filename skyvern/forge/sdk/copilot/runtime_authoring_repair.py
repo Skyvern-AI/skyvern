@@ -675,6 +675,11 @@ def _error_text_requires_stop(copilot_ctx: Any, data: dict[str, Any], result: di
     text_values = [data.get("failure_reason"), data.get("skip_reason")]
     if result is not None:
         text_values.append(result.get("error"))
+    # A failure in Skyvern's own egress is not a defect in the block, so authoring repair must not
+    # rewrite working code to chase it. This is the precedence the terminal-nav condition used to
+    # supply for these codes before that condition narrowed to target-owned failures.
+    if getattr(copilot_ctx, "last_test_proxy_owned_failure", False):
+        return True
     text = " ".join(str(value).lower() for value in text_values if value)
     return (
         "browser session not found" in text

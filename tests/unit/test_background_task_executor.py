@@ -14,7 +14,11 @@ from fastapi import BackgroundTasks
 from sqlalchemy import insert, literal, select, update
 
 from skyvern.config import settings
-from skyvern.exceptions import SkyvernException, WorkflowRetryAttemptLookupError
+from skyvern.exceptions import (
+    BackgroundSequentialCredentialUnsupported,
+    SkyvernException,
+    WorkflowRetryAttemptLookupError,
+)
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -2870,14 +2874,270 @@ async def test_execute_workflow_dispatches_from_latest_retry_attempt(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_first_dispatch_initializer_failure_is_retried_by_the_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization = SimpleNamespace(organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None)
+@pytest.mark.parametrize("need_call_webhook", [True, False])
+@pytest.mark.parametrize(
+    "scenario",
+    ["state_file", "llm_runtime", "lookup_failure", "attempt_row", "webhook_preparation", "transient_recovers"],
+)
+async def test_no_policy_initializer_failure_fails_the_run_durably(
+    interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch, scenario: str, need_call_webhook: bool
+) -> None:
+    database = interim_retry_db
+    async with database.Session() as session:
+        run = await session.get(WorkflowRunModel, "wr_retry")
+        assert run is not None
+        run.status = "created"
+        run.started_at = None
+        run.finished_at = None
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_retry", 1))
+        assert attempt is not None
+        if scenario == "attempt_row":
+            attempt.status = "created"
+            attempt.retry_decision = None
+            attempt.finished_at = None
+            attempt.next_attempt_at = None
+        else:
+            workflow = await session.get(WorkflowModel, "wf_retry")
+            assert workflow is not None
+            workflow.workflow_definition = {"blocks": [], "parameters": []}
+            await session.delete(attempt)
+        await session.commit()
+
+    monkeypatch.setattr(background_task_executor_module, "initialize_skyvern_state_file", AsyncMock())
+    monkeypatch.setattr(background_task_executor_module, "prepare_org_llm_runtime", AsyncMock())
+    initializer = "prepare_org_llm_runtime" if scenario == "llm_runtime" else "initialize_skyvern_state_file"
+    error = RuntimeError(f"{initializer} unavailable")
     monkeypatch.setattr(
-        app.DATABASE.workflow_runs,
-        "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(sequential_credential_id=None, status=WorkflowRunStatus.created)),
+        background_task_executor_module,
+        initializer,
+        AsyncMock(side_effect=[error, None] if scenario == "transient_recovers" else error),
     )
-    monkeypatch.setattr(app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    execute = AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "execute_workflow_with_retries", execute)
+    fail_run = AsyncMock(wraps=app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", fail_run)
+    webhook = AsyncMock(wraps=app.WORKFLOW_SERVICE.execute_workflow_webhook)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "execute_workflow_webhook", webhook)
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "deliver_prepared_workflow_webhook", deliver)
+    if scenario == "webhook_preparation":
+        monkeypatch.setattr(
+            app.WORKFLOW_SERVICE, "prepare_workflow_webhook", AsyncMock(side_effect=RuntimeError("preparation failed"))
+        )
+    executor = BackgroundTaskExecutor()
+    executor._schedule = MagicMock()  # type: ignore[method-assign]
+    organization = await database.organizations.get_organization("org_test")
+    assert organization is not None
+    await executor.execute_workflow(
+        request=None,
+        background_tasks=None,
+        organization=organization,
+        workflow_id="wf_retry",
+        workflow_run_id="wr_retry",
+        workflow_permanent_id="wpid_retry",
+        max_steps_override=None,
+        api_key="test-dispatch-key",
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
+    )
+    _background_tasks, dispatch, attempt, execution_kwargs = executor._schedule.call_args.args
+    execution_kwargs["need_call_webhook"] = need_call_webhook
+    get_attempts = database.workflow_run_attempts.get_attempts
+    if scenario == "lookup_failure":
+        monkeypatch.setattr(
+            database.workflow_run_attempts, "get_attempts", AsyncMock(side_effect=RuntimeError("db down"))
+        )
+    await dispatch(attempt, execution_kwargs)
+    execute.assert_not_awaited()
+    run = await database.workflow_runs.get_workflow_run("wr_retry")
+    assert run is not None
+    assert run.started_at is None
+    key = ("wr_retry", 1)
+    assert run.status == WorkflowRunStatus.queued
+    assert run.failure_reason is None
+    fail_run.assert_not_awaited()
+    webhook.assert_not_awaited()
+    assert key in executor._retry_dispatches_needing_recovery
+    assert key in executor._retry_resumes_needing_recovery
+    assert executor._initializer_failures[key] == 1
+
+    dispatches = 2 if scenario == "transient_recovers" else background_task_executor_module.INITIALIZER_FAILURE_BUDGET
+    for dispatch_number in range(2, dispatches + 1):
+        executor._schedule.reset_mock()
+        await executor._recover_pending_retries_once(resume_fresh=True)
+        executor._schedule.assert_called_once()
+        background_tasks, resume, resume_attempt = executor._schedule.call_args.args
+        assert background_tasks is None
+        assert resume == executor._resume_pending_retry
+        assert resume_attempt == attempt
+        await resume(resume_attempt)
+        if dispatch_number < dispatches:
+            run = await database.workflow_runs.get_workflow_run("wr_retry")
+            assert run is not None
+            assert run.status == WorkflowRunStatus.queued
+            assert run.failure_reason is None
+            fail_run.assert_not_awaited()
+            webhook.assert_not_awaited()
+            execute.assert_not_awaited()
+            assert key in executor._retry_dispatches_needing_recovery
+            assert key in executor._retry_resumes_needing_recovery
+            assert executor._initializer_failures[key] == dispatch_number
+
+    run = await database.workflow_runs.get_workflow_run("wr_retry")
+    assert run is not None
+    assert run.started_at is None
+    attempts = await get_attempts("wr_retry")
+    if scenario in {"lookup_failure", "attempt_row"}:
+        assert run.status == WorkflowRunStatus.queued
+        assert run.failure_reason is None
+        fail_run.assert_not_awaited()
+        webhook.assert_not_awaited()
+        assert key in executor._retry_dispatches_needing_recovery
+        assert key in executor._retry_resumes_needing_recovery
+        assert executor._initializer_failures[key] == background_task_executor_module.INITIALIZER_FAILURE_BUDGET
+        execute.assert_not_awaited()
+        if scenario == "attempt_row":
+            assert len(attempts) == 1
+            assert attempts[0].status == "queued"
+            assert attempts[0].started_at is None
+        else:
+            assert not attempts
+    elif scenario == "transient_recovers":
+        execute.assert_awaited_once()
+        assert run.status == WorkflowRunStatus.queued
+        assert run.failure_reason is None
+        fail_run.assert_not_awaited()
+        webhook.assert_not_awaited()
+        assert not attempts
+        assert not executor._retry_dispatches_needing_recovery
+        assert not executor._retry_resumes_needing_recovery
+        assert key not in executor._initializer_failures
+    else:
+        assert run.status == WorkflowRunStatus.failed
+        reason = f"Workflow run initialization failed before execution: RuntimeError: {error}"
+        assert run.failure_reason == reason
+        fail_run.assert_awaited_once_with(workflow_run_id="wr_retry", failure_reason=reason, cascade_children=False)
+        if need_call_webhook:
+            webhook.assert_awaited_once_with(run, api_key="test-dispatch-key", claim_kind=None)
+        else:
+            webhook.assert_not_awaited()
+        assert not attempts
+        assert not executor._retry_dispatches_needing_recovery
+        assert not executor._retry_resumes_needing_recovery
+        assert key not in executor._initializer_failures
+        executor._schedule.reset_mock()
+        await executor._recover_pending_retries_once(resume_fresh=True)
+        executor._schedule.assert_not_called()
+        execute.assert_not_awaited()
+    if need_call_webhook and scenario in {"state_file", "llm_runtime"}:
+        deliver.assert_awaited_once()
+    else:
+        deliver.assert_not_awaited()
+    if app.WORKFLOW_SERVICE._background_tasks:
+        await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "duplicate",
+        "terminal_reread",
+        "foreign_terminal",
+        "nonfinal_reread",
+        "reread_failure",
+        "missing_reread",
+        "delivery_failure",
+    ],
+)
+async def test_fail_run_without_attempt_row_finalization_outcomes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, scenario: str
+) -> None:
+    run = SimpleNamespace(
+        workflow_run_id="wr_test", status=WorkflowRunStatus.failed, failure_reason="initialization failed"
+    )
+    finalization_error = RuntimeError("finalization failed")
+    fail_run = AsyncMock(return_value=run)
+    reread = AsyncMock(return_value=run)
+    webhook = AsyncMock()
+    if scenario == "duplicate":
+        fail_run.return_value = None
+    elif scenario == "delivery_failure":
+        webhook.side_effect = RuntimeError("delivery failed")
+    else:
+        fail_run.side_effect = finalization_error
+        if scenario == "nonfinal_reread":
+            run.status = WorkflowRunStatus.queued
+        elif scenario == "foreign_terminal":
+            run.status = WorkflowRunStatus.canceled
+        elif scenario == "reread_failure":
+            reread.side_effect = RuntimeError("re-read failed")
+        elif scenario == "missing_reread":
+            reread.return_value = None
+    get_attempts = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        retry_policy_module,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                workflow_run_attempts=SimpleNamespace(get_attempts=get_attempts),
+                workflow_runs=SimpleNamespace(get_workflow_run=reread),
+            ),
+            WORKFLOW_SERVICE=SimpleNamespace(
+                mark_workflow_run_as_failed_if_not_final=fail_run,
+                execute_workflow_webhook=webhook,
+            ),
+        ),
+    )
+    if scenario in {"nonfinal_reread", "reread_failure"}:
+        with pytest.raises(RuntimeError) as exc_info:
+            await retry_policy_module.fail_run_without_attempt_row("wr_test", "initialization failed")
+        assert exc_info.value is finalization_error
+        if scenario == "reread_failure":
+            assert exc_info.value.__context__ is reread.side_effect
+    else:
+        assert await retry_policy_module.fail_run_without_attempt_row("wr_test", "initialization failed") is True
+    get_attempts.assert_awaited_once_with("wr_test")
+    fail_run.assert_awaited_once_with(
+        workflow_run_id="wr_test", failure_reason="initialization failed", cascade_children=False
+    )
+    if scenario in {"duplicate", "delivery_failure"}:
+        reread.assert_not_awaited()
+    else:
+        reread.assert_awaited_once_with("wr_test")
+    if scenario in {"terminal_reread", "delivery_failure"}:
+        webhook.assert_awaited_once_with(run, api_key=None, claim_kind=None)
+    else:
+        webhook.assert_not_awaited()
+    if scenario == "reread_failure":
+        assert "leaving the run recoverable" in caplog.text
+    elif scenario == "delivery_failure":
+        assert "Failed to deliver workflow webhook after initialization failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_dispatch_initializer_failure_is_retried_by_the_sweep(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    organization = SimpleNamespace(organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_test",
+                    organization_id="org_test",
+                    workflow_id="wf_test",
+                    workflow_permanent_id="wpid_test",
+                    status="created",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_test", organization_id="org_test", attempt_number=1, status="created"
+                ),
+            ]
+        )
+        await session.commit()
     initializer_calls = 0
 
     async def flaky_initialize(**kwargs: object) -> None:
@@ -3446,19 +3706,63 @@ async def test_scheduled_task_is_retained_until_done() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_fails_closed_for_stamped_sequential_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "delivery_case",
+    [
+        "no_attempt_rows",
+        "attempt_rows",
+        "webhook_error",
+        "lookup_failure",
+        "lookup_failure_twice",
+        "helper_lookup_failure",
+        "helper_lookup_failure_already_final",
+        "row_appears",
+    ],
+)
+async def test_execute_workflow_fails_closed_for_stamped_sequential_credential(
+    monkeypatch: pytest.MonkeyPatch, delivery_case: str, caplog: pytest.LogCaptureFixture
+) -> None:
     workflow_run = SimpleNamespace(sequential_credential_id="cred_sequential", browser_session_id=None)
+    terminal_run = SimpleNamespace(
+        status=WorkflowRunStatus.failed,
+        failure_reason="Sequential credential execution is unavailable in the background executor",
+        finished_at=datetime.now(UTC),
+    )
+    get_run = AsyncMock(side_effect=[workflow_run, terminal_run])
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=workflow_run),
+        get_run,
     )
-    mark_failed = AsyncMock()
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_attempts,
+        "get_attempts",
+        AsyncMock(
+            return_value=[SimpleNamespace(attempt_number=1)] if delivery_case == "attempt_rows" else [],
+            side_effect={
+                "lookup_failure": [RuntimeError("db down"), []],
+                "lookup_failure_twice": [RuntimeError("db down"), RuntimeError("db down")],
+                "helper_lookup_failure": [[], RuntimeError("db down")],
+                "helper_lookup_failure_already_final": [[], RuntimeError("db down")],
+                "row_appears": [[], [SimpleNamespace(attempt_number=1)]],
+            }.get(delivery_case),
+        ),
+    )
+    mark_failed = AsyncMock(
+        return_value=None if delivery_case == "helper_lookup_failure_already_final" else terminal_run
+    )
     monkeypatch.setattr(app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    decision = RetryDecision(False, 1, 0, True, "sequential_credential_unsupported")
+    finalize = AsyncMock(return_value=decision)
+    monkeypatch.setattr(background_task_executor_module, "finalize_abandoned_attempt", finalize)
+    release = AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "_run_terminal_side_effects_with_retries", release)
+    webhook = AsyncMock(side_effect=RuntimeError("delivery failed") if delivery_case == "webhook_error" else None)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "execute_workflow_webhook", webhook)
     executor = BackgroundTaskExecutor()
     executor._schedule = MagicMock()  # type: ignore[method-assign]
 
-    with pytest.raises(SkyvernException, match="background executor"):
+    with pytest.raises(BackgroundSequentialCredentialUnsupported, match="background executor"):
         await executor.execute_workflow(
             request=None,
             background_tasks=None,
@@ -3467,16 +3771,44 @@ async def test_execute_workflow_fails_closed_for_stamped_sequential_credential(m
             workflow_run_id="wr_test",
             workflow_permanent_id="wpid_test",
             max_steps_override=None,
-            api_key=None,
+            api_key="test-api-key",
             browser_session_id=None,
             block_labels=None,
             block_outputs=None,
         )
 
     executor._schedule.assert_not_called()
-    mark_failed.assert_awaited_once()
-    assert mark_failed.await_args.kwargs["workflow_run_id"] == "wr_test"
-    assert mark_failed.await_args.kwargs["cascade_children"] is True
+    mark_failed.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        failure_reason=(
+            "Sequential credential execution is unavailable in the background executor; "
+            "the run failed closed before execution."
+        ),
+        cascade_children=True,
+    )
+    if delivery_case in {"attempt_rows", "row_appears"}:
+        get_run.assert_awaited_with(workflow_run_id="wr_test", organization_id="org_test")
+        finalize.assert_awaited_once_with(
+            workflow_run_id="wr_test",
+            organization_id="org_test",
+            reason="sequential_credential_unsupported",
+            status=terminal_run.status,
+            failure_reason=terminal_run.failure_reason,
+            finished_at=terminal_run.finished_at,
+        )
+        release.assert_awaited_once_with(terminal_run, decision, api_key="test-api-key")
+        webhook.assert_not_awaited()
+    else:
+        if delivery_case in {"lookup_failure_twice", "helper_lookup_failure_already_final"}:
+            webhook.assert_not_awaited()
+        else:
+            webhook.assert_awaited_once_with(terminal_run, api_key="test-api-key", claim_kind=None)
+        release.assert_not_awaited()
+        finalize.assert_not_awaited()
+    if delivery_case in {"lookup_failure_twice", "helper_lookup_failure", "helper_lookup_failure_already_final"}:
+        assert (
+            "Failed to fail the rejected run through the attempt-less path; writing the failure directly" in caplog.text
+        )
 
 
 @pytest.mark.asyncio
@@ -4073,3 +4405,60 @@ async def test_late_owner_failure_leaves_a_recorded_retry_to_the_next_sweep(
     else:
         scheduled.assert_not_called()
         assert key not in executor._retry_resumes_needing_recovery
+
+
+def test_background_task_set_is_isolated_across_event_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fire-and-forget task scheduled by one WorkflowService under one event loop must never
+    surface in a freshly built WorkflowService bound to a different loop. When it does, draining
+    the later service gathers a future from loop A and raises
+    ``ValueError: The future belongs to a different loop`` — the shard-2 CI failure this repairs.
+    Loop A stays open with its task pending through the ownership assertion; the finally cancels
+    and awaits that task on loop A so nothing is destroyed while pending.
+    """
+    loop_a = asyncio.new_event_loop()
+    loop_b = asyncio.new_event_loop()
+    stale_future = loop_a.create_future()
+
+    async def block_until_released(**_: object) -> None:
+        await stale_future
+
+    async def schedule_pending_task() -> WorkflowService:
+        svc = WorkflowService()
+        monkeypatch.setattr(
+            WorkflowService,
+            "_record_workflow_run_metadata_best_effort",
+            staticmethod(block_until_released),
+        )
+        svc._record_workflow_run_metadata_in_background(
+            workflow_run_id="wr_loop_a",
+            organization_id="org_loop_a",
+            run_metadata={"env": "prod"},
+        )
+        return svc
+
+    svc_a = loop_a.run_until_complete(schedule_pending_task())
+    leaked = set(svc_a._background_tasks)
+
+    try:
+        assert leaked, "expected a pending fire-and-forget task on loop A"
+
+        # Loop A is still open and its task still pending. A freshly built service (as the autouse
+        # fixture builds one per test) must not observe loop A's task; when it does, draining its
+        # own set under loop B gathers loop A's future and raises the cross-loop ValueError from CI.
+        svc_b = WorkflowService()
+        assert set(svc_b._background_tasks).isdisjoint(leaked)
+
+        async def drain() -> None:
+            await asyncio.gather(*svc_b._background_tasks)
+
+        loop_b.run_until_complete(drain())
+    finally:
+
+        async def cancel_leaked() -> None:
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
+
+        loop_a.run_until_complete(cancel_leaked())
+        loop_a.close()
+        loop_b.close()

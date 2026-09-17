@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock
+from urllib.parse import urlparse
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, Route, async_playwright
+from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -17,6 +23,11 @@ from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 from tests.unit.conftest import ScopeRecordingAgentFunction
+
+CHALLENGE_URL = (
+    "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2/av0/fake?sitekey=0xTESTKEY"
+)
+CHALLENGE_SUBDOMAIN_URL = "https://edge.challenges.cloudflare.com/cdn-cgi/challenge-platform/fake"
 
 
 class FakeLocator:
@@ -78,11 +89,21 @@ class FakeLocator:
 
 
 class FakeFrameElement:
-    def __init__(self, *, visible: bool) -> None:
+    def __init__(self, *, visible: bool, src: str | None = None, box: dict[str, float] | None = None) -> None:
         self._visible = visible
+        self._src = src
+        self._box = box if box is not None else {"x": 0.0, "y": 100.0, "width": 300.0, "height": 65.0}
+        self.get_attribute_calls: list[str] = []
 
     async def is_visible(self) -> bool:
         return self._visible
+
+    async def bounding_box(self) -> dict[str, float]:
+        return self._box
+
+    async def get_attribute(self, name: str) -> str | None:
+        self.get_attribute_calls.append(name)
+        return self._src if name == "src" else None
 
 
 class FakeFrame:
@@ -96,6 +117,8 @@ class FakeFrame:
         nested_marker: FakeLocator | None = None,
         is_hcaptcha_marker: bool = False,
         visible: bool = True,
+        src: str | None = None,
+        box: dict[str, float] | None = None,
     ) -> None:
         self.url = url
         self.anchor = anchor or FakeLocator(count=0)
@@ -103,7 +126,7 @@ class FakeFrame:
         self.detached = detached
         self.nested_marker = nested_marker or FakeLocator(count=0)
         self.is_hcaptcha_marker = is_hcaptcha_marker
-        self._element = FakeFrameElement(visible=visible)
+        self.element = FakeFrameElement(visible=visible, src=src, box=box)
 
     def locator(self, selector: str) -> FakeLocator:
         if selector == "#recaptcha-anchor":
@@ -118,7 +141,7 @@ class FakeFrame:
         return self.detached
 
     async def frame_element(self) -> FakeFrameElement:
-        return self._element
+        return self.element
 
 
 class FakePage:
@@ -187,6 +210,7 @@ async def test_real_sandbox_solve_captcha_is_fast_noop_without_challenge(monkeyp
 
     await fn()
 
+    assert await solve_challenge_ladder(FakePage()) is False
     agent_function.auto_solve_captchas.assert_not_awaited()
     agent_function.solve_recaptcha_token.assert_not_awaited()
 
@@ -1065,8 +1089,8 @@ async def test_a_challenge_frame_behind_wedged_frames_is_still_found(monkeypatch
 
 @pytest.mark.asyncio
 async def test_child_frames_are_not_probed_unless_the_caller_opts_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The code-block builtin keeps the main-document-only presence check; only an opted-in caller
-    # (the Task V3 solve_captcha tool) reaches a challenge nested in a child frame.
+    # The default path only reads child frames' URLs; probing their documents for markers stays opt-in
+    # (the Task V3 solve_captcha tool), so a marker nested in a non-challenge-host frame reads absent.
     agent_function = type(
         "AgentFunctionStub",
         (AgentFunction,),
@@ -1268,3 +1292,296 @@ async def test_ladder_anchor_completion_gate_runs_inside_scope(
 
     assert await solve_challenge_ladder(page) is True
     assert agent_function.events == expected_events
+
+
+def _has_playwright_browser() -> bool:
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_skip_no_browser = pytest.mark.skipif(
+    not _has_playwright_browser(),
+    reason="Requires Playwright browsers installed (run: playwright install chromium)",
+)
+
+_AUTO_RENDER_TURNSTILE_HTML = f"""<!DOCTYPE html>
+<html><body>
+  <form><input id="email" type="email" /><button type="submit">Submit</button></form>
+  <div class="cf-turnstile" data-sitekey="0xTESTKEY">
+    <iframe src="{CHALLENGE_URL}" style="width:300px;height:65px"></iframe>
+  </div>
+</body></html>
+"""
+
+_CLOSED_SHADOW_TURNSTILE_HTML = f"""<!DOCTYPE html>
+<html><body>
+  <form><input id="email" type="email" /><button type="submit">Submit</button></form>
+  <div id="widget-host"></div>
+  <script>
+    const root = document.getElementById("widget-host").attachShadow({{mode: "closed"}});
+    const f = document.createElement("iframe");
+    f.src = "{CHALLENGE_URL}";
+    f.style.width = "300px";
+    f.style.height = "65px";
+    root.appendChild(f);
+  </script>
+</body></html>
+"""
+
+
+async def _fulfill_challenge(route: Route) -> None:
+    await route.fulfill(status=200, content_type="text/html", body="<html><body>Verify you are human</body></html>")
+
+
+@asynccontextmanager
+async def _challenge_browser_page(html: str) -> AsyncIterator[Page]:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+            await context.route("https://challenges.cloudflare.com/**", _fulfill_challenge)
+            page = await context.new_page()
+            await page.set_content(html, wait_until="load")
+            assert any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames), (
+                "challenge frame did not commit"
+            )
+            yield page
+        finally:
+            await browser.close()
+
+
+def _stub_solver_agent() -> AgentFunction:
+    return type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_auto_render_turnstile_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_AUTO_RENDER_TURNSTILE_HTML) as page:
+        assert await solve_challenge_ladder(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_closed_shadow_root_turnstile_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A Turnstile mounted under a closed shadow root is unreachable by CSS locators; only page.frames sees it.
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_CLOSED_SHADOW_TURNSTILE_HTML) as page:
+        assert await page.locator(captcha_solver_module._CAPTCHA_MARKER_SELECTOR).count() == 0
+        assert await page.locator(captcha_solver_module._CAPTCHA_CHECKBOX_SELECTOR).count() == 0
+
+        assert await solve_challenge_ladder(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_child_frames", [False, True])
+@pytest.mark.parametrize("frame_url", [CHALLENGE_URL, CHALLENGE_SUBDOMAIN_URL])
+async def test_visible_cloudflare_challenge_frame_reaches_extension_arm(
+    monkeypatch: pytest.MonkeyPatch, probe_child_frames: bool, frame_url: str
+) -> None:
+    """A Turnstile widget can mount where no CSS locator reaches it, so a visible frame on the challenge
+    host is itself the presence signal, for both callers."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[FakeFrame(url=frame_url, visible=True)])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=probe_child_frames) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_builtin_reaches_extension_arm_for_a_visible_cloudflare_challenge_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[FakeFrame(url=CHALLENGE_URL, visible=True)])
+
+    assert await block_module._code_block_solve_captcha_builtin(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame_url", "visible", "box"),
+    [
+        ("https://evil.example.com/?next=challenges.cloudflare.com", True, None),
+        ("https://challenges.cloudflare.com.evil.example/", True, None),
+        (CHALLENGE_URL, False, None),
+        (CHALLENGE_URL, True, {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}),
+        (CHALLENGE_URL, True, {"x": -9999.0, "y": 0.0, "width": 300.0, "height": 65.0}),
+    ],
+)
+async def test_decoy_and_hidden_cloudflare_frames_stay_absent(
+    monkeypatch: pytest.MonkeyPatch, frame_url: str, visible: bool, box: dict[str, float] | None
+) -> None:
+    """The host must be matched on the parsed hostname, and Turnstile's hidden helper frames, its
+    invisible-mode 1x1 frame, and a frame parked off-screen sit on the real host, so those must keep
+    reading absent."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[FakeFrame(url=frame_url, visible=visible, box=box)])
+
+    assert await solve_challenge_ladder(page) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("frame_x", "present"), [(100.0, True), (5000.0, False)])
+async def test_challenge_frame_is_judged_on_screen_when_the_page_reports_no_viewport(
+    monkeypatch: pytest.MonkeyPatch, frame_x: float, present: bool
+) -> None:
+    """A display-fitted browser context reports no viewport size, so the configured browser size stands in."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(
+        frames=[
+            FakeFrame(url=CHALLENGE_URL, visible=True, box={"x": frame_x, "y": 0.0, "width": 300.0, "height": 65.0})
+        ]
+    )
+    page.viewport_size = None
+
+    assert await solve_challenge_ladder(page) is present
+
+
+@pytest.mark.asyncio
+async def test_an_uncommitted_challenge_frame_matches_on_its_iframe_src(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cross-origin challenge frame reports an empty URL until its navigation commits, while the iframe
+    element's src already names the challenge host."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[FakeFrame(url="", src=CHALLENGE_URL, visible=True)])
+
+    assert await solve_challenge_ladder(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "src",
+    [
+        "https://evil.example.com/?next=challenges.cloudflare.com",
+        "https://challenges.cloudflare.com.evil.example/",
+    ],
+)
+async def test_an_uncommitted_frame_with_a_decoy_src_stays_absent(monkeypatch: pytest.MonkeyPatch, src: str) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[FakeFrame(url="about:blank", src=src, visible=True)])
+
+    assert await solve_challenge_ladder(page) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_uncommitted_frame_with_a_foreign_src_is_still_selector_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The src probe must not short-circuit an uncommitted frame out of the marker scan it would otherwise
+    get."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    frame = FakeFrame(
+        url="about:blank", src="https://cdn.example/widget", nested_marker=FakeLocator(count=1), visible=True
+    )
+    page = FakePage(frames=[frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True
+
+
+@pytest.mark.asyncio
+async def test_a_committed_non_challenge_frame_is_never_probed_for_its_src(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading the src attribute is a round trip per frame; only frames with no committed URL may pay it."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    frame = FakeFrame(url="https://app.example/embed", nested_marker=FakeLocator(count=1), visible=True)
+    page = FakePage(frames=[frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True
+    assert frame.element.get_attribute_calls == []
+
+
+class _DetachedChallengeFrame(_DetachedFrame):
+    url = CHALLENGE_URL
+
+
+@pytest.mark.asyncio
+async def test_a_raising_challenge_frame_does_not_hide_a_visible_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(frames=[_DetachedChallengeFrame(), FakeFrame(url=CHALLENGE_URL, visible=True)])  # type: ignore[list-item]
+
+    assert await solve_challenge_ladder(page) is True
+
+
+class _WedgedChallengeFrame(_WedgedFrame):
+    url = CHALLENGE_URL
+
+
+@pytest.mark.asyncio
+async def test_wedged_challenge_frames_are_bounded_on_the_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.3)
+    page = FakePage(frames=[_WedgedChallengeFrame() for _ in range(5)])
+
+    started = time.monotonic()
+    assert await solve_challenge_ladder(page) is False
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_opted_in_absent_path_runs_one_frame_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two composed scans (challenge-host frames, then markers) would each spend the whole budget.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.3)
+    page = FakePage(frames=[_WedgedChallengeFrame()])
+
+    started = time.monotonic()
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_visible_challenge_frame_keeps_the_turnstile_extension_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Turnstile page must not inherit the hCaptcha image-challenge bound: it would hold a failing
+    extension arm open for a minute and a half."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    resolve_calls: list[float] = []
+    monkeypatch.setattr(
+        agent_function,
+        "resolve_captcha_solver_extension_timeout",
+        lambda _page, default_timeout: resolve_calls.append(default_timeout) or default_timeout,
+    )
+    page = FakePage(frames=[FakeFrame(url=CHALLENGE_URL, visible=True)])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True
+    assert resolve_calls == [captcha_solver_module._EXTENSION_ARM_TIMEOUT_SECONDS]

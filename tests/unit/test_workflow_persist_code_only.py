@@ -465,13 +465,20 @@ async def test_workflow_create_code_only_false_preserves_yaml_bytes(
     format_name: str,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch)
-    # prompt and steps supplied explicitly: omitted values are now defaulted/derived (new code
-    # block experience), which intentionally rewrites the definition.
+    # prompt and steps supplied as the code already derives them: omitted or stale values are
+    # defaulted/rebuilt (new code block experience), which intentionally rewrites the definition.
     definition = _workflow_definition(
         [
             _code_block(
                 prompt="",
-                steps=[{"description": "Open the page", "action_type": "goto_url", "line_start": 1, "line_end": 1}],
+                steps=[
+                    {
+                        "description": "Open https://example.com",
+                        "action_type": "goto_url",
+                        "line_start": 1,
+                        "line_end": 1,
+                    }
+                ],
             )
         ],
         proxy_location="RESIDENTIAL",

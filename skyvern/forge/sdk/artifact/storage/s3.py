@@ -936,7 +936,9 @@ class S3Storage(BaseStorage):
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)
 
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         # Artifact-first: when a run has DOWNLOAD artifact rows, return them as
         # the source of truth — the row carries enough to build a short signed
         # /v1/artifacts/{id}/content URL plus the SHA-256 we persisted at save
@@ -957,7 +959,9 @@ class S3Storage(BaseStorage):
             )
             if not rows_lookup_failed:
                 download_row_count = len(download_artifacts)
-            download_artifacts = dedupe_run_scoped_download_artifacts(download_artifacts)
+            download_artifacts = dedupe_run_scoped_download_artifacts(
+                download_artifacts, attempt_started_at=attempt_started_at
+            )
             if download_artifacts:
                 file_infos = await _file_infos_from_download_artifacts(download_artifacts)
                 if not file_infos:
