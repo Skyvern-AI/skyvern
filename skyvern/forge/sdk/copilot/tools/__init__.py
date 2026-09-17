@@ -981,10 +981,12 @@ async def run_blocks_tool(
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    # No definition change on this path, so the frontier never reaches the edit-in-place branch
-    # and a live page read would be spent on nothing.
     labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
-        copilot_ctx, block_labels, prior_definition, prior_definition
+        copilot_ctx,
+        block_labels,
+        prior_definition,
+        prior_definition,
+        await _frontier_runtime_page_url(copilot_ctx),
     )
     copilot_ctx.frontier_start_provenance = start_provenance
     with copilot_span(

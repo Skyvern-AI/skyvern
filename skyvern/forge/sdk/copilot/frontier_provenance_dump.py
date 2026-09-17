@@ -4,7 +4,8 @@ Enabled by ``COPILOT_DUMP_FRONTIER_PROVENANCE=<directory>``; see
 ``dev_scripts/replay_frontier_provenance.py`` for the replayer that consumes these packets.
 
 Local development only. Packets carry unredacted workflow definitions and extracted block
-outputs, so setting this anywhere real writes customer data to disk.
+outputs, so setting this anywhere real writes customer data to disk. A credential-bearing run
+keeps its browser position, so the block end URLs here can include post-login pages.
 """
 
 from __future__ import annotations

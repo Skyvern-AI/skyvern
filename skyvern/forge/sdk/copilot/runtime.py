@@ -462,6 +462,10 @@ class AgentContext:
     # Set by the planner when it proved a resume against the browser above; the next run is
     # threaded into that browser instead of the chat's. Consumed and cleared by that run.
     frontier_resume_session_id: str | None = None
+    # Set by the planner for a mid-workflow start it cannot bind to a browser: its verified prefix
+    # cannot be resumed, the stored order is not the run order, or it refills credentials. The
+    # chat's browser is not a safe target for any of those. Consumed and cleared by that run.
+    frontier_requires_own_browser: bool = False
     # Where the planned run starts from, stamped once per plan and consumed by that run. Only a
     # non-``unanchored`` start can credit its labels as composition-verified.
     frontier_start_provenance: FrontierStartProvenance | None = None
