@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -27,6 +28,7 @@ from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
@@ -196,6 +198,25 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     yield
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+@pytest.fixture(autouse=True)
+def reset_cli_runtime_entry() -> Iterator[None]:
+    """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
+
+    Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
+    against the default production URL in any later test that builds a cloud client. The env
+    load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
+    """
+    entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
+    yield
+    cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    for name, value in loaded.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)
