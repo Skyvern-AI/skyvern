@@ -336,6 +336,12 @@ def _workflow_definition_block_labels(workflow_definition: object | None) -> lis
     return labels
 
 
+def _executable_workflow_block_labels(workflow_definition: object | None) -> list[str]:
+    """Block labels in traversal order. The finally block runs outside it, so it is never the head."""
+    finally_label = getattr(workflow_definition, "finally_block_label", None)
+    return [label for label in _workflow_definition_block_labels(workflow_definition) if label != finally_label]
+
+
 def _current_workflow_block_labels(ctx: object) -> list[str]:
     workflow = getattr(ctx, "last_workflow", None)
     labels = _workflow_definition_block_labels(getattr(workflow, "workflow_definition", None))
@@ -418,13 +424,33 @@ def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
 
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
-    labels = _current_workflow_block_labels(ctx)
+    labels = _current_executable_workflow_block_labels(ctx)
     verified = set(getattr(ctx, "verified_prefix_labels", []) or [])
     return [label for label in labels if label not in verified]
 
 
-def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+def _current_finally_block_label(ctx: object) -> str | None:
+    """The finally block of the workflow in context, from whichever source its labels came from."""
+    definition = getattr(getattr(ctx, "last_workflow", None), "workflow_definition", None)
+    finally_label = getattr(definition, "finally_block_label", None)
+    if isinstance(finally_label, str) and finally_label:
+        return finally_label
+    # Labels fall back to the YAML when no model object is loaded yet, so this has to as well;
+    # reading only the model would leave the fallback treating the finally block as body work.
+    parsed = _parse_workflow_definition(getattr(ctx, "last_workflow_yaml", None))
+    yaml_label = parsed.get("finally_block_label") if parsed else None
+    return yaml_label if isinstance(yaml_label, str) and yaml_label else None
+
+
+def _current_executable_workflow_block_labels(ctx: object) -> list[str]:
+    """Traversal order for the workflow in context; the finally block runs outside it."""
+    finally_label = _current_finally_block_label(ctx)
     labels = _current_workflow_block_labels(ctx)
+    return [label for label in labels if label != finally_label] if finally_label else labels
+
+
+def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_executable_workflow_block_labels(ctx)
     verified = set(getattr(ctx, "composition_verified_labels", []) or [])
     return [label for label in labels if label not in verified]
 
@@ -542,6 +568,22 @@ def _raw_yaml_proxy_location(workflow_yaml: str) -> tuple[bool, Any]:
     if not isinstance(parsed_yaml, dict) or "proxy_location" not in parsed_yaml:
         return False, None
     return True, _proxy_location_trace_value(parsed_yaml.get("proxy_location"))
+
+
+def _parse_workflow_definition(yaml_str: str | None) -> dict[str, Any] | None:
+    """``workflow_definition`` as a plain dict, or None when the YAML cannot supply one."""
+    # The loader treats anything that is not a string as a stream and reads until it gets an empty
+    # chunk, so a non-string that never runs dry (a mocked context attribute) would never return.
+    if not isinstance(yaml_str, str) or not yaml_str:
+        return None
+    try:
+        parsed = safe_load_no_dates(yaml_str)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    return definition if isinstance(definition, dict) else None
 
 
 def _parse_workflow_blocks(yaml_str: str | None) -> list[Any] | None:

@@ -85,10 +85,6 @@ from skyvern.forge.sdk.copilot.code_block_security import (
     CodeBlockSecurityInput,
     runtime_code_security_errors,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    code_contains_credential_fill,
-    trajectory_has_credential_fill,
-)
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -169,6 +165,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     register_sensitive_origin_run_lease,
     release_sensitive_origin_run_lease,
     resolve_persistent_browser_state,
+    sensitive_origin_page_is_tainted,
+    sensitive_origin_runs_for_session,
     verify_build_test_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -191,6 +189,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_matching_origin_run_redaction_values,
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
+    scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -233,7 +232,10 @@ from ._shared import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     _completed_run_block_labels,
     _composition_unverified_current_workflow_labels,
+    _current_executable_workflow_block_labels,
+    _current_finally_block_label,
     _current_workflow_block_labels,
+    _executable_workflow_block_labels,
     _failed_run_block_labels,
     _fallback_page_info,
     _unverified_current_workflow_labels,
@@ -1324,30 +1326,9 @@ async def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> 
     return workflow if _workflow_covers_labels(workflow, labels) else None
 
 
-def _should_use_fresh_session_for_login_first_replay(
-    ctx: AgentContext,
-    labels_to_execute: list[str],
-    workflow: Workflow | None,
-) -> bool:
-    """Fresh session when this run replays a login fill into the scout's authenticated session.
-
-    Keyed on two planes the agent cannot edit between runs — the scout trajectory authenticated
-    via a credential fill and any executed block in this run fills one; frontier re-runs seeded
-    past login carry no credential fill and keep reusing the scout session.
-    """
-    if not trajectory_has_credential_fill(ctx.scout_trajectory):
-        return False
-    return _labels_replay_login_fill(labels_to_execute, workflow)
-
-
-def _labels_replay_login_fill(labels_to_execute: list[str], workflow: Workflow | None) -> bool:
-    if not labels_to_execute or workflow is None:
-        return False
-    code_inputs = _selected_code_security_inputs(
-        _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
-        selected_labels=set(labels_to_execute),
-    )
-    return any(code_contains_credential_fill(code_input.code) for code_input in code_inputs)
+def _run_starts_at_workflow_head(frontier_start_label: str | None, workflow_labels: Sequence[str]) -> bool:
+    """A plan that starts at the first block is the workflow as production runs it: from a blank browser."""
+    return bool(workflow_labels) and frontier_start_label == workflow_labels[0]
 
 
 def _runtime_code_security_failure_for_selected_labels(
@@ -1908,6 +1889,13 @@ def _attach_run_session_facts(
     # A carried resume browser is also not the chat's, so detachment is the honest fact for
     # "can I look at this run's page from here", not whether the session was minted.
     data["run_detached_from_chat"] = run_detached_from_chat
+    if used_fresh_run_session:
+        # Say that the page was blank, so code that needed a signed-in state reads as started
+        # somewhere else rather than as broken, and the next request can bring the blocks it needs.
+        data.setdefault(
+            "browser_start",
+            {"kind": "separate_blank_context", "restored_saved_profile": False, "inherited_browser_state": False},
+        )
     if not isinstance(page_evidence, Mapping):
         return
     data["challenge_stalled_fresh_session"] = (
@@ -2242,8 +2230,12 @@ async def _capture_and_store_post_run_page(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
     if evidence is not None and repair_page_evidence_is_admissible(evidence):
-        if sensitive_origin_run:
-            evidence = scrub_secrets_from_structure(ctx, evidence)
+        # Scrubbing is keyed to the values themselves, not to who ran: a run that fills no
+        # credential can still read a page an earlier run filled one into. It is a no-op when
+        # nothing is registered, so it is unconditional. A frame's pixels cannot be scrubbed, so it
+        # goes whenever the browser carries a sign-in — this run's or one it resumed.
+        evidence = scrub_secrets_from_structure(ctx, evidence)
+        if sensitive_origin_run or _run_browser_carries_a_sign_in(ctx, run_session_id):
             captured_frame = None
         _, preserved_stored_evidence = store_post_run_page_evidence(
             ctx,
@@ -2464,6 +2456,11 @@ async def _capture_dispatched_terminal_page_evidence(
         )
     if evidence is None or not _dispatched_terminal_page_evidence_is_usable(evidence):
         return
+    # Same rule as the inline capture: values are scrubbed whoever ran, and a frame whose pixels
+    # cannot be scrubbed goes whenever the browser carries a sign-in, including one this run resumed.
+    evidence = scrub_secrets_from_structure(ctx, evidence)
+    if _run_browser_carries_a_sign_in(ctx, run_session_id):
+        captured_frame = None
     _, preserved_stored_evidence = store_post_run_page_evidence(
         ctx,
         evidence,
@@ -2728,6 +2725,16 @@ def terminal_ready_for_latch(
     )
 
 
+def _run_browser_carries_a_sign_in(ctx: AgentContext, run_session_id: str | None) -> bool:
+    """Whether the browser a run executed in was signed in by any run, this one or an earlier one."""
+    # Only the run's own browser counts. The chat's browser is usually signed in after scouting, so
+    # asking about it would strip screenshots and locators from every clean run in a separate one.
+    # Taint is recorded and cleared for a session and its runs together, so this loses no coverage.
+    if run_session_id is None:
+        return sensitive_origin_page_is_tainted(ctx)
+    return bool(sensitive_origin_runs_for_session(ctx, run_session_id))
+
+
 def _credit_composition_verified_labels(
     ctx: AgentContext,
     labels_to_execute: list[str],
@@ -2737,9 +2744,14 @@ def _credit_composition_verified_labels(
     and executed exactly the workflow labels following the credit already earned."""
     if start_provenance == "unanchored":
         return
-    workflow_labels = _current_workflow_block_labels(ctx)
+    workflow_labels = _current_executable_workflow_block_labels(ctx)
     if not workflow_labels:
         return
+    # A full run carries the finally block in its label list while the workflow's own order leaves
+    # it out, so comparing the two unfiltered would reject the very run that proves the body.
+    finally_label = _current_finally_block_label(ctx)
+    if finally_label:
+        labels_to_execute = [label for label in labels_to_execute if label != finally_label]
     credited = list(ctx.composition_verified_labels or [])
     # Credit is an ordered contiguous prefix, so a workflow that no longer opens with it has to
     # re-earn the whole chain rather than keep set membership that says nothing about order.
@@ -2775,7 +2787,7 @@ async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool
 
 
 def _with_build_test_acquisition_context(
-    result: dict[str, Any], *, requested_block_labels: Sequence[str], fresh: bool
+    result: dict[str, Any], *, requested_block_labels: Sequence[str]
 ) -> dict[str, Any]:
     data = result.get("data")
     if not isinstance(data, dict):
@@ -2783,7 +2795,8 @@ def _with_build_test_acquisition_context(
         result["data"] = data
     data["requested_block_labels"] = list(requested_block_labels)
     data["executed_block_labels"] = []
-    data["used_fresh_run_session"] = fresh
+    # Nothing was minted when acquisition fails, whichever route was attempted.
+    data["used_fresh_run_session"] = False
     return result
 
 
@@ -2935,7 +2948,9 @@ async def _attach_post_run_browser_enrichment(
             origin_redaction_registry=origin_registry,
         )
 
-    if not sensitive_origin_run:
+    # Ask about the browser this run executed in, not the one the chat holds: a continuation
+    # resuming a detached sign-in browser leaves the chat's session untainted and this one not.
+    if not sensitive_origin_run and not _run_browser_carries_a_sign_in(ctx, run_session_id):
         locator_observations = await _observe_authored_locators(
             ctx,
             run_session_id=run_session_id,
@@ -2966,7 +2981,7 @@ async def _attach_post_run_browser_enrichment(
         )
 
     result_data["current_url"] = current_url
-    result_data["page_title"] = page_title
+    result_data["page_title"] = scrub_secrets_from_text(ctx, page_title)
     if locator_observations is not None:
         result_data["authored_locator_observations"] = locator_observations
     if not dispatch_to_worker and current_url:
@@ -3045,11 +3060,13 @@ async def _run_blocks_and_collect_debug(
     # Read the planner's session choice before any exit path, so a run that bails cannot leave it
     # set for a later run whose frontier was never proven against that browser.
     resume_session_id = None if explicit_blank else ctx.frontier_resume_session_id
+    planner_requires_own_browser = not explicit_blank and ctx.frontier_requires_own_browser
     start_provenance: FrontierStartProvenance = (
         "initial" if explicit_blank else ctx.frontier_start_provenance or "unanchored"
     )
     if not explicit_blank:
         ctx.frontier_resume_session_id = None
+        ctx.frontier_requires_own_browser = False
         ctx.frontier_start_provenance = None
 
     block_labels = params["block_labels"]
@@ -3227,16 +3244,17 @@ async def _run_blocks_and_collect_debug(
         )
 
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
-    if explicit_blank:
-        # Keep the authored profile configured, but never save this diagnostic browser over it.
-        runtime_workflow = runtime_workflow.model_copy(update={"persist_browser_session": False})
-    runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
-        runtime_workflow,
-        ctx,
-        labels_to_execute=labels_to_execute,
-        frontier_start_label=frontier_start_label,
-        block_outputs_to_seed=block_outputs_to_seed,
-    )
+    # The page the verified prefix ended on exists only in the browser the planner named for this
+    # run; a run without one starts from wherever its own browser is, not from that page.
+    runtime_frontier_anchor_url: str | None = None
+    if resume_session_id is not None:
+        runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
+            runtime_workflow,
+            ctx,
+            labels_to_execute=labels_to_execute,
+            frontier_start_label=frontier_start_label,
+            block_outputs_to_seed=block_outputs_to_seed,
+        )
     runtime_frontier_starter_url_seeded = False
 
     user_params: dict[str, Any] = params.get("parameters") or {}
@@ -3279,9 +3297,23 @@ async def _run_blocks_and_collect_debug(
 
     # A resume proven against another browser has to run in that browser; minting or falling back
     # to the chat's would drop the very state the resume was authorised against.
-    use_fresh_session = resume_session_id is None and (
-        force_fresh_session or _should_use_fresh_session_for_login_first_replay(ctx, labels_that_may_execute, workflow)
+    starts_at_workflow_head = _run_starts_at_workflow_head(
+        frontier_start_label, _executable_workflow_block_labels(workflow.workflow_definition)
     )
+    use_fresh_session = resume_session_id is None and (
+        force_fresh_session or planner_requires_own_browser or starts_at_workflow_head
+    )
+    if use_fresh_session and starts_at_workflow_head:
+        # The planner reads a head block that establishes no state as unanchored because it would
+        # meet whatever page authoring left open. A browser minted for this run is that proof.
+        start_provenance = "initial"
+    resumes_a_build_test_browser = resume_session_id is not None and resume_session_id != ctx.browser_session_id
+    if explicit_blank or use_fresh_session or resumes_a_build_test_browser:
+        # Keep the authored profile configured, but never save a build test's browser over it: the
+        # workflow's stored state is the thing that would be replaced, by a browser that exists to
+        # be thrown away. Every route out of the chat's browser is one — minted here, resumed from
+        # a build test that minted it earlier, or the explicitly blank diagnostic run.
+        runtime_workflow = runtime_workflow.model_copy(update={"persist_browser_session": False})
     # Reported as run evidence, so it stays literal: a browser minted for this run. A carried
     # browser is not one, and reporting it as such would misattribute a challenge that stalled.
     used_fresh_run_session = False
@@ -3293,18 +3325,14 @@ async def _run_blocks_and_collect_debug(
     # Without a session, the workflow service launches the browser in-process,
     # which only works in worker pods (cloakbrowser isn't in the API image).
     if use_fresh_session:
-        # The scout authenticated its debug session, so replaying the login-first
-        # synthesized block into it meets a rehydrated authenticated view and the
-        # login fill() waits out its full element timeout. Mint a fresh session for
-        # this run only, then restore the scout's debug session as the context
-        # session so the rest of the turn (scouting, narration, SKY-9328 reuse)
-        # keeps it; the fresh id is threaded into the run calls explicitly.
+        # The chat's browser holds whatever page scouting left open, so a run from the head is
+        # given its own; the chat keeps its session and the minted id is threaded in explicitly.
         debug_session_id = ctx.browser_session_id
         acquisition_ctx = replace(ctx)
         acquisition_ctx.browser_session_id = None
         session_err = await acquire_build_test_browser_session(acquisition_ctx, fresh=True)
         if session_err is not None:
-            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels, fresh=True)
+            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
         run_session_id = acquisition_ctx.browser_session_id
         if explicit_blank and (
             not isinstance(run_session_id, str) or not run_session_id or run_session_id == debug_session_id
@@ -3313,7 +3341,7 @@ async def _run_blocks_and_collect_debug(
         used_fresh_run_session = True
         run_detached_from_chat = True
         LOG.info(
-            "copilot_login_replay_fresh_session_minted",
+            "copilot_build_test_fresh_session_minted",
             labels_to_execute=labels_to_execute,
             frontier_start_label=frontier_start_label,
             run_session_id=run_session_id,
@@ -3337,7 +3365,7 @@ async def _run_blocks_and_collect_debug(
         # unverified session cannot be discovered later and must fail now instead.
         session_err = await acquire_build_test_browser_session(ctx, fresh=False)
         if session_err is not None:
-            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels, fresh=False)
+            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
         run_session_id = ctx.browser_session_id
 
     seeded_runtime_workflow = await _workflow_with_runtime_frontier_starter_url_seed(
@@ -3993,8 +4021,6 @@ async def _run_blocks_and_collect_debug(
 
         solver_attempt = _capture_solver_facts_and_strip_traces(results)
 
-        block_end_urls = {} if sensitive_origin_run else _block_end_urls_by_label(run_block_rows)
-
         result_data: dict[str, Any] = {
             "workflow_run_id": workflow_run.workflow_run_id,
             "workflow_id": snapshot.workflow.workflow_id,
@@ -4010,7 +4036,9 @@ async def _run_blocks_and_collect_debug(
             "failing_code_line": failing_code_line,
             "action_observations": action_observations,
         }
-        if runtime_frontier_anchor_url is not None:
+        # Reported for a plain run, withheld after a credential-bearing one for the same reason
+        # observed_block_end_urls is: a post-login address can carry a token or an account path.
+        if runtime_frontier_anchor_url is not None and not sensitive_origin_run:
             result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
         if runtime_frontier_starter_url_seeded:
             result_data["runtime_frontier_starter_url_seeded"] = True
@@ -4064,7 +4092,10 @@ async def _run_blocks_and_collect_debug(
             and all(result_row.get("status") == "completed" for result_row in results)
         )
         if run_fully_completed and execution.source_is_current(ctx):
-            existing_prefix = list(ctx.verified_prefix_labels or [])
+            # Credit belongs to a browser, not to the workflow. A run given its own browser proves
+            # only what it ran there; blocks proven in the browser this one replaced never touched
+            # it, and keeping them would let a later continuation resume here expecting their state.
+            existing_prefix = [] if used_fresh_run_session else list(ctx.verified_prefix_labels or [])
             existing_set = set(existing_prefix)
             for label in labels_to_execute:
                 if label not in existing_set:
@@ -4118,17 +4149,21 @@ async def _run_blocks_and_collect_debug(
         if run_fully_completed and execution.source_is_current(ctx):
             for label, output in block_outputs_by_label.items():
                 ctx.verified_block_outputs[label] = output
+            # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
+            # browser these pages describe is the one this run used.
+            ctx.verified_prefix_block_end_urls = _block_end_urls_by_label(run_block_rows)
+            ctx.verified_prefix_block_end_session_id = run_session_id
+            # A finally block runs after the body and can move the browser without changing its URL
+            # (a client-side sign-out, say), so a run that executed one cannot say where the browser
+            # ended: leave the position unproven and let the next plan restart from the head.
+            finally_label = snapshot.workflow.workflow_definition.finally_block_label
+            finally_ran = bool(finally_label) and any(row.label == finally_label for row in run_block_rows)
+            ctx.verified_prefix_terminal_label = None if finally_ran or not run_block_rows else run_block_rows[-1].label
+            # The planner compares that position in place and never shows it; only the continuation
+            # URL is seeded into a later run's workflow, so that alone is withheld after a credential run.
             if sensitive_origin_run:
-                # Preserve verified labels and outputs, but never carry browser-position URLs from
-                # a credential-bearing run into a later frontier or model-visible result.
-                _forget_browser_position(ctx)
                 ctx.verified_prefix_current_url = None
             else:
-                # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
-                # browser these pages describe is the one this run used.
-                ctx.verified_prefix_block_end_urls = dict(block_end_urls)
-                ctx.verified_prefix_block_end_session_id = run_session_id
-                ctx.verified_prefix_terminal_label = run_block_rows[-1].label if run_block_rows else None
                 verified_current_url = _valid_runtime_anchor_url(current_url)
                 if verified_current_url is not None:
                     ctx.verified_prefix_current_url = verified_current_url
@@ -4286,7 +4321,7 @@ async def _get_run_results(
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
     locator_observations: list[AuthoredLocatorObservationRow] | None = None
-    if not sensitive_origin_run:
+    if not sensitive_origin_run and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id):
         failed_block_code = _failed_block_code(run_workflow, newest_failed) if run_workflow is not None else None
         locator_observations = await _observe_authored_locators(
             ctx,
@@ -4313,7 +4348,7 @@ async def _get_run_results(
         if not dispatch_to_worker:
             result_data["current_url_live_observed"] = True
         if page_title:
-            result_data["page_title"] = page_title
+            result_data["page_title"] = scrub_secrets_from_text(ctx, page_title)
     if dispatch_to_worker and dispatched_end_url is None:
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
@@ -4978,6 +5013,7 @@ def _record_run_blocks_result(
                 {
                     "trust": trust_snapshot(copilot_ctx),
                     "current_workflow_labels": current_workflow_labels,
+                    "finally_block_label": _current_finally_block_label(copilot_ctx),
                     "unverified": unverified,
                     "composition_unverified": composition_unverified,
                     "planned_block_labels": planned_labels,

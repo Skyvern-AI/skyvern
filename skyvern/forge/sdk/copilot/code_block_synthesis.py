@@ -2938,15 +2938,6 @@ def code_contains_credential_fill(code: str) -> bool:
     return CREDENTIAL_FILL_CODE_PATTERN.search(code) is not None
 
 
-def trajectory_has_credential_fill(trajectory: Sequence[Mapping[str, Any]]) -> bool:
-    for interaction in trajectory:
-        if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        if str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS:
-            return True
-    return False
-
-
 def trajectory_has_browser_fill_interaction(trajectory: Sequence[Mapping[str, Any]]) -> bool:
     for interaction in trajectory:
         tool_name = str(interaction.get("tool_name") or "")
