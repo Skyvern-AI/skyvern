@@ -154,6 +154,14 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 # lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
 TARGET_LABEL_DATA_KEY = "target_label"
 TARGET_KIND_DATA_KEY = "target_kind"
+# The tool-result `data` key a recorded action's outcome rides on: the machine facts about what the
+# call achieved (`requested_url`, `url`, `http_status`, `page_transitioned`, `navigation_dead_end`),
+# carried verbatim to `RoundAction.outcome` for the caller to persist on the action row. Internal to
+# the loop like the two keys above -- never shown to the model, which reads the tool's own content.
+ACTION_OUTCOME_DATA_KEY = "action_outcome"
+# An HTTP status at or above this reached no usable page, so the action row reads as failed even
+# though the tool honestly returned ok (the model still gets the status and decides what to do).
+ACTION_OUTCOME_FAILED_HTTP_STATUS = 400
 # How long a call spent turning an address into a target, before the act. A context variable rather
 # than a field on the result, because the cohort this exists to price is the one where the handler
 # RAISES -- a driver timeout on a resolved target -- and a result the handler never returned cannot
@@ -312,6 +320,14 @@ class RoundAction(NamedTuple):
     # downstream: the loop already read it off the ToolSpec, and a second name list is a second place
     # for a new tool to be missing from.
     billable: bool = False
+    # What the action achieved, as the tool itself reported it (see ACTION_OUTCOME_DATA_KEY): machine
+    # facts only, for the caller to persist alongside the verb. None when the tool reported none --
+    # a call that errored before it reached a page has only its `error` below to offer.
+    outcome: dict[str, Any] | None = None
+    # The tool's own error text when the call failed, which is all a call that never reached a page
+    # can say about itself -- a refusal the engine issued on purpose reads as an unexplained failed
+    # row without it. Model-facing prose, so a caller that persists it must redact and cap it.
+    error: str | None = None
 
 
 # A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
@@ -1072,6 +1088,16 @@ def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
 
 def _is_finish(tool_name: str) -> bool:
     return tool_name == "finish"
+
+
+def _outcome_reports_failure(outcome: dict[str, Any] | None) -> bool:
+    """Whether a tool that returned ok nonetheless reported reaching no usable page. Read off the
+    machine facts the tool exposed (an HTTP status), so the tool never has to adjudicate its own
+    success -- and only the persisted row moves: the model still reads the tool's own ok result."""
+    if not outcome:
+        return False
+    status = outcome.get("http_status")
+    return isinstance(status, int) and status >= ACTION_OUTCOME_FAILED_HTTP_STATUS
 
 
 def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bool:
@@ -3393,21 +3419,25 @@ async def run_agent_tool_loop(
                 ):
                     action_nudges_due.append((tool_name, args, repeat_count))
             if submit_watch is not None and tool_name == "navigate" and result.status == "ok":
-                # Outside the billable/recordable branch on purpose: navigate is neither, so a clear
-                # placed in there never runs. The run left the page; the control it clicked went too.
+                # Outside the billable/recordable branch on purpose: the run left the page and the
+                # control it clicked went too, whatever navigate's spec flags happen to say.
                 submit_watch.clear()
             if spec is not None and (spec.billable or spec.recordable):
                 # Dispatched page actions enter the round with their outcome: a failed billable round
                 # still consumed budget and must persist (else later blocks undercount the run
                 # budget); recordable tools persist for artifact parity without billing/budget.
+                round_outcome = result_data.get(ACTION_OUTCOME_DATA_KEY)
+                round_outcome = round_outcome if isinstance(round_outcome, dict) else None
                 round_actions.append(
                     RoundAction(
                         tool_name,
                         args,
-                        result.status == "ok",
+                        result.status == "ok" and not _outcome_reports_failure(round_outcome),
                         result_data.get(TARGET_LABEL_DATA_KEY) or None,
                         result_data.get(TARGET_KIND_DATA_KEY) or None,
                         spec.billable,
+                        round_outcome,
+                        result.content if result.status == "error" else None,
                     )
                 )
                 if spec.billable and result.status == "ok":

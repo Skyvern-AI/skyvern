@@ -37,6 +37,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
     ACTION_LOOP_TERMINATE_AFTER,
+    ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -3095,7 +3096,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_on_round)
     assert outcome.status == "completed"
-    assert rounds == [[RoundAction("click", {}, False, billable=True)]]
+    assert rounds == [[RoundAction("click", {}, False, billable=True, error="tool_error: RuntimeError: boom")]]
     assert outcome.billable_actions == []  # billing still counts successes only
 
 
@@ -4440,6 +4441,154 @@ async def test_navigate_resets_action_counters() -> None:
     assert len(clicks) == 10
 
 
+_NAV_URL = "https://forms.example.test/contact-us"
+
+
+def _recordable_navigate(sink: list[tuple[str, dict[str, Any]]], *, outcome: dict[str, Any] | None = None) -> ToolSpec:
+    """The production navigate shape (SKY-16374): recordable so the navigation persists as an action
+    row with the round's screenshot, never billable, and carrying the outcome the caller writes onto
+    that row."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("navigate", args))
+        data: dict[str, Any] = {"page_state_changed": True}
+        if outcome is not None:
+            data[ACTION_OUTCOME_DATA_KEY] = outcome
+            if outcome.get("navigation_dead_end") is not None:
+                # As the real handler does: the top-level flag is what the loop's dead-end verdict
+                # reads, the outcome's copy is what the persisted row carries.
+                data["navigation_dead_end"] = outcome["navigation_dead_end"]
+        return ToolResult.ok("navigated", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="n",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        recordable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_reaches_the_round_with_its_outcome_and_costs_no_budget() -> None:
+    # The customer must see a URL the model typed itself, so navigate enters the action round like a
+    # click — carrying what the navigation achieved, not just the verb. It stays unbilled and unbudgeted:
+    # a navigation is not a page-mutating step, and a recorded row must never start metering.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    nav_outcome = {"requested_url": _NAV_URL, "url": _NAV_URL, "http_status": 200, "page_transitioned": True}
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "completed", "reason": "read it"})]]
+    outcome, _ = await _run(
+        script, [_recordable_navigate(navs, outcome=nav_outcome), make_finish_tool()], on_action_round=_on_round
+    )
+    assert outcome.status == "completed"
+    assert rounds == [[RoundAction("navigate", {"url": _NAV_URL}, True, None, None, False, nav_outcome)]]
+    assert outcome.billable_actions == []
+    assert outcome.action_steps == 0
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_action() -> None:
+    # A 404 landing stays a ToolResult.ok — the model reads the status and decides what to do, and that
+    # transcript must not change. The ROW is the customer's view, and a navigation onto a dead page has
+    # to read as a failed one there, or a run that died on a 404 shows a terminate out of nowhere.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    nav_outcome = {"requested_url": _NAV_URL, "url": _NAV_URL, "http_status": 404, "navigation_dead_end": 404}
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "completed", "reason": "should not win"})]]
+    outcome, _ = await _run(
+        script, [_recordable_navigate(navs, outcome=nav_outcome), make_finish_tool()], on_action_round=_on_round
+    )
+    assert [action.succeeded for round_actions in rounds for action in round_actions] == [False]
+    assert [action.outcome for round_actions in rounds for action in round_actions] == [nav_outcome]
+    # The dead-end verdict still ends the run (the row explains it; it does not replace it), and the
+    # model still read the tool's own ok result.
+    assert outcome.status == "terminated" and outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert [m["content"] for m in outcome.messages if m.get("name") == "navigate"] == ["navigated"]
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_call_that_failed_carries_its_error_text_to_the_round() -> None:
+    # A navigation that reached no page -- a load timeout, or the destructive-reload guard's deliberate
+    # refusal -- has no outcome to report, so the tool's own error is the only thing its persisted row
+    # can say about it. The caller has no other view of the call, and a failed row that explains
+    # nothing reads as a navigation that broke for no reason.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "failed", "reason": "never loaded"})]]
+    await _run(
+        script,
+        [_erroring_tool("navigate", navs, recordable=True), make_finish_tool()],
+        on_action_round=_on_round,
+    )
+    assert [(a.succeeded, a.outcome, a.error) for round_actions in rounds for a in round_actions] == [
+        (False, None, "navigate failed")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_navigations_to_one_url_are_recorded_without_arming_the_action_loop_guard() -> None:
+    # CONTRACT (deliberate exclusion): the action-loop terminator keys on BILLABLE calls, and a
+    # navigation is recorded but not billable, so repeating one is not treated like repeating a click.
+    # The guard exists to stop a run burning its action-step budget on an action that cannot progress,
+    # and a navigation spends none of it; and a successful navigate is itself page-change evidence,
+    # which clears the streak ledger, so counting navigations could never reach the verdict anyway.
+    # Recording a row must not change what ends a run.
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+        rounds.append(actions)
+
+    navs: list[tuple[str, dict[str, Any]]] = []
+    repeats = ACTION_LOOP_TERMINATE_AFTER + 2
+    script = [[("navigate", {"url": _NAV_URL})] for _ in range(repeats)]
+    script.append([("finish", {"status": "completed", "reason": "found the page in the end"})])
+    outcome, _ = await _run(
+        script,
+        [_recordable_navigate(navs), make_finish_tool()],
+        on_action_round=_on_round,
+        max_turns=200,
+        max_tool_calls=500,
+    )
+    assert outcome.status == "completed"
+    assert len(navs) == repeats  # never cut short by the action-loop verdict
+    assert len(rounds) == repeats  # and every one of them persisted as its own round
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_does_not_arm_the_finish_gate_failure_evidence() -> None:
+    # navigate now enters the same round branch that arms the failure-evidence trigger, which exists
+    # for actions that may have SUBMITTED something. A navigation has not, so arming it would make the
+    # finish gate hold verdicts on runs whose last action merely changed page.
+    nav_activity = ActivityRecency(turn=0, turns_remaining=5, tool_calls_remaining=10)
+    navs: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "failed", "reason": "no contact form"})]]
+    await _run(script, [_recordable_navigate(navs), make_finish_tool()], activity=nav_activity)
+    assert nav_activity.last_trigger_turn is None
+
+    # Control: a click on the same path does arm it, so the None above is a live assertion.
+    click_activity = ActivityRecency(turn=0, turns_remaining=5, tool_calls_remaining=10)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click_script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "no contact form"})],
+    ]
+    await _run(click_script, [_billable_tool("click", clicks), make_finish_tool()], activity=click_activity)
+    assert click_activity.last_trigger_turn is not None
+
+
 def _captcha_tool(results: list[str]) -> ToolSpec:
     """solve_captcha fake: recordable, non-billable, returns each result as a tool ERROR (the
     tri-state's not-solved arm) — the arm the false-negative verdicts followed in production."""
@@ -5538,19 +5687,22 @@ async def test_actions_that_name_no_control_never_arm_the_pending_gate() -> None
         assert asked == [], (tool_name, asked)
 
 
+@pytest.mark.parametrize("recordable", [False, True])
 @pytest.mark.asyncio
-async def test_navigating_away_clears_the_recorded_control() -> None:
+async def test_navigating_away_clears_the_recorded_control(recordable: bool) -> None:
     # The run left the page deliberately; the control it clicked went with it, so a marker found at
-    # that selector on the new page belongs to something the run never submitted. `navigate` is
-    # neither billable nor recordable in the production tool set, so the clear has to be reachable
-    # from a plain tool.
+    # that selector on the new page belongs to something the run never submitted. The clear is keyed on
+    # the tool NAME and sits outside the billable/recordable branch, so it must fire whatever navigate's
+    # spec flags say: `recordable=True` is the production shape (SKY-16374), `False` the shape before it.
     probe, asked = _pending_probe(_PENDING)
     watch = SubmitWatch()
     clicks: list[tuple[str, dict[str, Any]]] = []
     navigations: list[tuple[str, dict[str, Any]]] = []
+    navigate = _recording_tool("navigate", navigations)
+    navigate.recordable = recordable
     tools = [
         _billable_tool("click", clicks),
-        _recording_tool("navigate", navigations),
+        navigate,
         make_finish_tool(pending_marker=probe, submit_watch=watch),
     ]
     script = [

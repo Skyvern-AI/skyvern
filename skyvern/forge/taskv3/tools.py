@@ -46,6 +46,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
+    ACTION_OUTCOME_DATA_KEY,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
@@ -11809,6 +11810,16 @@ def build_browser_tools(
         # terminated (v1's behavior) rather than defaulting the outcome to failed.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
             data["navigation_dead_end"] = response.status
+        # What the persisted action row says happened. The requested URL is the model's own argument
+        # (a placeholder or payload ref must not be unwrapped into a row), and the dead-end status is
+        # repeated from the loop's signal above because the row never sees that one.
+        outcome: dict[str, Any] = {"requested_url": requested, "url": landed}
+        if response is not None:
+            outcome["http_status"] = response.status
+        outcome["page_transitioned"] = landed_canonical != pre_nav_canonical
+        if "navigation_dead_end" in data:
+            outcome["navigation_dead_end"] = data["navigation_dead_end"]
+        data[ACTION_OUTCOME_DATA_KEY] = outcome
         return ToolResult.ok(f"navigated to {landed}{status}", data=data)
 
     async def file_upload(args: dict[str, Any]) -> ToolResult:
@@ -12880,6 +12891,11 @@ def build_browser_tools(
             "file_upload",
         ):
             _tool_spec.billable = True
+        if _tool_spec.name == "navigate":
+            # Recordable, not billable: a URL the model typed itself is an action the customer needs
+            # to see (one action row + the round's screenshot), but it mutates no page, so it must not
+            # consume the action-step budget or meter like one that does.
+            _tool_spec.recordable = True
         if _tool_spec.name in ("observe", "get_html", "look"):
             # Large perception dumps: only the latest snapshot is relevant, so let the loop elide older
             # ones from the re-sent transcript (bounds context on perception-heavy pages). look's legend
