@@ -16,7 +16,20 @@ from skyvern.webeye.video_utils import (
     plan_run_segment,
     prepare_recording_for_upload,
     probe_media_duration_seconds,
+    remux_mp4_faststart,
 )
+
+
+def _mvhd_duration(data: bytes) -> int | None:
+    """Read the movie duration from the first ``mvhd`` box (0 for an empty_moov init)."""
+    i = data.find(b"mvhd")
+    if i < 0:
+        return None
+    body = data[i + 4 :]
+    version = body[0]
+    if version == 1:
+        return struct.unpack(">Q", body[4 + 8 + 8 + 4 : 4 + 8 + 8 + 4 + 8])[0]
+    return struct.unpack(">I", body[4 + 4 + 4 + 4 : 4 + 4 + 4 + 4 + 4])[0]
 
 
 def _write_unfinalized_webm(path: str) -> bytes:
@@ -318,6 +331,88 @@ async def test_finalize_webm_end_to_end_sets_duration(tmp_path) -> None:
     output = await finalize_webm(src)
     # Duration element tag is 0x4489 — must be present after finalization.
     assert b"\x44\x89" in output[:4096]
+
+
+@pytest.mark.asyncio
+async def test_remux_mp4_faststart_defragments_and_sets_duration(tmp_path) -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    frag = str(tmp_path / "frag.mp4")
+    subprocess.check_call(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=160x90:rate=15:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            frag,
+        ]
+    )
+    frag_bytes = open(frag, "rb").read()
+    # Precondition: input is a fragmented MP4 whose init moov carries no duration.
+    assert b"moof" in frag_bytes
+    assert _mvhd_duration(frag_bytes) == 0
+
+    out_path = await remux_mp4_faststart(frag)
+    assert out_path is not None
+    # Output is created beside the source (same mount) so the caller can swap it in atomically.
+    assert os.path.dirname(out_path) == os.path.dirname(frag)
+    try:
+        out_bytes = open(out_path, "rb").read()
+    finally:
+        os.unlink(out_path)
+
+    # Postcondition: de-fragmented (no movie-fragment boxes) with a real duration,
+    # so a native <video> can read the length and seek without a full-file scan.
+    assert b"moof" not in out_bytes
+    assert (_mvhd_duration(out_bytes) or 0) > 0
+    # Faststart layout specifically: the moov must sit ahead of the mdat, not just be de-fragmented
+    # (de-fragmentation alone already drops moof and sets duration even without +faststart).
+    moov_off = out_bytes.find(b"moov")
+    mdat_off = out_bytes.find(b"mdat")
+    assert moov_off != -1 and mdat_off != -1 and moov_off < mdat_off
+
+
+@pytest.mark.asyncio
+async def test_remux_mp4_faststart_writes_output_beside_source(tmp_path, monkeypatch) -> None:
+    # Deterministic (no ffmpeg): the helper must place its temp output on the source's own
+    # directory/mount so the caller's swap is an atomic same-filesystem os.replace.
+    src = tmp_path / "sub" / "rec.mp4"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"x")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_run(src_path, *, suffix, output_args, timeout_seconds, operation, input_args=None, output_dir=None):
+        captured["output_dir"] = output_dir
+        captured["output_args"] = output_args
+        out = tmp_path / "sub" / "out.mp4"
+        out.write_bytes(b"y")
+        return str(out)
+
+    monkeypatch.setattr(video_utils.shutil, "which", lambda _binary: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_utils, "_run_ffmpeg_to_temp", _fake_run)
+
+    out = await remux_mp4_faststart(str(src))
+    assert out is not None
+    assert captured["output_dir"] == str(src.parent)
+    assert captured["output_args"] == ["-c", "copy", "-movflags", "+faststart"]
 
 
 def test_plan_run_segment_clamps_leading_run_in_long_session() -> None:
