@@ -39,7 +39,7 @@ from skyvern.forge.taskv3.code_surface import (
     apply_surface,
     configured_surface,
 )
-from skyvern.forge.taskv3.loop import CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
+from skyvern.forge.taskv3.loop import ACTION_OUTCOME_DATA_KEY, CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
 from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
@@ -3207,6 +3207,50 @@ async def test_navigate_reports_http_status(monkeypatch: pytest.MonkeyPatch) -> 
     assert "HTTP 400" in r.content
 
 
+@pytest.mark.asyncio
+async def test_navigate_is_recordable_and_reports_the_outcome_of_the_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-16374: a URL the model typed itself is an action the customer must see, so navigate is
+    # recordable (one action row + that round's screenshot) while staying out of billing and the
+    # action-step budget. The row is only worth having if it says what HAPPENED, so the handler
+    # reports where it asked to go, where it landed, what the page answered, and whether the page
+    # moved -- the facts the caller persists on the row.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+
+    class _RedirectTo404(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+            self.calls.append(("goto", {"url": url}))
+            self.url = "https://example.test/not-found"
+            return SimpleNamespace(status=404)
+
+    tools = build_browser_tools(_fixed_page_provider(_RedirectTo404()))
+    navigate = _tool(tools, "navigate")
+    assert (navigate.recordable, navigate.billable) == (True, False)
+    r = await navigate.handler({"url": "https://example.test/contact-us"})
+    assert r.status == "ok", r.content
+    assert (r.data or {}).get(ACTION_OUTCOME_DATA_KEY) == {
+        "requested_url": "https://example.test/contact-us",
+        "url": "https://example.test/not-found",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
+
+    # A navigation that landed back where it started reports no transition, and a page that answered
+    # no response carries no status at all rather than a fabricated one.
+    page, same_page_tools = _reload_guard_tools(monkeypatch, filled=0)
+    r2 = await _tool(same_page_tools, "navigate").handler({"url": page.url})
+    assert r2.status == "ok", r2.content
+    assert (r2.data or {}).get(ACTION_OUTCOME_DATA_KEY) == {
+        "requested_url": page.url,
+        "url": page.url,
+        "page_transitioned": False,
+    }
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_digest_containment_dedupe_keeps_one_banner_copy() -> None:
@@ -4904,6 +4948,11 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
         [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
         [("finish", {"status": "completed", "reason": "should not win"})],
     ]
+    rounds: list[list[Any]] = []
+
+    async def _on_round(round_actions: list[Any], _turn_text: str | None) -> None:
+        rounds.append(round_actions)
+
     outcome = await run_agent_tool_loop(
         llm_caller=_ScriptedCaller(script),
         system_prompt="sys",
@@ -4911,9 +4960,23 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
         tools=all_tools,
         max_turns=10,
         max_tool_calls=20,
+        on_action_round=_on_round,
     )
 
     assert outcome.status == "terminated"
+    # ...and the whole production chain behind the row the customer reads: the real spec is recordable,
+    # so the navigation reaches the caller as its own round; the real handler's outcome rides it; and a
+    # 404 landing is flagged as a FAILED action even though the tool honestly returned ok (SKY-16374).
+    assert [(a.tool, a.succeeded, a.billable) for round_actions in rounds for a in round_actions] == [
+        ("navigate", False, False)
+    ]
+    assert rounds[0][0].outcome == {
+        "requested_url": "https://jobs.example.test/acme/closed",
+        "url": "https://jobs.example.test/acme/closed",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
 
 
 # --- Commit-verified click-open dropdown selection. The staging specimen: a click-open
