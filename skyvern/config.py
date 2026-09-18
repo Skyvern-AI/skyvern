@@ -541,6 +541,11 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
+    # When type's click is refused only by the viewport check (a sub-pixel input under its own display
+    # layer), press the mouse at the field's centre before focusing, then Tab and read the value back
+    # (SKY-16501). Force-on term only: runs are randomized per run by the flag of the same name, read
+    # through run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, ...). Off: the field is reached by focus() alone.
+    TASK_V3_TYPE_COORDINATE_CLICK: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
@@ -773,6 +778,7 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS: int = 20
+    TWILIO_SMS_2FA_ENABLED: bool = False
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 

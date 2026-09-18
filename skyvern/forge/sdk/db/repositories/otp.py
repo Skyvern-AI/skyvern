@@ -3,20 +3,38 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, asc, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.models import TOTPCodeModel
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
 from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN, normalize_email_address
+from skyvern.utils.phone_validation import looks_like_phone_identifier, phone_identifier_candidates
+
+_EXTERNAL_MESSAGE_DEDUPE_INDEX = "uq_totp_codes_org_external_message_id"
+
+
+def _is_duplicate_external_message(error: IntegrityError) -> bool:
+    constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if constraint_name == _EXTERNAL_MESSAGE_DEDUPE_INDEX:
+        return True
+    error_text = str(error.orig).lower()
+    return (
+        _EXTERNAL_MESSAGE_DEDUPE_INDEX in error_text
+        or "unique constraint failed: totp_codes.organization_id, totp_codes.external_message_id" in error_text
+    )
 
 
 def _identifier_filter(totp_identifier: str) -> ColumnElement[bool]:
     stripped_identifier = totp_identifier.strip()
     if SAFE_EMAIL_ADDRESS_PATTERN.fullmatch(stripped_identifier):
         return func.lower(TOTPCodeModel.totp_identifier) == normalize_email_address(totp_identifier)
+    if looks_like_phone_identifier(stripped_identifier):
+        return TOTPCodeModel.totp_identifier.in_({totp_identifier, *phone_identifier_candidates(stripped_identifier)})
     return TOTPCodeModel.totp_identifier == totp_identifier
 
 
@@ -141,6 +159,28 @@ class OTPRepository(BaseRepository):
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
 
+    @db_operation("count_otp_codes_since")
+    async def count_otp_codes_since(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        created_after: datetime,
+        source: str | None = None,
+    ) -> int:
+        async with self.Session() as session:
+            query = (
+                select(func.count())
+                .select_from(TOTPCodeModel)
+                .where(
+                    TOTPCodeModel.organization_id == organization_id,
+                    _identifier_filter(totp_identifier),
+                    TOTPCodeModel.created_at >= to_naive_utc(created_after),
+                )
+            )
+            if source is not None:
+                query = query.where(TOTPCodeModel.source == source)
+            return int((await session.scalar(query)) or 0)
+
     @db_operation("create_otp_code")
     async def create_otp_code(
         self,
@@ -175,6 +215,56 @@ class OTPRepository(BaseRepository):
             await session.refresh(new_totp_code)
             return TOTPCode.model_validate(new_totp_code)
 
+    @db_operation("create_otp_code_if_new", log_errors=False)
+    async def create_otp_code_if_new(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        content: str,
+        code: str,
+        otp_type: OTPType,
+        task_id: str | None = None,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        source: str | None = None,
+        external_message_id: str | None = None,
+        expired_at: datetime | None = None,
+    ) -> TOTPCode | None:
+        async with self.Session() as session:
+            if external_message_id is not None:
+                existing = await session.scalar(
+                    select(TOTPCodeModel).filter_by(
+                        organization_id=organization_id,
+                        external_message_id=external_message_id,
+                    )
+                )
+                if existing is not None:
+                    return None
+            row = TOTPCodeModel(
+                organization_id=organization_id,
+                totp_identifier=totp_identifier,
+                content=content,
+                code=code,
+                task_id=task_id or None,
+                workflow_id=workflow_id or None,
+                workflow_run_id=workflow_run_id or None,
+                source=source,
+                external_message_id=external_message_id,
+                expired_at=to_naive_utc(expired_at),
+                otp_type=otp_type,
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                error.hide_parameters = True
+                await session.rollback()
+                if _is_duplicate_external_message(error):
+                    return None
+                raise
+            await session.refresh(row)
+            return TOTPCode.model_validate(row)
+
     @db_operation("create_raw_otp_code")
     async def create_raw_otp_code(
         self,
@@ -203,6 +293,55 @@ class OTPRepository(BaseRepository):
             )
             session.add(row)
             await session.commit()
+            await session.refresh(row)
+            return RawTOTPCode.model_validate(row)
+
+    @db_operation("create_raw_otp_code_if_new", log_errors=False)
+    async def create_raw_otp_code_if_new(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        content: str,
+        task_id: str | None = None,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        source: str | None = None,
+        external_message_id: str | None = None,
+        expired_at: datetime | None = None,
+    ) -> RawTOTPCode | None:
+        async with self.Session() as session:
+            if external_message_id is not None:
+                existing = await session.scalar(
+                    select(TOTPCodeModel).filter_by(
+                        organization_id=organization_id,
+                        external_message_id=external_message_id,
+                    )
+                )
+                if existing is not None:
+                    return None
+            row = TOTPCodeModel(
+                organization_id=organization_id,
+                totp_identifier=totp_identifier,
+                content=content,
+                code=None,
+                otp_type=None,
+                parse_status="raw",
+                task_id=task_id or None,
+                workflow_id=workflow_id or None,
+                workflow_run_id=workflow_run_id or None,
+                source=source,
+                external_message_id=external_message_id,
+                expired_at=to_naive_utc(expired_at),
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                error.hide_parameters = True
+                await session.rollback()
+                if _is_duplicate_external_message(error):
+                    return None
+                raise
             await session.refresh(row)
             return RawTOTPCode.model_validate(row)
 
@@ -262,7 +401,7 @@ class OTPRepository(BaseRepository):
                     TOTPCodeModel.organization_id == organization_id,
                     TOTPCodeModel.parse_status == "raw",
                 )
-                .values(code=code, otp_type=otp_type, parse_status="parsed", modified_at=datetime.now(timezone.utc))
+                .values(code=code, otp_type=otp_type, parse_status="parsed", modified_at=naive_utc_now())
                 .returning(TOTPCodeModel)
             )
             row = (await session.scalars(query)).one_or_none()

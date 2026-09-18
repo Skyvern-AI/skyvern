@@ -28,7 +28,7 @@ from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple
 from urllib.parse import urlparse
 
 import structlog
@@ -67,7 +67,11 @@ from skyvern.forge.taskv3.loop import (
     set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
-from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, run_arm_enabled
+from skyvern.forge.taskv3.run_arms import (
+    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+    TYPE_COORDINATE_CLICK_FLAG,
+    run_arm_enabled,
+)
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
@@ -4171,6 +4175,18 @@ def _click_blocked_only_by_viewport(exc: BaseException) -> bool:
     # check is one focus() may stand in for; a field something covered on any retry keeps its error.
     message = str(exc)
     return "outside of the viewport" in message and not any(b in message for b in _OTHER_CLICK_BLOCKERS)
+
+
+# How type put the caret in a field: a checked click, focus() alone, or an unchecked press at its centre.
+_Reach = Literal["click", "focus", "point"]
+
+
+_CHANGED_VALUE_ECHO_MAX = 80
+
+# Same rule observe applies before it shows a field's value.
+_FIELD_VALUE_IS_SECRET_JS = (
+    "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
+)
 
 
 def _typed_text_landed(read: str | None, typed: str) -> bool:
@@ -9969,7 +9985,39 @@ def build_browser_tools(
             return True
         return False
 
-    async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> None:
+    async def _click_at_box_centre(page: Any, selector: str) -> bool:
+        # No actionability or hit-target check: the press lands on whatever paints at the field's centre,
+        # which for a sub-pixel input is the display layer the probe has just ruled its own skin. Some
+        # segment widgets move their section cursor only on a trusted pointer event, so focus() alone
+        # leaves the keys rendering in the display while the input stays empty.
+        top = _current_page()
+        try:
+            # bounding_box() is relative to the main viewport even for an element inside a frame.
+            box = await page.locator(selector).first.bounding_box(timeout=2000)
+            width, height = await top.evaluate("() => [innerWidth, innerHeight]")
+            if not box:
+                return False
+            x = box["x"] + box["width"] / 2
+            y = box["y"] + box["height"] / 2
+            if not (0 <= x < width and 0 <= y < height):
+                return False
+            realm = page if _acted_realm else None
+            while realm is not None and realm.parent_frame is not None:
+                # A frame clips its content, so a point outside its element lands on the parent page.
+                frame_box = await (await realm.frame_element()).bounding_box()
+                if not frame_box or not (
+                    frame_box["x"] <= x < frame_box["x"] + frame_box["width"]
+                    and frame_box["y"] <= y < frame_box["y"] + frame_box["height"]
+                ):
+                    return False
+                realm = realm.parent_frame
+            await page.evaluate("() => { window.__tv3_doc = 1; }")
+            await top.mouse.click(x, y)
+        except Exception:
+            return False
+        return True
+
+    async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> _Reach:
         # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
         # A widget that hands the caret to another segment would take the keys there, so a caret that
         # does not stay put re-raises the click's error; the caller must still prove the keystrokes landed.
@@ -9979,25 +10027,44 @@ def build_browser_tools(
         # not tell a fill from a query; with no click to reach its rows, keep the error.
         if await _declares_a_list(page, selector):
             raise exc
+        reach: _Reach = "focus"
+        if run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, settings.TASK_V3_TYPE_COORDINATE_CLICK) and (
+            await _click_at_box_centre(page, selector)
+        ):
+            reach = "point"
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=1000)
+            except Exception:
+                pass
+            try:
+                same_document = bool(await page.evaluate("() => window.__tv3_doc === 1"))
+            except Exception:
+                same_document = False
+            if not same_document:
+                # The press followed a link: the selector may match something on the destination.
+                raise exc
         try:
+            # Still focused explicitly: the press need not move the caret, and the display it landed on
+            # may have no handler that forwards focus to the input.
             await page.focus(selector, timeout=15000)
             held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
             held = None
         if held is not True:
             raise exc
+        return reach
 
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
-    ) -> tuple[bool, dict[str, Any] | None, bool]:
+    ) -> tuple[bool, dict[str, Any] | None, _Reach]:
         """Put the caret in `selector`. A False first element means the field is genuinely covered and
         must not be typed into. A click is how a widget learns to open its suggestion list, so it stays
-        the first move. The third element is True when the caret got there by focus() alone, after the
-        click could not reach the field -- nothing the page did in response to a click has been seen."""
+        the first move. A third element other than "click" means the checked click could not reach the
+        field -- nothing the page did in response to a click has been seen."""
         reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
-            return False, occluder, False
-        focused_without_click = False
+            return False, occluder, "click"
+        reach: _Reach = "click"
         if occluded:
             # Forcing skips the hit-target check but still dispatches at coordinates, so the wrapper
             # can take the event; the focus check below is what makes the outcome deterministic.
@@ -10013,8 +10080,7 @@ def build_browser_tools(
             except Exception as exc:
                 # Force skips the hit-target check but not the viewport one, which rejects any box of
                 # at most one square pixel: a segment input kept sub-pixel under its own display layer.
-                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
-                return True, None, True
+                return True, None, await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=1000)
             except Exception:
@@ -10027,14 +10093,14 @@ def build_browser_tools(
                 # The wrapper was a link and the click followed it. The selector may well match
                 # something on the destination, so typing now would put the text somewhere nobody
                 # asked for.
-                return False, occluder, False
+                return False, occluder, "click"
             try:
                 # The click may have remounted or hidden the field -- a wrapper that swaps its input
                 # on click is an ordinary SPA shape. fill() would wait its own full timeout for a
                 # node that is gone or invisible, which is the cost this whole path exists to avoid.
                 await page.wait_for_selector(selector, state="visible", timeout=1200)
             except Exception:
-                return False, occluder, False
+                return False, occluder, "click"
         else:
             try:
                 await page.click(selector, timeout=15000)
@@ -10042,8 +10108,7 @@ def build_browser_tools(
                 # A segmented control can keep its real input off-viewport with tabindex=-1 under an
                 # aria-hidden display layer: the probe finds nothing on top of it, but the click's
                 # hit-test has no point to land on.
-                await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
-                focused_without_click = True
+                reach = await _focus_in_place_of_click(page, selector, exc, focus_fallback=focus_fallback)
         try:
             focused = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
@@ -10054,7 +10119,7 @@ def build_browser_tools(
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
             await page.focus(selector, timeout=15000)
-        return True, None, focused_without_click
+        return True, None, reach
 
     def _occluder_labels_hold(occluder: dict[str, Any] | None, value: str) -> bool:
         # The covering layer IS the committed-selection surface only when its own accessible naming
@@ -10544,7 +10609,7 @@ def build_browser_tools(
 
     async def _type_and_commit(
         page: Any, selector: str, value: str, rounds: int, *, focus_fallback: bool = False
-    ) -> tuple[_TypeaheadPick, str | None, str | None, bool]:
+    ) -> tuple[_TypeaheadPick, str | None, str | None, _Reach]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
         # focus and then filters it in place keeps the same row nodes, so a snapshot taken after the click
@@ -10565,7 +10630,7 @@ def build_browser_tools(
             LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
         # The focus-only path tells a typeahead from a plain field by rows reacting to the typing, which
         # needs the pre-snapshot; without one it keeps today's error.
-        focused, occluder, focused_without_click = await _focus_for_typing(
+        focused, occluder, reach = await _focus_for_typing(
             page, selector, focus_fallback=focus_fallback and presnapshot_ok
         )
         if not focused:
@@ -10579,7 +10644,7 @@ def build_browser_tools(
                 pass
         await page.fill(selector, "", timeout=15000)
         await page.type(selector, value, delay=15, timeout=15000)
-        if not presnapshot_ok or focused_without_click:
+        if not presnapshot_ok or reach != "click":
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe. A field no click can reach gets no suggestion clicks
@@ -10588,10 +10653,10 @@ def build_browser_tools(
                 _TypeaheadPick(None, None, False, None, clicked=False, declared=False),
                 pre_value,
                 pre_own,
-                focused_without_click,
+                reach,
             )
         pick = await _commit_typeahead(page, selector, value, rounds, pre_own=pre_own)
-        return pick, pre_value, pre_own, False
+        return pick, pre_value, pre_own, reach
 
     async def _close_lingering_typeahead_list(
         page: Any, selector: str, committed: str | None, *, surface_vouched_pre_click: bool = False
@@ -10763,7 +10828,7 @@ def build_browser_tools(
             if not await _anchor_typeable(page, selector) and await _anchor_has_list_semantics(page, selector):
                 return await _open_observe_pick(page, selector, text)
             opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
-            result = await _type_typeahead_commit(page, selector, text)
+            result = await _type_typeahead_commit(page, selector, text, text_is_secret=text != args.get("text", ""))
             return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
         # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
@@ -10782,27 +10847,75 @@ def build_browser_tools(
             await page.press(selector, "Enter")
         return ToolResult.ok(f"typed into {selector}")
 
-    async def _type_typeahead_commit(page: Any, selector: str, text: str) -> ToolResult:
+    async def _value_changed_by_page_error(
+        page: Any, selector: str, typed: str, held: str, *, echo: bool
+    ) -> ToolResult:
+        # The page committed a value of its own ("3" -> "03", "13" -> "12"). Whether that is the value the
+        # task needs is the model's call, so the field is left as the page set it and both values are
+        # reported; only an exact read-back is ever a success.
+        if echo:
+            try:
+                echo = not await page.locator(selector).first.evaluate(_FIELD_VALUE_IS_SECRET_JS, timeout=2000)
+            except Exception:
+                echo = False
+        if not echo:
+            what = "a different value than the one typed"
+            verdict = "Re-observe it to see whether that value is the one the task needs"
+        else:
+            shown = _mask_refs(held if len(held) <= _CHANGED_VALUE_ECHO_MAX else held[:_CHANGED_VALUE_ECHO_MAX] + "…")
+            what = f"'{shown}' (you typed '{_mask_refs(typed)}')"
+            verdict = (
+                f"If '{shown}' is the value the task needs, the field is filled; do not type it again. If it is "
+                "not, the page did not accept the text as typed"
+            )
+        return ToolResult.error(
+            f"typed into {selector}; after focus left the field it holds {what}. The page changed it, and it "
+            f"was left as the page set it. {verdict}.",
+            data={"release_own_list": True},
+            error_class="value_changed_by_page",
+        )
+
+    async def _type_typeahead_commit(page: Any, selector: str, text: str, *, text_is_secret: bool) -> ToolResult:
         # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
         try:
-            pick, pre_value, _pre_own, focused_without_click = await _type_and_commit(
+            pick, pre_value, _pre_own, reach = await _type_and_commit(
                 page, selector, text, rounds=3, focus_fallback=True
             )
         except _FieldCovered as exc:
             return _covered_error(exc.selector, exc.occluder)
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
-        if focused_without_click:
+        if reach != "click":
             # focus() without a click cannot show the field took the keystrokes: a segmented control
             # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
             # the typed text counts as filled; anything else, including an unreadable field, is an
             # error, never a success. Rows reacting to the typing mean the field commits a picked
             # suggestion, which this path never clicks, so its raw text is no fill either. The poll's
             # wait also lets a widget that clears a rejected entry on a timer do so before the read.
-            # The value is not echoed: typed text may be a resolved secret.
             reacted = await _await_suggestion_rows(page, selector, text, rounds=8, any_region=True) is not None
-            if not reacted and _typed_text_landed(await _read_field_value(page, selector), text):
+            if not reacted and reach == "point":
+                # Look for a slow list BEFORE leaving the field: Tab closes it. Tab is what commits a
+                # segment widget's assembled value, so the read-back comes after it.
+                await asyncio.sleep(0.3)
+                reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
+                if not reacted:
+                    try:
+                        await _current_page().keyboard.press("Tab")
+                    except Exception:
+                        pass
+                    held = await _read_field_value(page, selector)
+                    landed = _typed_text_landed(held, text)
+                    LOG.info(
+                        "taskv3 type coordinate click fallback", landed=landed, page_changed=bool(held) and not landed
+                    )
+                    if landed:
+                        return ToolResult.ok(f"typed into {selector}")
+                    if held:
+                        # No restore: Tab already committed the page's value to the widget, and fill() fires no
+                        # blur, so taking the input back would leave the input and the widget disagreeing.
+                        return await _value_changed_by_page_error(page, selector, text, held, echo=not text_is_secret)
+            elif not reacted and _typed_text_landed(await _read_field_value(page, selector), text):
                 # The read-back costs a pause anyway, so spend it looking once more: a list slower than
                 # the poll would otherwise read as "no list" while its uncommitted query sits in the
                 # field. Slower than this is a bounded residual, not something a longer wait fixes.
@@ -10812,8 +10925,9 @@ def build_browser_tools(
             await _restore_pre_type_value(page, selector, pre_value, [text])
             return ToolResult.error(
                 f"typed into {selector}, but it does not hold the typed text afterwards — the field is NOT "
-                "filled and may hold part of it. It sits outside the viewport and could only be focused, "
-                "not clicked; re-observe and fill it through the control the page shows instead",
+                "filled and may hold part of it. It sits outside the viewport and could only be "
+                + ("clicked at its position" if reach == "point" else "focused, not clicked")
+                + "; re-observe and fill it through the control the page shows instead",
                 data={"release_own_list": True},
             )
         if pick.suggestion is None and pick.candidates:

@@ -8,7 +8,7 @@ credit card billing/contact fields, credit card metadata, or secret values)
 in any API response. The only fields that may be returned are non-sensitive
 metadata:
 
-  - Password credentials: ``username``, ``totp_type``, ``totp_identifier``
+  - Password credentials: ``username``, ``totp_type``, ``totp_identifier``, ``has_totp``
   - Credit card credentials: ``last_four``, ``brand``
   - Secret credentials: ``secret_label``
 
@@ -3468,6 +3468,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             username=credential.username or credential.credential_id,
             totp_type=credential.totp_type,
             totp_identifier=credential.totp_identifier,
+            has_totp=bool(credential.has_totp_seed),
         )
         return CredentialResponse(
             credential=credential_response,

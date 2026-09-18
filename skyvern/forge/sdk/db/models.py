@@ -9,6 +9,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -51,12 +52,14 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_phone_number_id,
     generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
+    generate_sms_config_id,
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
@@ -243,6 +246,89 @@ class OrganizationAuthTokenModel(Base):
     encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationSMSConfigModel(Base):
+    __tablename__ = "organization_sms_configs"
+    __table_args__ = (
+        Index(
+            "uq_org_sms_configs_one_connected",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("mode = 'connected' AND deleted_at IS NULL"),
+            sqlite_where=text("mode = 'connected' AND deleted_at IS NULL"),
+        ),
+        UniqueConstraint(
+            "sms_config_id",
+            "organization_id",
+            name="uq_organization_sms_configs_id_org",
+        ),
+    )
+
+    sms_config_id = Column(String, primary_key=True, default=generate_sms_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    mode = Column(String, nullable=False)
+    encrypted_webhook_secret = Column(String, nullable=False)
+    webhook_secret_encrypted_method = Column(String, nullable=False, default="aes", server_default="aes")
+    daily_ingest_cap = Column(Integer, nullable=False, default=100, server_default="100")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationPhoneNumberModel(Base):
+    __tablename__ = "organization_phone_numbers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["sms_config_id", "organization_id"],
+            [
+                "organization_sms_configs.sms_config_id",
+                "organization_sms_configs.organization_id",
+            ],
+            name="fk_organization_phone_numbers_sms_config_org",
+        ),
+        ForeignKeyConstraint(
+            ["credential_id", "organization_id"],
+            ["credentials.credential_id", "credentials.organization_id"],
+            name="fk_organization_phone_numbers_credential_org",
+        ),
+        Index(
+            "uq_org_phone_numbers_org_number",
+            "organization_id",
+            "phone_number",
+            unique=True,
+            postgresql_where=text("status = 'active' AND deleted_at IS NULL"),
+            sqlite_where=text("status = 'active' AND deleted_at IS NULL"),
+        ),
+    )
+
+    phone_number_id = Column(String, primary_key=True, default=generate_phone_number_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    sms_config_id = Column(String, nullable=False, index=True)
+    phone_number = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default="twilio", server_default="twilio")
+    provider_number_sid = Column(String, nullable=True)
+    previous_sms_url = Column(String, nullable=True)
+    previous_sms_method = Column(String, nullable=True)
+    previous_sms_application_sid = Column(String, nullable=True)
+    credential_id = Column(String, nullable=True)
+    provider_cost_cents = Column(Integer, nullable=True)
+    price_cents = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, default="active", server_default="active")
+    quarantined_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -977,6 +1063,7 @@ class BitwardenLoginCredentialParameterModel(Base):
     bitwarden_collection_id = Column(String, nullable=True, default=None)
     bitwarden_item_id = Column(String, nullable=True, default=None)
     url_parameter_key = Column(String, nullable=True, default=None)
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1091,7 +1178,7 @@ class OnePasswordCredentialParameterModel(Base):
     description = Column(String, nullable=True)
     vault_id = Column(String, nullable=False)
     item_id = Column(String, nullable=False)
-
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1204,6 +1291,14 @@ class TOTPCodeModel(Base):
     __table_args__ = (
         Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
         Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+        Index(
+            "uq_totp_codes_org_external_message_id",
+            "organization_id",
+            "external_message_id",
+            unique=True,
+            postgresql_where=text("external_message_id IS NOT NULL"),
+            sqlite_where=text("external_message_id IS NOT NULL"),
+        ),
     )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
@@ -1215,6 +1310,7 @@ class TOTPCodeModel(Base):
     content = Column(String, nullable=False)
     code = Column(String)
     source = Column(String)
+    external_message_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
@@ -1683,6 +1779,7 @@ class CredentialModel(Base):
     __tablename__ = "credentials"
     __table_args__ = (
         Index("credential_folder_id_idx", "folder_id"),
+        UniqueConstraint("credential_id", "organization_id", name="uq_credentials_id_org"),
         Index(
             "uq_credentials_browser_profile_id",
             "browser_profile_id",
@@ -1702,6 +1799,7 @@ class CredentialModel(Base):
     username = Column(String, nullable=True)
     totp_type = Column(String, nullable=False, default="none")
     totp_identifier = Column(String, nullable=True, default=None)
+    has_totp_seed = Column(Boolean, nullable=True)
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)

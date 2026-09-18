@@ -698,6 +698,7 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_collection_id: str | None = None
     # bitwarden item id to request the login credential
     bitwarden_item_id: str | None = None
+    totp_identifier: str | None = None
 
 
 class CredentialParameterYAML(ParameterYAML):
@@ -749,6 +750,7 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     vault_id: str
     item_id: str
     totp_field_name: str | None = None
+    totp_identifier: str | None = None
 
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):

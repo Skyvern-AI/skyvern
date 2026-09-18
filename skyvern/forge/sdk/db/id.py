@@ -65,6 +65,8 @@ TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
 TASK_RUN_PREFIX = "tr"
 TOTP_CODE_PREFIX = "totp"
+SMS_CONFIG_PREFIX = "smsc"
+PHONE_NUMBER_PREFIX = "pn"
 USER_PREFIX = "u"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
@@ -207,6 +209,16 @@ def generate_ai_suggestion_id() -> str:
 def generate_totp_code_id() -> str:
     int_id = generate_id()
     return f"{TOTP_CODE_PREFIX}_{int_id}"
+
+
+def generate_sms_config_id() -> str:
+    int_id = generate_id()
+    return f"{SMS_CONFIG_PREFIX}_{int_id}"
+
+
+def generate_phone_number_id() -> str:
+    int_id = generate_id()
+    return f"{PHONE_NUMBER_PREFIX}_{int_id}"
 
 
 def generate_action_id() -> str:

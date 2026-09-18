@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypedDict
 
 import structlog
 
@@ -18,6 +18,10 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 
 LOG = structlog.get_logger()
+
+
+class _HasTotpSeedKwargs(TypedDict, total=False):
+    has_totp_seed: bool
 
 
 class CredentialVaultService(ABC):
@@ -199,10 +203,13 @@ class CredentialVaultService(ABC):
 
         `password` defaults to "" so a login with no password can be stored, which makes an omitted
         password indistinguishable from an explicitly blanked one by value alone. Only an explicitly
-        set password may overwrite the stored one.
+        set password may overwrite the stored one. An omitted `totp` likewise preserves a stored
+        TOTP seed.
         """
         updated_fields = updated_credential.model_fields_set
-        if {"metadata", "password"}.issubset(updated_fields):
+        if {"metadata", "password"}.issubset(updated_fields) and (
+            "totp" in updated_fields or credential.has_totp_seed is False
+        ):
             return updated_credential
 
         existing_item = await self.get_credential_item(credential)
@@ -217,11 +224,13 @@ class CredentialVaultService(ABC):
                 )
             return updated_credential
 
+        if "totp" not in updated_fields:
+            # Assignment adds totp to the original request's model_fields_set so _update_db_credential derives has_totp_seed.
+            updated_credential.totp = existing_item.credential.totp
         preserved_fields: dict[str, object] = {}
-        for field_name in ("metadata", "password"):
+        for field_name in ("metadata", "password", "totp"):
             if field_name not in updated_fields:
                 preserved_fields[field_name] = getattr(existing_item.credential, field_name)
-
         return updated_credential.model_copy(update=preserved_fields)
 
     @staticmethod
@@ -265,6 +274,7 @@ class CredentialVaultService(ABC):
                 username=data.credential.username,
                 totp_type=data.credential.totp_type,
                 totp_identifier=data.credential.totp_identifier,
+                has_totp_seed=bool((data.credential.totp or "").strip()),
                 card_last4=None,
                 card_brand=None,
                 tested_url=data.tested_url,
@@ -283,6 +293,7 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                has_totp_seed=False,
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
@@ -299,6 +310,7 @@ class CredentialVaultService(ABC):
                 card_last4=None,
                 card_brand=None,
                 totp_identifier=None,
+                has_totp_seed=False,
                 secret_label=data.credential.secret_label,
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
@@ -322,6 +334,11 @@ class CredentialVaultService(ABC):
             proxy_kwargs["rotate_proxy_session_id"] = True
 
         if data.credential_type == CredentialType.PASSWORD:
+            has_totp_seed_kwargs: _HasTotpSeedKwargs = (
+                {"has_totp_seed": bool((data.credential.totp or "").strip())}
+                if "totp" in data.credential.model_fields_set
+                else {}
+            )
             return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
                 organization_id=credential.organization_id,
@@ -334,6 +351,7 @@ class CredentialVaultService(ABC):
                 card_last4=None,
                 card_brand=None,
                 tested_url=data.tested_url,
+                **has_totp_seed_kwargs,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
@@ -349,6 +367,7 @@ class CredentialVaultService(ABC):
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
                 tested_url=data.tested_url,
+                has_totp_seed=False,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.SECRET:
@@ -365,6 +384,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
                 tested_url=data.tested_url,
+                has_totp_seed=False,
                 **proxy_kwargs,
             )
         else:
