@@ -12276,8 +12276,12 @@ class FileParserBlock(Block):
 
     def _parse_excel_file_sync(self, file_path: str) -> list[dict[str, Any]]:
         try:
-            # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, engine="calamine")
+            # Read Excel file with pandas, specifying engine explicitly.
+            # keep_default_na=False ensures meaningful literal values like "N/A", "NA", "NULL", "None"
+            # are preserved as strings rather than coerced to NaN. Empty cells arrive as "" and are
+            # converted to pd.NA so _clean_dataframe_for_json still normalizes them to "nan".
+            df = pd.read_excel(file_path, engine="calamine", keep_default_na=False)
+            df = df.replace("", pd.NA)
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
