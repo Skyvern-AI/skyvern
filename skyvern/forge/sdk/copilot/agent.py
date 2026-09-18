@@ -4241,7 +4241,9 @@ async def _run_agent_loop_with_surface(
         allowlist=frozenset(alias_map.values()),
         context_provider=lambda: ctx,
         ordered_allowlist=(tuple(alias_map.values()) if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION else None),
-        enforce_dispatch_allowlist=(ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION),
+        enforce_dispatch_allowlist=(
+            ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION or ctx.turn_origin == TurnOrigin.runtime_self_heal
+        ),
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
