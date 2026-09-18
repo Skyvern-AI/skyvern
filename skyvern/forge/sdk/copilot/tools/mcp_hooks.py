@@ -491,7 +491,16 @@ async def _get_block_schema_post_hook(
                         "type": "string",
                         "description": (
                             "Every new or wholly rewritten code block must include this non-null string: "
-                            "the model-authored plain-language Goal shown in the editor."
+                            "the model-authored plain-language Goal shown in the editor, written for this code. "
+                            "Open with one sentence naming only what a person sees on the page once the block has "
+                            "succeeded, showing every value the block returns as it appears there, with no actions, "
+                            "conditions, 'after' or 'returns' clauses. Then give the route that reaches "
+                            "it: the site or page the block works on, the controls it uses by their visible label "
+                            "or role, the order it acts in, the inputs it reads by workflow parameter name (never "
+                            "a value), and what the block returns, naming only page content that first sentence "
+                            "already shows, never a data structure. A few sentences, enough for an agent to redo "
+                            "this block on a live browser without reading the code. Rewrite the Goal whenever you "
+                            "rewrite the code."
                         ),
                     }
                     required = schema.get("required")

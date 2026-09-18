@@ -316,7 +316,16 @@ class CodeArtifactMetadata(BaseModel):
         default=None, description="Label of the authored `code` block this artifact describes."
     )
     block_id: str | None = None
-    declared_goal: str = Field(default="", description="The durable goal this block accomplishes; model-owned.")
+    declared_goal: str = Field(
+        default="",
+        description=(
+            "The durable goal this block accomplishes; model-owned. First name only the visible page state a person "
+            "sees once the block has succeeded, showing every value it returns, with no actions, 'after' or 'returns' "
+            "clauses, then the route that reaches it: page, controls by visible label or role, action order, inputs "
+            "by workflow parameter name (never a value), and what the block returns, naming only page content the "
+            "first sentence already shows, never a data structure."
+        ),
+    )
     claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(
         default_factory=list,
         description=(

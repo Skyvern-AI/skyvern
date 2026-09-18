@@ -545,57 +545,6 @@ def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
     return yaml.safe_dump(data, sort_keys=False)
 
 
-def fill_code_block_prompts_in_yaml(
-    workflow_yaml: str,
-    *,
-    prior_yaml: str | None = None,
-    fallback_goals: dict[str, str] | None = None,
-) -> str:
-    """Return workflow_yaml with each code block's `prompt` (goal) filled when absent.
-
-    The editor treats a code block as code-first (plain view + steps) only when it
-    carries a `prompt`; the model authors the goal as artifact `declared_goal`, not on
-    the block, and code regeneration replaces the whole block YAML and drops it. Prefer
-    the prior block's prompt by label (exact user text, preserved across regen), then a
-    fallback goal by label (e.g. the model's `declared_goal`)."""
-    try:
-        data = yaml.safe_load(workflow_yaml)
-    except yaml.YAMLError:
-        return workflow_yaml
-    if not isinstance(data, (dict, list)):
-        return workflow_yaml
-
-    prior_prompts: dict[str, str] = {}
-    if prior_yaml:
-        try:
-            prior_data = yaml.safe_load(prior_yaml)
-        except yaml.YAMLError:
-            prior_data = None
-        if isinstance(prior_data, (dict, list)):
-            for block in _iter_code_block_dicts(prior_data):
-                label = block.get("label")
-                prompt = block.get("prompt")
-                if isinstance(label, str) and isinstance(prompt, str) and prompt:
-                    prior_prompts[label] = prompt
-
-    fallback_goals = fallback_goals or {}
-    changed = False
-    for block in _iter_code_block_dicts(data):
-        if block.get("prompt"):
-            continue
-        label = block.get("label")
-        if not isinstance(label, str):
-            continue
-        goal = prior_prompts.get(label) or fallback_goals.get(label)
-        if goal:
-            block["prompt"] = goal
-            changed = True
-
-    if not changed:
-        return workflow_yaml
-    return yaml.safe_dump(data, sort_keys=False)
-
-
 def fill_code_block_error_code_mappings_in_yaml(workflow_yaml: str, *, prior_yaml: str | None = None) -> str:
     """Preserve omitted code-block manifests by label while honoring explicit removal.
 
