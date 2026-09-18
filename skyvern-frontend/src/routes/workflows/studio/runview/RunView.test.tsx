@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 
+import { StudioPaneDefaultsProvider } from "../StudioPaneDefaults";
+import { useStudioPanes } from "../useStudioPanes";
+
 import {
   QueryClient,
   QueryClientProvider,
@@ -349,9 +352,11 @@ function seedRunningRun() {
 }
 
 function LocationSpy() {
+  const { panes } = useStudioPanes();
   const location = useLocation();
   return (
     <>
+      <output data-testid="runtime-panes">{panes.join(",")}</output>
       <div data-testid="location-pathname">{location.pathname}</div>
       <div data-testid="location-search">{location.search}</div>
       <div data-testid="location-state">{JSON.stringify(location.state)}</div>
@@ -452,30 +457,32 @@ function renderRunView(
     <QueryClientProvider client={queryClient}>
       <PageSlotsProvider value={pageSlots}>
         <MemoryRouter initialEntries={[initialEntry]}>
-          {/* The toggles live in the pane header (StudioShell); render them
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            {/* The toggles live in the pane header (StudioShell); render them
               alongside the body, under a TooltipProvider, the way the shell
               composes them. Only headerExtras (the toggles) sit under the
               compact context in production (StudioShell.tsx), not the body. */}
-          <TooltipProvider delayDuration={0}>
-            <StudioPaneCompactContext.Provider value={compact}>
-              <RunPaneViewToggles />
-            </StudioPaneCompactContext.Provider>
-            {(typeof initialEntry === "string"
-              ? initialEntry
-              : initialEntry.pathname
-            ).startsWith("/runs/") ? (
-              <Routes>
-                <Route
-                  path="/runs/:runId"
-                  element={<RunView workflowRunId="wr_1" {...props} />}
-                />
-              </Routes>
-            ) : (
-              <RunView workflowRunId="wr_1" {...props} />
-            )}
-          </TooltipProvider>
-          <LocationSpy />
-          {extra}
+            <TooltipProvider delayDuration={0}>
+              <StudioPaneCompactContext.Provider value={compact}>
+                <RunPaneViewToggles />
+              </StudioPaneCompactContext.Provider>
+              {(typeof initialEntry === "string"
+                ? initialEntry
+                : initialEntry.pathname
+              ).startsWith("/runs/") ? (
+                <Routes>
+                  <Route
+                    path="/runs/:runId"
+                    element={<RunView workflowRunId="wr_1" {...props} />}
+                  />
+                </Routes>
+              ) : (
+                <RunView workflowRunId="wr_1" {...props} />
+              )}
+            </TooltipProvider>
+            <LocationSpy />
+            {extra}
+          </StudioPaneDefaultsProvider>
         </MemoryRouter>
       </PageSlotsProvider>
     </QueryClientProvider>
@@ -724,15 +731,21 @@ describe("RunView view toggles", () => {
     });
   });
 
-  test("writes the required Overview pane when selecting a run view", async () => {
+  test("opens Overview without writing panes when selecting a run view", async () => {
     seedCompletedRun();
     renderRunView({}, "/?wr=wr_1");
 
     fireEvent.click(screen.getByRole("button", { name: "Inputs" }));
 
     await waitFor(() => {
+      expect(screen.getByTestId("runtime-panes").textContent).toContain(
+        "overview",
+      );
+      expect(screen.getByTestId("location-search").textContent).not.toContain(
+        "panes=",
+      );
       expect(screen.getByTestId("location-search").textContent).toContain(
-        "panes=overview,browser",
+        "view=inputs",
       );
     });
   });
@@ -1681,7 +1694,10 @@ describe("RunView failure presentation", () => {
       "CodeBlock failed because a browser operation failed at line 4.",
       "browser_operation_failed",
     );
-    const { container, getByTestId } = renderRunView({}, "/?wr=wr_1");
+    const { container, getByTestId } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=overview",
+    );
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
 
     fireEvent.click(
@@ -1691,7 +1707,10 @@ describe("RunView failure presentation", () => {
     );
 
     await waitFor(() =>
-      expect(getByTestId("location-search").textContent).toContain("browser"),
+      expect(getByTestId("runtime-panes").textContent).toContain("browser"),
+    );
+    expect(getByTestId("location-search").textContent).toContain(
+      "panes=overview",
     );
     await waitFor(() =>
       expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code"),
@@ -1729,11 +1748,9 @@ describe("RunView failure presentation", () => {
     );
 
     await waitFor(() =>
-      expect(getByTestId("location-search").textContent).toContain(
-        "panes=browser",
-      ),
+      expect(getByTestId("runtime-panes").textContent).toBe("browser"),
     );
-    expect(getByTestId("location-search").textContent).not.toContain(
+    expect(getByTestId("location-search").textContent).toContain(
       "panes=overview",
     );
   });
@@ -2002,7 +2019,10 @@ describe("RunView live affordances", () => {
     // Park the Browser pane on a pinned replay view: the Live CTA promises
     // live, so the pinned pill must not swallow the handoff.
     useStudioBrowserStore.setState({ view: "screenshots" });
-    const { container, getByTestId } = renderRunView();
+    const { container, getByTestId } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=overview",
+    );
     const scope = within(container);
 
     fireEvent.click(
@@ -2012,7 +2032,10 @@ describe("RunView live affordances", () => {
     // Unpins to the live edge and pins the Browser pane's view intent to live.
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
     expect(useStudioBrowserStore.getState().view).toBe("live");
-    expect(getByTestId("location-search").textContent).toContain("browser");
+    expect(getByTestId("runtime-panes").textContent).toContain("browser");
+    expect(getByTestId("location-search").textContent).toBe(
+      "?wr=wr_1&panes=overview",
+    );
   });
 
   test("a queued run shows only the queued status pill — no Live chip, no banner", () => {

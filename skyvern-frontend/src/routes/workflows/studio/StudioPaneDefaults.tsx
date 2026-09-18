@@ -1,57 +1,39 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useLocation } from "react-router-dom";
 
 import { toast } from "@/components/ui/use-toast";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { sanitizePaneWidth, type PaneWidths } from "@/store/paneWidths";
 
-import { liveSearch } from "./liveSearch";
 import {
-  copilotContextForSearch,
+  CREATE_STUDIO_PANES,
   DEFAULT_STUDIO_PANES,
   fitPanesToWidth,
   panesFitWidth,
+  panesListEqual,
+  panesWithoutDeletedBlocked,
   resolveOpenPanes,
   searchWithRunReference,
-  STUDIO_PANE_IDS,
   type StudioPaneId,
-  withCopilotSelection,
 } from "./panes";
-import {
-  StudioPaneDefaultsContext,
-  type PaneClamp,
-  type PaneWrite,
-} from "./StudioPaneDefaultsContext";
-import { useStudioRunId } from "./useStudioRunId";
+import { StudioPaneDefaultsContext } from "./StudioPaneDefaultsContext";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
-// Drop unknown ids and duplicates; return null when the result is empty/invalid.
-function sanitizeLearnedPanes(
-  raw: StudioPaneId[] | undefined,
-): readonly StudioPaneId[] | null {
-  // Guard the localStorage boundary: corrupted/foreign values may not be arrays.
-  if (!Array.isArray(raw) || raw.length === 0) return null;
-  const seen = new Set<string>();
-  const result: StudioPaneId[] = [];
-  for (const id of raw) {
-    if ((STUDIO_PANE_IDS as readonly string[]).includes(id) && !seen.has(id)) {
-      seen.add(id);
-      result.push(id);
-    }
-  }
-  return result.length > 0 ? result : null;
-}
+type PaneState = {
+  key: string;
+  panes: StudioPaneId[];
+  paneWidths: PaneWidths;
+  entryId: number;
+};
 
-/**
- * First-visit pane policy for one studio mount. The state-aware default and
- * the narrow-viewport clamp are both latched exactly once (the shell remounts
- * per workflow via its key), so panes never reshuffle after first paint. The
- * blocks signal is synchronous — the shell only mounts with the workflow
- * loaded — so the latch decides from real data, never a placeholder.
- *
- * Built agents restore the user's last edit-class pane arrangement; empty
- * agents always start on the factory Editor + Browser default.
- */
 export function StudioPaneDefaultsProvider({
   hasBlocks,
   children,
@@ -60,130 +42,184 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
-  const studioRunId = useStudioRunId();
+  const pathRunId = useFirstParam("workflowRunId", "runId");
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-
-  // hasBlocks gates only the learned-layout lookup, not the factory default
-  // itself — empty agents never restore a saved arrangement.
-  const [defaultPanes] = useState<readonly StudioPaneId[]>(() => {
-    if (!hasBlocks) {
-      return [...DEFAULT_STUDIO_PANES];
-    }
-    const learnedEdit = sanitizeLearnedPanes(
-      useStudioShellStore.getState().paneLayouts["edit"],
-    );
-    return learnedEdit ?? [...DEFAULT_STUDIO_PANES];
-  });
-
-  const [learnedRunPanes] = useState<readonly StudioPaneId[] | null>(() =>
-    sanitizeLearnedPanes(useStudioShellStore.getState().paneLayouts.run),
-  );
-
-  const [initialUrlPanes] = useState<readonly StudioPaneId[]>(() =>
-    resolveOpenPanes(
-      searchWithRunReference(liveSearch(location.search), studioRunId),
-      defaultPanes,
-      learnedRunPanes,
-    ),
-  );
-
-  const [initialPanes] = useState<readonly StudioPaneId[]>(() => {
-    const search = searchWithRunReference(
-      liveSearch(location.search),
-      studioRunId,
-    );
-    const resolved = initialUrlPanes;
-    const selection =
-      useStudioShellStore.getState().copilotSelectionByLayout[
-        copilotContextForSearch(search)
-      ];
-    return workflowDeleted
-      ? resolved
-      : withCopilotSelection(resolved, selection);
-  });
-
-  const [clamp, setClamp] = useState<PaneClamp | null>(null);
   const stageElRef = useRef<HTMLElement | null>(null);
-  const measuredRef = useRef(false);
-  const wroteRef = useRef(false);
+  const transitionRef = useRef<{
+    key: string;
+    panes?: readonly StudioPaneId[];
+  } | null>(null);
+  const locationKeyRef = useRef(location.key);
+  const measuredEntryRef = useRef<number | null>(null);
+  const wroteEntryRef = useRef<number | null>(null);
 
-  // Ref callbacks run before paint, so an over-wide shared link is clamped to
-  // its fitting prefix without ever flashing the full list.
-  const registerStageElement = useCallback(
-    (el: HTMLElement | null) => {
-      stageElRef.current = el;
-      if (!el || measuredRef.current || wroteRef.current) {
-        return;
+  const keyForSearch = useCallback(
+    (search: string) => {
+      const params = new URLSearchParams(
+        searchWithRunReference(search, pathRunId),
+      );
+      return JSON.stringify([
+        location.pathname,
+        params.get("wr") ?? (params.has("active") ? "active" : null),
+        params.get("panes"),
+        params.get("embed") === "true" ? ["embed", params.get("view")] : null,
+      ]);
+    },
+    [location.pathname, pathRunId],
+  );
+  const key = keyForSearch(location.search);
+
+  const initialPanes = () => {
+    const resolved = resolveOpenPanes(
+      searchWithRunReference(location.search, pathRunId),
+      hasBlocks ? DEFAULT_STUDIO_PANES : CREATE_STUDIO_PANES,
+    );
+    const panes = workflowDeleted
+      ? panesWithoutDeletedBlocked(resolved)
+      : resolved;
+    const width = stageElRef.current?.clientWidth ?? 0;
+    return width > 0 ? fitPanesToWidth(panes, width) : panes;
+  };
+  const [state, setState] = useState<PaneState>(() => ({
+    key,
+    panes: initialPanes(),
+    paneWidths: {},
+    entryId: 0,
+  }));
+  const latestRef = useRef(state);
+  let current = state;
+  if (state.key !== key) {
+    const transition = transitionRef.current;
+    current =
+      transition?.key === key
+        ? {
+            ...state,
+            key,
+            panes: transition.panes ? [...transition.panes] : state.panes,
+          }
+        : {
+            key,
+            panes: initialPanes(),
+            paneWidths: {},
+            entryId: state.entryId + 1,
+          };
+    setState(current);
+  }
+  latestRef.current = current;
+  // React can restart a navigation render before committing its state.
+  useLayoutEffect(() => {
+    if (locationKeyRef.current !== location.key) {
+      transitionRef.current = null;
+      locationKeyRef.current = location.key;
+    }
+  }, [location.key]);
+
+  const getPanes = useCallback(() => latestRef.current.panes, []);
+  const updatePanes = useCallback(
+    (compute: (panes: StudioPaneId[]) => StudioPaneId[]) => {
+      const previous = latestRef.current;
+      const computed = compute([...previous.panes]);
+      const panes = workflowDeleted
+        ? panesWithoutDeletedBlocked(computed)
+        : computed;
+      wroteEntryRef.current = previous.entryId;
+      if (!panesListEqual(previous.panes, panes)) {
+        latestRef.current = { ...previous, panes };
+        setState(latestRef.current);
       }
-      const width = el.clientWidth;
-      if (width <= 0) {
-        return;
-      }
-      measuredRef.current = true;
-      const fitted = fitPanesToWidth(initialPanes, width);
-      const urlFitted = fitPanesToWidth(initialUrlPanes, width);
+      const firstRun = useStudioFirstRunStore.getState();
+      if (!firstRun.coachMarkSeen) firstRun.markCoachMarkSeen();
+      const width = stageElRef.current?.clientWidth ?? 0;
       if (
-        fitted.length !== initialPanes.length ||
-        urlFitted.length !== initialUrlPanes.length
+        width > 0 &&
+        panes.length > previous.panes.length &&
+        !panesFitWidth(panes, width) &&
+        !firstRun.narrowNudgeSeen
       ) {
-        setClamp({
-          source: initialPanes,
-          presented: fitted,
-          urlSource: initialUrlPanes,
-          urlPresented: urlFitted,
+        firstRun.markNarrowNudgeSeen();
+        toast({
+          title: "Tight fit",
+          description:
+            "Panes keep a minimum width, so this view may feel cramped. Close a pane from the left rail any time.",
         });
       }
     },
-    [initialPanes, initialUrlPanes],
+    [workflowDeleted],
   );
 
-  const notePaneWrite = useCallback((change: PaneWrite) => {
-    wroteRef.current = true;
-    setClamp((current) => {
-      if (current === null) {
-        return current;
-      }
-      if (change.nextRuntimeSource !== undefined) {
-        return {
-          ...current,
-          source: [...change.nextRuntimeSource],
-          presented: [...change.next],
-        };
-      }
-      return null;
-    });
-    const firstRun = useStudioFirstRunStore.getState();
-    // Toggling a pane is the lesson the coach mark teaches.
-    if (!firstRun.coachMarkSeen) {
-      firstRun.markCoachMarkSeen();
-    }
-    const stageWidth = stageElRef.current?.clientWidth ?? 0;
+  const registerStageElement = useCallback((el: HTMLElement | null) => {
+    stageElRef.current = el;
+    const current = latestRef.current;
     if (
-      stageWidth > 0 &&
-      change.next.length > change.previous.length &&
-      !panesFitWidth(change.next, stageWidth) &&
-      !firstRun.narrowNudgeSeen
-    ) {
-      firstRun.markNarrowNudgeSeen();
-      toast({
-        title: "Tight fit",
-        description:
-          "Panes keep a minimum width, so this view may feel cramped. Close a pane from the left rail any time.",
-      });
+      !el ||
+      el.clientWidth <= 0 ||
+      measuredEntryRef.current === current.entryId ||
+      wroteEntryRef.current === current.entryId
+    )
+      return;
+    measuredEntryRef.current = current.entryId;
+    const panes = fitPanesToWidth(current.panes, el.clientWidth);
+    if (!panesListEqual(current.panes, panes)) {
+      latestRef.current = { ...current, panes };
+      setState(latestRef.current);
     }
   }, []);
 
-  const value = useMemo(
-    () => ({
-      defaultPanes,
-      clamp,
-      notePaneWrite,
-      registerStageElement,
-      learnedRunPanes,
-    }),
-    [defaultPanes, clamp, notePaneWrite, registerStageElement, learnedRunPanes],
+  const setPaneWidths = useCallback((widths: PaneWidths) => {
+    const paneWidths = { ...latestRef.current.paneWidths };
+    for (const [id, raw] of Object.entries(widths)) {
+      const width = sanitizePaneWidth(raw);
+      if (width !== undefined) paneWidths[id] = width;
+    }
+    latestRef.current = { ...latestRef.current, paneWidths };
+    setState(latestRef.current);
+  }, []);
+  const resetPaneWidths = useCallback(() => {
+    latestRef.current = { ...latestRef.current, paneWidths: {} };
+    setState(latestRef.current);
+  }, []);
+  const preserveNextEntry = useCallback(
+    (search: string | null, panes?: readonly StudioPaneId[]) => {
+      if (search === null) {
+        transitionRef.current = null;
+        return;
+      }
+      const key = keyForSearch(search);
+      if (key === latestRef.current.key) {
+        transitionRef.current = null;
+        if (panes) updatePanes(() => [...panes]);
+      } else {
+        transitionRef.current = { key, panes };
+      }
+    },
+    [keyForSearch, updatePanes],
   );
 
+  const value = useMemo(
+    () => ({
+      isStudio: true,
+      panes: current.panes,
+      paneWidths: current.paneWidths,
+      entryId: current.entryId,
+      getPanes,
+      updatePanes,
+      registerStageElement,
+      setPaneWidths,
+      resetPaneWidths,
+      preserveNextEntry,
+    }),
+    [
+      current.panes,
+      current.paneWidths,
+      current.entryId,
+      getPanes,
+      updatePanes,
+      registerStageElement,
+      setPaneWidths,
+      resetPaneWidths,
+      preserveNextEntry,
+    ],
+  );
   return (
     <StudioPaneDefaultsContext.Provider value={value}>
       {children}

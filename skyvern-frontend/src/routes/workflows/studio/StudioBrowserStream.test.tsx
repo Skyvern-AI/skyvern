@@ -9,6 +9,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { type StudioPaneId } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 
@@ -94,7 +95,7 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRecordingState = useRecordingStore.getState();
 
-// Drives a real pane-state URL write, so the effect chain under test is the
+// Drives a real runtime pane change, so the effect chain under test is the
 // same one a spine click goes through.
 function OpenBrowserPaneButton() {
   const { openPane } = useStudioPanes();
@@ -105,7 +106,7 @@ function OpenBrowserPaneButton() {
   );
 }
 
-// The browser pane's visibility comes from ?panes= in the URL.
+// The incoming URL seeds visit-scoped pane visibility.
 function renderStudioBrowserStream(
   initialPath: string,
   visiblePanes?: readonly StudioPaneId[],
@@ -116,10 +117,10 @@ function renderStudioBrowserStream(
         <Route
           path="/workflows/:workflowPermanentId/studio"
           element={
-            <>
+            <StudioPaneDefaultsProvider hasBlocks={true}>
               <StudioBrowserStream visiblePanes={visiblePanes} />
               <OpenBrowserPaneButton />
-            </>
+            </StudioPaneDefaultsProvider>
           }
         />
       </Routes>

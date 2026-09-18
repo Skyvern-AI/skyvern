@@ -23,12 +23,7 @@ import { TaskRecording } from "@/routes/tasks/detail/TaskRecording";
 import { WorkflowEditor } from "@/routes/workflows/editor/WorkflowEditor";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
-import {
-  parsePanesParam,
-  RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
-  toReadableSearch,
-} from "@/routes/workflows/studio/panes";
+import { toReadableSearch } from "@/routes/workflows/studio/panes";
 import { useTaskV2Query } from "@/routes/runs/useTaskV2Query";
 
 const loadingIndicator = (
@@ -110,33 +105,8 @@ function RunRouter() {
     (studioView === "outputs" || studioView === "inputs")
       ? "timeline"
       : studioView;
-  const embedded = searchParams.get("embed") === "true";
-  const requestedView = routedStudioView ?? searchParams.get("view");
-  const requiredPane = requestedView === "recording" ? "browser" : "overview";
-  const embeddedPanes = parsePanesParam(searchParams.get(STUDIO_PANES_PARAM));
-  const embeddedLayoutInvalid =
-    embeddedPanes === null ||
-    embeddedPanes.length === 0 ||
-    embeddedPanes.some((pane) => pane !== "overview" && pane !== "browser");
-  const normalizeEmbeddedLayout =
-    embedded && (legacySubview !== undefined || embeddedLayoutInvalid);
-  if (isWorkflowRun && (routedStudioView || normalizeEmbeddedLayout)) {
-    if (routedStudioView) {
-      searchParams.set("view", routedStudioView);
-    }
-    const panes = embedded
-      ? [requiredPane]
-      : (parsePanesParam(searchParams.get(STUDIO_PANES_PARAM)) ?? [
-          ...RUN_APPEND_PANES,
-        ]);
-    searchParams.set(
-      STUDIO_PANES_PARAM,
-      embedded
-        ? requiredPane
-        : [requiredPane, ...panes.filter((pane) => pane !== requiredPane)].join(
-            ",",
-          ),
-    );
+  if (isWorkflowRun && routedStudioView) {
+    searchParams.set("view", routedStudioView);
     return (
       <Navigate
         to={{
