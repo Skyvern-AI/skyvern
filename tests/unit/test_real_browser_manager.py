@@ -20,7 +20,7 @@ from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepa
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
-from skyvern.webeye import real_browser_manager
+from skyvern.webeye import dialog_handler, real_browser_manager
 from skyvern.webeye.browser_artifacts import (
     BrowserArtifacts,
     DownloadBinding,
@@ -3007,3 +3007,155 @@ async def test_workflow_sweep_cancel_still_sweeps_siblings_releases_session_and_
     assert sorted(swept) == ["tsk_owned", "wr_run"]  # sibling still swept despite the first owner's mid-sweep cancel
     release.assert_awaited_once()  # session release ran once
     teardown.assert_called_once_with("wr_run")  # stream teardown completed once
+
+
+@pytest.mark.parametrize("run_state_present", [True, False], ids=["run-browser-deferred", "task-browser-only"])
+@pytest.mark.asyncio
+async def test_workflow_run_cleanup_clears_run_dialog_answers_even_when_the_browser_survives(
+    monkeypatch: pytest.MonkeyPatch, run_state_present: bool
+) -> None:
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock()
+    if run_state_present:
+        manager.pages["wr_dialog_run"] = browser_state
+    manager.pages["tsk_dialog_run"] = browser_state
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", MagicMock(return_value=True))
+    context = MagicMock()
+    for run_id in ("wr_dialog_run", "wr_dialog_child", "wr_dialog_other"):
+        dialog_handler.set_run_dialog_policy(context, "accept", None, run_id)
+
+    try:
+        await manager.cleanup_for_workflow_run(
+            "wr_dialog_run",
+            task_ids=["tsk_dialog_run"],
+            close_browser_on_completion=False,
+            child_workflow_run_ids=["wr_dialog_child"],
+        )
+        remaining = list(dialog_handler._run_dialog_policies[context])
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_other"])
+
+    browser_state.close.assert_not_awaited()
+    assert remaining == ["wr_dialog_other"]
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["unshared", "shared-with-another-run"])
+@pytest.mark.asyncio
+async def test_workflow_run_cleanup_drops_unnamed_run_answers_only_from_an_unshared_context(
+    monkeypatch: pytest.MonkeyPatch, shared: bool
+) -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    browser_state = MagicMock()
+    browser_state.browser_context = context
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock()
+    manager.pages["wr_dialog_top"] = browser_state
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda *_args: shared)
+    dialog_handler.set_run_dialog_policy(context, "accept", None, "wr_dialog_grandchild")
+
+    try:
+        await manager.cleanup_for_workflow_run("wr_dialog_top", task_ids=[], close_browser_on_completion=False)
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_grandchild"])
+
+    assert remaining == (["wr_dialog_grandchild"] if shared else [])
+
+
+@pytest.mark.asyncio
+async def test_a_run_occupying_a_persistent_session_drops_a_previous_runs_dialog_answer() -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context = context
+    pbs_state.get_working_page = AsyncMock(return_value=MagicMock())
+    pbs_state.get_or_create_page = AsyncMock()
+    answers_at_navigation: list[list[str]] = []
+    pbs_state.navigate_to_url = AsyncMock(
+        side_effect=lambda **_kwargs: answers_at_navigation.append(
+            list(dialog_handler._run_dialog_policies.get(context, {}))
+        )
+    )
+    dialog_handler.set_run_dialog_policy(context, "dismiss", None, "wr_dialog_previous")
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=make_workflow_run("wr_dialog_next"),
+                url="https://example.com",
+                browser_session_id="bs_dialog",
+            )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_previous"])
+
+    assert answers_at_navigation == [[]]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_a_child_run_inheriting_its_parents_browser_keeps_the_parents_dialog_answer() -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    parent_state = MagicMock()
+    parent_state.browser_context = context
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
+    manager.pages["wr_dialog_parent"] = parent_state
+    dialog_handler.set_run_dialog_policy(context, "dismiss", None, "wr_dialog_unrelated")
+    dialog_handler.set_run_dialog_policy(context, "accept", None, "wr_dialog_parent")
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            with patch.object(manager, "_start_frame_publisher", AsyncMock()):
+                result = await manager.get_or_create_for_workflow_run(
+                    workflow_run=make_workflow_run("wr_dialog_child", parent_workflow_run_id="wr_dialog_parent"),
+                    url="https://example.com",
+                )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_parent", "wr_dialog_unrelated"])
+
+    assert result is parent_state
+    assert remaining == ["wr_dialog_parent"]
+
+
+@pytest.mark.asyncio
+async def test_a_nested_run_keeps_every_live_ancestors_dialog_answer() -> None:
+    """Runs A -> B -> C -> D on one browser: D's acquisition must not drop B, which it cannot name."""
+    manager = RealBrowserManager()
+    context = MagicMock()
+    shared_state = MagicMock()
+    shared_state.browser_context = context
+    shared_state.get_working_page = AsyncMock(return_value=MagicMock())
+    live = {"wr_dialog_a", "wr_dialog_b", "wr_dialog_c"}
+    # wr_dialog_gone finished but left its page entry behind, so liveness decides, not the entry.
+    for run_id in (*live, "wr_dialog_gone"):
+        manager.pages[run_id] = shared_state
+    for run_id in ("wr_dialog_b", "wr_dialog_gone"):
+        dialog_handler.set_run_dialog_policy(context, "accept", None, run_id)
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = lambda run_id: run_id in live
+            with patch.object(manager, "_start_frame_publisher", AsyncMock()):
+                await manager.get_or_create_for_workflow_run(
+                    workflow_run=make_workflow_run("wr_dialog_d", parent_workflow_run_id="wr_dialog_c"),
+                    url="https://example.com",
+                )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_b", "wr_dialog_gone"])
+
+    assert remaining == ["wr_dialog_b"]
