@@ -7906,12 +7906,14 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
 @pytest.mark.parametrize(
     "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
 )
+@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(
-    misroute: str, text: str, template: str
+    misroute: str, text: str, template: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would
-    # turn today's loud failure into a date that reads as filled and is not.
+    # Reaching the field by focus() alone, or by a press no hit test checked, proves nothing about the
+    # keystrokes. A success here would turn today's loud failure into a date that reads as filled and is not.
     # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     html = template + f"<script>{misroute}</script>"
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -7921,6 +7923,12 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
             assert "outside of the viewport" in str(exc), exc
         else:
             assert r.status == "error", r.content
+            if coordinate_click and text != text.strip() and template is _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML:
+                # Only the on-screen sub-pixel field is pressed. That path Tabs out, so the widget has
+                # committed its trimmed value: it is reported and left in place, not taken back.
+                assert "holds '2023'" in r.content, r.content
+                assert await page.eval_on_selector("#year", "el => el.value") == "2023"
+                return
             assert "NOT filled" in r.content, r.content
         assert await page.eval_on_selector("#year", "el => el.value") == ""
         assert await page.eval_on_selector("#month", "el => el.value") == ""
@@ -7946,6 +7954,7 @@ _UNCLICKABLE_TYPEAHEAD_HTML = """
   city.addEventListener("blur", () => {{ city.value = ""; }});
   city.addEventListener("input", () => {{ window.__cityTyped = true; }});
   city.addEventListener("focus", () => {{ window.__cityFocused = true; }});
+  document.addEventListener("pointerdown", () => {{ window.__cityPressed = true; }});
   {echo}
 </script>
 """
@@ -8030,11 +8039,13 @@ _ECHO_SCRIPT = (
         "skinned-subpixel-declared-slow-rows",
     ],
 )
+@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
-    template: str, aria: str, delay_ms: int, echo: str
+    template: str, aria: str, delay_ms: int, echo: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A field that DECLARES a list is refused before it is focused, so the page must be untouched:
     # asserting only the verdict cannot tell that guard from a later one reaching the same answer.
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     declares = bool(aria)
     async with _content_page(template.format(aria=aria, delay_ms=delay_ms, echo=echo)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -8046,7 +8057,7 @@ async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as
             assert r.status == "error", r.content
             assert "NOT filled" in r.content, r.content
         if declares:
-            assert await page.evaluate("() => !window.__cityFocused && !window.__cityTyped")
+            assert await page.evaluate("() => !window.__cityFocused && !window.__cityTyped && !window.__cityPressed")
 
 
 @_skip_no_browser
@@ -8069,6 +8080,129 @@ async def test_type_fills_a_segment_input_the_click_cannot_reach(html: str) -> N
         assert await page.eval_on_selector("#year", "el => el.value") == "2023"
         # Real key events reached the widget, not just a value write.
         assert await page.eval_on_selector("#year-display", "el => el.textContent") == "2023"
+
+
+# SKY-16501: the sub-pixel segment under its own display, from a widget that moves its section cursor only
+# on a TRUSTED pointer event on the display. Until then a digit renders in the display and the input stays
+# empty; the widget commits the value to its form model when focus leaves. Nothing here moves focus on a
+# press, so a fix that relies on the press to focus the input fails too.
+_SEGMENTED_DATE_TRUSTED_PRESS_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:240px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="year" type="text" role="spinbutton" aria-label="Year"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div id="year-display" aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">YYYY</div>
+  </div>
+  <div style="position:relative;width:40px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+</div>
+<script>
+  const year = document.getElementById("year");
+  const display = document.getElementById("year-display");
+  let armed = false;
+  display.addEventListener("pointerdown", (e) => { if (e.isTrusted) armed = true; });
+  year.addEventListener("keydown", (e) => {
+    if (!/^[0-9]$/.test(e.key)) return;
+    e.preventDefault();
+    if (!armed) {
+      display.textContent = (display.textContent === "YYYY" ? "" : display.textContent) + e.key;
+      return;
+    }
+    year.value += e.key;
+    year.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  year.addEventListener("input", () => { display.textContent = year.value || "YYYY"; });
+  year.addEventListener("blur", () => { window.__committedYear = year.value; });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
+async def test_type_fills_a_segment_that_takes_keys_only_after_a_trusted_press(
+    coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
+    async with _content_page(_SEGMENTED_DATE_TRUSTED_PRESS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        if not coordinate_click:
+            # focus() alone: the digits show in the display and the field stays empty, so it is refused.
+            assert r.status == "error", r.content
+            assert "NOT filled" in r.content, r.content
+            assert await page.eval_on_selector("#year", "el => el.value") == ""
+            return
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == "2023"
+        assert await page.evaluate("() => window.__committedYear") == "2023"
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+_COMMIT_ON_BLUR = 'year.addEventListener("blur", () => { window.__committedYear = year.value; });'
+
+
+def _segment_reformatting_on_blur(reformat: str) -> str:
+    html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+        _COMMIT_ON_BLUR,
+        'year.addEventListener("blur", () => { ' + reformat + " window.__committedYear = year.value; });",
+    )
+    assert html != _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    return html
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reformat", "typed", "held"),
+    [
+        ('year.value = year.value.padStart(2, "0");', "3", "03"),
+        ('if (year.value.length === 2) year.value = "20" + year.value;', "23", "2023"),
+        # A substitution the model did not ask for: reported, never a success.
+        ("year.value = String(Math.min(12, Number(year.value)));", "13", "12"),
+        ('year.value = "1999";', "2023", "1999"),
+        # Differs only by whitespace: taking it back would empty the input while the widget keeps "3".
+        ("year.value = year.value.trim();", "3 ", "3"),
+    ],
+    ids=["zero-pad", "century", "clamp", "unrelated", "trim"],
+)
+async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_text(
+    reformat: str, typed: str, held: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+    async with _content_page(_segment_reformatting_on_blur(reformat)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": typed})
+        assert r.status == "error", r.content
+        assert f"holds '{held}'" in r.content, r.content
+        assert "NOT filled" not in r.content, r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == held
+        assert await page.evaluate("() => window.__committedYear") == held
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret", ["typed-credential", "one-time-code-box"])
+async def test_type_does_not_echo_a_changed_value_it_may_not_show(secret: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+    html = _segment_reformatting_on_blur('year.value = year.value + "9";')
+    text = "4417"
+    resolve = None
+    if secret == "typed-credential":
+        text = "placeholder_pin"
+        resolve = lambda t: "4417" if t == "placeholder_pin" else t  # noqa: E731
+    else:
+        html = html.replace('<input id="year"', '<input id="year" data-skyvern-otp-box')
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=resolve)
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": text})
+        assert await page.eval_on_selector("#year", "el => el.value") == "44179"
+        assert r.status == "error", r.content
+        assert "different value" in r.content, r.content
+        assert "4417" not in r.content, r.content
 
 
 # The field hangs directly off <body>, so EVERY overlay on the page is "inside its parent". A purely
@@ -8174,6 +8308,99 @@ async def test_type_stops_when_the_forced_click_navigates_away() -> None:
             assert page.url.endswith("/elsewhere"), page.url
             # Not a 15s fill() wait against a selector on some other document.
             assert elapsed < 10, elapsed
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: pytest.MonkeyPatch) -> None:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+    start_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+        "if (e.isTrusted) armed = true;", 'if (e.isTrusted) location.href = "/elsewhere";'
+    )
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                # The destination has a field the same selector matches.
+                elsewhere = route.request.url.endswith("/elsewhere")
+                body = '<input id="year" type="text">' if elsewhere else start_html
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://segment.test/start")
+            tools = build_browser_tools(_fixed_page_provider(page))
+            try:
+                r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            except Exception as exc:
+                assert "outside of the viewport" in str(exc), exc
+            else:
+                assert r.status == "error", r.content
+            assert page.url.endswith("/elsewhere"), page.url
+            assert await page.eval_on_selector("#year", "el => el.value") == ""
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["same", "cross"])
+@pytest.mark.parametrize("placement", ["inside", "clipped"])
+async def test_type_presses_a_framed_segment_only_where_its_frame_shows_it(
+    origin: str, placement: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The press is a main-page mouse event, so it must land in frame-offset coordinates. A field the frame
+    # clips (fixed below the frame's 120px height) has its centre over the parent page, where a
+    # page-wide decoy would take the press instead.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    frame_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    decoy = ""
+    if placement == "clipped":
+        frame_html = frame_html.replace(
+            'style="display:flex;width:240px;height:30px"', 'style="position:fixed;left:0;top:400px"', 1
+        )
+        decoy = (
+            '<button style="position:absolute;inset:0;width:1024px;height:900px"'
+            ' onpointerdown="window.__decoyPressed = true">decoy</button>'
+        )
+    frame_host = "parent.test" if origin == "same" else "child.test"
+    parent_html = (
+        f'{decoy}<iframe src="http://{frame_host}/frame" style="position:absolute;left:150px;top:120px;'
+        'width:300px;height:120px;border:0;z-index:1"></iframe>'
+    )
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+
+            async def _serve(route: Any) -> None:
+                body = frame_html if route.request.url.endswith("/frame") else parent_html
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await context.route("**/*", _serve)
+            page = await context.new_page()
+            await page.goto("http://parent.test/start")
+            frame = page.frames[1]
+            await frame.wait_for_selector("#year", state="attached")
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            if placement == "inside":
+                assert r.status == "ok", r.content
+                assert await frame.evaluate("() => window.__committedYear") == "2023"
+                return
+            assert await page.evaluate("() => window.__decoyPressed") is None
+            assert r.status == "error", r.content
+            assert "could only be focused, not clicked" in r.content, r.content
+            assert await frame.eval_on_selector("#year", "el => el.value") == ""
         finally:
             await browser.close()
 
