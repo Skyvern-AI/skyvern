@@ -7842,6 +7842,37 @@
                   "other_information": {
                     "title": "Other Information"
                   },
+                  "terminate_criterion": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Terminate Criterion",
+                    "description": "Condition that stops Apply. Omit to use the recipe default; null or empty text disables it.",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button, redirect, or HTTP 404 alone is insufficient."
+                  },
+                  "error_code_mapping": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Error Code Mapping",
+                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "default": {
+                      "job_expired": "The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications."
+                    }
+                  },
                   "username": {
                     "anyOf": [
                       {
@@ -7925,6 +7956,32 @@
                       }
                     ],
                     "title": "Other Information"
+                  },
+                  "terminate_criterion": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Terminate Criterion",
+                    "description": "Condition that stops Apply. Omit for the recipe default; empty text disables it.",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button, redirect, or HTTP 404 alone is insufficient."
+                  },
+                  "error_code_mapping": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Error Code Mapping",
+                    "description": "JSON text containing an object of error codes and descriptions. Omit for the recipe default; JSON null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}"
                   },
                   "username": {
                     "anyOf": [
@@ -9971,6 +10028,17 @@
             ],
             "title": "Bitwarden Item Id"
           },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10074,6 +10142,17 @@
               }
             ],
             "title": "Bitwarden Item Id"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
           }
         },
         "type": "object",
@@ -20655,6 +20734,17 @@
             ],
             "title": "Totp Field Name"
           },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -20731,6 +20821,17 @@
               }
             ],
             "title": "Totp Field Name"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
           }
         },
         "type": "object",
@@ -21173,6 +21274,12 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "has_totp": {
+            "type": "boolean",
+            "title": "Has Totp",
+            "description": "Whether the stored password credential includes a non-empty TOTP seed. Legacy rows with an unknown value report false until the credential is updated.",
+            "default": false
           }
         },
         "type": "object",
