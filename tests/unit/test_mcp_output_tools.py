@@ -31,6 +31,19 @@ async def test_output_tool_registration_is_additive_static_and_lean_only() -> No
     assert tools_by_name["skyvern_finish"].tags == {"lean"}
     assert tools_by_name["skyvern_extract_structured"].description == output_tools.EXTRACT_STRUCTURED_DESCRIPTION
     assert tools_by_name["skyvern_finish"].description == output_tools.FINISH_DESCRIPTION
+    output_param = tools_by_name["skyvern_finish"].parameters["properties"]["output"]
+    assert "array" in output_param["type"]
+    assert output_param.get("items") == {}
+
+
+@pytest.mark.asyncio
+async def test_finish_output_schema_specifies_items_for_gemini_api_compatibility() -> None:
+    tools = await mcp.list_tools()
+    finish_tool = next(tool for tool in tools if tool.name == "skyvern_finish")
+    output_schema = finish_tool.parameters["properties"]["output"]
+    assert output_schema["type"] == ["object", "array", "string", "number", "boolean", "null"]
+    assert output_schema["items"] == {}
+
 
 
 @pytest.mark.asyncio
