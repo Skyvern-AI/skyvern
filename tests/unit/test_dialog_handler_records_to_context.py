@@ -413,6 +413,63 @@ class TestDeclaredDialogPolicy:
         with pytest.raises(ValueError):
             dialog_handler.set_dialog_policy(MagicMock(), "ignore")
 
+    @pytest.mark.parametrize("run_declared_first", [True, False], ids=["run-then-block", "block-then-run"])
+    @pytest.mark.asyncio
+    async def test_the_later_declaration_answers_during_the_block_and_the_run_answer_outlives_it(
+        self,
+        isolated_context: SkyvernContext,
+        armed_page: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        run_declared_first: bool,
+    ) -> None:
+        isolated_context.navigation_goal = "goal"
+        monkeypatch.setattr(
+            dialog_handler.app, "SECONDARY_LLM_API_HANDLER", AsyncMock(side_effect=AssertionError("LLM consulted"))
+        )
+        run_id = "wr_test"
+        if run_declared_first:
+            dialog_handler.set_run_dialog_policy(armed_page.context, "accept", "from the run", run_id)
+        try:
+            dialog_handler.set_dialog_policy(armed_page.context, "dismiss")
+            if not run_declared_first:
+                dialog_handler.set_run_dialog_policy(armed_page.context, "accept", "from the run", run_id)
+            during_block = _make_dialog("prompt", "Delete?")
+            await dialog_handler._handle_dialog(during_block, page=armed_page)
+            dialog_handler.clear_dialog_policy(armed_page.context)
+            after_block = _make_dialog("prompt", "Name?")
+            await dialog_handler._handle_dialog(after_block, page=armed_page)
+        finally:
+            dialog_handler.clear_run_dialog_policies([run_id])
+
+        if run_declared_first:
+            during_block.dismiss.assert_awaited_once_with()
+            during_block.accept.assert_not_awaited()
+        else:
+            during_block.accept.assert_awaited_once_with("from the run")
+            during_block.dismiss.assert_not_awaited()
+        after_block.accept.assert_awaited_once_with("from the run")
+        assert dialog_handler.take_dialog_records(armed_page.context) == []
+
+    @pytest.mark.asyncio
+    async def test_clearing_a_child_run_answer_restores_the_parent_then_default_handling(
+        self, isolated_context: SkyvernContext, armed_page: MagicMock
+    ) -> None:
+        dialog_handler.set_run_dialog_policy(armed_page.context, "accept", "parent", "wr_parent_answer")
+        dialog_handler.set_run_dialog_policy(armed_page.context, "dismiss", None, "wr_child_answer")
+        answers = [_make_dialog("prompt", "Name?", default_value="default") for _ in range(3)]
+        try:
+            await dialog_handler._handle_dialog(answers[0], page=armed_page)
+            dialog_handler.clear_run_dialog_policies(["wr_child_answer"])
+            await dialog_handler._handle_dialog(answers[1], page=armed_page)
+            dialog_handler.clear_run_dialog_policies(["wr_parent_answer"])
+            await dialog_handler._handle_dialog(answers[2], page=armed_page)
+        finally:
+            dialog_handler.clear_run_dialog_policies(["wr_parent_answer", "wr_child_answer"])
+
+        answers[0].dismiss.assert_awaited_once_with()
+        answers[1].accept.assert_awaited_once_with("parent")
+        answers[2].accept.assert_awaited_once_with("default")
+
 
 class _DriverError(Exception):
     """Stands in for the deployed driver's error type, which is deliberately NOT the
