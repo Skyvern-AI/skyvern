@@ -2332,6 +2332,31 @@ async def test_llm_caller_does_not_mark_parse_failure_completed(
     assert enrich_span.call_args.kwargs["mark_completed"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_id, expected",
+    [
+        ("gen-provider-issued-1", {"response_id": "gen-provider-issued-1"}),
+        # litellm synthesizes an id when the provider sent none.
+        (None, {}),
+    ],
+    ids=["provider-id", "litellm-synthesized"],
+)
+async def test_llm_caller_metrics_log_carries_only_a_provider_issued_response_id(
+    monkeypatch: pytest.MonkeyPatch, response_id: str | None, expected: dict[str, str]
+) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    response = _bridge_response(model_id=None)
+    if response_id is not None:
+        response.id = response_id
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+
+    await caller.call(prompt="test", prompt_name="extract-actions")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert {k: v for k, v in metrics.items() if k == "response_id"} == expected
+
+
 def test_recovered_tier_stays_out_of_the_persisted_response_artifact() -> None:
     """The LLM_RESPONSE artifact is dumped from this object. A tier we recovered must not appear
     there, or a later investigation reads our own inference as something the provider reported —

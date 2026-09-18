@@ -632,6 +632,34 @@ async def test_copilot_model_usage_survives_response_parse_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_id, expected",
+    [
+        ("gen-provider-issued-1", {"response_id": "gen-provider-issued-1"}),
+        # What litellm stamps when the provider sent no id.
+        (litellm.ModelResponse().id, {}),
+        (None, {}),
+    ],
+    ids=["provider-id", "litellm-synthesized", "no-id"],
+)
+async def test_metrics_log_carries_only_a_provider_issued_response_id(
+    span_exporter: InMemorySpanExporter, response_id: str | None, expected: dict[str, str]
+) -> None:
+    def response() -> ParityResponse:
+        r = ParityResponse("gpt-4")
+        r.id = response_id  # type: ignore[attr-defined]
+        return r
+
+    direct = await _run_direct(span_exporter, responses=[response()], parameters={})
+    router = await _run_router(span_exporter, responses=[response()], parameters={})
+
+    for outcome in (direct, router):
+        assert outcome.error is None
+        (metrics,) = outcome.metrics_events
+        assert {k: v for k, v in metrics.items() if k == "response_id"} == expected
+
+
+@pytest.mark.asyncio
 async def test_zero_usage_records_none_token_fields_on_both(span_exporter: InMemorySpanExporter) -> None:
     def zero_response() -> ParityResponse:
         return ParityResponse("gpt-4", prompt_tokens=0, completion_tokens=0, reasoning_tokens=0, cached_tokens=0)

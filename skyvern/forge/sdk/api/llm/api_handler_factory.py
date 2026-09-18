@@ -612,6 +612,22 @@ def _effective_service_tier(response: object) -> str | None:
     return reported if isinstance(reported, str) else _recovered_service_tier(response)
 
 
+# litellm stamps "chatcmpl-<uuid4>" on a response whose provider sent no id; logging it would
+# invent a correlation key that matches nothing on the provider side.
+_LITELLM_SYNTHESIZED_RESPONSE_ID = re.compile(
+    r"chatcmpl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+
+def _response_id_log_fields(response: object) -> dict[str, str]:
+    response_id = getattr(response, "id", None)
+    if not isinstance(response_id, str) or not response_id:
+        return {}
+    if _LITELLM_SYNTHESIZED_RESPONSE_ID.fullmatch(response_id):
+        return {}
+    return {"response_id": response_id}
+
+
 def _response_provider(response: object) -> str | None:
     provider = getattr(response, "provider", None)
     if provider is None:
@@ -2350,6 +2366,7 @@ class LLMAPIHandlerFactory:
                     service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -2975,6 +2992,7 @@ class LLMAPIHandlerFactory:
                     service_tier_source=service_tier_source,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -3745,6 +3763,7 @@ class LLMCaller:
                 service_tier_source=service_tier_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
+                **_response_id_log_fields(response),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
                 **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -4220,7 +4239,7 @@ class LLMCaller:
                     LOG.warning(
                         "OpenRouter response missing usage.cost; cost will be reported as 0",
                         llm_key=self.original_llm_key,
-                        response_id=getattr(response, "id", None),
+                        **_response_id_log_fields(response),
                     )
             else:
                 computed_cost = LLMAPIHandlerFactory.completion_cost_or_none(response)
