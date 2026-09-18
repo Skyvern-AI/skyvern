@@ -1,4 +1,7 @@
+import json
 import runpy
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -54,3 +57,78 @@ def test_openrouter_deepseek_v4_flash_0731_registry_config(monkeypatch: pytest.M
             "quantizations": ["fp8"],
         },
     }
+
+
+def _openrouter_capture_server(captured: dict[str, Any]) -> HTTPServer:
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            captured["body"] = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            payload = json.dumps(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "deepseek/deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": '{"actions": []}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    return HTTPServer(("127.0.0.1", 0), _Handler)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_v4_flash_sends_provider_ignore_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenRouter skips an unrecognized slug in `ignore` silently instead of rejecting it, so a
+    typo would leave the route on the defective provider while the config still looked right."""
+    captured: dict[str, Any] = {}
+    real_get_config = config_registry.LLMConfigRegistry.get_config
+
+    with _openrouter_capture_server(captured) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            monkeypatch.setattr(config_registry.settings, "ENABLE_OPENROUTER", True)
+            monkeypatch.setattr(config_registry.settings, "OPENROUTER_API_KEY", "test-key")
+            monkeypatch.setattr(
+                config_registry.settings, "OPENROUTER_API_BASE", f"http://127.0.0.1:{server.server_port}"
+            )
+            monkeypatch.setattr(llm_schemas, "_settings", lambda: config_registry.settings)
+            assert config_registry.__file__ is not None
+
+            registry_namespace = runpy.run_path(str(Path(config_registry.__file__)))
+            llm_config = registry_namespace["LLMConfigRegistry"].get_config("OPENROUTER_DEEPSEEK_V4_FLASH")
+            assert llm_config.litellm_params is not None
+            assert llm_config.litellm_params["extra_body"] == {"provider": {"ignore": ["open-inference"]}}
+
+            # The process-wide registry may hold a config issue for this key (no OpenRouter key in
+            # the environment), which would hand back the dummy handler instead of calling out.
+            monkeypatch.setattr(config_registry.LLMConfigRegistry, "get_config_issue", lambda _: None)
+            monkeypatch.setattr(
+                config_registry.LLMConfigRegistry,
+                "get_config",
+                lambda key: llm_config if key == "OPENROUTER_DEEPSEEK_V4_FLASH" else real_get_config(key),
+            )
+            monkeypatch.setattr(LLMAPIHandlerFactory, "_handler_cache", {})
+            await LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER_DEEPSEEK_V4_FLASH")(prompt="hello")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    assert captured["body"]["provider"] == {"ignore": ["open-inference"]}
