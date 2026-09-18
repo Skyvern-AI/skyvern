@@ -349,7 +349,18 @@ async def skyvern_finish(
         Field(
             description="Optional final JSON value: object, array, string, number, boolean, or null",
             # Any generates an empty schema; directory listing requires every param to carry a type.
-            json_schema_extra={"type": ["object", "array", "string", "number", "boolean", "null"]},
+            # The array arm must declare `items`: Gemini's function-calling API rejects any array
+            # schema without it (HTTP 400 on every request), while OpenAI/Anthropic tolerate it. #8611
+            json_schema_extra={
+                "anyOf": [
+                    {"type": "object"},
+                    {"type": "array", "items": {}},
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ]
+            },
         ),
     ] = None,
     schema: Annotated[str | None, Field(description="Optional JSON Schema string for output validation")] = None,
