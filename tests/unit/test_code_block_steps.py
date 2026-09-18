@@ -9,7 +9,6 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
-    fill_code_block_prompts_in_yaml,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
@@ -310,65 +309,6 @@ def test_bind_is_idempotent_so_callers_can_bind_before_the_seam():
 
 def test_bind_noop_on_unparseable():
     assert bind_referenced_parameters_in_yaml("::not yaml::") == "::not yaml::"
-
-
-def test_fill_prompts_preserves_prior_block_prompt_across_regen():
-    # Regenerating a code block replaces the whole block YAML, dropping the goal.
-    # Without the prompt the editor renders the legacy code-only layout, so the
-    # block's prior prompt must be carried forward (exact user text).
-    prior = (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "  - block_type: code\n"
-        "    label: block_1\n"
-        "    prompt: Build an agent to find the top post on the site\n"
-        "    code: 'x = 1'\n"
-    )
-    regenerated = (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "  - block_type: code\n"
-        "    label: block_1\n"
-        "    code: |\n"
-        "      await page.goto('https://example.com/')\n"
-    )
-    out = yaml.safe_load(fill_code_block_prompts_in_yaml(regenerated, prior_yaml=prior))
-    assert out["workflow_definition"]["blocks"][0]["prompt"] == "Build an agent to find the top post on the site"
-
-
-def test_fill_prompts_falls_back_to_declared_goal_for_new_block():
-    new = "workflow_definition:\n  blocks:\n  - block_type: code\n    label: block_2\n    code: 'x = 1'\n"
-    out = yaml.safe_load(
-        fill_code_block_prompts_in_yaml(new, prior_yaml=None, fallback_goals={"block_2": "Search the catalog"})
-    )
-    assert out["workflow_definition"]["blocks"][0]["prompt"] == "Search the catalog"
-
-
-def test_fill_prompts_prefers_prior_over_fallback_and_preserves_existing():
-    prior = "workflow_definition:\n  blocks:\n  - block_type: code\n    label: b\n    prompt: Exact user text\n    code: 'x=1'\n"
-    new = (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "  - block_type: code\n"
-        "    label: b\n"
-        "    code: 'y=2'\n"
-        "  - block_type: code\n"
-        "    label: c\n"
-        "    prompt: Already set\n"
-        "    code: 'z=3'\n"
-    )
-    out = yaml.safe_load(
-        fill_code_block_prompts_in_yaml(new, prior_yaml=prior, fallback_goals={"b": "model goal", "c": "ignored"})
-    )
-    blocks = out["workflow_definition"]["blocks"]
-    assert blocks[0]["prompt"] == "Exact user text"  # prior beats fallback
-    assert blocks[1]["prompt"] == "Already set"  # existing prompt untouched
-
-
-def test_fill_prompts_noop_without_sources():
-    new = "workflow_definition:\n  blocks:\n  - block_type: code\n    label: b\n    code: 'x=1'\n"
-    out = yaml.safe_load(fill_code_block_prompts_in_yaml(new))
-    assert "prompt" not in out["workflow_definition"]["blocks"][0]
 
 
 @pytest.mark.asyncio
