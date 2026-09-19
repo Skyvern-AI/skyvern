@@ -80,12 +80,20 @@ class TestJinjaDomainFilter:
     def test_returns_input_for_empty_string(self) -> None:
         assert _jinja_domain_filter("") == ""
 
+    def test_strips_userinfo_credentials_from_netloc(self) -> None:
+        assert _jinja_domain_filter("https://user:hunter2@example.com/login") == "example.com"
+
 
 class TestExtractFirstBlockDomain:
     def test_extracts_domain_from_first_block_with_url(self) -> None:
         blocks = [_task_block("step1", url="https://www.fanr.gov.ae/documents")]
         wf = _workflow(blocks)
         assert _extract_first_block_domain(wf, {}) == "www.fanr.gov.ae"
+
+    def test_strips_userinfo_credentials_from_url(self) -> None:
+        blocks = [_task_block("step1", url="https://user:hunter2@example.com/login")]
+        wf = _workflow(blocks)
+        assert _extract_first_block_domain(wf, {}) == "example.com"
 
     def test_skips_blocks_without_url(self) -> None:
         blocks = [
