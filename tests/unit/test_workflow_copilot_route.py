@@ -74,6 +74,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
     CopilotPendingTurn,
+    CopilotVideoEvidenceArtifact,
+    CopilotVideoObservation,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotChat,
@@ -822,6 +824,80 @@ async def test_a_client_without_proposal_tokens_can_still_reject(
 
     assert clear.await_args.kwargs["expected_owner_turn_id"] == "turn-a"
     assert clear.await_args.kwargs["expected_revision"] == 3
+
+
+@pytest.mark.asyncio
+async def test_detected_unsafe_video_status_is_persisted_on_the_attachment(
+    sqlite_engine: AsyncEngine,
+) -> None:
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.USER,
+        content="make a workflow from this",
+        attached_files=[CopilotAttachedFile(file_id="file_1", filename="demo.mp4")],
+    )
+
+    await repo.mark_workflow_copilot_video_attachments_unsafe(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        file_ids=frozenset({"file_1"}),
+    )
+
+    messages = await repo.get_workflow_copilot_chat_messages(chat.workflow_copilot_chat_id)
+    assert messages[0].attached_files[0].video_safety_status == "unsafe"
+
+
+@pytest.mark.asyncio
+async def test_overlength_video_status_is_persisted_on_the_attachment(sqlite_engine: AsyncEngine) -> None:
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.USER,
+        content="make a workflow from this",
+        attached_files=[CopilotAttachedFile(file_id="file_1", filename="demo.mp4")],
+    )
+
+    await repo.mark_workflow_copilot_video_attachments_too_long(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        file_ids=frozenset({"file_1"}),
+    )
+
+    messages = await repo.get_workflow_copilot_chat_messages(chat.workflow_copilot_chat_id)
+    assert messages[0].attached_files[0].video_processing_status == "too_long"
+
+
+@pytest.mark.asyncio
+async def test_video_evidence_artifact_is_persisted_on_the_attachment(sqlite_engine: AsyncEngine) -> None:
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.USER,
+        content="make a workflow from this",
+        attached_files=[CopilotAttachedFile(file_id="file_1", filename="demo.mp4")],
+    )
+    artifact = CopilotVideoEvidenceArtifact(
+        version="1",
+        duration_seconds=42.0,
+        sampled_frame_count=18,
+        observations=(CopilotVideoObservation(timestamp_seconds=3.0, description="A menu opens.", confidence="high"),),
+    )
+
+    await repo.persist_workflow_copilot_video_evidence_artifacts(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        artifacts={"file_1": artifact},
+    )
+
+    messages = await repo.get_workflow_copilot_chat_messages(chat.workflow_copilot_chat_id)
+    assert messages[0].attached_files[0].video_evidence == artifact
 
 
 @pytest.mark.asyncio

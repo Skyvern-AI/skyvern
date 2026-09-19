@@ -186,6 +186,8 @@ def _new_ctx() -> SimpleNamespace:
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
         design_start_emitted=False,
     )
 
@@ -568,6 +570,9 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
+        user_message="",
     )
 
     with pytest.raises(CopilotUnrecoverableToolError):

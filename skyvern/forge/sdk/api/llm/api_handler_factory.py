@@ -223,6 +223,10 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_REQUIRED_PROMPT_NAMES = {
+    "workflow-copilot-video-perception",
+    "workflow-copilot-video-secret-safety",
+}
 VISION_FALLBACK_PROMPT_NAMES = {
     "anthropic-cua",
     "css-shape-convert",
@@ -230,6 +234,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "solve-arithmetic-captcha",
     "solve-dice-captcha",
     "ui-tars-system-prompt",
+    *VISION_REQUIRED_PROMPT_NAMES,
 }
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
@@ -505,6 +510,8 @@ def _llm_screenshots_for_call(
     prompt_name: str | None = None,
     step: Step | None = None,
 ) -> list[bytes] | None:
+    if screenshots and prompt_name in VISION_REQUIRED_PROMPT_NAMES and not llm_config.supports_vision:
+        raise ValueError(f"Prompt {prompt_name!r} requires a vision-capable model")
     if not llm_config.supports_vision:
         return None
     if context and not context.llm_screenshots_enabled_for_prompt(
@@ -603,6 +610,22 @@ def _effective_service_tier(response: object) -> str | None:
     """What the provider reported, else what we recovered. Never the other way around."""
     reported = getattr(response, "service_tier", None)
     return reported if isinstance(reported, str) else _recovered_service_tier(response)
+
+
+# litellm stamps "chatcmpl-<uuid4>" on a response whose provider sent no id; logging it would
+# invent a correlation key that matches nothing on the provider side.
+_LITELLM_SYNTHESIZED_RESPONSE_ID = re.compile(
+    r"chatcmpl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+
+def _response_id_log_fields(response: object) -> dict[str, str]:
+    response_id = getattr(response, "id", None)
+    if not isinstance(response_id, str) or not response_id:
+        return {}
+    if _LITELLM_SYNTHESIZED_RESPONSE_ID.fullmatch(response_id):
+        return {}
+    return {"response_id": response_id}
 
 
 def _response_provider(response: object) -> str | None:
@@ -2343,6 +2366,7 @@ class LLMAPIHandlerFactory:
                     service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -2968,6 +2992,7 @@ class LLMAPIHandlerFactory:
                     service_tier_source=service_tier_source,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -3738,6 +3763,7 @@ class LLMCaller:
                 service_tier_source=service_tier_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
+                **_response_id_log_fields(response),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
                 **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -4213,7 +4239,7 @@ class LLMCaller:
                     LOG.warning(
                         "OpenRouter response missing usage.cost; cost will be reported as 0",
                         llm_key=self.original_llm_key,
-                        response_id=getattr(response, "id", None),
+                        **_response_id_log_fields(response),
                     )
             else:
                 computed_cost = LLMAPIHandlerFactory.completion_cost_or_none(response)

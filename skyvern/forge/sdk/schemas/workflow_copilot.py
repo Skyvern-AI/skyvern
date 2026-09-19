@@ -213,6 +213,21 @@ def _attached_files_or_empty(value: Any) -> Any:
     return [] if value is None else value
 
 
+class CopilotVideoObservation(BaseModel):
+    timestamp_seconds: float = Field(..., ge=0, le=300)
+    description: str = Field(..., min_length=1, max_length=500)
+    confidence: Literal["low", "medium", "high"]
+
+
+class CopilotVideoEvidenceArtifact(BaseModel):
+    """Compact, reusable perception output; raw video frames never enter the acting-model loop."""
+
+    version: Literal["1"]
+    duration_seconds: float = Field(..., gt=0, le=300)
+    sampled_frame_count: int = Field(..., ge=1, le=120)
+    observations: tuple[CopilotVideoObservation, ...] = Field(..., min_length=1, max_length=80)
+
+
 class CopilotAttachedFile(BaseModel):
     """An uploaded file the user attached to a copilot turn.
 
@@ -228,6 +243,18 @@ class CopilotAttachedFile(BaseModel):
     )
     size_bytes: int | None = Field(None, description="Size recorded at upload time")
     available: bool = Field(True, description="Whether the file still resolves for this organization")
+    video_safety_status: Literal["unsafe"] | None = Field(
+        None,
+        description="Server-owned sticky status for a video in which the safety boundary detected a raw secret",
+    )
+    video_processing_status: Literal["too_long"] | None = Field(
+        None,
+        description="Server-owned terminal status for a video that exceeds the supported duration",
+    )
+    video_evidence: CopilotVideoEvidenceArtifact | None = Field(
+        None,
+        description="Server-owned, reusable visual-observation timeline derived from an attached video",
+    )
 
 
 class WorkflowCopilotChatMessage(BaseModel):

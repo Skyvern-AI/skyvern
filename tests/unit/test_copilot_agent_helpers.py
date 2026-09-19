@@ -252,9 +252,19 @@ def _challenge_effects_contract() -> DiagnosisRepairContract:
         repair_decision=RepairDecision(next_action=RepairNextAction.STOP),
         verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
         challenge=ChallengeEffects(
-            kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
+            basis="run_wall", kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
         ),
         levers=[Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")],
+    )
+
+
+def _frame_only_challenge_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
+        verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
+        challenge=ChallengeEffects(basis="page_frames", frame_hosts=["challenges.cloudflare.com"]),
     )
 
 
@@ -519,6 +529,8 @@ class TestFailedTestResponseNormalization:
         no_contract_ctx = _challenge_failure_ctx()
         empty_recourse_ctx = _challenge_failure_ctx()
         empty_recourse_ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
+        frame_only_ctx = _challenge_failure_ctx()
+        frame_only_ctx.latest_diagnosis_repair_contract = _frame_only_challenge_contract()
 
         expected = (
             "I created a draft workflow with 2 blocks and tested it, but the test failed. "
@@ -527,6 +539,7 @@ class TestFailedTestResponseNormalization:
         )
         assert _rewrite_failed_test_response("The site blocked me.", no_contract_ctx) == expected
         assert _rewrite_failed_test_response("The site blocked me.", empty_recourse_ctx) == expected
+        assert _rewrite_failed_test_response("The site blocked me.", frame_only_ctx) == expected
 
     def test_rewrite_failed_test_response_avoids_success_language(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response

@@ -25,11 +25,14 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     SOLVER_ATTEMPT_KEY,
     BuildTestEvidencePacket,
     RecordedBuildTestOutcome,
+    challenge_notices,
     recorded_outcome_from_run_blocks_result,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_KIND_KEY,
     ChallengeKind,
+    composition_challenge_carrier,
+    stamp_challenge_frame_fact,
 )
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -49,7 +52,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
-from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY
+from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, project_direct_test_handoff_packet_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -70,12 +73,16 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
-from skyvern.forge.sdk.copilot.tools.run_execution import finalize_build_test_result
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    finalize_build_test_result,
+    settle_terminal_challenge_after_enrichment,
+)
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
+from skyvern.webeye.actions.action_types import ActionType
 from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
@@ -5432,3 +5439,197 @@ def test_sign_in_taint_is_read_from_the_browser_the_run_used(
     record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id=tainted_session)
 
     assert run_execution_module._run_browser_carries_a_sign_in(ctx, run_session_id) is withheld
+
+
+def _completed_run_result() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_challenge",
+            "overall_status": "completed",
+            "blocks": [{"label": "submit_form", "block_type": "code", "status": "completed"}],
+        },
+    }
+
+
+def _frame_stamped_evidence(run_id: str) -> dict[str, Any]:
+    evidence = {
+        "workflow_run_id": run_id,
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://forms.example.test/apply",
+        "forms": [
+            {
+                "fields": [{"label": "Last name", "selector": "#lastName"}],
+                "submit_controls": [{"text": "Search", "selector": "button.search"}],
+            }
+        ],
+    }
+    return stamp_challenge_frame_fact(evidence, ["https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x"])
+
+
+def test_a_vendor_frame_on_a_completed_run_is_reported_without_failing_the_run() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    result = _completed_run_result()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert contract.challenge.kind is None
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.run_status == "completed"
+    assert contract.verification_result.user_goal_satisfied is True
+    assert composition_challenge_carrier(ctx.composition_page_evidence) is None
+    assert ctx.last_test_anti_bot is None
+    assert settle_terminal_challenge_after_enrichment(ctx, result) is False
+    assert ctx.last_run_outcome is None
+
+
+def test_a_frame_host_alone_buys_no_recourse_inventory() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "page_frames"
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert list(contract.levers) == []
+    assert len(challenge_notices(contract.challenge, list(contract.levers))) == 1
+
+
+def test_a_frame_only_record_ships_no_solver_facts_even_when_the_run_called_solve_captcha() -> None:
+    """``basis`` is excluded from the packet, so a solver key there would read as a wall with its only
+    disqualifier missing, including after the direct-test handoff revalidates the packet."""
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    result = _completed_run_result()
+    result["data"]["blocks"][0]["action_trace"] = [
+        {"action": ActionType.SOLVE_CAPTCHA.value, "status": "failed", "response": "solver did not clear it"}
+    ]
+
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result, workflow_updated=True)
+
+    packet = result["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
+    assert packet["run"]["status"] == "completed"
+    handoff = project_direct_test_handoff_packet_for_llm(BuildTestEvidencePacket.model_validate(packet)).model_dump(
+        mode="json", exclude_none=True
+    )
+    assert handoff["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
+
+
+def test_trace_data_distinguishes_a_frame_only_record_from_a_wall() -> None:
+    """``challenge_basis`` says which trigger built the record and ``challenge_solver_result`` is
+    null on a frame-only one, so neither field alone counts a mounted frame as a wall."""
+    frame_ctx = _ctx()
+    frame_ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    walled_ctx = _ctx()
+    walled_ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    walled_ctx.last_test_anti_bot = "Verify you are human"
+
+    traces = [
+        build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_completed_run_result(),
+            ctx=ctx,
+            workflow_updated=True,
+        ).to_trace_data()
+        for ctx in (frame_ctx, walled_ctx, _ctx())
+    ]
+
+    assert [trace["challenge_basis"] for trace in traces] == ["page_frames", "run_wall", None]
+    assert [trace["challenge_solver_result"] for trace in traces] == [None, "unresolved", None]
+
+
+def test_a_failed_run_whose_only_challenge_signal_is_a_frame_host_still_gets_no_levers() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    failed_result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_challenge",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "submit_form",
+                    "block_type": "code",
+                    "status": "failed",
+                    "failure_reason": "Timed out waiting for #lastName",
+                }
+            ],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=failed_result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "page_frames"
+    assert list(contract.levers) == []
+
+
+def test_an_anti_bot_category_restores_the_wall_presentation_beside_the_frame_hosts() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    ctx.last_test_anti_bot = "Verify you are human"
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "run_wall"
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert "captcha_solver" in [lever.mechanism for lever in contract.levers]
+
+
+def test_a_frame_fact_from_another_run_does_not_report_a_wall_on_this_one() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_other")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is None
+
+
+def test_a_partial_frame_read_that_found_no_host_reports_nothing_about_the_page() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = stamp_challenge_frame_fact(
+        _frame_stamped_evidence("wr_challenge"), [], complete=False
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert ctx.composition_page_evidence["challenge_frames"]["read"] == "partial"
+    assert contract.challenge is None

@@ -53,6 +53,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
+from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, run_arm_enabled
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -114,6 +115,9 @@ async def _run_execute_task_v3(
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         loop_mock.frame_perception_enabled_during_loop = frame_perception_enabled()
+        loop_mock.observe_offviewport_drop_during_loop = run_arm_enabled(
+            OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, forced=False
+        )
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -204,6 +208,34 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_pins_the_observe_offviewport_arm_before_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    reader = AsyncMock(
+        side_effect=lambda flag, *_a, **_k: "treatment" if flag == OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG else None
+    )
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", reader)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_offviewport_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    # Read inside the loop: the context is the same object after the run, so a pin written late would
+    # still be visible here -- and every observe call builds its script from the arm as it stands then.
+    assert loop_mock.observe_offviewport_drop_during_loop is True
+    assert loop_mock.context.run_arms[OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG] == (task.workflow_run_id, "treatment")
+    assert [c.args[1] for c in reader.await_args_list if c.args[0] == OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG] == [
+        task.workflow_run_id
+    ]
 
 
 @pytest.mark.asyncio

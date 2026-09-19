@@ -27,13 +27,14 @@ import pytest
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
 # delay-specific test can exercise the real function while other upload tests skip the sleep.
 from playwright.async_api import Error as _PlaywrightError
+from playwright.async_api import Frame, Page, Route
 from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -1756,11 +1757,13 @@ _STATUS_PAGE_HTML = """
 
 
 @contextlib.asynccontextmanager
-async def _content_page(html: str) -> AsyncIterator[Any]:
+async def _content_page(html: str, extra_args: list[str] | None = None) -> AsyncIterator[Any]:
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        browser = await pw.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic", *(extra_args or [])]
+        )
         try:
             context = await browser.new_context(viewport={"width": 1024, "height": 900})
             page = await context.new_page()
@@ -1811,6 +1814,9 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "hidden_dropped_off_canvas",
         "hidden_dropped_visibility",
         "hidden_dropped_zero_rect",
+        "hidden_dropped_off_viewport",
+        "off_viewport_unreachable_unnamed",
+        "off_viewport_unnamed_host_exempt",
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
@@ -4113,6 +4119,15 @@ def test_the_frame_census_control_set_cannot_silently_fall_behind_the_scanners_o
     q = terms(re.search(r"  const q = '([^']+)'", _OBSERVE_JS).group(1))
     missing = q - census
     assert not missing, f"census control set fell behind `q`: {sorted(missing)}"
+
+
+def test_observe_js_renders_the_shared_challenge_signature_verbatim() -> None:
+    # The alternation is spliced in from a constant the copilot scout also compiles, so a change
+    # made for the scout's benefit must not quietly rewrite the regex this script evaluates.
+    assert (
+        r"    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome"
+        r"|perimeterx|verify you are human|security challenge/i;"
+    ) in taskv3_tools._OBSERVE_JS
 
 
 @_skip_no_browser
@@ -12754,6 +12769,27 @@ async def test_type_into_an_open_combobox_is_not_blocked_by_its_own_listbox() ->
         assert await page.eval_on_selector("#src", "el => el.value") == "Applicant Referral"
 
 
+_SKINNED_COMBOBOX_BESIDE_A_FREE_FIELD_HTML = (
+    _OPEN_COMBOBOX_OWN_LISTBOX_HTML
+    + '<input id="free" type="text" style="position:absolute;left:400px;top:0;width:200px;height:30px">'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_skinned_type_leaves_no_cover_mark_for_the_next_probe_to_trust() -> None:
+    async with _content_page(_SKINNED_COMBOBOX_BESIDE_A_FREE_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        forced = await _tool(tools, "type").handler({"selector": "#src", "text": "Applicant Referral"})
+        assert forced.status == "ok", forced.content
+        assert await page.eval_on_selector("#src-lb", "el => el.hasAttribute('data-tv3-cover')") is True
+        html = await _tool(tools, "get_html").handler({})
+        assert "data-tv3-cover" not in html.content, html.content
+        free = await _tool(tools, "type").handler({"selector": "#free", "text": "hello"})
+        assert free.status == "ok", free.content
+        assert await page.query_selector("[data-tv3-cover]") is None
+
+
 # A native, full-sized, opacity:1 radio with a same-size SIBLING <label for=id> drawn on top of it —
 # not the zero-sized hidden-native shape the skinned-checkbox proxy path already covers.
 _RADIO_UNDER_SIBLING_LABEL_HTML = """
@@ -13112,6 +13148,221 @@ async def test_click_through_a_wall_nested_inside_the_own_label_is_still_covered
         assert r.status == "error", r.content
         assert "covered by" in r.content, r.content
         assert await page.eval_on_selector("#agree", "el => el.checked") is False
+
+
+# The widget's iframe sits in a CLOSED shadow root: the shape an in-page src scan would miss, which
+# is why containment is decided from the frame host upward rather than by scanning the layer.
+_CHALLENGE_FRAME_URL = "https://challenges.cloudflare.com/turnstile/v0/api.html"
+_CHALLENGE_FRAME_HOST = "challenges.cloudflare.com"
+
+_MOUNT_CLOSED_SHADOW_FRAMES_JS = """(host, arg) => {
+  const root = host.attachShadow({ mode: 'closed' });
+  for (const src of arg.srcs) {
+    const frame = document.createElement('iframe');
+    frame.src = src;
+    frame.style.cssText = arg.style;
+    root.appendChild(frame);
+  }
+}"""
+
+_CHALLENGE_WALL_HTML = """
+<!doctype html><html><body style="margin:0">
+<button id="go" style="position:absolute;left:40px;top:300px;width:120px;height:40px">Go</button>
+<input id="email" type="email" style="position:absolute;left:200px;top:300px;width:200px;height:40px">
+<div id="wall" role="dialog" aria-label="Please check the box below to continue."
+     style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff;z-index:9">
+  <div id="widget" style="position:absolute;left:40px;top:120px;width:300px;height:65px"></div>
+  <button id="close" style="position:absolute;left:40px;top:220px">Close</button>
+</div>
+</body></html>
+"""
+
+# The same wall, but the widget is a SIBLING of it rather than part of it: a page-embedded challenge
+# that a full-viewport consent backdrop happens to paint over is not what the backdrop contains.
+_CHALLENGE_BESIDE_WALL_HTML = """
+<!doctype html><html><body style="margin:0">
+<button id="go" style="position:absolute;left:40px;top:300px;width:120px;height:40px">Go</button>
+<input id="email" type="email" style="position:absolute;left:200px;top:300px;width:200px;height:40px">
+<div id="widget" style="position:absolute;left:500px;top:120px;width:300px;height:65px;z-index:__Z__"></div>
+<div id="wall" role="dialog" aria-label="Please check the box below to continue."
+     style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff;z-index:9">
+  <button id="close" style="position:absolute;left:40px;top:220px">Close</button>
+</div>
+</body></html>
+"""
+
+_CHALLENGE_WALL_IN_CHILD_FRAME_HTML = (
+    '<!doctype html><html><body style="margin:0"><iframe id="shell" srcdoc=\''
+    + _CHALLENGE_WALL_HTML.replace("'", "&apos;").replace("\n", "")
+    + '\' style="position:absolute;left:0;top:0;width:1000px;height:880px;border:0"></iframe></body></html>'
+)
+
+
+async def _mount_challenge_frame(
+    realm: Page | Frame,
+    page: Page,
+    host_selector: str,
+    *,
+    style: str = "width:300px;height:65px;border:0",
+    ahead_of_it: str | None = None,
+) -> None:
+    async def _fulfill(route: Route) -> None:
+        await route.fulfill(content_type="text/html", body="<p>Verify you are human</p>")
+
+    srcs = ([ahead_of_it] if ahead_of_it else []) + [_CHALLENGE_FRAME_URL]
+    await page.route(f"{_CHALLENGE_FRAME_URL}*", _fulfill)
+    async with page.expect_event("framenavigated", lambda f: _CHALLENGE_FRAME_URL in (f.url or "")):
+        await realm.eval_on_selector(host_selector, _MOUNT_CLOSED_SHADOW_FRAMES_JS, {"srcs": srcs, "style": style})
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_covered_by_a_layer_holding_a_challenge_frame_names_it_and_drops_the_dismissal() -> None:
+    async with _content_page(_CHALLENGE_WALL_HTML, extra_args=["--site-per-process"]) as page:
+        await _mount_challenge_frame(page, page, "#widget")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "error", r.content
+        assert r.error_class == "covered", r.error_class
+        assert '"Please check the box below to continue." (#wall)' in r.content, r.content
+        assert f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content, r.content
+        assert '#close "Close"' in r.content, r.content
+        assert "closes or dismisses" not in r.content, r.content
+        assert "solve_captcha" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_field_covered_by_a_challenge_layer_names_the_frame() -> None:
+    async with _content_page(_CHALLENGE_WALL_HTML) as page:
+        await _mount_challenge_frame(page, page, "#widget")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#email", "text": "a@b.co"})
+        assert r.status == "error", r.content
+        assert r.error_class == "covered", r.error_class
+        assert f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content, r.content
+        assert "closes or dismisses" not in r.content, r.content
+        assert await page.eval_on_selector("#email", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("z_index", "tool_name", "args"),
+    [("99", "click", {"selector": "#go"}), ("1", "type", {"selector": "#email", "text": "a@b.co"})],
+)
+async def test_a_challenge_frame_beside_the_covering_layer_is_not_reported_as_inside_it(
+    z_index: str, tool_name: str, args: dict[str, str]
+) -> None:
+    async with _content_page(_CHALLENGE_BESIDE_WALL_HTML.replace("__Z__", z_index)) as page:
+        await _mount_challenge_frame(page, page, "#widget")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, tool_name).handler(args)
+        assert r.status == "error", r.content
+        assert "challenge frame" not in r.content, r.content
+        assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
+
+
+# A wall that paints nothing and carries no control reads as a leftover backdrop -- except when it
+# holds the challenge, where "press Escape" would abandon the verification the page is waiting on.
+_TRANSPARENT_CHALLENGE_WALL_HTML = """
+<!doctype html><html><body style="margin:0">
+<button id="go" style="position:absolute;left:40px;top:300px;width:120px;height:40px">Go</button>
+<div id="wall" role="dialog" aria-label="Please check the box below to continue."
+     style="position:fixed;left:0;top:0;width:100%;height:100%;background:transparent;z-index:9">
+  <div id="widget" style="position:absolute;left:40px;top:120px;width:300px;height:65px"></div>
+</div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_invisible_wall_holding_a_challenge_frame_is_never_called_a_leftover_backdrop() -> None:
+    async with _content_page(_TRANSPARENT_CHALLENGE_WALL_HTML) as page:
+        await _mount_challenge_frame(page, page, "#widget")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "error", r.content
+        assert r.error_class == "covered", r.error_class
+        assert f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content, r.content
+        assert "INVISIBLE" not in r.content, r.content
+        assert "leftover backdrop" not in r.content, r.content
+        assert "press Escape" not in r.content, r.content
+        assert "closes or dismisses" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_authored_data_frame_does_not_stand_in_for_the_real_challenge_host() -> None:
+    payload = "turnstile " + "x" * 2000
+    async with _content_page(_CHALLENGE_WALL_HTML) as page:
+        await _mount_challenge_frame(page, page, "#widget", ahead_of_it=f"data:text/html,{payload}")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "error", r.content
+        assert f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content, r.content
+        assert "xxxx" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_challenge_frame_the_layer_does_not_render_is_not_reported_as_present() -> None:
+    async with _content_page(_CHALLENGE_WALL_HTML) as page:
+        await _mount_challenge_frame(page, page, "#widget", style="display:none")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "error", r.content
+        assert "challenge frame" not in r.content, r.content
+        assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("hidden", "reported"), [(None, True), ("middle", False), ("vendor", False)])
+async def test_a_nested_challenge_frame_is_reported_only_when_every_embedding_frame_renders(
+    hidden: str | None, reported: bool
+) -> None:
+    shown = "width:300px;height:65px;border:0"
+
+    def add_frame_js(frame_id: str, style: str) -> str:
+        return (
+            f"el => {{ const f = document.createElement('iframe'); f.id = '{frame_id}';"
+            " f.srcdoc = '<div id=\\\"inner\\\"></div>';"
+            f" f.style.cssText = '{style}'; el.appendChild(f); }}"
+        )
+
+    async with _content_page(_CHALLENGE_WALL_HTML) as page:
+        await page.eval_on_selector("#widget", add_frame_js("outer", shown))
+        await page.frame_locator("#outer").locator("#inner").wait_for(state="attached")
+        outer = next(f for f in page.frames if f.parent_frame is page.main_frame)
+        await outer.eval_on_selector(
+            "#inner", add_frame_js("middle", shown + ";visibility:hidden" if hidden == "middle" else shown)
+        )
+        await page.frame_locator("#outer").frame_locator("#middle").locator("#inner").wait_for(state="attached")
+        middle = next(f for f in page.frames if f.parent_frame is outer)
+        await _mount_challenge_frame(middle, page, "#inner", style="display:none" if hidden == "vendor" else shown)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "error", r.content
+        assert (f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content) is reported, r.content
+        assert ("closes or dismisses" in r.content) is not reported, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_challenge_layer_inside_a_child_frame_realm_is_still_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    async with _content_page(_CHALLENGE_WALL_IN_CHILD_FRAME_HTML) as page:
+        shell = page.frame_locator("#shell")
+        await shell.locator("#widget").wait_for(state="attached")
+        child = next(f for f in page.frames if f.parent_frame is page.main_frame)
+        await _mount_challenge_frame(child, page, "#widget")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#email", "text": "a@b.co"})
+        assert r.status == "error", r.content
+        assert f"contains a challenge frame ({_CHALLENGE_FRAME_HOST})" in r.content, r.content
+        assert "closes or dismisses" not in r.content, r.content
 
 
 # The sibling-label radio shape, but the label itself carries a widget role -- the boundary node must
@@ -14525,6 +14776,65 @@ async def test_covered_error_message_when_the_occluding_layer_has_no_controls_at
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
         assert "no controls were found on it" in r.content, r.content
+
+
+# A cover that qualifies as NOTHING: not pinned, no layer role, no aria-modal, not view-sized, and
+# not an ancestor of the field. The walk finds no layer and names the hit element itself, which is
+# the production shape behind most zero-control refusals -- an option row or a value cell, which has
+# no actionable child and nothing to dismiss.
+_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<span id="row" style="position:absolute;left:0;top:0;width:200px;height:30px;background:#fff">May</span>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hit_element() -> None:
+    """Both shapes render the same sentence with the same empty controls list, so the message cannot
+    tell them apart -- and they are not the same event. One is an overlay whose controls the
+    enumeration did not name; the other has no overlay at all."""
+    async with _content_page(_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert "no controls were found on it" in r.content, r.content
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "hit_fallback"}, recorded
+
+    async with _content_page(_DIALOG_WITH_NO_CONTROLS_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert "no controls were found on it" in r.content, r.content
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_covered_record_names_the_invisible_branch_from_both_of_its_constructions() -> None:
+    """The INVISIBLE branch through the real probe rather than a fake handler, and its two sub-cases
+    separately: they reach the same message from different constructions -- one names a layer and
+    finds it paints nothing, the other bails before naming anything at all, which is why the recorded
+    layer kind differs while the branch does not."""
+    cases = [
+        (_INVISIBLE_RESIDUAL_BACKDROP_HTML, ("qualified", "hit_fallback")),
+        (_INVISIBLE_ANCESTOR_WRAPPER_HTML, ("unnamed",)),
+    ]
+    for markup, kinds in cases:
+        async with _content_page(markup) as page:
+            taskv3_loop._COVERED_LAYER.set(None)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+            assert r.status == "error", r.content
+            assert "invisible" in r.content.lower(), r.content
+            recorded = taskv3_loop._COVERED_LAYER.get() or {}
+            assert recorded.get("branch") == "invisible", (recorded, r.content)
+            assert recorded.get("controls") == 0, (recorded, r.content)
+            assert recorded.get("layer_kind") in kinds, (recorded, r.content)
 
 
 # The HTML inert attribute makes a subtree non-focusable and non-clickable without touching any
@@ -16443,6 +16753,8 @@ async def test_acting_on_a_new_mark_does_not_read_as_a_page_change() -> None:
 
         assert len(await page.query_selector_all("[data-tv3-act]")) == 2  # both really are tagged
         assert before == after
+        await page.eval_on_selector("#a", "el => el.setAttribute('data-tv3-cover', '1')")
+        assert await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS) == after
 
 
 # A payload URL long enough to hit observe's per-field display caps (label 140, value 100,
@@ -22455,10 +22767,15 @@ async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch:
         "<button style='position:absolute;left:-9999px'>FOff</button>"
         "<button style='visibility:hidden'>FVis</button>"
         "<button style='display:none'>FZ1</button><button style='display:none'>FZ2</button>"
+        "<button style='position:fixed;left:10px;top:calc(100vh + 200px);width:40px;height:20px'></button>"
+        "<script>customElements.define('x-lite', class extends HTMLElement {});</script>"
+        "<x-lite><button style='position:fixed;left:60px;top:calc(100vh + 200px);width:40px;height:20px'>"
+        "</button></x-lite>"
         "<button>Frame Live</button>"
     )
     html = (
         '<button style="display:none">MainZ</button><button>Main Live</button>'
+        '<button style="position:fixed;left:10px;top:calc(100vh + 200px);width:40px;height:20px"></button>'
         f'<iframe srcdoc="{frame}" width="300" height="120"></iframe>'
     )
     async with _live_page(html) as page:
@@ -22473,6 +22790,9 @@ async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch:
         "hidden_dropped_zero_rect": 3,
     }, summary
     assert summary["hidden_dropped"] == 5, summary
+    # Counted in every arm and in every realm: this one is armed off, and each frame holds one.
+    assert summary["off_viewport_unreachable_unnamed"] == 2, summary
+    assert summary["off_viewport_unnamed_host_exempt"] == 1, summary
 
 
 # The shape SKY-15662 was diagnosed on: many live, visible per-row controls whose accessible name is
@@ -24054,8 +24374,6 @@ def test_no_page_only_playwright_api_is_called_on_a_realm_variable() -> None:
     import re
     from pathlib import Path
 
-    from playwright.async_api import Frame, Page
-
     page_only = {name for name in dir(Page) if not name.startswith("_") and not hasattr(Frame, name)}
     # Page inherits these from its event emitter; Frame has no event surface at all.
     page_only |= {"on", "once", "remove_listener"}
@@ -25604,3 +25922,158 @@ async def test_press_key_accepts_the_key_names_v1_accepts() -> None:
             r = await _tool(tools, "press_key").handler({"key": key, "selector": "#field"})
             assert r.status == "ok", (key, r.content)
             assert expected in await page.evaluate("window.__keys"), key
+
+
+# Controls placed past the bottom and past the right edge: the one-sided off-canvas gate (center-x left
+# of the page) reaches neither. Each carries a distinct tag/type so its digest line is identifiable
+# without a name. A fixed box does not move with the document, so no scroll brings either on screen.
+_OFFVIEWPORT_UNNAMED_HTML = (
+    "<!doctype html><html><head><title>Portal</title><style>"
+    ".away { position: fixed; width: 40px; height: 40px; }"
+    "</style></head><body>"
+    '<button id="go">Go</button>'
+    '<button type="submit" class="away" style="left:40px;top:calc(100vh + 200px)"></button>'
+    '<button type="reset" class="away" style="top:40px;left:calc(100vw + 200px)"></button>'
+    # Must-drop: a hyphenated tag that is not an upgraded custom element has no root that could hide a
+    # scroller, so it must not exempt its children.
+    '<app-shell><div role="option" tabindex="0" class="away" style="left:40px;top:calc(100vh + 200px)"></div></app-shell>'
+    # Must-not-drop: named, same off-screen geometry as the first.
+    '<button type="button" class="away" aria-label="Close notice" style="left:40px;top:calc(100vh + 200px)"></button>'
+    # Must-not-drop: unnamed, off screen, but its scroll container brings it into view. The container
+    # scrolls further than the document does, so only the container can be what keeps it.
+    '<div style="height:200px;overflow:auto"><div style="height:6000px"></div>'
+    '<a href="#in-scroller" style="display:inline-block;width:40px;height:40px"></a></div>'
+    # Must-not-drop: the same, but slotted into a component whose shadow scroll container wraps the slot.
+    '<x-scroller><div style="height:6000px"></div>'
+    '<div role="switch" aria-checked="false" tabindex="0" style="width:40px;height:40px"></div></x-scroller>'
+    # Must-not-drop: the same, slotted into a CLOSED root, whose scroll container is unreadable.
+    '<x-sealed><div style="height:6000px"></div>'
+    '<div role="menuitem" tabindex="0" style="width:40px;height:40px"></div></x-sealed>'
+    # Must-not-drop: the same closed root, with a form between that clobbers the host's own properties.
+    '<x-sealed><form><img name="tagName" alt=""><img name="shadowRoot" alt="">'
+    '<div role="menuitem" tabindex="0" class="away" style="left:40px;top:calc(100vh + 200px)"></div>'
+    "</form></x-sealed>"
+    # Must-not-drop: fixed, but a translated wrapper re-anchors it inside a scroll container.
+    '<div style="height:200px;overflow:auto"><div style="height:6000px"></div><div style="translate:0 0">'
+    '<div role="radio" aria-checked="false" tabindex="0" class="away" style="left:0;top:0"></div></div></div>'
+    # Must-not-drop: state carried the way a widget role carries it, which has no el.value at all.
+    '<div role="tab" aria-selected="true" tabindex="0" class="away"'
+    ' style="left:120px;top:calc(100vh + 200px)"></div>'
+    '<div role="switch" aria-checked="true" tabindex="0" class="away"'
+    ' style="left:180px;top:calc(100vh + 200px)"></div>'
+    # Must-not-drop: value-bearing in the two forms that reach the record after this gate runs -- a
+    # committed autocomplete surface, and a spinbutton's aria-valuenow.
+    '<div class="away" style="left:40px;top:calc(100vh + 400px);width:120px;height:40px">'
+    '<div class="single-value">Paris</div>'
+    '<input role="combobox" aria-autocomplete="list" aria-expanded="false"></div>'
+    '<div role="spinbutton" aria-valuenow="3" tabindex="0" class="away"'
+    ' style="left:40px;top:calc(100vh + 500px);width:40px;height:40px"></div>'
+    # Must-not-drop: a file input takes files without being visible.
+    '<input type="file" class="away" style="left:40px;top:calc(100vh + 200px)">'
+    # Must-not-drop: unnamed, below the fold of a document that scrolls to it.
+    '<div style="height:3000px"></div>'
+    '<div role="checkbox" aria-checked="false" tabindex="0" style="width:40px;height:40px"></div>'
+    "<script>customElements.define('x-scroller', class extends HTMLElement { constructor() { super();"
+    " this.attachShadow({ mode: 'open' }).innerHTML ="
+    " '<div style=\"height:200px;overflow-y:auto\"><slot></slot></div>'; } });"
+    "customElements.define('x-sealed', class extends HTMLElement { constructor() { super();"
+    " this.attachShadow({ mode: 'closed' }).innerHTML ="
+    " '<div style=\"height:200px;overflow-y:auto\"><slot></slot></div>'; } });</script>"
+    "</body></html>"
+)
+
+
+async def _observe_offviewport_fixture(monkeypatch: pytest.MonkeyPatch, arm: RunArm) -> Any:
+    # Driven by the run's pinned arm, not the env force, so the observe tool is shown to read the arm.
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    context = skyvern_context.SkyvernContext(
+        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
+    )
+    skyvern_context.set(context)
+    try:
+        async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "observe").handler({})
+    finally:
+        skyvern_context.reset()
+    assert r.status == "ok" and r.data is not None, r.content
+    return r
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_drops_an_unnamed_control_no_scroll_can_bring_into_the_viewport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r = await _observe_offviewport_fixture(monkeypatch, arm="treatment")
+
+    assert "button/submit ''" not in r.content, r.content
+    assert "button/reset ''" not in r.content, r.content
+    assert "div/option ''" not in r.content, r.content
+    assert "Close notice" in r.content, r.content
+    assert re.search(r"ref=\S+ a ''", r.content), r.content
+    for kept in ("div/checkbox", "div/switch", "div/menuitem", "div/radio", "input/file", "div/spinbutton"):
+        assert re.search(rf"ref=\S+ {kept} ''", r.content), (kept, r.content)
+    assert "Paris" in r.content, r.content
+    assert "(13 interactive elements)" in r.content, r.content
+    assert r.data["summary"]["hidden_dropped_off_viewport"] == 3, r.data["summary"]
+    assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
+    # The closed-root host's controls are kept and counted apart, not as at-risk candidates.
+    assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]
+    assert r.data["summary"]["hidden_dropped"] == 3, r.data["summary"]
+
+
+async def _observe_records(page: Any, arm: RunArm) -> dict[str, Any]:
+    from skyvern.forge.taskv3.tools import observe_js  # noqa: PLC0415
+
+    context = skyvern_context.SkyvernContext(
+        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
+    )
+    skyvern_context.set(context)
+    try:
+        return json.loads(await page.evaluate(observe_js()))
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_drop_never_removes_a_control_whose_record_reports_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The property, over whatever the page holds: a control the arm removes must not be one whose
+    # record carries state. Asserting the class rather than the three forms a field list happens to
+    # enumerate -- that list is what drifted before (SKY-16501).
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
+        listed_off = await _observe_records(page, "control")
+        listed_on = await _observe_records(page, "treatment")
+
+    def _identity(e: dict[str, Any]) -> str:
+        return str(e.get("selector") or f"i={e.get('i')}")
+
+    state_keys = ("value", "checked", "selected", "selectedOptions")
+    stateful = {_identity(e) for e in listed_off["elements"] if any(k in e for k in state_keys)}
+    kept = {_identity(e) for e in listed_on["elements"]}
+    dropped = {_identity(e) for e in listed_off["elements"]} - kept
+
+    assert dropped, listed_off["elements"]
+    assert stateful & dropped == set(), sorted(stateful & dropped)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["control", "unrandomized"])
+async def test_observe_lists_unnamed_offviewport_controls_outside_treatment(
+    monkeypatch: pytest.MonkeyPatch, arm: RunArm
+) -> None:
+    r = await _observe_offviewport_fixture(monkeypatch, arm=arm)
+
+    assert "button/submit ''" in r.content, r.content
+    assert "button/reset ''" in r.content, r.content
+    assert "div/option ''" in r.content, r.content
+    assert "(16 interactive elements)" in r.content, r.content
+    assert r.data["summary"]["hidden_dropped_off_viewport"] == 0, r.data["summary"]
+    # Exposure is measured in every arm, so treatment and control can be compared on the same set.
+    assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
+    assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]

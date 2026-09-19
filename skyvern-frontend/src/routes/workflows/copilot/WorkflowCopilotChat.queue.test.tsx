@@ -389,6 +389,61 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.queryByText("Drop files to attach")).toBeNull();
   });
 
+  it("offers and uploads demonstration video attachments", async () => {
+    await renderChat();
+
+    const input = document.querySelector(
+      'input[type="file"][accept*=".csv"]',
+    ) as HTMLInputElement;
+    expect(input).toBeTruthy();
+    expect(input.accept.split(",")).toEqual(
+      expect.arrayContaining([".mp4", ".webm", ".mov"]),
+    );
+
+    await dropAttachments(
+      new File(["video"], "demo.MP4", { type: "video/mp4" }),
+      new File(["video"], "demo.webm", { type: "video/webm" }),
+      new File(["video"], "demo.mov", { type: "video/quicktime" }),
+    );
+
+    await waitFor(() => expect(uploadCount.n).toBe(3));
+    expect(
+      screen.getByRole("button", { name: "Remove demo.MP4" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove demo.webm" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove demo.mov" }),
+    ).toBeTruthy();
+    expect(vi.mocked(toast)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Unsupported file type" }),
+    );
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Use a non-sensitive video" }),
+    );
+  });
+
+  it("allows videos up to the upload service's 30MB limit", async () => {
+    await renderChat();
+    const accepted = new File(["video"], "five-minutes.mp4", {
+      type: "video/mp4",
+    });
+    Object.defineProperty(accepted, "size", { value: 20 * 1024 * 1024 });
+    const rejected = new File(["video"], "too-large.mp4", {
+      type: "video/mp4",
+    });
+    Object.defineProperty(rejected, "size", { value: 30 * 1024 * 1024 + 1 });
+
+    await dropAttachments(accepted, rejected);
+
+    await waitFor(() => expect(uploadCount.n).toBe(1));
+    expect(
+      screen.getByRole("button", { name: "Remove five-minutes.mp4" }),
+    ).toBeTruthy();
+    expect(screen.getByText("over 30MB")).toBeTruthy();
+  });
+
   it("ignores unsupported dropped files before upload", async () => {
     await renderChat();
 

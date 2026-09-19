@@ -71,6 +71,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotCandidateDisposition,
     CopilotPendingTurn,
     CopilotProposalMetadata,
+    CopilotVideoEvidenceArtifact,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
@@ -1441,6 +1442,131 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(message)
             return WorkflowCopilotChatMessage.model_validate(message)
+
+    @db_operation("mark_workflow_copilot_video_attachments_unsafe")
+    async def mark_workflow_copilot_video_attachments_unsafe(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        file_ids: frozenset[str],
+    ) -> None:
+        if not file_ids:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in file_ids:
+                        found_file_ids.add(file_id)
+                        if attachment.get("video_safety_status") != "unsafe":
+                            attachment = {**attachment, "video_safety_status": "unsafe"}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(file_ids):
+                raise NotFoundError("Could not persist every unsafe Copilot video attachment")
+            await session.commit()
+
+    @db_operation("mark_workflow_copilot_video_attachments_too_long")
+    async def mark_workflow_copilot_video_attachments_too_long(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        file_ids: frozenset[str],
+    ) -> None:
+        if not file_ids:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in file_ids:
+                        found_file_ids.add(file_id)
+                        if attachment.get("video_processing_status") != "too_long":
+                            attachment = {**attachment, "video_processing_status": "too_long"}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(file_ids):
+                LOG.warning(
+                    "Could not persist every overlength Copilot video attachment",
+                    missing_file_ids=sorted(set(file_ids) - found_file_ids),
+                )
+            await session.commit()
+
+    @db_operation("persist_workflow_copilot_video_evidence_artifacts")
+    async def persist_workflow_copilot_video_evidence_artifacts(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        artifacts: dict[str, CopilotVideoEvidenceArtifact],
+    ) -> None:
+        if not artifacts:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in artifacts:
+                        artifact = artifacts[file_id]
+                        found_file_ids.add(file_id)
+                        serialized = artifact.model_dump(mode="json")
+                        if attachment.get("video_evidence") != serialized:
+                            attachment = {**attachment, "video_evidence": serialized}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(artifacts):
+                LOG.warning(
+                    "Could not persist every Copilot video evidence artifact",
+                    missing_file_ids=sorted(set(artifacts) - found_file_ids),
+                )
+            await session.commit()
 
     @db_operation("get_workflow_copilot_chat_messages", expected_errors=(DatabaseConnectionUnavailableError,))
     async def get_workflow_copilot_chat_messages(

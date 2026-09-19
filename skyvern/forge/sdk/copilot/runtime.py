@@ -31,6 +31,7 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -66,7 +67,7 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
-    from playwright.async_api import Page
+    from playwright.async_api import Frame, Page
 
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -323,6 +324,8 @@ class ScoutedInteraction(TypedDict):
     source_url: NotRequired[str]
     result_url: NotRequired[str]
     observed_effects: NotRequired[dict[str, bool]]
+    # The vendor signature literal matched in the challenge frame's URL, so no page-controlled host is kept.
+    challenge_vendor: NotRequired[str]
     observed_wait_ms: NotRequired[int]
     input_id: NotRequired[str]
     input_value: NotRequired[str]
@@ -408,6 +411,10 @@ class AgentContext:
     # finalizer before those tasks finish unwinding, and the manager refuses to retire a busy generation.
     admitted_browser_operations: dict[str, set[asyncio.Task[object]]] = field(default_factory=dict)
     heal_workflow_run_id: str | None = None
+    eval_mode: CopilotEvalMode | None = None
+    # True only while a card is on screen. credential_pause_used stays true for the rest of the
+    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
+    credential_ask_in_flight: bool = False
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
@@ -665,6 +672,20 @@ class AgentContext:
     pending_scout_download_detachers: list[Callable[[], None]] = field(default_factory=list)
     pending_scout_popup: Page | None = None
     pending_scout_popup_content_type: str | None = None
+    # Every child frame that navigated to a challenge vendor during the in-flight click. A widget can
+    # arrive with hidden helper frames beside it, so which one is on screen is decided at report time.
+    pending_scout_challenge_frames: list[Frame] = field(default_factory=list)
+    # The records this click wrote in each collection, so an effect observed after the fact updates
+    # them directly instead of searching for a locator the scrub may have dropped.
+    pending_scout_click_records: list[ScoutedInteraction] = field(default_factory=list)
+    # When the listener for the in-flight click went live, so the settle counts time already spent.
+    pending_scout_challenge_armed_at: float | None = None
+    # Removers for the frame listener armed for the in-flight click, run when the click post-hook
+    # returns, so one click's widget cannot land in another click's window.
+    pending_scout_challenge_detachers: list[Callable[[], None]] = field(default_factory=list)
+    # Vendor frames already present when the click was armed, with the area each rendered at then, so
+    # one the click reveals rather than navigates is still the click's effect.
+    pending_scout_challenge_prior_frames: list[tuple[Frame, float | None]] = field(default_factory=list)
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.
     pending_scout_ambiguous: tuple[str, bool] | None = None

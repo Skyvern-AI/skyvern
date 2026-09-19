@@ -119,7 +119,7 @@ describe("RecordingPanel", () => {
     cleanup();
   });
 
-  it("explains what Record task captures and what Skyvern creates", () => {
+  it("explains what Record Task captures and what Skyvern creates", () => {
     render(<RecordingPanel browserSessionId="pbs_123" />);
 
     expect(screen.getByText("Recording task")).toBeTruthy();

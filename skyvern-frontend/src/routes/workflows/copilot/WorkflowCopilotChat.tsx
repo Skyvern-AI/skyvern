@@ -485,6 +485,7 @@ export interface ChatMessage {
   attachedFiles?: CopilotAttachedFile[];
 }
 
+const VIDEO_ATTACHMENT_EXTENSIONS = [".mp4", ".webm", ".mov"] as const;
 const ATTACHMENT_EXTENSIONS = [
   ".csv",
   ".xlsx",
@@ -498,9 +499,11 @@ const ATTACHMENT_EXTENSIONS = [
   ".webp",
   ".tiff",
   ".tif",
+  ...VIDEO_ATTACHMENT_EXTENSIONS,
 ] as const;
 const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.join(",");
 const ATTACHMENT_SIZE_LIMIT_BYTES = 10 * 1024 * 1024;
+const VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES = 30 * 1024 * 1024;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the chat request.
 const ATTACHMENT_COUNT_LIMIT = 20;
 
@@ -509,6 +512,19 @@ function isSupportedAttachment(file: File): boolean {
   return ATTACHMENT_EXTENSIONS.some((extension) =>
     filename.endsWith(extension),
   );
+}
+
+function isVideoAttachment(file: File): boolean {
+  const filename = file.name.toLowerCase();
+  return VIDEO_ATTACHMENT_EXTENSIONS.some((extension) =>
+    filename.endsWith(extension),
+  );
+}
+
+function attachmentSizeLimit(file: File): number {
+  return isVideoAttachment(file)
+    ? VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES
+    : ATTACHMENT_SIZE_LIMIT_BYTES;
 }
 
 function hasFileDragPayload(dataTransfer: DataTransfer): boolean {
@@ -2841,11 +2857,13 @@ export function WorkflowCopilotChat({
 
   const uploadAttachment = useCallback(
     async (file: File) => {
-      if (file.size > ATTACHMENT_SIZE_LIMIT_BYTES) {
+      if (file.size > attachmentSizeLimit(file)) {
         toast({
           variant: "destructive",
           title: "File too large",
-          description: `${file.name} exceeds the 10MB limit.`,
+          description: isVideoAttachment(file)
+            ? `${file.name} exceeds the 30MB limit. Shorten or compress the clip, or attach ordered screenshots.`
+            : `${file.name} exceeds the 10MB limit.`,
         });
         setPendingAttachments((prev) => [
           ...prev,
@@ -2853,10 +2871,17 @@ export function WorkflowCopilotChat({
             localId: crypto.randomUUID(),
             filename: file.name,
             status: "error",
-            error: "over 10MB",
+            error: isVideoAttachment(file) ? "over 30MB" : "over 10MB",
           },
         ]);
         return;
+      }
+      if (isVideoAttachment(file)) {
+        toast({
+          title: "Use a non-sensitive video",
+          description:
+            "Videos can be up to five minutes and 30MB. Remove passwords, one-time codes, API keys, and other secrets.",
+        });
       }
       const uploadingCount = pendingAttachmentsRef.current.filter(
         (item) => item.status === "uploading",
@@ -3557,10 +3582,10 @@ export function WorkflowCopilotChat({
         (file) => !isSupportedAttachment(file),
       );
       const oversizedFiles = supportedFiles.filter(
-        (file) => file.size > ATTACHMENT_SIZE_LIMIT_BYTES,
+        (file) => file.size > attachmentSizeLimit(file),
       );
       const uploadableFiles = supportedFiles.filter(
-        (file) => file.size <= ATTACHMENT_SIZE_LIMIT_BYTES,
+        (file) => file.size <= attachmentSizeLimit(file),
       );
       if (unsupportedFiles.length > 0) {
         toast({
@@ -5792,7 +5817,7 @@ export function WorkflowCopilotChat({
                         content={
                           recordTaskDisabled
                             ? (authoringUnavailableReason ??
-                              "Record task is available when the browser is ready")
+                              "Record Task is available when the browser is ready")
                             : "Demonstrate the task in the browser"
                         }
                         blocked={recordTaskDisabled}
@@ -5801,7 +5826,7 @@ export function WorkflowCopilotChat({
                       >
                         <button
                           type="button"
-                          aria-label="Record task"
+                          aria-label="Record Task"
                           className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={recordTaskDisabled}
                           onClick={onRecordTask}
@@ -5811,7 +5836,7 @@ export function WorkflowCopilotChat({
                           </span>
                           <span className="min-w-0">
                             <span className="block font-medium text-foreground">
-                              Record task
+                              Record Task
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
                               Demonstrate it in the browser and create workflow

@@ -108,6 +108,33 @@ ToolOkClass = Literal[
     "attached_no_activity",
 ]
 
+# Which `covered` message the model actually got. They are one `tool_error_class`, so without this
+# the split is only recoverable by pulling step archives and classifying the prose.
+CoveredBranch = Literal[
+    # The layer was named and its controls enumerated into the message.
+    "named",
+    # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
+    "challenge",
+    # No layer to name: the message says only that something is on top of the field.
+    "unnamed",
+    # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
+    "invisible",
+]
+
+# WHICH ELEMENT the probe named as the layer, which the branch cannot recover. `named` with zero
+# controls spans two different events: a real overlay whose controls the enumeration dropped, and a
+# walk that qualified nothing and named the raw hit element -- an option row or a value cell, which
+# has no actionable child and nothing to dismiss. Only the probe knows which, so it is on the record.
+CoveredLayerKind = Literal[
+    # The walk found an element that qualifies as a layer: pinned, a layer role, aria-modal, <dialog>,
+    # or view-sized.
+    "qualified",
+    # Nothing qualified, so the probe named the hit element itself.
+    "hit_fallback",
+    # The probe named no element at all.
+    "unnamed",
+]
+
 
 @dataclass
 class ToolResult:
@@ -186,6 +213,10 @@ _FRAME_PERCEPTION: ContextVar[bool | None] = ContextVar("taskv3_frame_perception
 # A context variable rather than a result field because `click` returns from many places, several of
 # them after the probe has already answered -- the same reason `_RESOLVE_SECONDS` lives here.
 _HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", default=None)
+# Which `covered` message the refusal rendered, for the one tool call this context covers. A context
+# variable for the same reason `_HIT_CLASS` is one: the covered message is built in a shared helper
+# five call sites reach, several of them after the probe has already answered.
+_COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_layer", default=None)
 
 
 def record_resolve_seconds(elapsed: float) -> None:
@@ -222,6 +253,19 @@ def record_hit_class(
             "raised": raised,
         }
     )
+
+
+def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind) -> None:
+    """Record which `covered` message this call rendered. Telemetry only, never a behaviour change.
+
+    `controls` is how many controls the MESSAGE named, not how many the probe found: a control with
+    neither a selector nor a label is dropped from the message, and the existing eight-slot
+    truncation caps what the model is handed. So this is the count the model acted on. WHAT A
+    DENOMINATOR MEANS HERE: zero is not one event. Under `unnamed` it means there was no layer to
+    enumerate; under `named` it means the layer had no control the enumeration could name. Cut on
+    `tool_error_class:covered`, then group by `covered_branch`, and read the count within a branch.
+    """
+    _COVERED_LAYER.set({"branch": branch, "controls": int(controls), "layer_kind": layer_kind})
 
 
 def record_frame_perception(enabled: bool) -> None:
@@ -1522,6 +1566,9 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "hit_probe_seconds",
         "hit_probe_isolated",
         "hit_probe_raised",
+        "covered_branch",
+        "covered_controls",
+        "covered_layer_kind",
     }
 )
 
@@ -3141,6 +3188,7 @@ async def run_agent_tool_loop(
             _RESOLVE_SECONDS.set(None)
             _FRAME_PERCEPTION.set(None)
             _HIT_CLASS.set(None)
+            _COVERED_LAYER.set(None)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -3172,6 +3220,15 @@ async def run_agent_tool_loop(
                 # vocabulary with Python exception names under one facet, and taskv3 emits on every
                 # erroring tool call so it would dominate the values.
                 cost_fields["tool_error_class"] = result.error_class or "other"
+                # Only on the class they describe, so every other erroring row keeps exactly the
+                # fields it has today. Total over `covered` rows by construction: the helper that
+                # builds all three messages records before it returns any of them, so a covered row
+                # missing these means the class was emitted somewhere that is not that helper.
+                covered = _COVERED_LAYER.get()
+                if result.error_class == "covered" and covered is not None:
+                    cost_fields["covered_branch"] = covered["branch"]
+                    cost_fields["covered_controls"] = covered["controls"]
+                    cost_fields["covered_layer_kind"] = covered["layer_kind"]
             elif result.ok_class is not None:
                 # Prefixed for the same flat-index reason as `tool_error_class` above. NOT defaulted
                 # the way that field is: it is emitted only by tools whose `ok` spans distinct

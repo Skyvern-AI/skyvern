@@ -19,6 +19,11 @@ XAI_GROK_4_5_CONTEXT_WINDOW = 500_000
 # xAI publishes no output cap for grok-4.5; match the bound used by the other large reasoning
 # models here so LiteLLM's context bookkeeping never assumes 500k of output.
 XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
+# Extract-actions responses routed to this OpenRouter upstream came back without the `actions`
+# key, identically on every step retry, so the route skips it (SKY-16508). The value is
+# OpenRouter's own provider slug (https://openrouter.ai/api/v1/providers) - a name it does not
+# recognize in `ignore` is skipped silently rather than rejected.
+OPENINFERENCE_PROVIDER_SLUG = "open-inference"
 
 
 @dataclass(frozen=True)
@@ -2334,6 +2339,7 @@ if settings.ENABLE_OPENROUTER:
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
+                extra_body={"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]}},
             ),
         ),
     )

@@ -231,12 +231,12 @@ export function BrowserPaneActions() {
                   variant="ghost"
                   size="sm"
                   className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
-                  aria-label="Record task"
+                  aria-label="Record Task"
                   disabled={disabled}
                   onClick={() => startRecordingAtEnd?.()}
                 >
                   <span className="h-2 w-2 rounded-full bg-red-500" />
-                  {compact ? null : "Record task"}
+                  {compact ? null : "Record Task"}
                 </Button>
               </ControlTooltip>
             );

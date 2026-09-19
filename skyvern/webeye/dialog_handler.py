@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,12 +81,14 @@ DIALOG_POLICY_HELPER_CONTRACT: dict[str, Any] = {
         "The declaring call runs before any dialog fires, so records come back on the NEXT call: "
         "declare, drive the page, then call again to read what fired. An alert is recorded but "
         "answered by its own branch rather than by the policy. On the secure CodeBlock runner a "
-        "page.on('dialog', ...) registration is the same call and also consumes the pending "
-        "records when it is sent, ahead of the block's next page call."
+        "page.on('dialog', ...) registration returns no records, and a dialog it answers is not recorded."
     ),
     "lifetime": (
-        "The policy covers the whole browser context for the rest of the block -- sibling and popup "
-        "pages included -- and is revoked at block end, restoring default dialog handling. It answers "
+        "The policy covers the whole browser context -- sibling and popup pages included. A "
+        "set_dialog_policy call lasts for the rest of the block and is revoked at block end; on the secure "
+        "CodeBlock runner a page.on('dialog', ...) registration lasts for the rest of the workflow run, "
+        "like the listener it replaces; within a block, whichever of the two was declared later answers. "
+        "Once neither is in force, default dialog handling resumes. It answers "
         "confirm and prompt only: beforeunload is always accepted so that a declared 'dismiss' cannot "
         "cancel the block's own navigation, and is recorded like any other dialog. Revocation wins a "
         "tie: a dialog the page schedules as the block ends may be answered by default handling and "
@@ -97,6 +100,10 @@ DIALOG_POLICY_HELPER_CONTRACT: dict[str, Any] = {
 # attribute access, so a weak key taken from one would be dead before the next dialog fired.
 _dialog_policies: weakref.WeakKeyDictionary[BrowserContext, DialogPolicy] = weakref.WeakKeyDictionary()
 _dialog_records: weakref.WeakKeyDictionary[BrowserContext, list[dict[str, str]]] = weakref.WeakKeyDictionary()
+# Run-scoped answers keyed by the declaring run id; the most recent declaration answers. The owner is never
+# read from the SkyvernContext at dialog time: Playwright dispatches events with the context of whoever
+# started the driver, not the run now on the page, so stale owners are dropped when a run acquires the context.
+_run_dialog_policies: weakref.WeakKeyDictionary[BrowserContext, dict[str, DialogPolicy]] = weakref.WeakKeyDictionary()
 
 
 def _policy_key(browser_context: BrowserContext) -> BrowserContext | None:
@@ -128,6 +135,44 @@ def clear_dialog_policy(browser_context: BrowserContext) -> None:
         return
     _dialog_policies.pop(key, None)
     _dialog_records.pop(key, None)
+
+
+def set_run_dialog_policy(
+    browser_context: BrowserContext, action: str, prompt_text: str | None, workflow_run_id: str
+) -> None:
+    if action not in DIALOG_POLICY_ACTIONS:
+        raise ValueError(f"unsupported dialog policy action: {action!r}")
+    # The later declaration wins, so this one replaces a block answer armed earlier in the block.
+    _dialog_policies.pop(browser_context, None)
+    owners = _run_dialog_policies.setdefault(browser_context, {})
+    owners.pop(workflow_run_id, None)
+    owners[workflow_run_id] = DialogPolicy(action=action, prompt_text=prompt_text)
+
+
+def retain_run_dialog_policies(browser_context: BrowserContext, owner_run_ids: Iterable[str | None]) -> None:
+    """Drop run answers on this context declared by any run outside ``owner_run_ids``."""
+    key = _policy_key(browser_context)
+    owners = _run_dialog_policies.get(key) if key is not None else None
+    if not owners:
+        return
+    keep = set(owner_run_ids)
+    for run_id in [run_id for run_id in owners if run_id not in keep]:
+        del owners[run_id]
+
+
+def clear_run_dialog_policies(workflow_run_ids: Iterable[str]) -> None:
+    """Drop these runs' answers from every context, since a context can outlive the run that armed it."""
+    run_ids = set(workflow_run_ids)
+    for owners in list(_run_dialog_policies.values()):
+        for run_id in run_ids:
+            owners.pop(run_id, None)
+
+
+def clear_context_run_dialog_policies(browser_context: BrowserContext) -> None:
+    """Drop every run answer on a context no other live run shares, including a grandchild's the caller cannot name."""
+    key = _policy_key(browser_context)
+    if key is not None:
+        _run_dialog_policies.pop(key, None)
 
 
 def take_dialog_records(browser_context: BrowserContext) -> list[dict[str, str]]:
@@ -166,6 +211,7 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     default_value = dialog.default_value
 
     policy: DialogPolicy | None = None
+    policy_scope = "block"
     policy_context = _policy_key(page.context) if page is not None else None
     if policy_context is not None:
         policy = _dialog_policies.get(policy_context)
@@ -176,6 +222,9 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
             records = _dialog_records.setdefault(policy_context, [])
             records.append({"type": dialog_type, "message": recorded_message})
             del records[:-MAX_DIALOG_POLICY_RECORDS]
+        elif run_policies := _run_dialog_policies.get(policy_context):
+            policy = next(reversed(run_policies.values()))
+            policy_scope = "run"
 
     ctx = skyvern_context.current()
     organization_id = ctx.organization_id if ctx else None
@@ -232,7 +281,7 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
             await _respond("accept")
             return
         if policy is not None:
-            log.info("Dialog answered by declared policy", policy_action=policy.action)
+            log.info("Dialog answered by declared policy", policy_action=policy.action, policy_scope=policy_scope)
             await _respond(policy.action, policy.prompt_text)
             return
 

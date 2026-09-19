@@ -95,6 +95,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
+    CopilotVideoEvidenceArtifact,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotBrowserAblationResponseUpdate,
@@ -2166,6 +2167,9 @@ async def _new_copilot_chat_post(
                 file_ids=_turn_attachment_ids(chat_request, chat_messages),
                 organization_id=organization.organization_id,
                 known_filenames=_attachment_filenames_from_history(chat_messages),
+                known_video_safety_statuses=_attachment_video_safety_statuses_from_history(chat_messages),
+                known_video_processing_statuses=_attachment_video_processing_statuses_from_history(chat_messages),
+                known_video_evidence=_attachment_video_evidence_from_history(chat_messages),
             )
             new_attached_files = [
                 attached for attached in turn_attached_files if attached.file_id in set(chat_request.attached_file_ids)
@@ -2369,6 +2373,29 @@ async def _new_copilot_chat_post(
                     narrative_payload=None,
                 )
 
+            async def persist_unsafe_video_file_ids(file_ids: frozenset[str]) -> None:
+                await app.DATABASE.workflow_params.mark_workflow_copilot_video_attachments_unsafe(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    file_ids=file_ids,
+                )
+
+            async def persist_too_long_video_file_ids(file_ids: frozenset[str]) -> None:
+                await app.DATABASE.workflow_params.mark_workflow_copilot_video_attachments_too_long(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    file_ids=file_ids,
+                )
+
+            async def persist_video_evidence_artifacts(
+                artifacts: dict[str, CopilotVideoEvidenceArtifact],
+            ) -> None:
+                await app.DATABASE.workflow_params.persist_workflow_copilot_video_evidence_artifacts(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    artifacts=artifacts,
+                )
+
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -2389,6 +2416,9 @@ async def _new_copilot_chat_post(
                     stored_completion_criteria=None,
                     prior_turn_outcome=prior_turn_outcome,
                     persist_canonical_user_message=persist_canonical_user_message,
+                    persist_unsafe_video_file_ids=persist_unsafe_video_file_ids,
+                    persist_too_long_video_file_ids=persist_too_long_video_file_ids,
+                    persist_video_evidence_artifacts=persist_video_evidence_artifacts,
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
@@ -2652,6 +2682,9 @@ async def _resolve_copilot_attached_files(
     file_ids: list[str],
     organization_id: str,
     known_filenames: dict[str, str] | None = None,
+    known_video_safety_statuses: dict[str, str] | None = None,
+    known_video_processing_statuses: dict[str, str] | None = None,
+    known_video_evidence: dict[str, CopilotVideoEvidenceArtifact] | None = None,
 ) -> list[CopilotAttachedFile]:
     """Resolve attachment ids against this organization's own upload rows.
 
@@ -2686,6 +2719,9 @@ async def _resolve_copilot_attached_files(
                     filename=uploaded_file.filename,
                     size_bytes=uploaded_file.size_bytes,
                     available=True,
+                    video_safety_status=(known_video_safety_statuses or {}).get(file_id),
+                    video_processing_status=(known_video_processing_statuses or {}).get(file_id),
+                    video_evidence=(known_video_evidence or {}).get(file_id),
                 )
             )
             continue
@@ -2696,6 +2732,9 @@ async def _resolve_copilot_attached_files(
                 if uploaded_file is not None
                 else (known_filenames or {}).get(file_id, ""),
                 available=False,
+                video_safety_status=(known_video_safety_statuses or {}).get(file_id),
+                video_processing_status=(known_video_processing_statuses or {}).get(file_id),
+                video_evidence=None,
             )
         )
     return resolved
@@ -2707,6 +2746,39 @@ def _attachment_filenames_from_history(messages: list[WorkflowCopilotChatMessage
         for message in messages
         for attached in message.attached_files
         if attached.filename
+    }
+
+
+def _attachment_video_safety_statuses_from_history(
+    messages: list[WorkflowCopilotChatMessage],
+) -> dict[str, str]:
+    return {
+        attached.file_id: attached.video_safety_status
+        for message in messages
+        for attached in message.attached_files
+        if attached.video_safety_status is not None
+    }
+
+
+def _attachment_video_processing_statuses_from_history(
+    messages: list[WorkflowCopilotChatMessage],
+) -> dict[str, str]:
+    return {
+        attached.file_id: attached.video_processing_status
+        for message in messages
+        for attached in message.attached_files
+        if attached.video_processing_status is not None
+    }
+
+
+def _attachment_video_evidence_from_history(
+    messages: list[WorkflowCopilotChatMessage],
+) -> dict[str, CopilotVideoEvidenceArtifact]:
+    return {
+        attached.file_id: attached.video_evidence
+        for message in messages
+        for attached in message.attached_files
+        if attached.video_evidence is not None
     }
 
 
@@ -3631,6 +3703,9 @@ async def _history_with_resolved_attachments(
             file_ids=[attached.file_id for message in messages for attached in message.attached_files],
             organization_id=organization_id,
             known_filenames=_attachment_filenames_from_history(messages),
+            known_video_safety_statuses=_attachment_video_safety_statuses_from_history(messages),
+            known_video_processing_statuses=_attachment_video_processing_statuses_from_history(messages),
+            known_video_evidence=_attachment_video_evidence_from_history(messages),
         )
     }
     for message in history:

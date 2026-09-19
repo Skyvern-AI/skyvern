@@ -13,6 +13,7 @@ alongside `make_finish_tool()`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import io
 import json
@@ -53,20 +54,25 @@ from skyvern.forge.taskv3.loop import (
     REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    CoveredBranch,
+    CoveredLayerKind,
     SemanticCommitStats,
     ToolHandler,
     ToolResult,
     ToolSpec,
+    record_covered_layer,
     record_frame_perception,
     record_hit_class,
     record_resolve_seconds,
     set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
+from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -190,6 +196,22 @@ _MARKER_ATTR_OPEN = 'data-tv3="'
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
 _MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
+
+_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
+
+# Containment is walked from the frame's host upward because the probe runs in an isolated world and
+# its shadow walk pierces only OPEN roots -- neither sees a widget iframe mounted inside a closed one.
+_COVER_ANCESTOR_WALK_LIMIT = 40
+_HOST_INSIDE_COVER_JS = r"""(host, limit) => {
+  let n = host;
+  for (let depth = 0; n && depth < limit; depth++) {
+    try {
+      if (n.nodeType === 1 && n.hasAttribute('data-tv3-cover')) return true;
+      n = n.parentElement || (n.getRootNode() || {}).host || null;
+    } catch (e) { return false; }
+  }
+  return false;
+}"""
 
 
 def _marker_head_fragment_len(content: str, offset: int) -> int:
@@ -3368,6 +3390,8 @@ _TYPE_TARGET_PROBE_JS = (
 """
     + _NATIVE_LABEL_JS
     + r"""
+  try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
+
   // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
   // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
   // exactly the controls that addressing made reachable. The executor resolves it; take its element.
@@ -4013,8 +4037,11 @@ _TYPE_TARGET_PROBE_JS = (
       return isHit ? big : pos === 'absolute' && big;
     };
     let layer = null;
+    // Which element ends up named, which the message itself cannot express: a qualifying layer and
+    // the hit element the walk fell back to render the same sentence.
+    let layerKind = 'unnamed';
     for (let n = top; n && n.nodeType === 1 && n !== document.body; n = n.parentNode || n.host || null) {
-      if (isLayer(n, n === top)) { layer = n; break; }
+      if (isLayer(n, n === top)) { layer = n; layerKind = 'qualified'; break; }
     }
     if (!layer) {
       // Nothing in the walk qualified, and top is merely an ancestor/clipping container of the
@@ -4031,6 +4058,7 @@ _TYPE_TARGET_PROBE_JS = (
         return out;
       }
       layer = top;
+      layerKind = 'hit_fallback';
     }
     // Own name, then whichever names the DIALOG this layer wraps (deepAll pierces into the layer's
     // shadow tree, since a component-hosted consent widget renders entirely inside one), then a
@@ -4085,7 +4113,9 @@ _TYPE_TARGET_PROBE_JS = (
     // because that is where a footer actually lives.
     const truncated = allControls.length > 8;
     const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
+    try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    out.occluder.layerKind = layerKind;
     // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
     // pointer (elementFromPoint returned it) but can paint nothing -- fully transparent, no visible
     // control, heading or text -- so the field looks clear on screen and "dismiss the overlay you
@@ -5148,6 +5178,7 @@ async () => {
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
+  const _DROP_OFFVIEWPORT_UNNAMED = __OBSERVE_DROP_OFFVIEWPORT_UNNAMED__;
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -5168,6 +5199,14 @@ async () => {
   };
   const _parentOf = _getter(Node.prototype, 'parentElement');
   const _scrollLeftOf = _getter(Element.prototype, 'scrollLeft');
+  const _assignedSlotOf = _getter(Element.prototype, 'assignedSlot');
+  const _tagNameOf = _getter(Element.prototype, 'tagName');
+  const _localNameOf = _getter(Element.prototype, 'localName');
+  const _shadowRootOf = _getter(Element.prototype, 'shadowRoot');
+  const _scrollHeightOf = _getter(Element.prototype, 'scrollHeight');
+  const _scrollWidthOf = _getter(Element.prototype, 'scrollWidth');
+  const _clientHeightOf = _getter(Element.prototype, 'clientHeight');
+  const _clientWidthOf = _getter(Element.prototype, 'clientWidth');
   const _prevOf = _getter(Node.prototype, 'previousSibling');
   const _nextOf = _getter(Node.prototype, 'nextSibling');
   const _firstChildOf = _getter(Node.prototype, 'firstChild');
@@ -6012,6 +6051,9 @@ async () => {
   let hiddenDroppedOffCanvas = 0;
   let hiddenDroppedVisibility = 0;
   let hiddenDroppedZeroRect = 0;
+  let hiddenDroppedOffViewport = 0;
+  let offViewportUnreachableUnnamed = 0;
+  let offViewportUnnamedHostExempt = 0;
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
@@ -6048,6 +6090,106 @@ async () => {
       }
     }
     return false;
+  };
+  // The state the record reports for a control, computed once and used by both the record below and
+  // the off-viewport gate. Asked in one place on purpose: two enumerations of "carries state" drift,
+  // and the gate's copy drifting is a silently dropped control.
+  const _stateFields = (el) => {
+    const out = {};
+    const role = el.getAttribute('role');
+    const secret = el.type === 'password' || isOtpInputValueSecret(el);
+    if (secret) { if (el.value) out.value = '(hidden)'; }
+    else if (el.tagName === 'SELECT' && el.multiple === true) {
+      const picked = Array.from(el.selectedOptions || []);
+      out.selectedOptions = picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
+      out.selectedTotal = picked.length;
+    }
+    else if (el.value) out.value = String(el.value).slice(0, _RETAIN_WIDTH);
+    else if (_isAutocomplete(el)) {
+      const sv = ownCommittedSurface(el);
+      if (sv) out.value = String(sv).slice(0, _RETAIN_WIDTH);
+    }
+    if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
+    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+      const ck = el.getAttribute('aria-checked');
+      if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
+    }
+    const selected = el.getAttribute('aria-selected');
+    if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) out.selected = selected === 'true';
+    if (role === 'spinbutton' && !secret) {
+      const now = el.getAttribute('aria-valuenow');
+      if (now !== null && !out.value) out.value = String(now).slice(0, _RETAIN_WIDTH);
+    }
+    return out;
+  };
+  // Fails towards reporting state, so a control whose state cannot be read is never dropped for being empty.
+  const _reportsState = (el) => {
+    try {
+      for (const k in _stateFields(el)) return true;
+      return false;
+    } catch (e) {
+      return true;
+    }
+  };
+  const _outsideViewport = (b) => b.right <= 0 || b.bottom <= 0 || b.left >= window.innerWidth || b.top >= window.innerHeight;
+  const _SCROLLS = /^(?:auto|scroll|overlay|hidden)$/;
+  // Walks the flat tree: a slotted node is laid out inside its slot, so a scroll container wrapping
+  // the slot in the host's shadow tree moves it; and a scroll container or fixed ancestor outside
+  // the control's own tree still decides whether a scroll can move it.
+  const _layoutParentOf = (n) => {
+    let slot = null;
+    try { slot = _assignedSlotOf.call(n); } catch (e) { slot = null; }
+    if (slot) return slot;
+    const p = _parentOf.call(n);
+    if (p) return p;
+    let r = null;
+    try { r = Node.prototype.getRootNode.call(n); } catch (e) { r = null; }
+    return r instanceof ShadowRoot ? r.host : null;
+  };
+  // A registered custom element whose shadow root reads null has one that is closed or none at all:
+  // the two cannot be told apart without attaching a root, which would mutate the page. Either way a
+  // slot and the scroll container wrapping it may be unreadable, so nothing observable proves a box
+  // below such a host unreachable. Kept out of _scrollReachable, which answers a question about
+  // layout; this one is about what the walk can see.
+  const _unreadableRootHostAbove = (node) => {
+    for (let p = _layoutParentOf(node); p; p = _layoutParentOf(p)) {
+      try {
+        // Read through the prototype: a form exposes its named controls as its own properties, so an
+        // <input name="tagName"> between the control and the host would otherwise hide the host.
+        const tag = String(_tagNameOf.call(p) || '');
+        if (tag.includes('-') && !!customElements.get(_localNameOf.call(p)) && _shadowRootOf.call(p) === null) return true;
+      } catch (e) {
+        continue;
+      }
+    }
+    return false;
+  };
+  // Whether some scroll could bring box `b` of `node` into the viewport. Errs towards true: any
+  // scroll container with overflow above the node counts, whichever way it scrolls. A fixed box does
+  // not move with the ancestors above it unless one of them re-anchors it (any transform, filter,
+  // perspective or containment, including their will-change hints); otherwise the document scrolls
+  // to any box inside its scroll extent.
+  const _scrollReachable = (node, b) => {
+    let pinned = false;
+    for (let p = node; p; p = _layoutParentOf(p)) {
+      const cs = window.getComputedStyle(p);
+      if (pinned) {
+        const anchors = [cs.transform, cs.translate, cs.rotate, cs.scale, cs.perspective, cs.filter, cs.backdropFilter].some((v) => v && v !== 'none')
+          || /paint|layout|strict|content/.test(cs.contain || '') || cs.contentVisibility === 'auto'
+          || /transform|translate|rotate|scale|perspective|filter/.test(cs.willChange || '');
+        if (!anchors) continue;
+        pinned = false;
+      }
+      if (p !== node) {
+        if (_SCROLLS.test(cs.overflowY) && _scrollHeightOf.call(p) > _clientHeightOf.call(p)) return true;
+        if (_SCROLLS.test(cs.overflowX) && _scrollWidthOf.call(p) > _clientWidthOf.call(p)) return true;
+      }
+      if (cs.position === 'fixed') pinned = true;
+    }
+    if (pinned) return false;
+    const se = document.scrollingElement || document.documentElement;
+    return b.bottom + window.scrollY > 0 && b.top + window.scrollY < _scrollHeightOf.call(se)
+      && b.right + window.scrollX > 0 && b.left + window.scrollX < _scrollWidthOf.call(se);
   };
   // v1 isElementVisible (domUtils.js) force-marks a native form control inside an open shadow root
   // as visible even when CSS hides it: web-component libraries hide the native input via
@@ -6194,6 +6336,28 @@ async () => {
       phantomDropped++;
       continue;
     }
+    // An unnamed control no scroll can bring on screen is one the model can neither identify nor
+    // click: an action on it waits out the whole timeout. Named controls stay, off screen or not, and
+    // so does a file input, which takes files without being visible. Counted in every arm, so the
+    // exposed SET can be compared across arms; only the drop is gated. The per-call count cannot: a
+    // drop does not consume the element budget, so a truncating call in treatment examines further
+    // down the page than the same call in control.
+    if (ownGated && !hidden && unnamed && !_reportsState(el)
+        && !(el.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'file')
+        && gr.width !== 0 && gr.height !== 0 && _outsideViewport(gr) && !_scrollReachable(gateEl, gr)) {
+      // Kept, and counted apart from the exposed set: an exempt control is not at risk of a wrong
+      // drop, and a page that exempts every candidate must not read as a page that had none.
+      if (_unreadableRootHostAbove(gateEl)) {
+        offViewportUnnamedHostExempt++;
+      } else {
+        offViewportUnreachableUnnamed++;
+        if (_DROP_OFFVIEWPORT_UNNAMED) {
+          hiddenDropped++;
+          hiddenDroppedOffViewport++;
+          continue;
+        }
+      }
+    }
     let selector = naturalSelector(el);
     if (!selector) {
       // We do not write inside a shadow root. Setting a marker there is a mutation of the
@@ -6262,42 +6426,12 @@ async () => {
     // element line for a selector that does not exist.
     if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
-    // el.value on a <select multiple> is the FIRST selected option only: a control holding nine
-    // reads as holding one, so an overwrite and an accumulation look identical. Report the set
-    // instead -- the scalar is a false readout here, not a partial one. Single-select is untouched.
-    const _multiSelect = el.tagName === 'SELECT' && el.multiple === true;
-    if (secretValue) { if (el.value) rec.value = '(hidden)'; }
-    else if (_multiSelect) {
-      const _picked = Array.from(el.selectedOptions || []);
-      // Retained per item at the same width as the scalar branch below: this list rides in the
-      // persistent conversation prefix, so an uncapped label is paid for on every later turn.
-      rec.selectedOptions = _picked.slice(0, 60).map((o) => (o.value + '|' + o.text).slice(0, _RETAIN_WIDTH));
-      // The size actually held, not the size retained. Python renders the truncation marker off
-      // this: a list that lost its tail silently reads as the whole selection.
-      rec.selectedTotal = _picked.length;
-    }
-    else if (el.value) rec.value = String(el.value).slice(0, _RETAIN_WIDTH);
-    // React-Select-style commit: the widget clears el.value and moves the label into its own surface
-    // (D3). Only when el.value is empty, so a field still holding its own text is never overridden.
-    else if (_isAutocomplete(el)) {
-      const sv = ownCommittedSurface(el);
-      if (sv) rec.value = String(sv).slice(0, _RETAIN_WIDTH);
-    }
-    // ARIA defines switch as a checkbox variant carrying the same aria-checked, so it belongs here.
-    if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
-    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
-      // Presence-gated like `selected` below: an absent aria-checked, or "mixed", is a state the
-      // page never stated, and reporting checked=False for an ON switch is the exact wrong-way
-      // toggle this enumeration exists to prevent.
-      const ck = el.getAttribute('aria-checked');
-      if (ck === 'true' || ck === 'false') rec.checked = ck === 'true';
-    }
-    const selected = el.getAttribute('aria-selected');
-    if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) rec.selected = selected === 'true';
-    if (role === 'spinbutton' && !secretValue) {
-      const now = el.getAttribute('aria-valuenow');
-      if (now !== null && !rec.value) rec.value = String(now).slice(0, _RETAIN_WIDTH);
-    }
+    // el.value on a <select multiple> is the FIRST selected option only, a React-Select commit moves
+    // the label off el.value into the widget's own surface, and a widget role carries its state in
+    // aria-checked / aria-selected / aria-valuenow. All of that lives in _stateFields, which the
+    // off-viewport gate asks the same question of. Retained at the scalar width per item: this rides
+    // in the persistent conversation prefix, so an uncapped label is paid for on every later turn.
+    Object.assign(rec, _stateFields(el));
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
     const isChoice = el.type === 'checkbox' || el.type === 'radio' || role === 'checkbox' || role === 'radio';
     // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
@@ -6745,7 +6879,9 @@ async () => {
   // input is not actionable.
   const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,[role=button],[role=option],[role=combobox],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
   try {
-    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    const sig = /"""
+    + CHALLENGE_VENDOR_SIGNATURE
+    + r"""/i;
     const vw = window.innerWidth || document.documentElement.clientWidth || 0;
     const vh = window.innerHeight || document.documentElement.clientHeight || 0;
     // A design system packages the widget inside its own shadow root, where a document query cannot
@@ -6881,7 +7017,7 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -6895,6 +7031,13 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     key = f'"__tv3el_{secrets.token_hex(8)}"'
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+        .replace(
+            "__OBSERVE_DROP_OFFVIEWPORT_UNNAMED__",
+            "true"
+            if run_arm_enabled(OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED)
+            else "false",
+            1,
+        )
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
     )
@@ -6911,6 +7054,8 @@ def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
     return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
 
 
+# Frozen at import, with no context, so the run-arm terms in it read off forever. Tests only: the
+# production path rebuilds the script per call. Never assert arm-sensitive behaviour against this.
 _OBSERVE_JS = observe_js()
 
 
@@ -7775,6 +7920,9 @@ _OBSERVE_SUMMED_KEYS = (
     "hiddenDroppedOffCanvas",
     "hiddenDroppedVisibility",
     "hiddenDroppedZeroRect",
+    "hiddenDroppedOffViewport",
+    "offViewportUnreachableUnnamed",
+    "offViewportUnnamedHostExempt",
     "phantomDropped",
     "markersMinted",
     "markersReused",
@@ -8573,6 +8721,9 @@ def build_browser_tools(
             "hidden_dropped_off_canvas": int(data.get("hiddenDroppedOffCanvas") or 0),
             "hidden_dropped_visibility": int(data.get("hiddenDroppedVisibility") or 0),
             "hidden_dropped_zero_rect": int(data.get("hiddenDroppedZeroRect") or 0),
+            "hidden_dropped_off_viewport": int(data.get("hiddenDroppedOffViewport") or 0),
+            "off_viewport_unreachable_unnamed": int(data.get("offViewportUnreachableUnnamed") or 0),
+            "off_viewport_unnamed_host_exempt": int(data.get("offViewportUnnamedHostExempt") or 0),
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
@@ -8721,9 +8872,9 @@ def build_browser_tools(
                 html = ""
         else:
             html = mask_otp_values_in_html(await page.content())
-        # The click/type reaction gate stamps data-tv3-pre on every visible element; internal bookkeeping
-        # that, left in place, costs a third of the truncation budget below in noise.
-        html = html.replace(' data-tv3-pre="1"', "")
+        # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
+        # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
+        html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
         # still on the page when this runs. It is a stable handle rather than a dangerous one -- the
         # token belongs to the element, not the number -- but it is ours, not the page's, and it
@@ -8769,13 +8920,60 @@ def build_browser_tools(
             error_class="disabled",
         )
 
+    def _named_controls(occluder: dict[str, Any] | None) -> list[str]:
+        """The controls the MESSAGE names. A control with neither a selector nor a label is dropped
+        from the sentence, so the list the model acts on is not always the list the probe found."""
+        parts = []
+        for control in (occluder or {}).get("controls") or []:
+            control_selector = control.get("selector") if isinstance(control, dict) else None
+            label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
+            if control_selector and label:
+                parts.append(f'{control_selector} "{label}"')
+            elif control_selector:
+                parts.append(control_selector)
+            elif label:
+                parts.append(f'"{label}" (no selector — re-observe to address it)')
+        return parts
+
+    def _covered_branch(occluder: dict[str, Any] | None) -> CoveredBranch:
+        """Which message will render. The dispatch below branches on THIS, so the
+        recorded branch and the sentence the model got cannot disagree -- including after a new
+        branch is added, which only has to be expressed here once."""
+        if not occluder:
+            return "unnamed"
+        # Ahead of `invisible`: a transparent wall holding a live challenge frame is not a leftover
+        # backdrop, and telling the model to press Escape on it abandons the verification.
+        if str(occluder.get("challengeFrame") or "").strip():
+            return "challenge"
+        if occluder.get("invisible"):
+            return "invisible"
+        return "named"
+
+    def _record_covered(occluder: dict[str, Any] | None, branch: CoveredBranch, *, controls: list[str]) -> None:
+        # The ghost-cover branch returns before the probe names an element, so it reports no kind at
+        # all; that absence IS `unnamed`, not a missing reading.
+        kind = (occluder or {}).get("layerKind")
+        layer_kind: CoveredLayerKind = kind if kind in ("qualified", "hit_fallback") else "unnamed"
+        # `controls` is the list the message will name, which is why it is passed in rather than
+        # recomputed here: the INVISIBLE message omits controls on purpose, and it stays truthful only
+        # because the probe sets `invisible` solely on a layer that had none to name.
+        record_covered_layer(branch, controls=len(controls), layer_kind=layer_kind)
+
     def _covered_error(
         selector: str, occluder: dict[str, Any] | None = None, *, verb: str = "typed into"
     ) -> ToolResult:
         also = "" if verb == "clicked" else " — a person could not click it either"
         name = str((occluder or {}).get("name") or "").strip()
         layer_selector = (occluder or {}).get("selector")
-        if occluder and occluder.get("invisible"):
+        challenge_frame = str((occluder or {}).get("challengeFrame") or "").strip()
+        # Recorded from here, above every return, because this helper is the single place every
+        # message is built: one call covers click, both typing paths and the two re-raises, and a
+        # branch added below cannot slip out un-recorded. The layer's NAME is deliberately not
+        # recorded -- it is page text, and these names carry personal data.
+        parts = _named_controls(occluder)
+        branch = _covered_branch(occluder)
+        _record_covered(occluder, branch, controls=parts)
+        if branch == "invisible":
             # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
             # Telling the model to dismiss an overlay it can see is then a false instruction that makes
             # it flail; name the layer as invisible and point at recovery routes that do not depend on
@@ -8796,7 +8994,7 @@ def build_browser_tools(
                 "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way.",
                 error_class="covered",
             )
-        if not occluder:
+        if branch == "unnamed":
             return ToolResult.error(
                 f"{selector} is rendered but something else is on top of it, so it cannot be {verb}{also}. "
                 "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe.",
@@ -8805,22 +9003,18 @@ def build_browser_tools(
         layer_desc = f'"{name}"' if name else "a layer"
         if layer_selector:
             layer_desc = f"{layer_desc} ({layer_selector})"
-        parts = []
-        for control in occluder.get("controls") or []:
-            control_selector = control.get("selector") if isinstance(control, dict) else None
-            label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
-            if control_selector and label:
-                parts.append(f'{control_selector} "{label}"')
-            elif control_selector:
-                parts.append(control_selector)
-            elif label:
-                parts.append(f'"{label}" (no selector — re-observe to address it)')
         if parts:
             controls_desc = "; ".join(parts)
         else:
             controls_desc = "re-observe — no controls were found on it"
-        if occluder.get("truncated"):
+        if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
+        if branch == "challenge":
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, which contains a challenge frame "
+                f"({challenge_frame}), so it cannot be {verb}{also}. Its controls: {controls_desc}.",
+                error_class="covered",
+            )
         return ToolResult.error(
             f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. "
             # The layer may be a general modal, not just a consent wall -- these are every control
@@ -9513,7 +9707,9 @@ def build_browser_tools(
                 # `ownLabel` (the field's own skin-sized label) is the one occluded case that is not a
                 # block; it falls through to the force-retry below.
                 if reach_probe and reach_probe.get("occluded") and not reach_probe.get("ownLabel"):
-                    return _covered_error(selector, reach_probe.get("occluder"), verb="clicked")
+                    occluder = reach_probe.get("occluder")
+                    await _annotate_challenge_frame(page, _current_page(), occluder)
+                    return _covered_error(selector, occluder, verb="clicked")
                 # A URL is the wrong question (pushState moves it without leaving the page); the token
                 # planted before the click answers "is this still the same document" exactly.
                 try:
@@ -9694,6 +9890,44 @@ def build_browser_tools(
         await page.hover(selector, timeout=15000)
         return ToolResult.ok(f"hovered {selector}")
 
+    async def _annotate_challenge_frame(realm: Any, top_page: Any, occluder: dict[str, Any] | None) -> None:
+        if not occluder:
+            return
+        try:
+            root = realm.main_frame if realm is top_page else realm
+            for frame in top_page.frames:
+                parsed = urlparse(frame.url or "")
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    continue
+                if not _CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
+                    continue
+                chain = [frame]
+                while chain[-1].parent_frame is not None and chain[-1].parent_frame is not root:
+                    chain.append(chain[-1].parent_frame)
+                if chain[-1].parent_frame is not root:
+                    continue
+                handles: list[Any] = []
+                try:
+                    # is_visible() judges an element only within its own document, so every iframe on the way
+                    # from the match up to the acting realm has to render for the challenge to be on screen.
+                    rendered = True
+                    for link in chain:
+                        handles.append(await link.frame_element())
+                        if not await handles[-1].is_visible():
+                            rendered = False
+                            break
+                    if rendered and await handles[-1].evaluate(_HOST_INSIDE_COVER_JS, _COVER_ANCESTOR_WALK_LIMIT):
+                        occluder["challengeFrame"] = parsed.hostname
+                        return
+                except Exception:
+                    LOG.debug("taskv3 could not place a challenge frame against the covering layer", exc_info=True)
+                finally:
+                    for handle in handles:
+                        with contextlib.suppress(Exception):
+                            await handle.dispose()
+        except Exception:
+            LOG.debug("taskv3 could not enumerate frames under the covering layer", exc_info=True)
+
     async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool, dict[str, Any] | None]:
         """(reachable, occluded, occluder). Raises when the field cannot accept typed text at all. Shared
         by both typing paths: fill() does no hit-testing, so without this a covered password or email
@@ -9710,6 +9944,7 @@ def build_browser_tools(
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):
+            await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
         # Reachable: a skinned own-popup is force-typed past, so there is no blocking occluder to
         # report. The probe still names it (the click path, which reads the probe directly, needs the

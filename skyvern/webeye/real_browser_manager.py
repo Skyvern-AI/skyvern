@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -47,6 +47,11 @@ from skyvern.webeye.cdp_frame_publisher import (
     CDPFramePublisher,
     stream_key_for_task,
     stream_key_for_workflow_run,
+)
+from skyvern.webeye.dialog_handler import (
+    clear_context_run_dialog_policies,
+    clear_run_dialog_policies,
+    retain_run_dialog_policies,
 )
 from skyvern.webeye.display_recorder import (
     DisplayRecorder,
@@ -236,12 +241,35 @@ async def _rebind_pbs_download_dir(
         )
 
 
+def _retain_run_dialog_answers(
+    browser_state: BrowserState,
+    workflow_run_id: str | None,
+    parent_workflow_run_id: str | None = None,
+    live_run_ids: Iterable[str] = (),
+) -> None:
+    if browser_state.browser_context is None:
+        return
+    context = skyvern_context.current()
+    retain_run_dialog_policies(
+        browser_state.browser_context,
+        (
+            workflow_run_id,
+            parent_workflow_run_id,
+            context.root_workflow_run_id if context else None,
+            *live_run_ids,
+        ),
+    )
+
+
 async def _on_browser_state_acquired(
     browser_state: BrowserState,
     workflow_run_id: str | None,
+    parent_workflow_run_id: str | None = None,
+    live_run_ids: Iterable[str] = (),
 ) -> BrowserState:
     browser_context = browser_state.browser_context
     if browser_context is not None:
+        _retain_run_dialog_answers(browser_state, workflow_run_id, parent_workflow_run_id, live_run_ids)
         await app.AGENT_FUNCTION.on_browser_context_acquired(browser_context, workflow_run_id)
     return browser_state
 
@@ -815,7 +843,9 @@ class RealBrowserManager(BrowserManager):
                         self.pages.pop(stale_key, None)
                 browser_state = None
             else:
-                return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
+                return await _on_browser_state_acquired(
+                    browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                )
 
         if browser_session_id:
             if not task.organization_id:
@@ -877,6 +907,9 @@ class RealBrowserManager(BrowserManager):
                         LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
                     else:
                         LOG.warning("Organization ID is not set for task", task_id=task.task_id)
+                    _retain_run_dialog_answers(
+                        browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                    )
                     await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                     self._store_session_lease(
                         expected_runnable_id,
@@ -953,7 +986,9 @@ class RealBrowserManager(BrowserManager):
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
-        return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+        )
 
     async def get_or_create_for_workflow_run(
         self,
@@ -986,7 +1021,9 @@ class RealBrowserManager(BrowserManager):
                 browser_state = None
             else:
                 LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
-                return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                return await _on_browser_state_acquired(
+                    browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+                )
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
@@ -1040,7 +1077,12 @@ class RealBrowserManager(BrowserManager):
                         workflow_run_id=workflow_run_id,
                         organization_id=workflow_run.organization_id,
                     )
-                    return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                    return await _on_browser_state_acquired(
+                        browser_state,
+                        workflow_run_id,
+                        parent_workflow_run_id,
+                        self._live_run_ids_sharing(browser_state),
+                    )
                 # The inherited state is genuinely torn down (disconnected and page-less).
                 # Drop the stale entry and fall through to create a fresh browser for this run.
                 LOG.warning(
@@ -1096,6 +1138,12 @@ class RealBrowserManager(BrowserManager):
                 )
                 if browser_state is not None:
                     LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                    _retain_run_dialog_answers(
+                        browser_state,
+                        workflow_run_id,
+                        parent_workflow_run_id,
+                        self._live_run_ids_sharing(browser_state),
+                    )
                     # An SDK-minted synthetic run only reads a session owned by another runnable.
                     # It cannot rebind that runnable's download directory or acquire a cleanup lease.
                     if expected_runnable_id is not None:
@@ -1162,6 +1210,12 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
+                            _retain_run_dialog_answers(
+                                browser_state,
+                                workflow_run_id,
+                                parent_workflow_run_id,
+                                self._live_run_ids_sharing(browser_state),
+                            )
                             if expected_runnable_id is not None:
                                 self._store_session_lease(
                                     workflow_run.workflow_run_id,
@@ -1260,7 +1314,9 @@ class RealBrowserManager(BrowserManager):
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
-        return await _on_browser_state_acquired(browser_state, workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+        )
 
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
@@ -1518,6 +1574,18 @@ class RealBrowserManager(BrowserManager):
 
         return browser_state_to_close
 
+    def _live_run_ids_sharing(self, browser_state: BrowserState) -> set[str]:
+        """Workflow runs live in this process that hold this exact state: an acquiring run's whole
+        ancestor chain when nested runs share a browser, rather than only the parent and root it can
+        name, and a live sibling on the same browser too."""
+        return {
+            page_id
+            for page_id, state in self.pages.items()
+            if page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX)
+            and state is browser_state
+            and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(page_id)
+        }
+
     def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
         # NON-PBS ONLY. Python-object sharing of an ephemeral BrowserState is process-local, so an
         # alias may veto the terminal close only when it denotes ANOTHER workflow run that is
@@ -1554,6 +1622,7 @@ class RealBrowserManager(BrowserManager):
         # observed below, or sees CLOSING. The tombstone also holds the session lease immediately,
         # before deferred-close parameters exist, until complete_stream_teardown releases it.
         mark_stream_closing(workflow_run_id)
+        clear_run_dialog_policies((workflow_run_id, *(child_workflow_run_ids or ())))
         browser_state_to_close = self.pages.get(workflow_run_id)
         session_lease = self._persistent_session_leases.get(workflow_run_id)
         recording_finalized = False
@@ -1596,6 +1665,8 @@ class RealBrowserManager(BrowserManager):
                     sampling=True,
                     workflow_run_id=workflow_run_id,
                 )
+            elif browser_state_to_close.browser_context:
+                clear_context_run_dialog_policies(browser_state_to_close.browser_context)
 
             # Stop tracing before closing the browser if tracing is enabled.
             # Skip when the browser is shared — Playwright supports only one active
@@ -1789,7 +1860,9 @@ class RealBrowserManager(BrowserManager):
         workflow_run_id = context.workflow_run_id if context else None
         browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
-            return await _on_browser_state_acquired(browser_state, workflow_run_id)
+            return await _on_browser_state_acquired(
+                browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+            )
 
         if browser_session_id:
             # Fail closed: look the session up under its real organization_id (release's symmetric key).
@@ -1871,7 +1944,9 @@ class RealBrowserManager(BrowserManager):
             browser_session_id=browser_session_id,
         )
 
-        return await _on_browser_state_acquired(browser_state, workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+        )
 
     async def cleanup_for_script(
         self,

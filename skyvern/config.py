@@ -552,6 +552,9 @@ class Settings(BaseSettings):
     # actuation without the probe realm gives working actions whose readbacks answer about the main
     # document instead of the element's own -- a verdict reported without being measured.
     TASK_V3_FRAME_PERCEPTION: bool = False
+    # Force-on term only: the arm is randomized per run by the flag of the same name and read through
+    # run_arm_enabled() in skyvern/forge/taskv3/run_arms.py (SKY-16501).
+    TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool

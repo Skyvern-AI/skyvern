@@ -17,7 +17,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
-from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata, CopilotEvalMode
+from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
@@ -1118,7 +1118,6 @@ class CopilotContext(AgentContext):
     copilot_question_pause_seconds: float = 0.0
     human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
-    eval_mode: CopilotEvalMode | None = None
     eval_prompt_sha256: str | None = None
     eval_tool_surface_sha256: str | None = None
     eval_native_tool_names: tuple[str, ...] = ()
@@ -1166,9 +1165,6 @@ class CopilotContext(AgentContext):
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
     credential_pause_used: bool = False
-    # True only while a card is on screen. credential_pause_used stays true for the rest of the
-    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
-    credential_ask_in_flight: bool = False
     # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
     # A run that then hits a real login wall has evidence the guess did not, so it gets the budget
     # back once.

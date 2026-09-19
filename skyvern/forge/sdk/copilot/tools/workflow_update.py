@@ -316,7 +316,16 @@ class CodeArtifactMetadata(BaseModel):
         default=None, description="Label of the authored `code` block this artifact describes."
     )
     block_id: str | None = None
-    declared_goal: str = Field(default="", description="The durable goal this block accomplishes; model-owned.")
+    declared_goal: str = Field(
+        default="",
+        description=(
+            "The durable goal this block accomplishes; model-owned. First name only the visible page state a person "
+            "sees once the block has succeeded, showing every value it returns, with no actions, 'after' or 'returns' "
+            "clauses, then the route that reaches it: page, controls by visible label or role, action order, inputs "
+            "by workflow parameter name (never a value), and what the block returns, naming only page content the "
+            "first sentence already shows, never a data structure."
+        ),
+    )
     claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(
         default_factory=list,
         description=(
@@ -742,11 +751,16 @@ def _withheld_labels_within(labels: list[str], budget: int) -> list[str]:
     return exhausted if len(json.dumps(exhausted)) <= budget else []
 
 
-def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str) -> dict[str, str]:
+def _changed_code_blocks(
+    prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str
+) -> tuple[dict[str, str], list[str]]:
+    """The accepted code per changed label, plus the labels whose stored code is not the bytes the
+    submission carried — a model anchoring its next edit on what it submitted would miss those."""
     prior = _workflow_yaml_code_blocks_by_label(prior_yaml)
     submitted = _workflow_yaml_code_blocks_by_label(submitted_yaml)
     accepted = _workflow_yaml_code_blocks_by_label(accepted_yaml)
     changed: dict[str, str] = {}
+    rewritten: list[str] = []
     for label, block in accepted.items():
         code = block.get("code")
         if not isinstance(code, str):
@@ -758,7 +772,9 @@ def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_y
         if unchanged_since_prior and matches_submission:
             continue
         changed[label] = code
-    return changed
+        if submitted_block is not None and not matches_submission:
+            rewritten.append(label)
+    return changed, sorted(rewritten)
 
 
 def _advisory_labels_by_diagnostic(
@@ -3812,7 +3828,14 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
         return result
     carried = {
         key: update_data[key]
-        for key in ("findings", "stored_code", "stored_code_withheld", "persistence", "persistence_message")
+        for key in (
+            "findings",
+            "stored_code",
+            "stored_code_withheld",
+            "stored_code_rewritten",
+            "persistence",
+            "persistence_message",
+        )
         if update_data.get(key)
     }
     if not carried:
@@ -4440,7 +4463,9 @@ async def _update_workflow(
         # otherwise-successful update_workflow tool call. ``isinstance``
         # narrows the parameter's declared ``AgentContext`` to the
         # envelope-aware ``CopilotContext`` for mypy.
-        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        changed_code_blocks, stored_code_rewritten = _changed_code_blocks(
+            prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
+        )
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, CopilotContext):
             # Best-effort — the workflow is already persisted, so a narrative detail must never
@@ -4487,11 +4512,14 @@ async def _update_workflow(
             data["stored_code"] = stored_code
         if stored_code_withheld:
             data["stored_code_withheld"] = stored_code_withheld
+        if stored_code_rewritten:
+            data["stored_code_rewritten"] = stored_code_rewritten
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",
                 returned_chars={label: len(code) for label, code in stored_code.items()},
                 withheld_labels=stored_code_withheld,
+                rewritten_labels=stored_code_rewritten,
             )
         # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
         # crafted block code must never turn a successful update into a failed turn.

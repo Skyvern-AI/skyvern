@@ -74,6 +74,9 @@ _READ_METHODS: dict[str, str] = {
 # Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
 # interaction methods, which the keyword scan below already covers).
 _PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
+# Injected into the code block's namespace as a bare builtin rather than a page method
+# (block.py build_safe_vars), so it is called as `await solve_captcha(page)` with no receiver.
+_BARE_NAME_METHODS: frozenset[str] = frozenset({"solve_captcha"})
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
 _IGNORED_METHODS: frozenset[str] = frozenset(
     {"wait_for_load_state", "wait_for_selector", "wait_for_url", "wait_for_function"}
@@ -132,9 +135,15 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
             continue
         call = node.value
-        if not isinstance(call.func, ast.Attribute):
+        receiver_node: ast.expr | None
+        if isinstance(call.func, ast.Attribute):
+            method = call.func.attr
+            receiver_node = call.func.value
+        elif isinstance(call.func, ast.Name) and call.func.id in _BARE_NAME_METHODS:
+            method = call.func.id
+            receiver_node = None
+        else:
             continue
-        method = call.func.attr
         if method in _IGNORED_METHODS:
             continue
         action_type = _METHOD_ACTION_TYPES.get(method) or _READ_METHODS.get(method)
@@ -142,7 +151,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
             continue
         goto_url = _goto_url_node(call, method)
         goto_arg = goto_url if isinstance(goto_url, ast.Name) else None
-        first_arg = call.args[0] if call.args else goto_url
+        first_arg = (call.args[0] if call.args else goto_url) if receiver_node is not None else None
         goto_literal = None
         if goto_arg is not None:
             if bindings is None:
@@ -154,12 +163,14 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 line_start=node.lineno,
                 line_end=getattr(node, "end_lineno", None) or node.lineno,
                 method=method,
-                receiver=_safe_unparse(call.func.value),
+                receiver=_safe_unparse(receiver_node) if receiver_node is not None else "",
                 first_arg=_safe_unparse(first_arg) if first_arg is not None else None,
                 prompt=_prompt_literal(call, method),
                 loop_var=_enclosing_loop_var(node, parents, loop_vars),
                 store_name=_store_name(node, parents, store_names) if action_type == "extract" else None,
-                element_name=_element_name(call.func.value) if action_type == "extract" else None,
+                element_name=(
+                    _element_name(receiver_node) if action_type == "extract" and receiver_node is not None else None
+                ),
                 goto_name=goto_arg.id if goto_arg else None,
                 goto_literal=goto_literal,
             )
@@ -527,57 +538,6 @@ def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
         derived = derive_code_block_steps(block["code"])
         if block.get("steps") != derived:
             block["steps"] = derived
-            changed = True
-
-    if not changed:
-        return workflow_yaml
-    return yaml.safe_dump(data, sort_keys=False)
-
-
-def fill_code_block_prompts_in_yaml(
-    workflow_yaml: str,
-    *,
-    prior_yaml: str | None = None,
-    fallback_goals: dict[str, str] | None = None,
-) -> str:
-    """Return workflow_yaml with each code block's `prompt` (goal) filled when absent.
-
-    The editor treats a code block as code-first (plain view + steps) only when it
-    carries a `prompt`; the model authors the goal as artifact `declared_goal`, not on
-    the block, and code regeneration replaces the whole block YAML and drops it. Prefer
-    the prior block's prompt by label (exact user text, preserved across regen), then a
-    fallback goal by label (e.g. the model's `declared_goal`)."""
-    try:
-        data = yaml.safe_load(workflow_yaml)
-    except yaml.YAMLError:
-        return workflow_yaml
-    if not isinstance(data, (dict, list)):
-        return workflow_yaml
-
-    prior_prompts: dict[str, str] = {}
-    if prior_yaml:
-        try:
-            prior_data = yaml.safe_load(prior_yaml)
-        except yaml.YAMLError:
-            prior_data = None
-        if isinstance(prior_data, (dict, list)):
-            for block in _iter_code_block_dicts(prior_data):
-                label = block.get("label")
-                prompt = block.get("prompt")
-                if isinstance(label, str) and isinstance(prompt, str) and prompt:
-                    prior_prompts[label] = prompt
-
-    fallback_goals = fallback_goals or {}
-    changed = False
-    for block in _iter_code_block_dicts(data):
-        if block.get("prompt"):
-            continue
-        label = block.get("label")
-        if not isinstance(label, str):
-            continue
-        goal = prior_prompts.get(label) or fallback_goals.get(label)
-        if goal:
-            block["prompt"] = goal
             changed = True
 
     if not changed:

@@ -180,6 +180,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
+from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, resolve_run_arm
 from skyvern.forge.taskv3.target_label import compose_target_intention
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
@@ -498,7 +499,7 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # page change and resets the stall counter -- on a frozen page the model works through
     # mark after mark, which is precisely the run the stall detector exists to catch.
     # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
-    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
+    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
     " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
@@ -1850,6 +1851,13 @@ class ForgeAgent:
                 context,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
+            )
+            await resolve_run_arm(
+                context,
+                OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED,
             )
         offer_error_codes = False
         if task.error_code_mapping:
