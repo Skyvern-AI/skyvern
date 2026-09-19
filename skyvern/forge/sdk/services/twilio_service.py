@@ -151,6 +151,7 @@ def _error_message(response: httpx.Response) -> str:
 
 def compute_twilio_signature(auth_token: str, url: str, params: Mapping[str, str]) -> str:
     signed_payload = url + "".join(key + params[key] for key in sorted(params))
+    # Twilio signs webhook requests with HMAC-SHA1 (https://www.twilio.com/docs/usage/webhooks/webhooks-security).
     digest = hmac.new(auth_token.encode(), signed_payload.encode(), hashlib.sha1).digest()
     return base64.b64encode(digest).decode()
 
