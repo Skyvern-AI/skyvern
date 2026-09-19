@@ -312,19 +312,19 @@ class _ProtocolNamedDiagnostic(BaseModel):
 
 @pytest.mark.parametrize("registered_log_stream", [True, False], indirect=True)
 @pytest.mark.parametrize("route", ["native", "stdlib", "downstream_renamer"])
-@pytest.mark.parametrize("protocol_word", ["event", "msg", "level", "warning", "warn"])
+@pytest.mark.parametrize("secret", ["event", "msg", "level", "warning", "warn"])
 def test_registered_protocol_words_preserve_emitted_messages_and_severity(
-    registered_log_stream: io.StringIO, route: str, protocol_word: str
+    registered_log_stream: io.StringIO, route: str, secret: str
 ) -> None:
-    context = SkyvernContext(runtime_secret_values={protocol_word})
-    payload = dict.fromkeys(("event", "msg", "level", "warning"), protocol_word)
+    context = SkyvernContext(runtime_secret_values={secret})
+    payload = dict.fromkeys(("event", "msg", "level", "warning"), secret)
     original = payload.copy()
     model = _ProtocolNamedDiagnostic(**payload)
     fields = {
         "payload": payload,
         "model": model,
-        f"user:{protocol_word}": protocol_word,
-        "url": f"https://example.invalid/verify?value={protocol_word}",
+        f"user:{secret}": secret,
+        "url": f"https://example.invalid/verify?value={secret}",
     }
     logger = structlog.get_logger("skyvern.test.protocol")
     if route == "downstream_renamer":
@@ -356,19 +356,17 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
     with skyvern_context.scoped(context):
         emit("Diagnostic emission")
         try:
-            raise ValueError(protocol_word)
+            raise ValueError(secret)
         except ValueError:
-            emit(f"Diagnostic emission: {protocol_word}", exc_info=True)
+            emit(f"Diagnostic emission: {secret}", exc_info=True)
     context.runtime_secret_values.clear()
     assert payload == original
     assert model.model_dump() == original
-    assert fields[f"user:{protocol_word}"] == protocol_word
-    payload["late"] = protocol_word
+    assert fields[f"user:{secret}"] == secret
+    payload["late"] = secret
     model.event = "changed after capture"
 
-    masked_payload = {
-        key.replace(protocol_word, REDACTED_SECRET_PLACEHOLDER): REDACTED_SECRET_PLACEHOLDER for key in original
-    }
+    masked_payload = {key.replace(secret, REDACTED_SECRET_PLACEHOLDER): REDACTED_SECRET_PLACEHOLDER for key in original}
     expected_messages = ["Diagnostic emission", f"Diagnostic emission: {REDACTED_SECRET_PLACEHOLDER}"]
     emitted = re.sub(r"\x1b\[[0-9;]*m", "", registered_log_stream.getvalue())
     record_groups = []
@@ -383,8 +381,8 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
         assert f"user:{REDACTED_SECRET_PLACEHOLDER}={REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"url=https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"ValueError: {REDACTED_SECRET_PLACEHOLDER}" in emitted
-        assert f"Diagnostic emission: {protocol_word}" not in emitted
-        assert f"ValueError: {protocol_word}" not in emitted
+        assert f"Diagnostic emission: {secret}" not in emitted
+        assert f"ValueError: {secret}" not in emitted
     if route != "stdlib":
         record_groups.append(json.loads(json.dumps(context.log, cls=SkyvernJSONLogEncoder)))
     for records in record_groups:

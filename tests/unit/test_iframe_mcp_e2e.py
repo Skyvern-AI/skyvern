@@ -46,7 +46,7 @@ from skyvern.cli.mcp_tools.browser import (
 )
 from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.forge.sdk.copilot import mcp_adapter
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurface
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurface, CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
@@ -282,6 +282,7 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
         overlays=overlays,
         ordered_native_names=(),
         ordered_mcp_names=surface_names,
+        identity=CopilotToolSurfaceIdentity.OPTIONAL,
     )
     without_frames = [tool for tool in advertised if not tool.name.startswith("skyvern_frame_")]
     old_surface = CopilotToolSurface(
@@ -290,6 +291,7 @@ async def test_copilot_advertised_frame_tool_chain_real_browser(
         overlays={tool.name: overlays[tool.name] for tool in without_frames},
         ordered_native_names=(),
         ordered_mcp_names=tuple(tool.name for tool in without_frames),
+        identity=CopilotToolSurfaceIdentity.OPTIONAL,
     )
     assert surface.advertised_sha256(advertised) != old_surface.advertised_sha256(without_frames)
 

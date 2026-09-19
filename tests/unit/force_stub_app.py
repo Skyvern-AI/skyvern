@@ -6,6 +6,7 @@ from skyvern.config import settings
 from skyvern.forge import set_force_app_instance
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
@@ -57,6 +58,9 @@ def create_forge_stub_app() -> ForgeApp:
     # truthy AsyncMocks and hijack CodeBlock.execute into the runner path. Match
     # the real OSS base no-op so unit tests exercise the legacy in-process path.
     fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
+    # Same footgun on the copilot browser-code gate: an auto-mocked mode would offer run_browser_code
+    # instead of the OSS default.
+    fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock

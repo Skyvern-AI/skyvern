@@ -117,25 +117,37 @@ async def test_navigation_accepts_public_caller_destination(
 
 @pytest.mark.parametrize("http_status", [200, 404, 410])
 @pytest.mark.asyncio
-async def test_navigate_to_url_records_last_navigation_status(
+async def test_navigate_to_url_records_last_navigation_status_with_the_url_it_came_back_on(
     browser_state: RealBrowserState,
     monkeypatch: pytest.MonkeyPatch,
     http_status: int,
 ) -> None:
-    # The Task V3 loop reads last_navigation_status to classify a dead/removed starting URL, so a
-    # navigation must record the final response's HTTP status on the state (not leave it unset).
+    # The Task V3 loop reads last_navigation_status to classify a dead/removed starting URL and names
+    # the page in the customer's failure_reason, so the two must be recorded from the SAME response.
+    # A page that moves during the settle or challenge-solver wait (a client-side redirect off a 404)
+    # would otherwise leave a later read of page.url standing in for the URL the status belongs to --
+    # telling the customer the redirect destination returned 404.
     def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
     url = "https://public.example.test/path"
-    response = SimpleNamespace(status=http_status, request=SimpleNamespace(url=url, redirected_from=None))
+    redirected_to = "https://public.example.test/somewhere-else"
+    response = SimpleNamespace(status=http_status, url=url, request=SimpleNamespace(url=url, redirected_from=None))
     page = MagicMock()
-    page.goto = AsyncMock(return_value=response)
+    page.url = url
+
+    async def goto(*_args: object, **_kwargs: object) -> object:
+        # The client-side redirect lands while the navigation is still settling.
+        page.url = redirected_to
+        return response
+
+    page.goto = AsyncMock(side_effect=goto)
 
     await browser_state.navigate_to_url(page=page, url=url)
 
     assert browser_state.last_navigation_status == http_status
+    assert browser_state.last_navigation_url == url
 
 
 @pytest.mark.asyncio

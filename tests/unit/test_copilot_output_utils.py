@@ -1641,6 +1641,20 @@ class TestFormatToolResultForUser:
         )
         assert agent_summary == "Clicked 'xpath=//button[2]'"
 
+    def test_summarize_tool_result_reports_browser_code_operations_and_page(self) -> None:
+        agent_summary = summarize_tool_result(
+            "run_browser_code",
+            {
+                "ok": True,
+                "current_url": "https://example.com/members?page=3",
+                "operations": [
+                    {"operation": "goto", "status": "ok"},
+                    {"operation": "click", "status": "ok", "selector": "#nextBtn"},
+                ],
+            },
+        )
+        assert agent_summary == "Ran browser code (2 operation(s)) at https://example.com/members?page=3"
+
 
 class TestUserFacingSuccess:
     @staticmethod

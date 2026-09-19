@@ -71,6 +71,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_CLAIM_LEASE,
     COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
     CopilotPendingTurn,
@@ -4202,6 +4203,43 @@ async def _load_history(chat_id: str = "chat-1") -> Any:
     )
 
 
+@pytest.mark.parametrize(
+    ("claim_age", "still_holding"),
+    [
+        (timedelta(seconds=30), True),
+        (COPILOT_PROPOSAL_CLAIM_LEASE + timedelta(seconds=1), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chat_history_reports_the_claim_lease_as_a_remaining_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    claim_age: timedelta,
+    still_holding: bool,
+) -> None:
+    """A client that compared claimed_at to its own clock disagreed with the server whenever it
+    drifted, so the row carries what is left of the lease instead of when it started."""
+    canonical = _make_copilot_workflow("Saved", _NOW)
+    proposal = canonical.model_dump(mode="json")
+    proposal["_copilot_yaml"] = "title: Candidate\n"
+    proposal[COPILOT_PROPOSAL_METADATA_KEY] = {
+        "owner_turn_id": "turn-owner",
+        "revision": 1,
+        "canonical_fingerprint": _fingerprint_of(canonical),
+        "disposition": "accepting",
+        "claimed_at": (datetime.now(timezone.utc) - claim_age).isoformat(),
+    }
+    chat = _make_persisted_chat([], proposed_workflow=proposal)
+    _install_reconcile_store(monkeypatch, chat, canonical=canonical)
+
+    remaining = (await _load_history()).proposed_claim_expires_in_seconds
+
+    if not still_holding:
+        assert remaining is None
+    else:
+        assert remaining is not None
+        assert 0 < remaining <= COPILOT_PROPOSAL_CLAIM_LEASE.total_seconds()
+
+
 @pytest.mark.asyncio
 async def test_chat_history_marks_abandoned_turn_interrupted_not_cancelled(
     monkeypatch: pytest.MonkeyPatch,
@@ -6523,10 +6561,60 @@ async def test_history_still_shows_a_candidate_whose_accept_died_holding_its_cla
         SimpleNamespace(now=lambda tz=None: _NOW, fromisoformat=datetime.fromisoformat),
     )
 
-    proposal, metadata, _run = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+    proposal, metadata, _run, _claim = await workflow_copilot_route._history_proposal_state(chat, "org-1")
 
     assert proposal is stored
     assert metadata is not None and metadata.disposition == "accepting"
+
+
+@pytest.mark.asyncio
+async def test_a_live_claim_is_still_reported_when_canonical_moved_under_the_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hiding the proposal must not hide the claim.
+
+    A concurrent save moves canonical, so the fingerprint no longer matches and the candidate is
+    correctly withheld - but an Accept may still be writing under that claim, which is exactly when
+    a client must not save over it. Reporting no claim while one is live is not ambiguity; the
+    client reads an explicit null as "the server says nobody is writing" and releases its fence.
+    """
+    canonical = _make_copilot_workflow("Base", _NOW)
+    stored = {
+        "workflow_id": "wf-1",
+        "_copilot_yaml": "title: Base\n",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": _fingerprint_of(canonical),
+            "disposition": "accepting",
+            "claimed_at": _NOW.isoformat(),
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    # Someone else's save landed, so canonical is no longer what this proposal was built against.
+    moved = _make_copilot_workflow("Moved by another writer", _NOW)
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=moved)),
+    )
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "datetime",
+        SimpleNamespace(now=lambda tz=None: _NOW, fromisoformat=datetime.fromisoformat),
+    )
+
+    proposal, metadata, _run, claim_expires_in = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+
+    assert proposal is None
+    assert metadata is None
+    assert claim_expires_in == COPILOT_PROPOSAL_CLAIM_LEASE.total_seconds()
 
 
 @pytest.mark.asyncio
@@ -6575,7 +6663,7 @@ async def test_a_large_run_output_is_bounded_before_it_reaches_every_history_res
         ),
     )
 
-    _proposal, _metadata, run_facts = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+    _proposal, _metadata, run_facts, _claim = await workflow_copilot_route._history_proposal_state(chat, "org-1")
 
     assert run_facts is not None
     by_id = {row.output_parameter_id: row.value for row in run_facts.outputs}
