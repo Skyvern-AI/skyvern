@@ -18,6 +18,7 @@ down_revision: Union[str, None] = "0aa6bda1df12"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
 def _set_local_ddl_timeouts() -> None:
     """Bound live-table DDL waits, including after OSS code generation."""
     if op.get_bind().dialect.name == "postgresql":

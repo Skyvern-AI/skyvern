@@ -18,12 +18,17 @@ down_revision: Union[str, None] = "eee46e1b1dbf"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
 def _set_local_lock_timeout() -> None:
     """Bound lock waits for the current transaction, including after OSS codegen."""
     if op.get_bind().dialect.name == "postgresql":
         op.execute("SET LOCAL lock_timeout = '5s'")
+
+
 _CREDENTIALS_UNIQUE_INDEX = "uq_credentials_id_org"
 _CREDENTIALS_UNIQUE_CONSTRAINT = "uq_credentials_id_org"
+
+
 def _credentials_constraint_exists() -> bool:
     return bool(
         op.get_bind()
@@ -33,6 +38,8 @@ def _credentials_constraint_exists() -> bool:
         )
         .scalar()
     )
+
+
 def _credentials_invalid_index() -> str | None:
     return (
         op.get_bind()
@@ -48,6 +55,8 @@ def _credentials_invalid_index() -> str | None:
         )
         .scalar()
     )
+
+
 def _reset_index_timeouts() -> None:
     for statement in ("RESET statement_timeout;", "RESET lock_timeout;"):
         try:
@@ -56,6 +65,8 @@ def _reset_index_timeouts() -> None:
             # A failed concurrent statement can leave the transaction aborted.
             # Never replace its useful provider/driver exception with cleanup noise.
             pass
+
+
 def _build_credentials_unique_index() -> None:
     invalid_leftover = _credentials_invalid_index()
     with op.get_context().autocommit_block():
@@ -72,6 +83,8 @@ def _build_credentials_unique_index() -> None:
             _reset_index_timeouts()
             raise
         _reset_index_timeouts()
+
+
 def _ensure_credentials_unique_constraint() -> None:
     if op.get_bind().dialect.name != "postgresql":
         op.create_unique_constraint(
