@@ -60,9 +60,7 @@ describe("searchWithRunSwitched system focus", () => {
       systemFocus: true,
     });
     expect(focused).toBe("?panes=browser&wr=wr_1&wrs=copilot");
-    expect(searchWithRunSwitched(focused, "wr_2")).toBe(
-      "?panes=browser&wr=wr_2",
-    );
+    expect(searchWithRunSwitched(focused, "wr_2")).toBe("?wr=wr_2");
   });
 
   it("keeps the marker when the copilot hands off between its own runs", () => {
@@ -92,7 +90,7 @@ describe("useSwitchStudioRun", () => {
     });
     result.current("wr_1");
     expect(navigate).toHaveBeenCalledWith(
-      { search: "?panes=copilot,browser&wr=wr_1" },
+      { search: "?wr=wr_1" },
       { replace: false },
     );
   });

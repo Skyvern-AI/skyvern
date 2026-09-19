@@ -81,7 +81,6 @@ import {
   BLOCK_SIDEBAR_WIDTH_MAX,
   useBlockSidebarWidthStore,
 } from "@/store/BlockSidebarWidthStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
@@ -123,7 +122,6 @@ beforeEach(() => {
     content: "parameters",
   });
   useBlockSidebarWidthStore.getState().reset();
-  useStudioShellStore.getState().reset();
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = StubFormForBlockType(key);
   }

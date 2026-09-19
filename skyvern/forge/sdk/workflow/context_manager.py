@@ -66,6 +66,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
 from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -74,6 +75,19 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
 LOG = structlog.get_logger()
+
+
+def _normalize_credential_totp_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = normalize_identifier(value)
+    if normalized.startswith("+") or not looks_like_phone_identifier(normalized):
+        return normalized
+    digits = re.sub(r"\D", "", normalized)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return normalized
+
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
@@ -954,9 +968,13 @@ class WorkflowRunContext:
         )
         credential = credential_item.credential
 
-        credential_totp_identifier = db_credential.totp_identifier or getattr(credential, "totp_identifier", None)
+        credential_totp_identifier = db_credential.totp_identifier
+        if not credential_totp_identifier and isinstance(credential, PasswordCredential):
+            credential_totp_identifier = credential.totp_identifier
         if credential_totp_identifier:
-            self.credential_totp_identifiers[parameter.key] = credential_totp_identifier
+            normalized_totp_identifier = _normalize_credential_totp_identifier(credential_totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -1148,6 +1166,10 @@ class WorkflowRunContext:
         if item is None:
             LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
             raise ValueError(f"1Password item not found. {lookup_context}")
+        if parameter.totp_identifier:
+            normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -1399,7 +1421,6 @@ class WorkflowRunContext:
                 # username secret
                 username_secret_id = f"{random_secret_id}_username"
                 self.secrets[username_secret_id] = secret_credentials[BitwardenConstants.USERNAME]
-                # password secret
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
                 self.values[parameter.key] = {
@@ -1408,6 +1429,10 @@ class WorkflowRunContext:
                     "password": password_secret_id,
                 }
                 self.parameters[parameter.key] = parameter
+                if parameter.totp_identifier:
+                    normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+                    if normalized_totp_identifier is not None:
+                        self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
                 if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
                     totp_secret_id = f"{random_secret_id}_totp"

@@ -215,13 +215,14 @@ async def login(
         yaml_parameters = [
             BitwardenLoginCredentialParameterYAML(
                 key=parameter_key,
-                collection_id=login_request.bitwarden_collection_id,
-                item_id=login_request.bitwarden_item_id,
-                url=login_request.url,
+                bitwarden_collection_id=login_request.bitwarden_collection_id,
+                bitwarden_item_id=login_request.bitwarden_item_id,
+                url_parameter_key=login_request.url,
                 description="The ID of the bitwarden collection to use for login",
                 bitwarden_client_id_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_ID",
                 bitwarden_client_secret_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_SECRET",
                 bitwarden_master_password_aws_secret_key="SKYVERN_BITWARDEN_MASTER_PASSWORD",
+                totp_identifier=resolved_totp_identifier,
             )
         ]
     elif login_request.credential_type == CredentialType.onepassword:
@@ -239,6 +240,7 @@ async def login(
                 vault_id=login_request.onepassword_vault_id,
                 item_id=login_request.onepassword_item_id,
                 totp_field_name=login_request.onepassword_totp_field_name,
+                totp_identifier=resolved_totp_identifier,
             )
         ]
     elif login_request.credential_type == CredentialType.azure_vault:

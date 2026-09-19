@@ -53,7 +53,11 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
-from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, run_arm_enabled
+from skyvern.forge.taskv3.run_arms import (
+    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+    TYPE_COORDINATE_CLICK_FLAG,
+    run_arm_enabled,
+)
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -118,6 +122,7 @@ async def _run_execute_task_v3(
         loop_mock.observe_offviewport_drop_during_loop = run_arm_enabled(
             OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, forced=False
         )
+        loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -269,6 +274,32 @@ async def test_execute_task_v3_resolves_frame_perception_before_the_loop(monkeyp
 
     provider.assert_awaited_once_with(
         FRAME_PERCEPTION_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bucketing by block (task_id) would give one workflow run several draws and inflate exposure.
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_type_coordinate_click_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.type_coordinate_click_enabled_during_loop is True
+    assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        TYPE_COORDINATE_CLICK_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )

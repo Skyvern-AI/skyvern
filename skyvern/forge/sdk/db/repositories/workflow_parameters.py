@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_alchemy_db import read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
     DatabaseConnectionUnavailableError,
@@ -377,6 +378,7 @@ class WorkflowParametersRepository(BaseRepository):
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, BitwardenLoginCredentialParameter):
+            now = naive_utc_now()
             return BitwardenLoginCredentialParameterModel(
                 bitwarden_login_credential_parameter_id=parameter.bitwarden_login_credential_parameter_id,
                 workflow_id=parameter.workflow_id,
@@ -388,7 +390,10 @@ class WorkflowParametersRepository(BaseRepository):
                 bitwarden_collection_id=parameter.bitwarden_collection_id,
                 bitwarden_item_id=parameter.bitwarden_item_id,
                 url_parameter_key=parameter.url_parameter_key,
-                deleted_at=parameter.deleted_at,
+                totp_identifier=parameter.totp_identifier,
+                created_at=to_naive_utc(parameter.created_at) or now,
+                modified_at=to_naive_utc(parameter.modified_at) or now,
+                deleted_at=to_naive_utc(parameter.deleted_at),
             )
         elif isinstance(parameter, BitwardenSensitiveInformationParameter):
             return BitwardenSensitiveInformationParameterModel(
@@ -431,6 +436,7 @@ class WorkflowParametersRepository(BaseRepository):
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
+            now = naive_utc_now()
             return OnePasswordCredentialParameterModel(
                 onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
                 workflow_id=parameter.workflow_id,
@@ -438,7 +444,10 @@ class WorkflowParametersRepository(BaseRepository):
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
-                deleted_at=parameter.deleted_at,
+                totp_identifier=parameter.totp_identifier,
+                created_at=to_naive_utc(parameter.created_at) or now,
+                modified_at=to_naive_utc(parameter.modified_at) or now,
+                deleted_at=to_naive_utc(parameter.deleted_at),
             )
         elif isinstance(parameter, AzureVaultCredentialParameter):
             return AzureVaultCredentialParameterModel(

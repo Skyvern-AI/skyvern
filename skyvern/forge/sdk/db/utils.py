@@ -43,6 +43,8 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
+    TwilioCredential,
+    TwilioOrganizationAuthToken,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -505,7 +507,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | TwilioOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -524,6 +526,17 @@ async def convert_to_organization_auth_token(
     elif token_type == OrganizationAuthTokenType.bitwarden_credential:
         credential = BitwardenCredential.model_validate_json(token)
         return BitwardenOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.twilio_credential:
+        credential = TwilioCredential.model_validate_json(token)
+        return TwilioOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -780,6 +793,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
         bitwarden_item_id=bitwarden_login_credential_parameter_model.bitwarden_item_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
+        totp_identifier=bitwarden_login_credential_parameter_model.totp_identifier,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
         deleted_at=bitwarden_login_credential_parameter_model.deleted_at,

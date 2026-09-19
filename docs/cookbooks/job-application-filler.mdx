@@ -40,6 +40,8 @@ You can use the [recipe page](https://app.skyvern.com/recipes/job-apps) or the A
     If the site uses two-factor authentication, enable **Uses 2FA?** and supply your configured 2FA identifier when needed.
   </Step>
   <Step title="Start and track the application">
+    Open **Advanced options** to edit **Terminate if** or **Error code mapping**. The defaults stop an application when the posting explicitly says it is closed and classify that outcome as `job_expired`. Use **Reset to defaults** to restore both settings.
+
     Submit the form, then open the returned run link. The **Runs** panel lists applications and job extractions with their status.
   </Step>
 </Steps>
@@ -83,6 +85,8 @@ The response contains the new run ID:
 
 The run executes asynchronously. This response confirms that the run started; poll its status to get the extraction output.
 
+Extract can complete for a closed posting when its details remain readable. The normal `extract_output.extracted_information` object includes `availability`: `closed` for explicit closure, `open` for evidence that applications are accepted, or `unknown` when the page is ambiguous. Readable details remain in that object. Closure does not itself make Extract fail.
+
 ### Apply with a resume URL
 
 [Apply to a job](/api-reference/recipes/apply-to-a-job) accepts JSON with `job_url`, `resume_url`, and `custom_prompt`. Include `custom_prompt` even when you have no instructions; use an empty string.
@@ -123,6 +127,39 @@ The API supports PDF, DOCX, and image resumes. The default upload limit is 30 Mi
 
 Both Apply request formats return only `workflow_run_id`. Check the run result to determine whether the application was submitted.
 
+### Configure termination and error codes
+
+Apply accepts two optional settings in either request format. If you omit them, it uses these defaults:
+
+```json
+{
+  "terminate_criterion": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button, redirect, or HTTP 404 alone is insufficient.",
+  "error_code_mapping": {
+    "job_expired": "The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications."
+  }
+}
+```
+
+`terminate_criterion` tells the agent when to stop. `error_code_mapping` defines the codes that the failure classifier may return. Keep both when you want early stopping and a stable code. A prompt alone does not define a machine-readable error code.
+
+| Setting               | Omitted                       | Disabled       | Custom value                |
+|-----------------------|-------------------------------|----------------|-----------------------------|
+| `terminate_criterion` | Default closure rule          | `null` or `""` | Replaces the default rule   |
+| `error_code_mapping`  | Default `job_expired` mapping | `null` or `{}` | Replaces the entire mapping |
+
+The settings are independent. Clearing a rule does not clear the mapping, and clearing the mapping does not clear the rule. Use a JSON object with nonempty string keys and string descriptions for the mapping. Only configured codes can be returned; replacing the mapping can remove `job_expired`.
+
+In multipart requests, send the criterion as text and the mapping as JSON text:
+
+```bash
+--form 'terminate_criterion=Stop when the posting explicitly says applications are closed.' \
+--form 'error_code_mapping={"job_expired":"The posting explicitly says applications are closed."}'
+```
+
+Send text `null` or `{}` to disable the multipart mapping, or an empty criterion field to disable the rule. In the dashboard, clear **Terminate if** or enter `null` or `{}` in **Error code mapping**. Advanced settings apply to each URL in a bulk submission and are not saved in browser storage.
+
+Apply checks closure when it observes the posting; resume parsing or login may already have occurred. The default rule applies only to explicit expiry, closure, filled positions, or statements that applications are no longer accepted. A missing button, redirect, or HTTP 404 alone is insufficient. Editing or disabling the rule uses agent execution when a deterministic adapter cannot represent it.
+
 ### Supply credentials and a 2FA identifier
 
 For a site that needs login, add these fields to the JSON Apply body:
@@ -157,6 +194,8 @@ curl 'https://api.skyvern.com/v1/runs/wr_123' \
 ```
 
 Poll this endpoint while the run is active. When it finishes, inspect its status and output. A successful launch response alone does not confirm extraction or application completion.
+
+With the default Apply settings, an explicitly closed posting terminates the run. Inspect the standard `status`, `failure_reason`, and `errors` fields. A classified expiry has `error_code: "job_expired"`, with `reasoning` and `confidence_float`, in `errors`. The same fields use the normal workflow webhook payload. Classification only returns configured codes when it can identify a match; an empty `errors` list is not proof that a posting is open. Extract availability appears in the normal workflow `outputs`, not in the recipe run list.
 
 To list recipe runs for your organization, use [List job recipe runs](/api-reference/recipes/list-job-recipe-runs):
 

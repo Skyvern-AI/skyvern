@@ -73,7 +73,7 @@ import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
@@ -194,10 +194,6 @@ import {
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
-import {
-  initialEditorAutoOpenState,
-  shouldAutoOpenEditor,
-} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -415,14 +411,9 @@ function Workspace({
   const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
-  const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);
+  const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
+    useStudioPaneDefaults();
   const studioCopilotOpen = studioPanes.includes("copilot");
-  // Armed iff the workflow has no blocks at mount — the studio shell remounts
-  // Workspace per workflow, so `workflow` is always populated here. The first
-  // copilot build that lands blocks auto-opens the Editor pane, exactly once.
-  const editorAutoOpenStateRef = useRef(
-    initialEditorAutoOpenState(workflow.workflow_definition.blocks.length),
-  );
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -2409,6 +2400,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 embedded={embedded}
+                paneEntryKey={embedded ? studioEntryId : undefined}
                 paneLayoutKey={
                   embedded
                     ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
@@ -3230,18 +3222,6 @@ function Workspace({
             // snap-back); only version-restore/load call applyWorkflowUpdate
             // without this and stay a clean baseline.
             applyWorkflowUpdate(workflowData, { ...options, userDriven: true });
-            const { fire, nextState } = shouldAutoOpenEditor(
-              editorAutoOpenStateRef.current,
-              {
-                embedded,
-                applied: options?.applied,
-                blockCount: workflowData.workflow_definition.blocks.length,
-              },
-            );
-            editorAutoOpenStateRef.current = nextState;
-            if (fire) {
-              openStudioPane("editor");
-            }
           } catch (error) {
             console.error(
               "Failed to parse and apply agent",

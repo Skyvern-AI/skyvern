@@ -159,6 +159,30 @@ export function startAnchoredViewport({
   };
 }
 
+// Entry positioning uses one measured node's absolute canvas bounds. A large
+// block may extend past the pane edges; entry zoom remains exactly 100%.
+export function centeredNodeViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  if (
+    pane.width <= 0 ||
+    pane.height <= 0 ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    return null;
+  }
+  return {
+    x: pane.width / 2 - bounds.x - bounds.width / 2,
+    y: pane.height / 2 - bounds.y - bounds.height / 2,
+    zoom: 1,
+  };
+}
+
 export const END_ANCHOR_BOTTOM_PX = 24;
 
 /**

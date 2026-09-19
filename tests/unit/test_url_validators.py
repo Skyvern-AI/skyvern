@@ -14,11 +14,28 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.utils.url_validators import (
     encode_url,
     is_blocked_host,
+    redact_url_for_display,
+    redact_url_query,
     validate_fetch_url,
     validate_redirect_url,
     validate_url,
     validate_webhook_url,
 )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://hooks.example/sms?token=secret&key=another", "https://hooks.example/sms"),
+        ("https://hooks.example/sms?token=secret#fragment", "https://hooks.example/sms#fragment"),
+        ("https://[2001:db8::1]:8443/sms?token=secret", "https://[2001:db8::1]:8443/sms"),
+        ("HTTPS://Hooks.Example/sms%2Fpath#fragment", "HTTPS://Hooks.Example/sms%2Fpath#fragment"),
+        ("https://hooks.example/sms#fragment?not-a-query", "https://hooks.example/sms#fragment?not-a-query"),
+        ("", ""),
+    ],
+)
+def test_redact_url_query(url: str, expected: str) -> None:
+    assert redact_url_query(url) == expected
 
 
 def test_encode_url_basic():
@@ -47,6 +64,25 @@ def test_encode_url_with_pre_encoded_chars():
     url = "https://example.com/search?q=hello world&type=test%20test"
     expected = "https://example.com/search?q=hello%20world&type=test%20test"
     assert encode_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://api.skyvern.com/v1/sms/inbound/smsc_123?token=secret#fragment",
+            "https://api.skyvern.com/…?…",
+        ),
+        ("https://[2001:db8::1]:8443/hook?token=secret", "https://[2001:db8::1]:8443/…?…"),
+        ("https://customer.example/hook", "https://customer.example/…"),
+        ("https://customer.example/secret/token-value", "https://customer.example/…"),
+        (None, None),
+        ("https://hooks.example:bad/hook?token=secret", "[invalid URL]"),
+        ("/hook?token=secret", "[invalid URL]"),
+    ],
+)
+def test_redact_url_for_display_removes_query_and_fragment(url: str | None, expected: str | None) -> None:
+    assert redact_url_for_display(url) == expected
 
 
 @pytest.mark.parametrize(

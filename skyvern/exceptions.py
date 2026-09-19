@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.util import find_spec
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
+
+if TYPE_CHECKING:
+    from skyvern.errors.errors import UserDefinedError
 
 # Representative modules that indicate the local extra is installed enough for
 # embedded/browser import graphs. Keep this list intentionally small, but include
@@ -1828,7 +1831,10 @@ class AzureConfigurationError(AzureBaseError):
 
 
 class ScriptTerminationException(SkyvernException):
-    def __init__(self, reason: str | None = None) -> None:
+    def __init__(
+        self, reason: str | None = None, *, user_defined_errors: list["UserDefinedError"] | None = None
+    ) -> None:
+        self.user_defined_errors = user_defined_errors
         super().__init__(reason)
 
 

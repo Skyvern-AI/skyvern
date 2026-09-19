@@ -59,6 +59,8 @@ ToolErrorClass = Literal[
     # The target resolved, but the page will not let the act happen.
     "disabled",
     "not_editable",
+    # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
+    "value_changed_by_page",
     "covered",
     "inert",
     "unreachable",

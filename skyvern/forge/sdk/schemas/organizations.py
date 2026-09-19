@@ -1,7 +1,18 @@
+import re
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    ModelWrapValidatorHandler,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import InitErrorDetails
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.utils.organization_slug import is_valid_org_slug
@@ -117,6 +128,108 @@ class BitwardenCredentialResponse(BaseModel):
         ...,
         description="The Bitwarden credential (master_password redacted for security)",
     )
+
+
+def _twilio_error_without_inputs(error: ValidationError) -> ValidationError:
+    # hide_input_in_errors only affects text; remove inputs from structured errors too.
+    return ValidationError.from_exception_data(
+        error.title,
+        cast(list[InitErrorDetails], error.errors(include_input=False, include_url=False)),
+        hide_input=True,
+    )
+
+
+def _validate_twilio_without_error_inputs(value: object, handler: ModelWrapValidatorHandler[BaseModel]) -> BaseModel:
+    try:
+        return handler(value)
+    except ValidationError as error:
+        raise _twilio_error_without_inputs(error) from None
+
+
+class _TwilioJSONModel(BaseModel):
+    @classmethod
+    def model_validate_json(cls, json_data: str | bytes | bytearray, **kwargs: Any) -> Self:
+        # Malformed JSON fails before model validators can remove secret inputs.
+        try:
+            return super().model_validate_json(json_data, **kwargs)
+        except ValidationError as error:
+            raise _twilio_error_without_inputs(error) from None
+
+
+class TwilioCredential(_TwilioJSONModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    account_sid: str
+    api_key_sid: str | None = None
+    api_key_secret: str | None = Field(default=None, repr=False)
+    auth_token: str | None = Field(default=None, repr=False)
+
+    @field_validator("account_sid")
+    @classmethod
+    def validate_account_sid(cls, value: str) -> str:
+        if re.fullmatch(r"AC[0-9a-fA-F]{32}", value) is None:
+            raise ValueError("Twilio account_sid must match AC followed by 32 hexadecimal characters")
+        return value
+
+    @field_validator("api_key_sid")
+    @classmethod
+    def validate_api_key_sid(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"SK[0-9a-fA-F]{32}", value) is None:
+            raise ValueError("Twilio api_key_sid must match SK followed by 32 hexadecimal characters")
+        return value
+
+    @field_validator("api_key_secret", "auth_token")
+    @classmethod
+    def validate_secret(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Twilio secrets must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_authentication(self) -> "TwilioCredential":
+        has_api_key_sid = self.api_key_sid is not None
+        has_api_key_secret = self.api_key_secret is not None
+        if has_api_key_sid != has_api_key_secret:
+            raise ValueError("Provide both api_key_sid and api_key_secret")
+        if self.auth_token or (has_api_key_sid and has_api_key_secret):
+            return self
+        raise ValueError("Provide auth_token or both api_key_sid and api_key_secret")
+
+    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
+
+
+class TwilioCredentialSafe(_TwilioJSONModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    account_sid: str
+    api_key_sid: str | None = None
+    has_auth_token: bool
+
+    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
+
+
+class TwilioOrganizationAuthToken(OrganizationAuthTokenBase, _TwilioJSONModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    credential: TwilioCredential
+
+    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
+
+
+class CreateTwilioCredentialRequest(_TwilioJSONModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    credential: TwilioCredential
+
+    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
+
+
+class TwilioCredentialResponse(_TwilioJSONModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    credential: TwilioCredentialSafe
+
+    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
 
 
 class CreateOnePasswordTokenRequest(BaseModel):

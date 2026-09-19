@@ -188,6 +188,7 @@ def convert_workflow_definition(
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
                 totp_field_name=parameter.totp_field_name,
+                totp_identifier=parameter.totp_identifier,
                 created_at=now,
                 modified_at=now,
             )
@@ -232,6 +233,7 @@ def convert_workflow_definition(
                 description=parameter.description,
                 bitwarden_collection_id=parameter.bitwarden_collection_id,
                 bitwarden_item_id=parameter.bitwarden_item_id,
+                totp_identifier=parameter.totp_identifier,
                 created_at=now,
                 modified_at=now,
             )

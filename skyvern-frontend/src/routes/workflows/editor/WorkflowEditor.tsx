@@ -43,7 +43,10 @@ function WorkflowEditor() {
     studioEnabled && workflowQueryFailed && fallbackRun?.workflow?.deleted_at
       ? fallbackRun.workflow
       : undefined;
-  const effectiveWorkflow = fetchedWorkflow ?? deletedWorkflowSnapshot;
+  const effectiveWorkflow =
+    (fetchedWorkflow?.workflow_permanent_id === workflowPermanentId
+      ? fetchedWorkflow
+      : undefined) ?? deletedWorkflowSnapshot;
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
@@ -72,7 +75,13 @@ function WorkflowEditor() {
     workflowQueryFailed &&
     Boolean(deepLinkRunId) &&
     fallbackRunIsLoading;
-  if (isLoading || isGlobalWorkflowsLoading || awaitingRunFallback) {
+  if (
+    isLoading ||
+    isGlobalWorkflowsLoading ||
+    awaitingRunFallback ||
+    (fetchedWorkflow &&
+      fetchedWorkflow.workflow_permanent_id !== workflowPermanentId)
+  ) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <div className="animate-pulse">

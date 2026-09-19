@@ -153,7 +153,7 @@ import {
   liveLocationState,
   liveSearch,
 } from "@/routes/workflows/studio/liveSearch";
-import { resolveOpenPanes } from "@/routes/workflows/studio/panes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
@@ -1354,6 +1354,7 @@ export function WorkflowCopilotChat({
   const lastFollowedLabelRef = useRef<string | null>(null);
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
+  const { resolveLivePanes } = useStudioPanes();
   const switchStudioRun = useSwitchStudioRun({
     replace: true,
     systemFocus: true,
@@ -1579,7 +1580,7 @@ export function WorkflowCopilotChat({
         return;
       }
       const nodeId = resolveTimelineBlockJumpNodeId({
-        editorOpen: resolveOpenPanes(window.location.search).includes("editor"),
+        editorOpen: resolveLivePanes().includes("editor"),
         targets: handle.getTargets(),
         label,
       });
@@ -1614,6 +1615,7 @@ export function WorkflowCopilotChat({
       location.search,
       location.hash,
       location.state,
+      resolveLivePanes,
     ],
   );
   const recoverCredentialTurn = useRef<

@@ -306,8 +306,8 @@ describe("BrowserTab view machine", () => {
       expect(screen.getByTestId("location-search").textContent).toContain(
         "view=recording",
       );
-      expect(screen.getByTestId("location-search").textContent).toContain(
-        "panes=browser,overview",
+      expect(screen.getByTestId("location-search").textContent).not.toContain(
+        "panes=",
       );
     });
   });

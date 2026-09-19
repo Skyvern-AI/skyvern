@@ -51,6 +51,8 @@ from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.routes.sms_inbound import sms_inbound_router
+from skyvern.forge.sdk.routes.twilio_integration import twilio_integration_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
     ensure_local_org,
@@ -500,6 +502,13 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
+    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
+    # the handler) and the org-scoped integration management routes. Same
+    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    fastapi_app.include_router(sms_inbound_router, prefix="/v1/sms", include_in_schema=False)
+    fastapi_app.include_router(sms_inbound_router, prefix="/api/v1/sms", include_in_schema=False)
+    fastapi_app.include_router(twilio_integration_router, prefix="/v1/integrations/twilio", include_in_schema=False)
+    fastapi_app.include_router(twilio_integration_router, prefix="/api/v1/integrations/twilio", include_in_schema=False)
 
     # local dev endpoints
     if settings.ENV == "local":
