@@ -262,6 +262,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         payload = {
             "capture_case_id": getattr(ctx, "eval_capture_case_id", None),
             "eval_mode": getattr(ctx, "eval_mode", None),
+            "tool_surface_identity": getattr(ctx, "tool_surface_identity", None),
             "ordered_native_tool_names": list(getattr(ctx, "eval_native_tool_names", ())),
             "ordered_mcp_tool_names": list(getattr(ctx, "eval_mcp_tool_names", ())),
             "prompt_sha256": (

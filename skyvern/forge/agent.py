@@ -395,11 +395,26 @@ _TASKV3_TOOL_ACTION_TYPES = {
 }
 
 
+def _taskv3_label_secret_values(task: Task, secret_values: Collection[str] = ()) -> set[str]:
+    """Drop-only: the set that decides whether a page-supplied element name is dropped from text that
+    leaves the run. Unfloored and blind to the mask-secrets opt-in on purpose -- it reaches no redaction
+    path, and a matching name is dropped whole rather than scrubbed, so a 3-char PIN must still match.
+    Both frames that print a page-supplied name (the timeline label below, the loop's action-loop
+    verdict) check against this one set, so a label dropped from the row cannot survive in the verdict."""
+    return (
+        set(secret_values)
+        | app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            task.workflow_run_id, respect_artifact_redaction_flag=False
+        )
+        | app.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check(task.workflow_run_id)
+    )
+
+
 def _taskv3_row_intention(
     task: Task, round_action: RoundAction, secret_values: set[str], redacted_args: dict[str, Any]
 ) -> str | None:
-    """The persisted label for one v3 action. This is the only frame that holds the unfloored drop-check
-    secrets, and a failure here is logged without exc_info, so no traceback renderer can print them."""
+    """The persisted label for one v3 action. This frame holds the unfloored drop-check secrets, and a
+    failure here is logged without exc_info, so no traceback renderer can print them."""
     if round_action.tool == "navigate":
         # A navigation names no element, so the element-label composer has nothing to say about it:
         # the URL is the whole subject. Read from the already-redacted args, never the raw ones.
@@ -408,19 +423,11 @@ def _taskv3_row_intention(
             return None
         return f"Navigated to {url}" if round_action.succeeded else f"Tried to navigate to {url}"
     try:
-        # Drop-only: this set decides whether to drop a page-supplied name and reaches no redaction path.
-        label_secret_values = (
-            secret_values
-            | app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
-                task.workflow_run_id, respect_artifact_redaction_flag=False
-            )
-            | app.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check(task.workflow_run_id)
-        )
         return compose_target_intention(
             round_action.tool,
             round_action.target_name,
             round_action.target_kind,
-            label_secret_values,
+            _taskv3_label_secret_values(task, secret_values),
             succeeded=round_action.succeeded,
         )
     except Exception:
@@ -1774,12 +1781,18 @@ class ForgeAgent:
         close_browser_on_completion: bool,
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
+        workflow_owned_recovery: bool = False,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
         The loop owns the page for the entire task and returns a single outcome, which we
         map onto the task's terminal state here. Runs exactly once: the caller returns
         next_step=None for this engine, so neither retry nor execute-all-steps recursion fires.
+
+        `workflow_owned_recovery` marks a run a workflow drives on its own live browser without a
+        block of its own (the code block AI fallback). It gets the block treatment — the caller's
+        step budget, the workflow-run ceiling, per-call page re-resolution and child-frame reach —
+        because it must not outspend or under-reach the v1 run it replaces.
         """
         from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
         from skyvern.forge.sdk.api.llm.schema_validator import (
@@ -1803,6 +1816,8 @@ class ForgeAgent:
         )
         from skyvern.forge.taskv3.handoff_redaction import (
             MAX_PERSISTED_FINISH_REASON_CHARS,
+            caller_authored_block_urls,
+            caller_known_published_urls,
             mask_signed_urls_in_text,
             sanitize_handoff_url,
         )
@@ -1815,7 +1830,10 @@ class ForgeAgent:
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
         # Bare tasks keep today's exact semantics: one page grabbed up front, for the run's duration.
-        if task_block is not None:
+        # A block reuses the browser across blocks, so neither the landing status nor its URL belongs
+        # to this block's start; only a bare task names a starting page in the dead-end verdict.
+        initial_navigation_url: str | None = None
+        if task_block is not None or workflow_owned_recovery:
             # Fail fast (with the same recovery attempt bare tasks get) when the page is already
             # gone at block start; mid-run losses surface through the per-call provider instead.
             await browser_state.must_get_working_page()
@@ -1833,6 +1851,11 @@ class ForgeAgent:
 
         else:
             initial_page = await browser_state.must_get_working_page()
+            # The pair setup recorded, not the page's URL now: the status belongs to the landed response
+            # (page.goto returns the last redirect hop), and the settle and challenge-solver waits that
+            # follow it give a client-side redirect time to move the page somewhere the status was never
+            # about. Reading the page here would name that destination as the page that 404ed.
+            initial_navigation_url = browser_state.last_navigation_url
 
             async def _page_provider() -> Any:
                 return initial_page
@@ -1846,16 +1869,18 @@ class ForgeAgent:
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
         context = skyvern_context.current()
+        pinned_frame_arm: tuple[bool, str | None] | None = None
         if context:
             # Once for the whole run, before anything reads it: the tool list bakes one of these
             # reads into the observe description at build time, and a value that could change
             # afterwards would leave that description describing a different run than the one
             # executing.
-            await resolve_frame_perception(
-                context,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-            )
+            if not workflow_owned_recovery:
+                await resolve_frame_perception(
+                    context,
+                    distinct_id=task.workflow_run_id or task.task_id,
+                    organization_id=task.organization_id,
+                )
             await resolve_run_arm(
                 context,
                 OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
@@ -1959,6 +1984,27 @@ class ForgeAgent:
                 block_context_section=block_context_section,
             ),
         )
+
+        # A BARE task's `url`/`navigation_goal` are the caller's own typed text -- not the composed
+        # `goal` above, which also carries a prior block's handoff prose. Inside a workflow run neither
+        # field is caller-typed any more: both are Jinja-rendered from a context holding prior blocks'
+        # page-derived output, so the sources are the block's unrendered definition strings, read at the
+        # block seam before that render. Nothing pinned for this task -> host only, never the rendered
+        # fields (SKY-16271).
+        verdict_known_urls = (
+            caller_known_published_urls(task.url, task.navigation_goal)
+            if task_block is None and not task.workflow_run_id
+            else caller_authored_block_urls(
+                context,
+                workflow_run_id=task.workflow_run_id,
+                block_label=task_block.label if task_block is not None else None,
+            )
+        )
+
+        def _label_secret_values() -> Collection[str]:
+            # Read per verdict, not once here: a run resolves credentials and codes as it goes, and a
+            # verdict composed late must check the page's name against the registry as it stands then.
+            return _taskv3_label_secret_values(task)
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
@@ -2131,9 +2177,12 @@ class ForgeAgent:
         # step-engine steps, which starves the less round-efficient v3 loop. Either signal alone marks
         # the budget as owned — the block class settles it when task_type was left at its `general`
         # default, which would otherwise floor an action block to many times its intended rounds.
-        atomic_block_budget = task_block is not None and (
-            isinstance(task_block, (ActionBlock, ValidationBlock))
-            or (task.task_type or TaskType.general) != TaskType.general
+        atomic_block_budget = workflow_owned_recovery or (
+            task_block is not None
+            and (
+                isinstance(task_block, (ActionBlock, ValidationBlock))
+                or (task.task_type or TaskType.general) != TaskType.general
+            )
         )
         if not atomic_block_budget:
             floored_step_cap = max(step_cap, MIN_ACTION_STEPS)
@@ -2149,7 +2198,7 @@ class ForgeAgent:
                 )
             step_cap = floored_step_cap
         workflow_step_ceiling: int | None = None
-        if task_block is not None:
+        if task_block is not None or workflow_owned_recovery:
             # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
             # budget unit (round-stamped action rows make prior v3 rounds count exactly).
             workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
@@ -2425,6 +2474,14 @@ class ForgeAgent:
         prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
+        if context and workflow_owned_recovery:
+            # The v1 run this replaces scraped child frames unconditionally, and the failing call it
+            # recovers may target one, so the arm is pinned on rather than sampled. Pinned here, with
+            # the credential key, so the finally below frees it on every exit; the only reader before
+            # the loop is a closure that runs inside it.
+            pinned_frame_arm = (context.frame_perception_flag, context.frame_perception_resolved_run_id)
+            context.frame_perception_flag = True
+            context.frame_perception_resolved_run_id = task.task_id
         try:
             # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context hides get_verification_code.
@@ -2479,7 +2536,9 @@ class ForgeAgent:
                 # The 2026-08-18 scoping decision kept the completed-side settle probe off the
                 # bare-task arm. Fenced by its own deferral budget so it does not also disable
                 # the failure-evidence gate that shares the sampler (SKY-14598).
-                max_settle_deferrals=DEFAULT_MAX_SETTLE_DEFERRALS if task_block is not None else 0,
+                max_settle_deferrals=(
+                    DEFAULT_MAX_SETTLE_DEFERRALS if task_block is not None or workflow_owned_recovery else 0
+                ),
                 llm_caller=llm_caller,
                 goal=goal,
                 parameters=parameters,
@@ -2514,11 +2573,18 @@ class ForgeAgent:
                 # status unambiguously belongs to the starting posting. A workflow block reuses the
                 # browser_state across blocks, so its last status may be a prior block's — skip it there
                 # and let the in-loop `navigate` classifier cover block-driven dead-ends.
-                initial_navigation_status=(browser_state.last_navigation_status if task_block is None else None),
+                initial_navigation_status=(
+                    browser_state.last_navigation_status if task_block is None and not workflow_owned_recovery else None
+                ),
+                initial_navigation_url=initial_navigation_url,
+                caller_known_urls=verdict_known_urls,
+                label_secret_values=_label_secret_values,
             )
         finally:
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
+            if context and pinned_frame_arm is not None:
+                context.frame_perception_flag, context.frame_perception_resolved_run_id = pinned_frame_arm
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
@@ -2923,6 +2989,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         complete_verification: bool = True,
         engine: RunEngine = RunEngine.skyvern_v1,
+        workflow_owned_recovery: bool = False,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
@@ -3124,6 +3191,7 @@ class ForgeAgent:
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                         task_block=task_block,
+                        workflow_owned_recovery=workflow_owned_recovery,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
@@ -3329,6 +3397,7 @@ class ForgeAgent:
                     task_block=task_block,
                     complete_verification=complete_verification,
                     engine=engine,
+                    workflow_owned_recovery=workflow_owned_recovery,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -3346,6 +3415,7 @@ class ForgeAgent:
                     task_block=task_block,
                     complete_verification=complete_verification,
                     engine=engine,
+                    workflow_owned_recovery=workflow_owned_recovery,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -6103,8 +6173,10 @@ class ForgeAgent:
             browser_state = pre_resolved_browser_state
             # An inherited browser_state was NOT navigated to this task's url here, so its
             # last_navigation_status belongs to an earlier navigation, not this task's starting URL.
-            # Clear it so the Task V3 loop never reads a stale status as this run's starting-URL dead-end.
+            # Clear it so the Task V3 loop never reads a stale status as this run's starting-URL dead-end,
+            # and the URL with it: the two are only ever read as a pair.
             browser_state.last_navigation_status = None
+            browser_state.last_navigation_url = None
         elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,

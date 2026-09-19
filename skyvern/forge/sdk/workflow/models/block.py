@@ -257,6 +257,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine, read_browser_type
@@ -322,7 +323,7 @@ from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, s
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
-    from skyvern.forge.agent_functions import CodeBlockEngineFailure
+    from skyvern.forge.agent_functions import CodeBlockEngineFailure, DownloadClaimOutcome
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
     from skyvern.webeye.browser_engine import BrowserEngineSelection
     from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
@@ -415,7 +416,21 @@ async def capture_block_download_baseline(
 DOWNLOAD_BINDING_FAILURE_REASON = (
     "A file downloaded into the run directory but no registered download landed in the block output."
 )
+DOWNLOAD_CLAIM_FAILURE_REASON = (
+    "The block ran a download operation but no downloaded file was registered for this workflow run."
+)
 UNBOUND_DOWNLOAD_OUTPUT_KEY = "download_registration_failed"
+
+
+@dataclass
+class DownloadClaimOutcomeRecorder:
+    """A one-shot channel the brokered claim writes its outcome into so the block-owned settlement can
+    tell a proven delivery from the branch-5 placeholder without inspecting the returned filename."""
+
+    outcome: DownloadClaimOutcome | None = None
+
+    def record(self, outcome: DownloadClaimOutcome) -> None:
+        self.outcome = outcome
 
 
 def bind_downloaded_files_to_output(result: Any, downloaded_files: list[FileInfo]) -> Any:
@@ -2099,6 +2114,17 @@ class BaseTaskBlock(Block):
         block_context = skyvern_context.current()
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
+
+        # Read the block's caller-known URLs off its own definition strings before anything replaces
+        # them: both the parameter substitution below and the Jinja render after it resolve against the
+        # run context, which holds prior blocks' page-derived output (SKY-16271).
+        pin_caller_authored_block_urls(
+            block_context,
+            workflow_run_id=workflow_run_id,
+            block_label=self.label,
+            url=self.url,
+            navigation_goal=self.navigation_goal,
+        )
 
         # Get workflow from context if available, otherwise query database
         workflow = workflow_run_context.workflow
@@ -5229,6 +5255,7 @@ async def _code_block_click_and_claim_download_builtin(
     download_evidence: DownloadEvidenceProbe | None = None,
     action: Callable[[], Awaitable[None]] | None = None,
     timeout_seconds: float | None = None,
+    outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
 ) -> str:
     """Click ``selector`` once and confirm the browser download it fires, returning the sanitized
     suggested filename as a summary.
@@ -5238,13 +5265,24 @@ async def _code_block_click_and_claim_download_builtin(
     provider-owned destination — and the execution layer registers from there. Copying or replaying
     here would add a second writer to a single-writer system (SKY-11371) and double-register the
     delivered file, so the only thing this operation owns is the trigger and the event. ``action``
-    replaces the click when the trigger runs elsewhere, as for a brokered ``page.expect_download``."""
+    replaces the click when the trigger runs elsewhere, as for a brokered ``page.expect_download``.
+
+    ``outcome_recorder`` receives which branch resolved the claim so the block-owned settlement can
+    arm its truthful-completion verdict on the branch-5 placeholder alone; the return value and every
+    branch's compatibility behavior are unchanged."""
+
+    def _record(outcome: DownloadClaimOutcome) -> None:
+        if outcome_recorder is not None:
+            outcome_recorder.record(outcome)
+
     if download_binding is None or download_binding not in (DownloadBinding.RUN_DIR, DownloadBinding.SESSION_DIR):
+        _record("raised")
         raise CodeBlockDownloadClaimError(
             "click_and_claim_download is only supported when downloads are bound to a known destination."
         )
     resolved_selector = str(selector or "").strip()
     if action is None and not resolved_selector:
+        _record("raised")
         raise CodeBlockDownloadClaimError("click_and_claim_download requires the selector of the affordance to click.")
     click_error: BaseException | None = None
     # Only a binding whose delivery this page cannot observe can reach the grace branch below, so
@@ -5306,17 +5344,22 @@ async def _code_block_click_and_claim_download_builtin(
             if delivered_name is None:
                 # A selector that no longer matches is a page failure, not a download that failed to
                 # fire. Re-raise Playwright's own error so the healing path still recognises its type.
+                _record("raised")
                 raise click_error
             # The click did not return, but this binding's writer registered a file it started, so
             # failing here would fail a download that arrived.
+            _record("returned_proven")
             return delivered_name
         if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
             # The click landed, and this binding's delivery belongs to the session watcher or to the
             # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
             # Download event need ever reach this page. Failing here would fail a download that
             # succeeded; the execution layer still reports an unregistered intent when nothing
-            # arrives.
+            # arrives. A returned placeholder with no registered delta is the only success-shaped
+            # value without proof, so settlement arms its verdict on exactly that.
+            _record("returned_proven" if delivered_name is not None else "returned_unproven")
             return delivered_name or _DOWNLOAD_CLAIM_FALLBACK_STEM
+        _record("raised")
         raise CodeBlockDownloadClaimError(
             "Clicking the affordance did not fire a browser download."
             if action is None
@@ -5346,12 +5389,17 @@ async def _code_block_click_and_claim_download_builtin(
     summary = normalize_download_filename(download.suggested_filename or "") or _DOWNLOAD_CLAIM_FALLBACK_STEM
     if monitor_owns_binding:
         # The monitor denies browser-native downloads and fetches the file itself, so Playwright
-        # reports a delivered download as cancelled. Delivery is the monitor's to prove here.
+        # reports a delivered download as cancelled. Delivery is the monitor's to prove here. An event
+        # fired, so this is not the branch-5 no-event placeholder the settlement verdict arms on.
+        _record("returned_proven")
         return summary
     if not outcome_readable:
+        _record("raised")
         raise CodeBlockDownloadClaimError("The browser download outcome could not be confirmed.")
     if failure:
+        _record("raised")
         raise CodeBlockDownloadClaimError(f"The browser download did not complete: {failure}")
+    _record("returned_proven")
     return summary
 
 
@@ -5361,6 +5409,7 @@ def _bind_code_block_download_claim(
     workflow_run_id: str | None,
     download_binding: DownloadBinding | None,
     download_evidence: DownloadEvidenceProbe | None = None,
+    outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
 ) -> Callable[[Page | RecordingPage, str], Awaitable[str]]:
     """Two-argument closure rather than a `partial`: keyword
     defaults on a `partial` would let block code override the run identity it is bound to."""
@@ -5373,6 +5422,7 @@ def _bind_code_block_download_claim(
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
             download_evidence=download_evidence,
+            outcome_recorder=outcome_recorder,
         )
 
     return click_and_claim_download
@@ -5808,6 +5858,7 @@ class CodeBlock(Block):
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
+        download_claim_outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
         authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
@@ -5850,6 +5901,7 @@ class CodeBlock(Block):
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
             download_evidence=download_evidence,
+            outcome_recorder=download_claim_outcome_recorder,
         )
         safe_vars["attach_authorized_file"] = bind_inline_attach_authorized_file(
             page,
@@ -6264,16 +6316,18 @@ async def wrapper({default_args}):
             download_run_id=storage_run_id,
         )
         if session_bound and registered_files == []:
-            registered_files = (
-                await self._await_in_flight_session_download(
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    run_id=storage_run_id,
-                    download_operation_invoked=download_operation_invoked,
-                )
-                or registered_files
+            settled, settle_reads_failed = await self._await_in_flight_session_download(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                run_id=storage_run_id,
+                download_operation_invoked=download_operation_invoked,
             )
+            if settle_reads_failed:
+                # A settle-phase read/claim failed after a readable-empty first read: the registration
+                # is now unreadable, not proven-empty, so abstain rather than collapse it to [].
+                return None, set()
+            registered_files = settled or registered_files
         return registered_files, set()
 
     async def _await_in_flight_session_download(
@@ -6284,24 +6338,28 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         run_id: str,
         download_operation_invoked: bool = False,
-    ) -> list[FileInfo] | None:
-        """Return a session download once its final watcher row becomes visible.
+    ) -> tuple[list[FileInfo] | None, bool]:
+        """Return a session download once its final watcher row becomes visible, plus whether a
+        settle-phase read failed.
 
         The watcher drops the partial's artifact row on Chrome's rename and writes the final row from
         the same event batch, in either order. A visible partial or a typed broker receipt therefore
         authorizes the same bounded settle poll; neither a vanished partial nor completed browser
-        bytes alone prove that the final artifact row is committed."""
+        bytes alone prove that the final artifact row is committed. The second element is ``True`` when
+        a claim/read raised or a settle read came back unreadable, so the caller abstains instead of
+        reading the exhausted poll as a proven-empty registration."""
         context = skyvern_context.current()
         browser_session_id = context.browser_session_id if context else None
         if not browser_session_id:
-            return None
+            return None, False
+        reads_failed = False
         try:
             in_flight = await app.STORAGE.list_downloading_files_in_browser_session(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
             )
             if not in_flight and not download_operation_invoked:
-                return None
+                return None, False
             if in_flight:
                 LOG.info(
                     "Code block finished with a session download still in flight; waiting for it",
@@ -6328,7 +6386,9 @@ async def wrapper({default_args}):
                     download_run_id=run_id,
                 )
                 if settled:
-                    return settled
+                    return settled, False
+                if settled is None:
+                    reads_failed = True
                 await asyncio.sleep(_CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS)
         except Exception:
             LOG.warning(
@@ -6338,7 +6398,8 @@ async def wrapper({default_args}):
                 browser_session_id=browser_session_id,
                 exc_info=True,
             )
-        return None
+            return None, True
+        return None, reads_failed
 
     async def _read_back_downloaded_files(
         self,
@@ -6392,6 +6453,7 @@ async def wrapper({default_args}):
         skipped_file_names: set[str],
         attempt_started_at: datetime | None = None,
         authored_registration: bool = False,
+        download_claim_outcome: DownloadClaimOutcome | None = None,
     ) -> tuple[Any, str | None]:
         """Bind registration evidence into the block output, returning a failure reason if it cannot.
 
@@ -6459,6 +6521,22 @@ async def wrapper({default_args}):
         if downloaded_files:
             _log_verdict_skipped_for_partial_save()
             return output, None
+        if download_claim_outcome == "returned_unproven" and not registered_file_names and not skipped_file_names:
+            # A brokered claim returned the branch-5 placeholder and, after the bounded in-flight
+            # wait, nothing registered to this run's current attempt. Completing here would report a
+            # phantom success on a download that never landed; fail truthfully instead. Keyed on the
+            # pre-filter read so a file attributed to another loop iteration is never read as "nothing
+            # registered", and gated above on ``downloaded_files is not None`` so an unreadable read
+            # still abstains.
+            LOG.error(
+                "codeblock.download_claim_unproven",
+                engine=engine,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                organization_id=organization_id,
+            )
+            return unbound_download_output(output), DOWNLOAD_CLAIM_FAILURE_REASON
         download_dir_after = current_attempt_local_download_dir_file_identities(
             resolved_download_id,
             attempt_started_at,
@@ -7000,6 +7078,8 @@ async def wrapper({default_args}):
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=False,
                     pre_resolved_browser_state=browser_state,
+                    engine=RunEngine.skyvern_v3,
+                    workflow_owned_recovery=True,
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -7640,6 +7720,7 @@ async def wrapper({default_args}):
         download_dir_before: set[tuple[str, int, int]] | None = None,
         attempt_started_at: datetime | None = None,
         redaction_parameters: dict[str, Any] | None = None,
+        download_claim_outcome: DownloadClaimOutcome | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -7692,6 +7773,7 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             session_bound=session_download_lane_active(browser_state),
                             download_run_id=resolved_download_id,
+                            download_operation_invoked=download_claim_outcome is not None,
                         )
                         bound_output, binding_failure_reason = await self._bind_and_grade_downloads(
                             engine="inline",
@@ -7705,6 +7787,7 @@ async def wrapper({default_args}):
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            download_claim_outcome=download_claim_outcome,
                         )
                     except asyncio.CancelledError:
                         # A cancel inside the storage round-trips must not book the healed block
@@ -8407,6 +8490,9 @@ async def wrapper({default_args}):
             credential_release_guard.log_armed()
         await recorder.create_task_and_step()
         recording_page = recorder.recording_page
+        # Bound before the try so the shared except arms can read it even when the secure path raises
+        # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
+        inline_download_claim_outcome = DownloadClaimOutcomeRecorder()
 
         try:
             await recorder.link_block()
@@ -8567,6 +8653,11 @@ async def wrapper({default_args}):
                             download_dir_before=download_dir_before,
                             attempt_started_at=attempt_started_at,
                             redaction_parameters=serialized_parameter_values,
+                            download_claim_outcome=(
+                                secure_code_block_result.download_operation_receipt.outcome
+                                if secure_code_block_result.download_operation_receipt is not None
+                                else None
+                            ),
                         )
                     if secure_code_block_result.block_result is None:
                         LOG.warning(
@@ -8673,6 +8764,11 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
                             authored_registration=block_output_has_registered_download(secure_output),
+                            download_claim_outcome=(
+                                secure_code_block_result.download_operation_receipt.outcome
+                                if secure_code_block_result.download_operation_receipt is not None
+                                else None
+                            ),
                         )
                     except asyncio.CancelledError:
                         # A cancel inside the storage round-trips must not book the executed block
@@ -8734,6 +8830,7 @@ async def wrapper({default_args}):
                 download_run_id=resolved_download_id,
                 download_binding=download_binding_of(browser_state),
                 download_evidence=download_evidence,
+                download_claim_outcome_recorder=inline_download_claim_outcome,
                 authorized_file_materializations=authorized_file_materializations,
             )
             try:
@@ -8896,6 +8993,7 @@ async def wrapper({default_args}):
                     download_dir_before=download_dir_before,
                     attempt_started_at=attempt_started_at,
                     redaction_parameters=serialized_parameter_values,
+                    download_claim_outcome=inline_download_claim_outcome.outcome,
                 )
             if (
                 type(e) is ErrorCode
@@ -9046,6 +9144,7 @@ async def wrapper({default_args}):
                 download_dir_before=download_dir_before,
                 attempt_started_at=attempt_started_at,
                 redaction_parameters=serialized_parameter_values,
+                download_claim_outcome=inline_download_claim_outcome.outcome,
             )
 
         else:
@@ -9071,6 +9170,7 @@ async def wrapper({default_args}):
                     workflow_run_block_id=workflow_run_block_id,
                     session_bound=session_download_lane_active(browser_state),
                     download_run_id=resolved_download_id,
+                    download_operation_invoked=inline_download_claim_outcome.outcome is not None,
                 )
                 result, binding_failure_reason = await self._bind_and_grade_downloads(
                     engine="inline",
@@ -9084,6 +9184,7 @@ async def wrapper({default_args}):
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    download_claim_outcome=inline_download_claim_outcome.outcome,
                 )
             except asyncio.CancelledError:
                 # A cancel inside the storage round-trips must not book the executed block as

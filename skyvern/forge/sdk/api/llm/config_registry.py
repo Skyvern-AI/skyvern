@@ -24,6 +24,9 @@ XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
 # OpenRouter's own provider slug (https://openrouter.ai/api/v1/providers) - a name it does not
 # recognize in `ignore` is skipped silently rather than rejected.
 OPENINFERENCE_PROVIDER_SLUG = "open-inference"
+# OpenRouter routes by provider SLUG and skips an unrecognised one silently, so a name here
+# that no longer matches enforces nothing. Both are asserted in tests for that reason.
+AMAZON_BEDROCK_PROVIDER_SLUG = "amazon-bedrock"
 
 
 @dataclass(frozen=True)

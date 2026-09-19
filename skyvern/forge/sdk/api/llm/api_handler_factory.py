@@ -75,6 +75,7 @@ from skyvern.schemas.llm import (
     LLMAllowedFailsPolicy,
     LLMConfig,
     LLMRouterConfig,
+    LLMRouterModelConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
@@ -175,6 +176,29 @@ def _llm_hard_deadline_seconds(timeout: Any, attempts: int | None) -> float | No
 def _json_error_body_length(error: JSONDecodeError) -> int | None:
     doc = getattr(error, "doc", None)
     return len(doc) if isinstance(doc, str) else None
+
+
+def _dispatchable_deployments(llm_config: LLMRouterConfig) -> list[LLMRouterModelConfig]:
+    """The deployments a router can actually serve a call from: the main group plus any fallback
+    group. A deployment outside both is unreachable, so judging a call by it would be wrong.
+    """
+    groups = {llm_config.main_model_group}
+    fallback_group = llm_config.fallback_model_group
+    if isinstance(fallback_group, str):
+        groups.add(fallback_group)
+    elif fallback_group:
+        groups.update(fallback_group)
+    return [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+
+
+def _endpoint_cannot_serve_responses_api(model: str | None, api_base: str | None) -> bool:
+    """Whether an endpoint is one litellm's chat->responses bridge must not be used against.
+
+    An explicit api_base points litellm at somewhere that is not guaranteed to implement
+    /v1/responses, whatever the model is named; only Azure is known to serve it. Shared so the
+    single-config and router-deployment checks cannot drift apart.
+    """
+    return bool(api_base) and not str(model or "").startswith("azure/")
 
 
 async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
@@ -1521,16 +1545,9 @@ class LLMAPIHandlerFactory:
         # exactly that and nothing else (a model_info label saying gpt-5.6 would answer True where
         # litellm will not bridge, sending the dict to a chat-completions endpoint).
         if isinstance(llm_config, LLMRouterConfig):
-            # EVERY deployment that can serve the call (main + fallback groups, same filter as
-            # _resolve_tool_choice_support) must be a bridge model: a mixed router could hand the
-            # dict reasoning_effort to a non-bridge fallback, which rejects it.
-            groups = {llm_config.main_model_group}
-            fallback_group = llm_config.fallback_model_group
-            if isinstance(fallback_group, str):
-                groups.add(fallback_group)
-            elif fallback_group:
-                groups.update(fallback_group)
-            deployments = [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+            # EVERY deployment that can serve the call must be a bridge model: a mixed router
+            # could hand the dict reasoning_effort to a non-bridge fallback, which rejects it.
+            deployments = _dispatchable_deployments(llm_config)
             if not deployments:
                 return False
             return all(_is_bridge_model(deployment.litellm_params.get("model")) for deployment in deployments)
@@ -3289,7 +3306,9 @@ class LLMCaller:
         self._warned_unsupported_tool_choice = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
-        # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
+        # _openrouter_model_name only recognises the LLMConfig shape, so only that shape has its
+        # llm_key rewritten to the bare model id. A router config whose deployments are
+        # openrouter/ models keeps its group name here, and so logs under a different key.
         if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
             if not self._custom_openrouter:
@@ -3337,11 +3356,17 @@ class LLMCaller:
         # OPENAI_COMPATIBLE registration, whose key name is configurable): only real OpenAI and
         # Azure endpoints are known to serve the bridge, and real OpenAI needs no api_base.
         litellm_params = getattr(self.llm_config, "litellm_params", None)
-        if (
-            isinstance(self.llm_config, LLMConfig)
-            and litellm_params is not None
-            and litellm_params.get("api_base")
-            and not self.llm_config.model_name.startswith("azure/")
+        if isinstance(self.llm_config, LLMConfig) and litellm_params is not None:
+            if _endpoint_cannot_serve_responses_api(self.llm_config.model_name, litellm_params.get("api_base")):
+                return False
+        # A router config carries its api_base per deployment rather than on the config, so the
+        # same test has to run over the deployments it can dispatch to. One that cannot serve the
+        # bridge is enough to deny: the router picks the deployment, this call cannot.
+        if isinstance(self.llm_config, LLMRouterConfig) and any(
+            _endpoint_cannot_serve_responses_api(
+                deployment.litellm_params.get("model"), deployment.litellm_params.get("api_base")
+            )
+            for deployment in _dispatchable_deployments(self.llm_config)
         ):
             return False
         return LLMAPIHandlerFactory.uses_openai_responses_bridge(self.llm_config)
@@ -3366,15 +3391,7 @@ class LLMCaller:
             return False
         try:
             if isinstance(self.llm_config, LLMRouterConfig):
-                groups = {self.llm_config.main_model_group}
-                fallback_group = self.llm_config.fallback_model_group
-                if isinstance(fallback_group, str):
-                    groups.add(fallback_group)
-                elif fallback_group:
-                    groups.update(fallback_group)
-                deployments = [
-                    deployment for deployment in self.llm_config.model_list if deployment.model_name in groups
-                ]
+                deployments = _dispatchable_deployments(self.llm_config)
                 if not deployments:
                     return False
                 return all(

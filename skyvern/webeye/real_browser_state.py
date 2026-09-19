@@ -165,6 +165,8 @@ class RealBrowserState(BrowserState):
         # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
         # response). Read by the Task V3 loop to classify a dead/removed starting URL; v1 ignores it.
         self.last_navigation_status: int | None = None
+        # The URL that status came back on, recorded from the same response so the pair cannot disagree.
+        self.last_navigation_url: str | None = None
         # The proxy this browser was actually built with. Downstream layers see only a flattened
         # sentence, which cannot say which hop it went through.
         self.built_with_proxy_location: ProxyLocationInput = None
@@ -470,13 +472,28 @@ class RealBrowserState(BrowserState):
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
+        landed_url: str | None = None
+
+        async def goto(strategy: str) -> object:
+            nonlocal landed_url
+            response = await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy)
+            # Read off the SAME response the status is read from (duck-typed like _navigation_status:
+            # whichever engine's response object this is, its url is the last redirect hop's). The settle
+            # wait inside navigate_with_retry and the challenge-solver wait below both give a client-side
+            # redirect time to move page.url off the URL the status belongs to, so a later read of the
+            # page would pair the status with a page the status was never about (SKY-16271).
+            response_url = getattr(response, "url", None)
+            landed_url = response_url if isinstance(response_url, str) else None
+            return response
+
         self.last_navigation_status = await navigate_with_retry(
-            navigate=lambda strategy: page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
+            navigate=goto,
             url=url,
             retry_times=retry_times,
             settle=self._wait_for_settle,
             wait_until=wait_until,
         )
+        self.last_navigation_url = landed_url
         await self._wait_for_challenge_solver(page=page)
 
     async def _wait_for_challenge_solver(self, page: Page) -> None:

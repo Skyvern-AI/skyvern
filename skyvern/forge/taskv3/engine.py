@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
 import structlog
 
@@ -207,6 +207,9 @@ async def run_task_v3_agent_loop(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
+    initial_navigation_url: str | None = None,
+    caller_known_urls: frozenset[str] = frozenset(),
+    label_secret_values: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
@@ -412,6 +415,9 @@ async def run_task_v3_agent_loop(
             verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
+            initial_navigation_url=initial_navigation_url,
+            caller_known_urls=caller_known_urls,
+            label_secret_values=label_secret_values,
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
@@ -448,6 +454,9 @@ async def run_task_v3_agent_loop(
     LOG.info(
         "taskv3 engine loop finished",
         status=outcome.status,
+        # The per-run home of the guard class that used to be a prefix on the customer-facing reason:
+        # one row per run, so "how often did this policy end a run" is a facet, not a string match.
+        guard=outcome.guard,
         turns=outcome.turns,
         tool_calls=outcome.tool_calls,
         tool_seconds=outcome.tool_seconds,

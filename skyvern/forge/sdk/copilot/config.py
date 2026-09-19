@@ -47,7 +47,7 @@ DEFAULT_TOKEN_BUDGET = 90_000
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
     "Do NOT reason about the page from memory. Re-take the screenshot "
-    "(get_browser_screenshot) or call evaluate before deciding your next step."
+    "(get_browser_screenshot) or read the page again before deciding your next step."
 )
 
 DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {

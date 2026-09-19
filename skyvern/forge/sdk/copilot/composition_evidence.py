@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -1339,10 +1340,15 @@ def composition_page_evidence_error(
                 block_observation_refs=block_observation_refs,
             )
             if string_step is not None:
+                observation_source = (
+                    "inspect_page_for_composition"
+                    if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE
+                    else "inspect_page_for_composition or evaluate"
+                )
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
-                    "inspect_page_for_composition or evaluate for click-reached blocks. "
+                    f"{observation_source} for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
@@ -1370,13 +1376,20 @@ def composition_page_evidence_error(
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
-                    "Inspect or evaluate the reached page again and pass the new observation_step in "
+                    "Inspect the reached page again and pass the new observation_step in "
                     "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
+            if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE:
+                inspect_hint = (
+                    f"Open {target_url!r} from browser code if the browser is not already there, then call "
+                    "inspect_page_for_composition"
+                )
+            else:
+                inspect_hint = f"Call inspect_page_for_composition(target_url={target_url!r})"
             return (
                 f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
-                f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
+                f"authored. {inspect_hint} before composing page-dependent "
                 "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
                 f"Offending blocks: {_format_page_block_findings([block])}"
             )

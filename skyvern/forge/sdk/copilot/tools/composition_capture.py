@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import structlog
+from agents import FunctionTool
+from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_FRAMES_KEY,
@@ -53,11 +55,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
-    clear_sensitive_origin_page_taint,
+    clear_sensitive_origin_page_taint_after_navigation,
     effective_browser_session_id,
     resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
+    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -98,6 +101,7 @@ from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
+    _live_working_page_url,
     _mark_post_run_page_observed,
 )
 
@@ -1286,6 +1290,11 @@ async def _inspect_page_for_composition_under_custody(
             )
             evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
         else:
+            # Read, compared and dropped: a withheld page's URL decides whether the navigation left
+            # it, and is never part of the evidence.
+            taint_source_url = (
+                await _live_working_page_url(copilot_ctx) if sensitive_origin_page_is_tainted(copilot_ctx) else None
+            )
             nav_result = await _discovery_navigate(
                 copilot_ctx,
                 entry_url,
@@ -1318,7 +1327,13 @@ async def _inspect_page_for_composition_under_custody(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                clear_sensitive_origin_page_taint(copilot_ctx)
+                if taint_source_url is not None:
+                    # Raw against raw: the navigate result's URL is secret-scrubbed, the before-URL is not.
+                    clear_sensitive_origin_page_taint_after_navigation(
+                        copilot_ctx,
+                        source_url=taint_source_url,
+                        result_url=await _live_working_page_url(copilot_ctx),
+                    )
                 capture = await _capture_composition_evidence(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1495,3 +1510,69 @@ def _attach_author_time_levers(copilot_ctx: Any, evidence: dict[str, Any]) -> No
     challenge_state["levers"] = [
         lever.model_dump(mode="json", exclude_none=True) for lever in author_time_levers(copilot_ctx)
     ]
+
+
+COMPOSITION_INSPECTION_TOOL_NAME = "inspect_page_for_composition"
+CURRENT_PAGE_INSPECTION_TARGET = "current_page"
+_CURRENT_PAGE_INSPECTION_DESCRIPTION = """Inspect the page the browser is currently on before composing workflow blocks.
+
+This is a bounded read of current page state, not a way to reach a page: it cannot navigate, and
+it observes whichever page the browser already shows. Use it for uncertainty about controls,
+selectors, visible state or layout, before authoring blocks that fill fields, submit searches,
+filter results or expand result rows, and after a run to read the page that run stopped on.
+`target="debug"` (the default) reads the browser this chat drives; `target="last_run"` reads the
+browser used by the most recent test run. The packet describes the page only as it is at that
+moment: a control that appears solely after an interaction -- a Delete control after an Add click,
+a cart after add-to-cart, the secure area after login -- is absent from it until that interaction
+has happened.
+
+Returns observed page evidence: current URL, title, navigation targets, form fields with labels and
+selectors, submit/search controls, result containers, compact visible text excerpts, anti-bot
+indicators, and bounded visual challenge evidence when DOM evidence shows challenge state. The
+returned `observation_step` is the side-channel id to pass in `block_observation_refs` when a newly
+authored block acts on this observed page. Do NOT paste the evidence into workflow YAML; use it to
+ground concise block prompts. If a select reports `options_omitted=true`, `option_count` is the
+observed total and its selector remains available. If those options are needed, read that one select
+from browser code; do not repeat the full-page inspection. If a block run changes pages, inspect the
+reached page before authoring downstream form/search/result blocks. If the evidence shows required
+fields or controls that the user did not supply enough information for, ASK_QUESTION with that
+observed missing input. If evidence is sufficient, compose and run workflow blocks from the observed
+fields. `challenge_state` reports what the page looks like, which is not what a run will do: it does
+not establish that a submit/search path is closed, and a run settles that.
+
+When the page visibly shows a requested output but its markup is unclear, pass
+`requested_output_reads` with the `output_path` your block will return, the exact rendered
+`value_text`, and its visible `label`. The browser verifies the designation and returns every
+observed selector candidate with its cardinality as facts; you remain responsible for choosing a
+selector and authoring the workflow read."""
+
+
+def current_page_inspection_tool(tool: FunctionTool) -> FunctionTool:
+    """The URL target is dropped from the advertised schema and forced at dispatch, so no
+    navigation is reachable through this tool even if a model supplies the argument anyway."""
+    schema = copy.deepcopy(tool.params_json_schema)
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("target_url", None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [name for name in required if name != "target_url"]
+    navigating_invoke = tool.on_invoke_tool
+
+    # The agents runner hands a wrapper annotated with RunContextWrapper a forked bare context, and
+    # the delegate's generated invoke reads tool_name off it; only a ToolContext annotation keeps it.
+    async def invoke_on_current_page(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except ValueError:
+            return await navigating_invoke(ctx, arguments)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        parsed["target_url"] = CURRENT_PAGE_INSPECTION_TARGET
+        return await navigating_invoke(ctx, json.dumps(parsed))
+
+    projected = copy.copy(tool)
+    projected.description = _CURRENT_PAGE_INSPECTION_DESCRIPTION
+    projected.params_json_schema = schema
+    projected.on_invoke_tool = invoke_on_current_page
+    return projected

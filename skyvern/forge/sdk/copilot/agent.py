@@ -50,9 +50,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.browser_ablation import (
+    CopilotBrowserCodeMode,
     CopilotEvalMode,
     CopilotToolSurface,
+    CopilotToolSurfaceIdentity,
     config_for_eval_mode,
+    dispatch_allowlist_enforced,
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState, serialize_prior_budget_expiry
@@ -221,6 +224,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
+from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -1388,15 +1392,22 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         and outcome.reason_code == "no_meaningful_output"
         and outcome.workflow_run_id
     ):
-        lines.extend(
-            [
-                "POST-RUN PAGE-PATH CONTRACT UNBOUND:",
+        if ctx is not None and ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE:
+            observe_first = (
+                "Before acting on the page again from browser code, call inspect_page_for_composition to observe "
+                "the current page. If the fresh same-run observation is page-path-shaped, it will emit the exact "
+                "allowed click or Enter selector; use only that selector, from browser code with "
+                'target="last_run" when the run executed in its own browser, without navigating or re-authoring '
+                "first. Otherwise the existing blocker remains in force."
+            )
+        else:
+            observe_first = (
                 'Before any click or key press, call inspect_page_for_composition with target_url="current_page". '
                 "Do not use evaluate as a substitute. If the fresh same-run observation is page-path-shaped, it "
                 "will emit the exact allowed click or Enter selector; use only that selector without navigating or "
-                "re-authoring first. Otherwise the existing blocker remains in force.",
-            ]
-        )
+                "re-authoring first. Otherwise the existing blocker remains in force."
+            )
+        lines.extend(["POST-RUN PAGE-PATH CONTRACT UNBOUND:", observe_first])
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
     if outcome.observed_page_value_excerpt:
@@ -4242,7 +4253,7 @@ async def _run_agent_loop_with_surface(
         context_provider=lambda: ctx,
         ordered_allowlist=(tuple(alias_map.values()) if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION else None),
         enforce_dispatch_allowlist=(
-            ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION or ctx.turn_origin == TurnOrigin.runtime_self_heal
+            dispatch_allowlist_enforced(ctx.tool_surface_identity) or ctx.turn_origin == TurnOrigin.runtime_self_heal
         ),
     )
     ctx.discovery_mcp_server = mcp_server
@@ -4274,6 +4285,7 @@ async def _run_agent_loop_with_surface(
                             # Without the ablation's ordered allowlist the server publishes in its own
                             # order, so record the order advertised rather than asserting one.
                             ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
+                            identity=ctx.tool_surface_identity or CopilotToolSurfaceIdentity.OPTIONAL,
                         ).advertised_sha256(advertised_mcp_tools)
                     attempts = 2 if allow_untested_retry else 1
                     for attempt in range(attempts):
@@ -5398,8 +5410,8 @@ async def _run_copilot_turn_impl(
     )
     from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
     from skyvern.forge.sdk.copilot.tools import (
-        NATIVE_TOOLS,
         _build_skyvern_mcp_overlays,
+        copilot_native_tools,
         get_skyvern_mcp_alias_map,
     )
 
@@ -5517,21 +5529,35 @@ async def _run_copilot_turn_impl(
     registered_mcp_tools = (
         await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
     )
+    browser_code_mode = await app.AGENT_FUNCTION.copilot_browser_code_mode(
+        organization_id=organization_id,
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+    )
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
-        native_tools=[tool for tool in NATIVE_TOOLS if tool.name != "ask_user" or chat_request.supports_question_tool],
+        native_tools=copilot_native_tools(
+            supports_question_tool=chat_request.supports_question_tool,
+            browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF,
+        ),
         alias_map=alias_map,
         overlays=overlays,
         registered_mcp_tools=registered_mcp_tools,
         browser_tools_available=copilot_config.browser_tools_available,
+        browser_code_mode=browser_code_mode,
     )
     native_tools = list(surface.native_tools)
     alias_map = surface.alias_map
     overlays = surface.overlays
-    if eval_mode is not None:
-        ctx.eval_tool_surface_sha256 = surface.sha256
-        ctx.eval_native_tool_names = surface.ordered_native_names
-        ctx.eval_mcp_tool_names = surface.ordered_mcp_names
+    ctx.tool_surface_identity = surface.identity
+    ctx.eval_tool_surface_sha256 = surface.sha256
+    ctx.eval_native_tool_names = surface.ordered_native_names
+    ctx.eval_mcp_tool_names = surface.ordered_mcp_names
+    LOG.info(
+        "copilot_tool_surface_resolved",
+        tool_surface_identity=surface.identity.value,
+        tool_surface_sha256=surface.sha256,
+        eval_mode=eval_mode.value if eval_mode is not None else None,
+    )
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
 
@@ -5783,3 +5809,4 @@ async def _run_copilot_turn_impl(
     finally:
         if model_session is not None:
             model_session.close()
+        await close_browser_code_session(ctx)

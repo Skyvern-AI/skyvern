@@ -24,13 +24,16 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
+from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, TypeVar
 
 import structlog
 
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
+from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
+from skyvern.forge.taskv3.target_label import describe_target
 
 LOG = structlog.get_logger()
 
@@ -416,6 +419,10 @@ class ToolSpec:
 class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
+    # Which loop guard authored this verdict (`PERCEPTION_STALL_GUARD` and its siblings), or None for a
+    # terminal the model or a budget produced. This is the machine-readable class that used to be a
+    # prefix on `reason`; `reason` itself is customer-facing text (see `_guard_verdict`).
+    guard: str | None = None
     extracted_output: Any = None
     # A user-defined error code the MODEL chose when finishing, drawn from the task's
     # error_code_mapping. Only ever set on a deliberate finish; None means the model was offered codes
@@ -539,9 +546,12 @@ PERCEPTION_STALL_TERMINATE_AFTER = 15
 # and exactly one of each survives, as before — whatever a non-strict provider adds to the call.
 PERCEPTION_SNAPSHOT_RETAIN = 2
 
-# Stable, facetable prefix for the stall verdict's reason — telemetry queries key on it to measure
-# how often the policy fires; change it only with the dashboards that read it.
-PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
+# The stall verdict's machine class. Stable and facetable — telemetry keys on it to measure how often
+# the policy fires — and it travels beside the verdict (`LoopOutcome.guard`, the guard's log line, the
+# engine's terminal record), never inside its text: a verdict's `reason` is persisted verbatim as the
+# customer-facing `task.failure_reason`, so a dashboard facet in it is a facet the customer reads
+# (SKY-16271). Change it only with the dashboards that read it.
+PERCEPTION_STALL_GUARD = "perception_stall"
 
 # Action-loop policy: N repeated executions of the same billable action (same tool + same args)
 # with no new evidence the page changed mean the run is re-trying against an unchanged outcome —
@@ -566,8 +576,8 @@ ACTION_LOOP_NUDGE_AFTER = 3
 # goal progress, only of page change.
 ACTION_LOOP_TERMINATE_AFTER = 8
 
-# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
-ACTION_LOOP_REASON_PREFIX = "action_loop:"
+# Facetable sibling of PERCEPTION_STALL_GUARD; same dashboard contract.
+ACTION_LOOP_GUARD = "action_loop"
 
 # Progress-gated action-step budget extension (SKY-15264): a run that hits its action-step cap while
 # the page is still demonstrably changing (a repeated probe returned fresh content, a navigation or
@@ -588,6 +598,7 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
 EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
 # Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
 # this module; the extraction-block refusal and tools.py's frame-work ledger both read this one set.
@@ -615,8 +626,9 @@ PAGE_STATE_STALL_TERMINATE_AFTER = 12
 # live (benign direction); the shadow event measures the would-terminate precision on the canary,
 # and promotion to a live verdict is a separate release decision on that data.
 PAGE_STATE_STALL_SHADOW_EVENT = "taskv3 loop page state stall would terminate"
-# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; reserved for the future live verdict.
-PAGE_STATE_STALL_REASON_PREFIX = "page_state_stall:"
+# Facetable sibling of PERCEPTION_STALL_GUARD; reserved for the future live verdict, which owes a
+# customer-facing sentence of its own the day it stops being shadow-only.
+PAGE_STATE_STALL_GUARD = "page_state_stall"
 
 # Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
 # a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
@@ -625,6 +637,15 @@ PAGE_STATE_STALL_REASON_PREFIX = "page_state_stall:"
 # capability failures, not dead-ends, and are left to the model / stay `failed`.
 NAVIGATION_DEAD_END_STATUSES = frozenset({404, 410})
 
+
+class _NavDeadEnd(NamedTuple):
+    """A navigation that landed on a hard dead-end status, and the URL it landed on when the tool
+    reported one."""
+
+    status: int
+    url: str | None
+
+
 # Defined here (not tools.py) so the batch-dispatch poisoning check below can compare against it
 # without an import cycle -- tools.py already imports ToolResult/ToolSpec from this module.
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
@@ -632,11 +653,17 @@ PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
 # removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
 # verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
-# navigation. Facetable sibling of the prefixes above.
-NAV_DEAD_END_REASON_PREFIX = "navigation_dead_end:"
+# navigation. Facetable sibling of the classes above.
+NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
-PAGE_REFRESH_EXHAUSTED_REASON_PREFIX = "page_refresh_exhausted:"
+PAGE_REFRESH_EXHAUSTED_GUARD = "page_refresh_exhausted"
+
+# A URL long enough to be a payload rather than a place is DROPPED from a verdict, never cut: the
+# customer-facing reason is redacted by whole-value match, so a truncated URL would no longer match a
+# registered secret it was cut from (the rule `clean_target_label` applies to an element name). The cap
+# is the handoff one rather than a second number: both answer "how much URL may leave the run".
+VERDICT_URL_MAX_CHARS = MAX_HANDOFF_URL_CHARS
 
 # Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
 # tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
@@ -1132,6 +1159,52 @@ def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
     return tool_name in ("click", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
 
 
+# Secret values reach the model only as `placeholder_...` tokens, so the guard below keys on the
+# token the model passed back and never on what it resolves to — it cannot handle a plaintext secret.
+# The prefix covers every registered secret, not only a login: AWS and Azure parameters and card
+# fields are minted the same way, which is why the refusal names a rejected value rather than a
+# failed sign-in. This matches greedily where the registry matches longest-known-key, so it shares
+# find_embedded_placeholder_tokens' boundary limitation and adds one: two tokens concatenated with no
+# separator merge into one, and a token the model reproduces with a different trailing fragment reads
+# as a different key and goes uncounted. Both fail toward under-counting. It cannot call the registry,
+# because loop.py must not import `app`; thread a token callable from agent.py if either is observed.
+_CREDENTIAL_PLACEHOLDER_RE = re.compile(re.escape(RANDOM_SECRET_ID_PREFIX) + r"[A-Za-z0-9_]+")
+# file_upload is excluded: its placeholder names a file, not a credential, and re-attaching a file
+# after a submit is ordinary recovery rather than a second authentication attempt. The code tool is
+# included for the reason _may_submit includes it — its body is opaque, so it is treated as possibly
+# having entered the credential rather than as certainly not.
+CREDENTIAL_ENTRY_TOOLS = (FILL_TOOLS | frozenset({CODE_TOOL_NAME})) - frozenset({"file_upload"})
+# How many times one credential may be submitted within a task, and the whole knob. Replaying the
+# rule over every v3 block in a 22h window: budget 1 refuses 38 blocks of which 23 COMPLETED, so it
+# would break more runs than it protects; budget 3 reaches the bottom of the range the observed
+# lockouts came from (3-5 submissions). 2 is the largest budget that stays under the observed harm
+# threshold. It is chosen against today's submit precision — _may_submit counts any click, so a
+# click that submits nothing still spends budget — and must be re-derived if that precision improves.
+CREDENTIAL_SUBMIT_BUDGET = 2
+
+
+def _credential_placeholders(args: dict[str, Any]) -> set[str]:
+    """Every credential placeholder token this call's arguments carry, across all of them.
+
+    Scanning the values rather than naming `text`/`value`/`chosen` keeps the guard from being a
+    list of argument conventions that a new fill tool can be added without. Nested because the
+    arguments are the model's JSON: `select_option` carries `values`/`labels` as arrays, so a
+    top-level-strings-only scan would let a credential through in a list.
+    """
+
+    def walk(value: Any) -> Iterator[str]:
+        if isinstance(value, str):
+            yield from _CREDENTIAL_PLACEHOLDER_RE.findall(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                yield from walk(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from walk(nested)
+
+    return set(walk(args))
+
+
 def _is_finish(tool_name: str) -> bool:
     return tool_name == "finish"
 
@@ -1524,6 +1597,88 @@ def _budget_exhausted_observation(cap: str, recency: ActivityRecency | None) -> 
     }
     json_line = json.dumps(payload, separators=(",", ":"))
     return f"{json_line}\nThe run's budget cap has tripped; this is the final turn before the run ends."
+
+
+def _guard_verdict(guard: str, reason: str) -> LoopOutcome:
+    """The one way a loop guard ends a run: the customer-facing sentence in `reason`, the machine class
+    in `guard`.
+
+    They are separate because `reason` leaves the system verbatim as the task's `failure_reason` — a
+    field on the customer webhook and the run view — so the facet a dashboard groups on, the counter
+    that tripped, the tool that reported it and the selector it compared all belong on the guard's own
+    log line instead (SKY-16271). `_budget_exhausted_reason` below holds the same standard for the
+    budget exits.
+    """
+    return LoopOutcome("terminated", reason, guard=guard)
+
+
+def _verdict_url(url: Any, caller_known_urls: Collection[str]) -> str | None:
+    """A URL fit to name in a customer-facing verdict, or None when nothing can be named.
+
+    `sanitize_published_url` owns the invariant this surface rests on -- a verdict publishes only what
+    the caller already gave us, plus the host -- so the scheme and host are always named and the path
+    only when the landed URL is one of `caller_known_urls`, elided to `/…` otherwise.
+    """
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")) or any(ch.isspace() for ch in url):
+        return None
+    published = sanitize_published_url(url, caller_known_urls)
+    # Only a caller URL can be this long once the path is elided, and the caller can read it in their
+    # own task config; cutting it would name a page that does not exist, so it is dropped whole.
+    if published is not None and len(published) > VERDICT_URL_MAX_CHARS:
+        return None
+    return published
+
+
+def _dead_end_reason(status: int, url: Any, *, page_noun: str, caller_known_urls: Collection[str]) -> str:
+    """The HTTP status stays in the sentence: `classify_from_failure_reason` derives NAVIGATION_FAILURE
+    from it, and it is the one fact separating a page that is gone from a page that is merely wrong."""
+    where = _verdict_url(url, caller_known_urls)
+    named = f"{page_noun} ({where})" if where else page_noun
+    return (
+        f"{named} returned HTTP {status}: it no longer exists or has been removed, so the task could "
+        "not be completed there."
+    )
+
+
+def _verdict_target(
+    tool: str,
+    name: Any,
+    kind: Any,
+    label_secret_values: Callable[[], Collection[str]] | None,
+    ctx: SkyvernContext | None,
+) -> str | None:
+    """The control a verdict names, or None when the acting call reported neither a name nor a kind.
+
+    A page-supplied name is only printable against the run's full drop-check secret set -- its
+    registered parameters included, unfloored, since a name is dropped whole rather than scrubbed --
+    and only the caller can see that registry, so it arrives as a resolver read at verdict time. Same
+    set the persisted timeline label is checked against: a credential-shaped label must not be dropped
+    from the row and printed here. With no resolver, no context, or a resolver that fails, the verdict
+    falls back to the kind floor rather than publishing page text it could not check -- a missing
+    context is a missing HALF of that set (the codes minted this turn), not a reason to skip it.
+    """
+    if not name and not kind:
+        return None
+    if label_secret_values is None or ctx is None:
+        return describe_target(tool, None, kind, ())
+    try:
+        secret_values = set(label_secret_values())
+    except Exception:
+        LOG.warning("taskv3 loop could not resolve a verdict's drop-check secrets", tool=tool)
+        return describe_target(tool, None, kind, ())
+    # Unfloored, and read live: a code minted this turn is not in the resolver's floored view.
+    secret_values |= set(ctx.runtime_secret_values)
+    return describe_target(tool, name, kind, secret_values)
+
+
+def _action_loop_reason(target: str | None) -> str:
+    """`target` is the control the run kept acting on, or None when the repeated call reported no name
+    (a failed call reports none) — then the verdict names no place rather than guessing one."""
+    where = f" on {target}" if target else ""
+    return (
+        f"The run repeated the same action{where} and the page did not change in response, so the task "
+        "could not make progress — commonly the site rejecting the action and showing the same page again."
+    )
 
 
 def _budget_exhausted_reason(cap_trip: str) -> str:
@@ -2146,7 +2301,7 @@ class LoopState:
     """
 
     outcome: LoopOutcome | None = None
-    pending_nav_dead_end: int | None = None
+    pending_nav_dead_end: _NavDeadEnd | None = None
     stall_nudges_due: list[tuple[str, int]] = field(default_factory=list)
     # Page-state stall detector (SKY-15265): consecutive billable rounds on a byte-identical
     # fingerprint, whether the one re-plan nudge went out, and whether one is due this turn.
@@ -2230,6 +2385,12 @@ class LoopState:
     action_counts: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
     action_warned: set[tuple[str, str]] = field(default_factory=set)
     billable_actions: list[str] = field(default_factory=list)
+    # Credential re-submit guard (SKY-16594), keyed on the placeholder token rather than the field:
+    # the page re-renders between attempts, so an element-keyed rule is evaded by the very re-render
+    # that precedes the second submit. Tokens entered since the last submit, and how many times each
+    # has been submitted; entering one that has spent CREDENTIAL_SUBMIT_BUDGET is refused.
+    credentials_entered: set[str] = field(default_factory=set)
+    credential_submits: dict[str, int] = field(default_factory=dict)
 
 
 async def run_agent_tool_loop(
@@ -2265,6 +2426,16 @@ async def run_agent_tool_loop(
     verification_blocker: VerificationBlocker | None = None,
     staged_downloads: set[str] | None = None,
     initial_navigation_status: int | None = None,
+    # Only ever named in the dead-end verdict's text, so a caller that has the status but not the URL
+    # (or whose URL is unfit to print) still gets the same verdict, minus the place.
+    initial_navigation_url: str | None = None,
+    # Every URL the CALLER gave this run, normalized by `caller_known_published_urls`. A guard verdict
+    # publishes a landed URL's path only when it is one of these; every other path is elided to its
+    # host. Computed once by the caller (it owns the task config) and never read by a tool.
+    caller_known_urls: frozenset[str] = frozenset(),
+    # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
+    # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
+    label_secret_values: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
@@ -2323,12 +2494,18 @@ async def run_agent_tool_loop(
         if st.refresh_cycles > max_refresh_cycles:
             # The queued calls were chosen on a page declared stale, so they are voided rather than
             # run; a page that keeps demanding a reload cannot be stabilized, and the run ends there.
-            LOG.warning("taskv3 loop refresh signal past cap", tool=tool_name, turn=st.turns)
+            LOG.warning(
+                "taskv3 loop refresh signal past cap",
+                tool=tool_name,
+                turn=st.turns,
+                guard=PAGE_REFRESH_EXHAUSTED_GUARD,
+                refresh_cycles=st.refresh_cycles,
+            )
             _append_skipped_tool_results(st.messages, remaining, "the page could not be stabilized")
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{PAGE_REFRESH_EXHAUSTED_REASON_PREFIX} a page-level handler requested a page reload "
-                f"{st.refresh_cycles} times — the page cannot be stabilized, so the goal cannot progress on it",
+            st.outcome = _guard_verdict(
+                PAGE_REFRESH_EXHAUSTED_GUARD,
+                "The page kept having to be reloaded and never settled into a state the run could act "
+                "on, so the task could not continue there.",
             )
             return True
         if reload_page is not None:
@@ -2554,15 +2731,16 @@ async def run_agent_tool_loop(
                 tool=tool_name,
                 identical_count=snap.live,
                 turn=st.turns,
+                guard=PERCEPTION_STALL_GUARD,
                 **attribution,
             )
             return (
-                LoopOutcome(
-                    "terminated",
-                    f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive identical snapshots from "
-                    f"one {tool_name} probe — the page stopped changing in response to actions, so the goal "
-                    "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
-                    "cross-origin frame)",
+                _guard_verdict(
+                    PERCEPTION_STALL_GUARD,
+                    "The page stopped changing in response to the run's actions — every fresh read of it "
+                    "came back with the same content — so the task could not make progress there, "
+                    "commonly because something on the page is in the way that the run cannot see or "
+                    "operate, such as a prompt inside an embedded frame.",
                 ),
                 stall_nudges,
             )
@@ -2640,11 +2818,19 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             st.outcome = LoopOutcome("canceled", "run canceled")
         else:
-            LOG.info("taskv3 loop initial navigation dead end", http_status=initial_navigation_status)
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{NAV_DEAD_END_REASON_PREFIX} the task's starting URL returned HTTP {initial_navigation_status} "
-                "— the target no longer exists or has been removed, so the goal cannot be completed there",
+            LOG.info(
+                "taskv3 loop initial navigation dead end",
+                http_status=initial_navigation_status,
+                guard=NAV_DEAD_END_GUARD,
+            )
+            st.outcome = _guard_verdict(
+                NAV_DEAD_END_GUARD,
+                _dead_end_reason(
+                    initial_navigation_status,
+                    initial_navigation_url,
+                    page_noun="The task's starting page",
+                    caller_known_urls=caller_known_urls,
+                ),
             )
 
     while st.outcome is None:
@@ -2912,6 +3098,36 @@ async def run_agent_tool_loop(
                             "refused: an extraction block does not type, select, or upload input. Extract what the "
                             "page shows now (clicking to reveal content is allowed), or finish with a status "
                             "that reflects it"
+                        ),
+                    }
+                )
+                continue
+            spent_credentials = (
+                {
+                    token
+                    for token in _credential_placeholders(args)
+                    if st.credential_submits.get(token, 0) >= CREDENTIAL_SUBMIT_BUDGET
+                }
+                if tool_name in CREDENTIAL_ENTRY_TOOLS
+                else set()
+            )
+            if spent_credentials:
+                LOG.info(CREDENTIAL_RESUBMIT_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                # Same reason the extraction refusal marks the batch: a click queued behind this call
+                # would submit the value still sitting in the field, which is the act being refused.
+                batch_had_failure = True
+                st.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "refused: this secret value has already been entered and submitted in this task. The "
+                            "page asking for it again means it was not accepted, and every further attempt spends a "
+                            "real allowance on the account behind it — a sign-in lockout budget, a card's retry "
+                            "limit — so it will not be entered again: retyping it, rewording it or putting it in a "
+                            "different field will all be refused the same way. Finish with a status that reflects "
+                            "the rejected value, or continue with whatever does not need it"
                         ),
                     }
                 )
@@ -3207,6 +3423,19 @@ async def run_agent_tool_loop(
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            # Entry is recorded only when the tool succeeded (a stale-ref failure put nothing in the
+            # field), but the submit is recorded on DISPATCH whatever the verdict: the loop ran the
+            # click itself, so nothing here asks the page whether a submission completed. Entry first,
+            # so a type that pressed Enter submits the value it just entered.
+            if spec is not None:
+                if tool_name in CREDENTIAL_ENTRY_TOOLS and result.status == "ok":
+                    st.credentials_entered |= _credential_placeholders(args)
+                if _may_submit(tool_name, args):
+                    # Cleared, so a second click on an untouched form is not a second submission of
+                    # a credential that was only ever entered once.
+                    for token in st.credentials_entered:
+                        st.credential_submits[token] = st.credential_submits.get(token, 0) + 1
+                    st.credentials_entered.clear()
             # Observe's summary counters are the only trace a perception change leaves on this
             # record; its content is deliberately never logged. Gated on the tool, not the payload,
             # so every other tool's record keeps exactly today's fields.
@@ -3460,15 +3689,20 @@ async def run_agent_tool_loop(
                         tool=tool_name,
                         repeat_count=repeat_count,
                         turn=st.turns,
+                        guard=ACTION_LOOP_GUARD,
                         **attribution,
                     )
-                    st.outcome = LoopOutcome(
-                        "terminated",
-                        f"{ACTION_LOOP_REASON_PREFIX} {repeat_count} repeated {tool_name} attempts on "
-                        f"{_action_target(args)} with no observed page change between attempts — the same "
-                        "action against an unchanged outcome (commonly re-submitting into the same "
-                        "rejection banner) cannot progress the goal",
+                    # The customer-facing half names the control by the page's own accessible name, never
+                    # the selector the model's nudge uses: that selector is usually v3's own `data-tv3`
+                    # marker, which matches nothing in the customer's markup (SKY-16271).
+                    named_target = _verdict_target(
+                        tool_name,
+                        result_data.get(TARGET_LABEL_DATA_KEY),
+                        result_data.get(TARGET_KIND_DATA_KEY),
+                        label_secret_values,
+                        skyvern_ctx,
                     )
+                    st.outcome = _guard_verdict(ACTION_LOOP_GUARD, _action_loop_reason(named_target))
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "action loop")
                     break
                 if (
@@ -3542,7 +3776,7 @@ async def run_agent_tool_loop(
                 # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
                 # it but do NOT break the batch: a later navigate in the same turn can land the run on a
                 # live page and clear it below. Applied once the batch settles (after this for-loop).
-                st.pending_nav_dead_end = dead_end_status
+                st.pending_nav_dead_end = _NavDeadEnd(dead_end_status, result_data.get("navigation_dead_end_url"))
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
@@ -3617,11 +3851,20 @@ async def run_agent_tool_loop(
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
         if st.outcome is None and st.pending_nav_dead_end is not None:
-            LOG.info("taskv3 loop navigation dead end", http_status=st.pending_nav_dead_end, turn=st.turns)
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{NAV_DEAD_END_REASON_PREFIX} navigate landed on a dead page (HTTP {st.pending_nav_dead_end}) — "
-                "the target no longer exists or has been removed, so the goal cannot be completed there",
+            LOG.info(
+                "taskv3 loop navigation dead end",
+                http_status=st.pending_nav_dead_end.status,
+                turn=st.turns,
+                guard=NAV_DEAD_END_GUARD,
+            )
+            st.outcome = _guard_verdict(
+                NAV_DEAD_END_GUARD,
+                _dead_end_reason(
+                    st.pending_nav_dead_end.status,
+                    st.pending_nav_dead_end.url,
+                    page_noun="The page the run opened",
+                    caller_known_urls=caller_known_urls,
+                ),
             )
 
         # Page-state stall detector (SKY-15265): tool-independent — any batch of billable work that

@@ -398,6 +398,14 @@ class SkyvernContext:
     # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
     # extraction / error-detection scrapes never touch it.
     transient_ui_consecutive_suppressions: int = 0
+    # The URLs the workflow AUTHOR typed into the running task block's own `url`/`navigation_goal`,
+    # read before those fields are rendered, and the (workflow_run_id, block label) the reading was
+    # done for. A Task V3 guard verdict publishes a landed URL's path only when it is one of these, so
+    # a URL that only exists after a template rendered a prior block's page-derived output is not one.
+    # Written and read only through skyvern.forge.taskv3.handoff_redaction; a stale owner reads as
+    # empty, which is host-only in the verdict.
+    caller_authored_block_urls: frozenset[str] = frozenset()
+    caller_authored_block_urls_owner: tuple[str, str] | None = None
     # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
     # task block of that run dispatches to, or None for control.
     workflow_block_engine_override: RunEngine | None = None

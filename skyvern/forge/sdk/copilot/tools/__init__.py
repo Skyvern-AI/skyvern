@@ -95,6 +95,8 @@ from .banned_blocks import _record_banned_block_reject_span as _record_banned_bl
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _run_blocks_structured_blocker_message as _run_blocks_structured_blocker_message
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
+from .browser_code import TOOL_NAME as BROWSER_CODE_TOOL_NAME
+from .browser_code import run_browser_code_tool
 from .completion import _build_run_evidence_snapshot as _build_run_evidence_snapshot
 from .completion import _completion_verification_handler as _completion_verification_handler
 from .completion import _is_outcome_evidence_candidate as _is_outcome_evidence_candidate
@@ -1151,8 +1153,8 @@ async def update_and_run_blocks_tool(
     for the reusable actions/checks the workflow actually needs.
     When you compose no-url blocks from a page reached by prior clicks, include
     `block_observation_refs` entries with each block label and the
-    `observation_step` returned by inspect_page_for_composition or evaluate for
-    the page that block acts on.
+    `observation_step` returned by inspect_page_for_composition (or another
+    page read) for the page that block acts on.
     For authored code blocks, include `code_artifact_metadata` rows describing
     declared goals, claimed outcomes, page dependencies, criteria, evidence
     refs, observation refs, and terminal verifier expectations.
@@ -1571,12 +1573,16 @@ async def fill_credential_field_tool(
     credential_id: str,
     field: str,
     submit_selector: str | None = None,
+    target: BrowserTarget = BrowserTarget.DEBUG,
 ) -> str:
-    """Fill ONE field of a SAVED credential into the live debug browser during code-only scouting.
+    """Fill ONE field of a SAVED credential into a live browser during code-only scouting.
+
+    `target="debug"` (the default) fills the browser this chat drives; `target="last_run"` fills the
+    browser the most recent test run executed in, the same one `run_browser_code(target="last_run")` acts on.
 
     The secret value is resolved server-side from the stored credential and never
     enters the conversation; the result reports only `typed_length`. Use this
-    instead of `type_text` whenever a login form field should receive a saved
+    rather than typing the value yourself whenever a login form field should receive a saved
     credential's username, password, or authenticator-app one-time code. Email/SMS
     OTP credentials are not filled during scouting because scouting has no
     workflow run/task context for safe polling.
@@ -1632,8 +1638,13 @@ async def fill_credential_field_tool(
     address string to `otp()` and ensure an active Gmail or Outlook connection exists
     for that mailbox.
     """
-    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field, submit_selector)
-    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+    binding = resolve_browser_session_binding(ctx.context, {"target": target.value})
+    if binding.unavailable_reason:
+        # Never fall back to the chat's browser: a credential filled there lands on a page the model did not name.
+        return json.dumps({"ok": False, "error": binding.unavailable_reason, **binding.provenance()})
+    with bound_call_browser_session(binding.session_id_override):
+        result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field, submit_selector)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, {**result, **binding.provenance()}))
 
 
 async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str) -> str:
@@ -1735,7 +1746,9 @@ NATIVE_TOOLS = [
     inspect_locator_matches_tool,
     fill_credential_field_tool,
     request_credential_tool,
+    run_browser_code_tool,
 ]
+
 
 # Native tools that cannot do their job without a browser: they dispatch a run, drive the
 # scouting tab, or read a live page. Membership is by hand because FunctionTool carries no
@@ -1747,5 +1760,15 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
         "fill_credential_field",
+        BROWSER_CODE_TOOL_NAME,
     }
 )
+
+
+def copilot_native_tools(*, supports_question_tool: bool, browser_code_available: bool) -> list[FunctionTool]:
+    return [
+        tool
+        for tool in NATIVE_TOOLS
+        if (tool.name != "ask_user" or supports_question_tool)
+        and (tool.name != BROWSER_CODE_TOOL_NAME or browser_code_available)
+    ]

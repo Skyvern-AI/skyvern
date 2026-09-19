@@ -122,6 +122,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "skyvern_frame_switch": "Opening embedded page",
     "skyvern_frame_main": "Returning to main page",
     "fill_credential_field": "Entering saved credentials",
+    "run_browser_code": "Running browser code",
     "edit_block": "Editing block",
     "add_block": "Adding block",
     "delete_block": "Deleting block",

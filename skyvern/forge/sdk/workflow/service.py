@@ -3239,7 +3239,7 @@ class WorkflowService:
                     version=version,
                 )
             if workflow is None:
-                LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
+                LOG.warning(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
                 raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
             workflow_id = workflow.workflow_id
             if workflow_request.proxy_location is None and workflow.proxy_location is not None:
@@ -13170,7 +13170,7 @@ class WorkflowService:
         )
 
         if workflow is None:
-            LOG.error(f"Workflow {workflow_permanent_id} not found")
+            LOG.warning(f"Workflow {workflow_permanent_id} not found")
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
 
         attempt_view = compute_attempt_view(
