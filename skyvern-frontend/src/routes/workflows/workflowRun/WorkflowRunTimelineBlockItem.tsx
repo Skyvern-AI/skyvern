@@ -10,6 +10,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type ActionsApiResponse,
+  type ActionSummary,
   ActionTypes,
   getReadableActionType,
   Status,
@@ -38,6 +39,7 @@ import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
 import {
   describeRecordedAction,
   findCodeStepForLine,
+  getActionSummary,
   isRecorderCallText,
   normalizeInlineText,
   taskV3CallText,
@@ -194,29 +196,6 @@ function StatusDot({
   );
 }
 
-type ActionSummary = {
-  text: string;
-  // Only the model's own prose is markdown. A typed value or a recorder trace is literal text and
-  // must render verbatim — a password containing "*" is not emphasis.
-  isProse: boolean;
-};
-
-function getActionSummary(action: ActionsApiResponse): ActionSummary | null {
-  const candidates: Array<[string | null | undefined, boolean]> = [
-    [action.reasoning, true],
-    [action.text, false],
-    [action.response, false],
-    [action.intention, true],
-  ];
-  for (const [value, isProse] of candidates) {
-    const text = normalizeInlineText(value);
-    if (text !== null) {
-      return { text, isProse };
-    }
-  }
-  return null;
-}
-
 function getRecordedActionMeta(action: ActionsApiResponse): {
   codeLine: number | null;
   durationMs: number | null;
@@ -274,13 +253,23 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
+  // An error row prints both halves of its summary: the exception that ended the block is
+  // recorded as the outcome, not the body.
+  const errorSummary = isCodeError ? getActionSummary(action) : null;
   const parts = [
-    // This row hides its label from sighted users, so it falls back to the readable type
-    // where the chat, which always shows the label, prints nothing.
-    isCodeError
-      ? (getActionSummary(action)?.text ?? null)
-      : (describeRecordedAction(action, matchedStep) ??
-        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
+    // Every other row hides its label from sighted users, so it falls back to the readable
+    // type where the chat, which always shows the label, prints nothing.
+    ...(isCodeError
+      ? [
+          normalizeInlineText(errorSummary?.body?.text),
+          errorSummary?.outcome ?? null,
+        ]
+      : [
+          describeRecordedAction(action, matchedStep) ??
+            getReadableActionType(action.action_type, {
+              nullActionLabel: "Step",
+            }),
+        ]),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -290,7 +279,9 @@ function getCodeActionRowPresentation(
     // Literal even when the leading part came from prose: the row's text is that part joined with
     // machine suffixes (line N, duration), and half-markdown-half-not would render as neither.
     summary:
-      parts.length > 0 ? { text: parts.join(" · "), isProse: false } : null,
+      parts.length > 0
+        ? { body: { text: parts.join(" · "), isProse: false }, outcome: null }
+        : null,
     detail:
       !isCodeError && isRecorderCallText(action.description)
         ? normalizeInlineText(action.description)
@@ -637,25 +628,29 @@ function TimelineActionRows({
                 ) : (
                   <span className="sr-only">{label}</span>
                 )}
-                {summary !== null ? (
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
+                {summary?.body ? (
+                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
                     ·{" "}
-                    {summary.isProse ? (
+                    {summary.body.isProse ? (
                       <InlineMarkdown
-                        text={summary.text}
+                        // One line: InlineMarkdown drops every paragraph break, so prose that
+                        // kept its own would render as glued-together words.
+                        text={normalizeInlineText(summary.body.text) ?? ""}
                         // Prose that renders to nothing must not blank the row; the sr-only
                         // label above already names it, so this copy is decorative.
                         fallback={<span aria-hidden="true">{label}</span>}
                       />
                     ) : (
-                      summary.text
+                      summary.body.text
                     )}
                   </span>
                 ) : (
                   // A Task V3 turn that emitted only tool calls leaves every action of that round
                   // with no prose, which used to render as a bare icon and index. Show the type
                   // label sighted readers were missing; it duplicates the sr-only label above, so
-                  // assistive tech must not read it twice. Error rows already show theirs.
+                  // assistive tech must not read it twice. Error rows already show theirs, and a
+                  // row that recorded an outcome says something better below.
+                  !summary?.outcome &&
                   tone !== "error" && (
                     <span
                       aria-hidden="true"
@@ -664,6 +659,19 @@ function TimelineActionRows({
                       · {label}
                     </span>
                   )
+                )}
+                {summary?.outcome && (
+                  // Never squeezed out by the plan: a row whose intention reads "Tried to
+                  // navigate to X" must still show the 404 it landed on, so the body truncates
+                  // first and this keeps its width.
+                  <span
+                    className={cn(
+                      "truncate text-muted-foreground dark:text-slate-500",
+                      summary.body ? "max-w-[60%] shrink-0" : "min-w-0 flex-1",
+                    )}
+                  >
+                    · Outcome: {summary.outcome}
+                  </span>
                 )}
               </button>
             </div>

@@ -4,11 +4,12 @@ import {
   buildCodeStepsByLabel,
   describeRecordedAction,
   findCodeStepForLine,
+  getActionSummary,
   getCodeStepPlainText,
   taskV3CallText,
   visitWorkflowBlocks,
 } from "./workflowBlockUtils";
-import type { ActionsApiResponse } from "@/api/types";
+import { ActionTypes, type ActionsApiResponse } from "@/api/types";
 import type {
   CodeBlock,
   CodeBlockStep,
@@ -362,5 +363,112 @@ describe("taskV3CallText", () => {
     expect(taskV3CallText("locator.click #sign-in")).toBeNull();
     expect(taskV3CallText("Click the sign-in button")).toBeNull();
     expect(taskV3CallText(null)).toBeNull();
+  });
+});
+
+describe("getActionSummary", () => {
+  it("falls back to the intention when the model left no reasoning", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: null,
+        intention: "Navigated to https://example.com/get-in-touch/",
+        response: null,
+        text: null,
+      }),
+    ).toEqual({
+      body: {
+        text: "Navigated to https://example.com/get-in-touch/",
+        isProse: true,
+      },
+      outcome: null,
+    });
+  });
+
+  // The dead-end navigation is why the outcome is not a fallback: the intention says where the
+  // agent meant to go, and only the response says the page was a 404.
+  it("keeps the recorded outcome beside an intention instead of behind it", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: null,
+        intention: "Tried to navigate to https://example.com/contact-us/",
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+        text: null,
+      }),
+    ).toEqual({
+      body: {
+        text: "Tried to navigate to https://example.com/contact-us/",
+        isProse: true,
+      },
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  it("keeps the recorded outcome beside the model's own reasoning", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: "**Following the footer link** to the contact page",
+        intention: "Tried to navigate to https://example.com/contact-us/",
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+      }),
+    ).toEqual({
+      body: {
+        text: "**Following the footer link** to the contact page",
+        isProse: true,
+      },
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  // goto_url is the case that made this chain necessary: url is subclass-only and never reaches
+  // the client, so a navigation row with no intention holds its destination only in response.
+  it("carries the response alone, as literal text, when that is all a row has", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: "   ",
+        intention: null,
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+      }),
+    ).toEqual({
+      body: null,
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  // A cached run writes the answer it typed to both text and response, and the card already prints
+  // it on its Input line.
+  it("does not report a typed value back as an outcome", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.InputText,
+        reasoning: null,
+        intention: "Enter your zip code",
+        response: "90210",
+        text: "90210",
+      }),
+    ).toEqual({
+      body: { text: "Enter your zip code", isProse: true },
+      outcome: null,
+    });
+  });
+
+  // Paragraph breaks survive for a card that renders blocks; collapsing them here would flatten a
+  // multi-paragraph provider summary into one run-on line.
+  it("keeps the prose body as written", () => {
+    expect(
+      getActionSummary({
+        reasoning: "**Investigating the iframe**\n\nThen reading the table",
+      })?.body,
+    ).toEqual({
+      text: "**Investigating the iframe**\n\nThen reading the table",
+      isProse: true,
+    });
+  });
+
+  it("returns null when a row carries no text at all, so the type pill is not doubled", () => {
+    expect(getActionSummary({ reasoning: "", text: null })).toBeNull();
   });
 });

@@ -1587,6 +1587,42 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText(/plan is active/)).toBeDefined();
   });
 
+  // Task V3 persists its own navigations as goto_url rows whose url never reaches the client: the
+  // intention says where it meant to go and only the response says the page was a dead end.
+  it("shows a recorded outcome alongside the intention it followed", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_dead_end",
+      block_type: "task",
+      label: "contact",
+      actions: [
+        {
+          action_id: "act_dead_end",
+          action_type: ActionTypes.GotoUrl,
+          status: Status.Failed,
+          reasoning: null,
+          text: null,
+          intention: "Tried to navigate to https://example.com/contact-us/",
+          response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Tried to navigate to/)).toBeDefined();
+    expect(screen.getByText(/HTTP 404, dead end/)).toBeDefined();
+  });
+
   // A Task V3 turn that emits only tool calls persists every action of that round with no prose at
   // all, which used to leave the row as a bare icon and index.
   it("falls back to a visible action type when an action carries no prose", () => {

@@ -8,6 +8,9 @@ export type CopilotHeaderControls = {
   onSelectChat: (chat: WorkflowCopilotChatSummary) => void;
   onNewChat: () => void;
   disabled: boolean;
+  newChatDisabled: boolean;
+  // Why chat navigation is locked (an Accept whose outcome is unresolved), or null.
+  navigationLockedReason: string | null;
 };
 
 /**
