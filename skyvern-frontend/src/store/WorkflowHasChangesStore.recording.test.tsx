@@ -179,3 +179,25 @@ describe("workflow recording attachment", () => {
     });
   });
 });
+
+describe("blocked saves", () => {
+  it("refuses to write the workflow and keeps it dirty while a save is blocked", async () => {
+    mocks.getClient.mockResolvedValue({ delete: mocks.delete, put: mocks.put });
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => saveData,
+      hasChanges: true,
+      pendingRecordingId: null,
+      pendingRecordingWorkflowPermanentId: null,
+      saveBlockedReason: "An Accept's outcome is still unconfirmed.",
+    });
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync(undefined)).rejects.toBeTruthy();
+    });
+
+    expect(mocks.put).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    useWorkflowHasChangesStore.setState({ saveBlockedReason: null });
+  });
+});

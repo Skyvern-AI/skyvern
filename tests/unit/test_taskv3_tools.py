@@ -616,16 +616,24 @@ async def test_navigate_and_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any(c[0] == "wait_for_selector" for c in page.calls)
 
 
-async def _navigate_status(monkeypatch: pytest.MonkeyPatch, status: int | None) -> Any:
+async def _navigate_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int | None,
+    landed_url: str | None = None,
+    page_url_after_load: str | None = None,
+) -> Any:
     import skyvern.utils.url_validators as urlv
 
     monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
     page = _FakePage()
 
     async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
-        page.url = url
+        responded_from = landed_url or url
+        # Where the page ends up, which a document rewriting its own address bar moves off the
+        # URL the response came back on.
+        page.url = page_url_after_load or responded_from
         page.calls.append(("goto", {"url": url}))
-        return None if status is None else SimpleNamespace(status=status)
+        return None if status is None else SimpleNamespace(status=status, url=responded_from)
 
     page.goto = _goto  # type: ignore[assignment]
     tools = build_browser_tools(_fixed_page_provider(page))
@@ -643,6 +651,18 @@ async def test_navigate_flags_dead_end_on_hard_404_or_410(monkeypatch: pytest.Mo
     assert (r.data or {}).get("navigation_dead_end") == status
 
 
+@pytest.mark.asyncio
+async def test_navigate_dead_end_reports_the_page_the_status_came_back_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The loop names this page in the customer-facing verdict (SKY-16271), so it must be where the
+    # status came from -- after a redirect, that is not the URL the model asked for, and after a
+    # document rewrites its own address bar during load it is not where the page ends up either.
+    expired = "https://jobs.example.test/acme/expired"
+    rewritten = "https://jobs.example.test/acme/browse"
+    r = await _navigate_status(monkeypatch, 404, landed_url=expired, page_url_after_load=rewritten)
+    assert (r.data or {}).get("navigation_dead_end") == 404
+    assert (r.data or {}).get("navigation_dead_end_url") == expired
+
+
 @pytest.mark.parametrize("status", [None, 200, 302, 401, 403, 429, 500, 503])
 @pytest.mark.asyncio
 async def test_navigate_does_not_flag_dead_end_for_non_dead_statuses(
@@ -654,6 +674,7 @@ async def test_navigate_does_not_flag_dead_end_for_non_dead_statuses(
     r = await _navigate_status(monkeypatch, status)
     assert r.status == "ok"
     assert "navigation_dead_end" not in (r.data or {})
+    assert "navigation_dead_end_url" not in (r.data or {})
 
 
 def _reload_guard_tools(monkeypatch: pytest.MonkeyPatch, filled: int) -> tuple[Any, list[Any]]:
@@ -1328,6 +1349,367 @@ async def test_type_non_text_input_skips_probe_fast_path() -> None:
     assert r.status == "ok"
     assert ("fill", ("#email", "john.smith@example.com")) in page.calls
     assert not page.clicked_suggestion
+
+
+class _DateSegmentFakePage(_TypeaheadFakePage):
+    """Extends the typeahead fake with the segmented-date group probe (_DATE_SEGMENT_GROUP_JS,
+    identified by its `targetLabel` field) and a per-segment locator.
+
+    By default (no `committed_digits`), a segment's readback reflects what was ACTUALLY typed into it
+    via `keyboard.type`/`press_sequentially` while it held focus -- a segment the fill loop never
+    focuses or types reads back empty, so a dropped segment is detectable. `committed_digits`, when
+    given, overrides that and reports a fixed value per label regardless of what was typed (a page that
+    silently drops/rejects specific segments); a label missing from that override reads back empty.
+    `blur_clamp` simulates a widget that rewrites one segment's value the moment focus leaves it for
+    another segment (the segment's real blur event), independent of what was typed there.
+    Everything else (the plain typeahead path a rejected/untriggered call falls back to) is inherited
+    unchanged from `_TypeaheadFakePage`."""
+
+    def __init__(
+        self,
+        *,
+        group_probe: dict[str, Any],
+        committed_digits: dict[str, str] | None = None,
+        broken_segment: str | None = None,
+        blur_clamp: tuple[str, str, str] | None = None,
+    ) -> None:
+        super().__init__(field_type="text", suggestion=None)
+        self._group_probe = group_probe
+        self._committed_override = committed_digits
+        self._broken_segment = broken_segment
+        self._blur_clamp = blur_clamp  # (label, from_value, to_value)
+        self.group_probe_calls = 0
+        self.focused_segment: str | None = None
+        self.typed_digits: dict[str, str] = {}
+        # Ordered (kind, label, ...) log of clear/type calls per segment locator, so a test can assert
+        # a segment's clear happened BEFORE its digits were typed, not just that both happened.
+        self.log: list[tuple[str, ...]] = []
+
+    async def evaluate(self, js: str, arg: Any = None) -> Any:
+        if "targetLabel" in js:
+            self.group_probe_calls += 1
+            return self._group_probe
+        if ".blur()" in js:
+            self._blur_current_segment()
+            self.focused_segment = None
+            return None
+        return await super().evaluate(js, arg)
+
+    def _blur_current_segment(self) -> None:
+        if self._blur_clamp:
+            clamp_label, from_value, to_value = self._blur_clamp
+            if self.focused_segment == clamp_label and self.typed_digits.get(clamp_label) == from_value:
+                self.typed_digits[clamp_label] = to_value
+
+    def _focus_segment(self, label: str) -> None:
+        self._blur_current_segment()
+        if label != self._broken_segment:
+            self.focused_segment = label
+
+    def locator(self, selector: str) -> Any:
+        if 'data-tv3-dateseg="' not in selector:
+            return super().locator(selector)
+        label = selector.split('"')[1]
+        outer = self
+
+        class _FakeSegLocator:
+            def __init__(self) -> None:
+                self.first = self
+
+            async def scroll_into_view_if_needed(self, timeout: int | None = None) -> None:
+                pass
+
+            async def focus(self, timeout: int | None = None) -> None:
+                outer._focus_segment(label)
+
+            async def press(self, key: str, timeout: int | None = None) -> None:
+                outer.log.append(("press", label, key))
+
+            async def press_sequentially(self, digits: str, delay: int | None = None) -> None:
+                if label != outer._broken_segment:
+                    outer.typed_digits[label] = digits
+                    outer.log.append(("type", label, digits))
+
+            async def evaluate(self, js: str, timeout: int | None = None) -> str:
+                if outer._committed_override is not None:
+                    return outer._committed_override.get(label) or ""
+                return outer.typed_digits.get(label, "")
+
+        return _FakeSegLocator()
+
+    class _KB:
+        def __init__(self, outer: _DateSegmentFakePage) -> None:
+            self._outer = outer
+
+        async def type(self, digits: str, delay: int | None = None) -> None:
+            seg = self._outer.focused_segment
+            if seg and seg != self._outer._broken_segment:
+                self._outer.typed_digits[seg] = digits
+                self._outer.log.append(("type", seg, digits))
+
+    @property
+    def keyboard(self) -> _DateSegmentFakePage._KB:
+        return _DateSegmentFakePage._KB(self)
+
+
+@pytest.mark.asyncio
+async def test_type_date_fills_all_three_segments_from_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A segmented date input rejects a whole "MM/DD/YYYY" typed into just one segment. Once the target
+    # resolves as a confirmed month/day/year spinbutton group, one type() call must fill all three
+    # segments and report success.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        committed_digits={"month": "09", "day": "18", "year": "2026"},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "ok"
+    assert page.group_probe_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_type_date_group_rejected_by_bijection_falls_back_to_todays_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing/duplicate/readonly segment must fail the bijection closed: the call falls through to
+    # today's single-field path (which still truncates, but that is the existing, unchanged behavior).
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": False, "reason": "missing", "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "ok"
+    assert ("type", ("#month-segment", "09/18/2026")) in page.calls
+    assert page.focused_segment is None
+
+
+@pytest.mark.asyncio
+async def test_type_single_component_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The most important safety property: a single component typed into a single segment (e.g. "09"
+    # into the month segment) must be completely untouched by the new path -- it never even runs the
+    # DOM probe, let alone routes into the group fill.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09"})
+    assert r.status == "ok"
+    assert page.group_probe_calls == 0
+    assert ("type", ("#month-segment", "09")) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_type_date_group_partial_commit_errors_naming_the_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A segment that never reads back its component must fail closed: an error naming which segment
+    # did not commit, never a false "typed into" success on a partially-filled date.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        committed_digits={"month": "09"},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "error"
+    assert "day" in r.content
+    assert "NOT filled" in r.content
+
+
+@pytest.mark.asyncio
+async def test_type_date_iso_format_is_parsed_by_structure_not_assumed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An ISO "2026-09-18" (LLMs emit this constantly) must resolve via the 4-digit year's POSITION
+    # (leading, so year-month-day), never via a blind month/day/year digit slice -- the previous blind
+    # slice read this as month=20, day=26, year=0918 and silently corrupted the date.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "2026-09-18"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"month": "09", "day": "18", "year": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_type_date_single_digit_month_day_zero_pads_correctly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "9/8/2026"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"month": "09", "day": "08", "year": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_type_date_separator_less_run_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A separator-less digit run can't be resolved to an arrangement at all (09182026 vs. 20260918),
+    # so it never even reaches the DOM probe -- exactly like a month name or a single component.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09182026"})
+    assert r.status == "ok", r.content
+    assert page.group_probe_calls == 0
+    assert ("type", ("#month-segment", "09182026")) in page.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["13/01/2026", "01/32/2026"],
+    ids=["invalid-under-the-default-month-first-reading", "invalid-under-either-reading"],
+)
+async def test_type_date_out_of_range_after_assignment_still_falls_back(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A shape-matching text DOES now reach the DOM probe -- the probe is what supplies the order that
+    # decides whether a leading component over 12 is a bad month or a valid day. With no "order" on
+    # the probe result (this fake's default), assignment defaults to month-first, so both of these
+    # remain invalid after assignment and fall back to today's single-field path -- probed, not blind.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": text})
+    assert r.status == "ok", r.content
+    assert page.group_probe_calls == 1
+    assert ("type", ("#month-segment", text)) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_type_date_ambiguous_value_defaults_month_first_when_widget_order_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No "order" on the probe result (e.g. an older probe payload) must not crash or guess a flip --
+    # it defaults to today's historical month-first reading.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "05/09/2026"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"month": "05", "day": "09", "year": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_type_date_ambiguous_value_reads_day_first_from_the_widgets_own_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reviewer's exact scenario: both leading components are <= 12, so the text alone cannot
+    # disambiguate. A widget whose group scan encounters "day" before "month" must land the FIRST
+    # numeric component in the day segment, not always month.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month", "order": ["day", "month", "year"]}
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "05/09/2026"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"month": "09", "day": "05", "year": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_type_date_day_first_widget_accepts_a_leading_component_over_twelve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Widened coverage: "18/09/2026" is rejected on a month-first reading (month=18), but is a valid
+    # day-first date (day=18, month=09) -- and the widget's own order says it should be read that way.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month", "order": ["day", "month", "year"]}
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "18/09/2026"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"month": "09", "day": "18", "year": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_type_date_group_clears_each_segment_before_typing_its_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A retry or a pre-filled segment already holds digits when focus lands on it; without an explicit
+    # clear those keystrokes append rather than replace. Each segment's clear must happen before its
+    # digits are typed.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        committed_digits={"month": "09", "day": "18", "year": "2026"},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "ok", r.content
+    for label in ("month", "day", "year"):
+        type_idx = next(i for i, entry in enumerate(page.log) if entry[0] == "type" and entry[1] == label)
+        clear_idx = next(
+            (i for i, entry in enumerate(page.log[:type_idx]) if entry[0] == "press" and entry[1] == label),
+            None,
+        )
+        assert clear_idx is not None, f"{label} segment was typed into without clearing its content first"
+
+
+@pytest.mark.asyncio
+async def test_type_date_group_rejects_a_read_back_longer_than_the_expected_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A page that reads back "010" for an expected "10" normalizes to the same int but is not the same
+    # commit -- it is exactly the shape an unclearer append would produce. Length must agree too.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        committed_digits={"month": "09", "day": "010", "year": "2026"},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/10/2026"})
+    assert r.status == "error", r.content
+    assert "day" in r.content
+
+
+@pytest.mark.asyncio
+async def test_type_date_widget_that_normalizes_the_final_segment_on_blur_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The final (year) segment still holds focus right after the fill loop, so a widget that
+    # normalizes/clamps a value only on blur has not fired that yet. The tool must blur it and only
+    # then take the read-back that decides success.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        blur_clamp=("year", "2026", "2020"),
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "error", r.content
+    assert "year" in r.content
+
+
+@pytest.mark.asyncio
+async def test_type_date_widget_that_clamps_a_segment_on_blur_is_not_reported_as_filled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _date_segment_holds only checks a segment right after typing it, while it still has focus. A
+    # day segment that clamps 31 -> 28 only once focus leaves it (its blur, which fires only once the
+    # loop focuses year) still reads "31" at that moment; the final re-verify must catch the drift.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        blur_clamp=("day", "31", "28"),
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "02/31/2026"})
+    assert r.status == "error", r.content
+    assert "day" in r.content
+
+
+@pytest.mark.asyncio
+async def test_type_date_dropped_segment_never_reads_back_as_filled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake's read-back must reflect what was actually typed: a segment the fill loop never
+    # focuses/types (simulated here by a widget that refuses focus on `day`) must read back empty, so
+    # a regression that drops a segment from the loop is caught rather than reported as a success.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(
+        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
+        broken_segment="day",
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
+    assert r.status == "error", r.content
+    assert "day" in r.content
+    assert "NOT filled" in r.content
 
 
 @pytest.mark.asyncio
@@ -7934,6 +8316,63 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
         assert await page.eval_on_selector("#month", "el => el.value") == ""
 
 
+# A fieldset holding a real month/day/year spinbutton group ALSO holds an unrelated
+# spinbutton (e.g. an employee ID). The bijection probe must reject a target that is not itself a
+# date segment rather than hijacking the sibling group just because the fieldset contains one.
+_FIELDSET_WITH_UNRELATED_SPINBUTTON_HTML = """
+<fieldset>
+  <input id="employee-id" type="text" role="spinbutton" aria-label="Employee ID">
+  <input id="month" type="text" role="spinbutton" aria-label="Month">
+  <input id="day" type="text" role="spinbutton" aria-label="Day">
+  <input id="year" type="text" role="spinbutton" aria-label="Year">
+</fieldset>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_an_unrelated_spinbutton_never_hijacks_a_sibling_date_group() -> None:
+    # An 8-digit ID typed into an unrelated spinbutton must land in THAT field; it must never silently
+    # overwrite a sibling month/day/year group just because they share a fieldset.
+    async with _content_page(_FIELDSET_WITH_UNRELATED_SPINBUTTON_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#employee-id", "text": "09/18/2026"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#employee-id", "el => el.value") == "09/18/2026"
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+        assert await page.eval_on_selector("#day", "el => el.value") == ""
+        assert await page.eval_on_selector("#year", "el => el.value") == ""
+
+
+# A day segment that clamps its value on blur -- which fires only once focus leaves it for
+# the next segment -- must not be reported as a successful fill once the committed value has drifted
+# from what was requested.
+_DATE_GROUP_CLAMPS_DAY_ON_BLUR_HTML = """
+<div role="group" aria-label="Start date">
+  <input id="month" type="text" role="spinbutton" aria-label="Month">
+  <input id="day" type="text" role="spinbutton" aria-label="Day">
+  <input id="year" type="text" role="spinbutton" aria-label="Year">
+</div>
+<script>
+  document.getElementById('day').addEventListener('blur', () => {
+    const day = document.getElementById('day');
+    if (day.value === '31') { day.value = '28'; }
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_date_widget_clamping_a_segment_on_blur_is_not_reported_as_filled() -> None:
+    async with _content_page(_DATE_GROUP_CLAMPS_DAY_ON_BLUR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Month"]', "text": "02/31/2026"})
+        assert r.status == "error", r.content
+        assert "day" in r.content
+        assert await page.eval_on_selector("#day", "el => el.value") == "28"
+
+
 # The same unclickable shape on a field that only commits a picked suggestion: the raw query sits in
 # the input until blur, so reading it back proves nothing.
 _UNCLICKABLE_TYPEAHEAD_HTML = """
@@ -8591,6 +9030,31 @@ async def test_type_refuses_a_covered_field_whose_type_skips_the_typeahead_probe
         r = await _tool(tools, "type").handler({"selector": "#em", "text": "someone@example.com"})
         assert r.status == "error", r.content
         assert await page.eval_on_selector("#em", "el => el.value") == ""
+
+
+# The segmented-date fill path's early return used to skip the reachability/occluder guard entirely,
+# so a date field under a consent wall could be driven by programmatic focus()+keyboard input and
+# report success on a control a person could not have reached.
+_COVERED_DATE_SEGMENT_GROUP_HTML = """
+<div role="group" style="position:absolute;left:0;top:0;width:300px;height:40px">
+  <span role="spinbutton" aria-label="Month" tabindex="0">MM</span>
+  <span role="spinbutton" aria-label="Day" tabindex="0">DD</span>
+  <span role="spinbutton" aria-label="Year" tabindex="0">YYYY</span>
+</div>
+<div id="consent" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">Accept cookies</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_covered_segmented_date_group_without_typing_into_it() -> None:
+    async with _content_page(_COVERED_DATE_SEGMENT_GROUP_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Month"]', "text": "10/25/2020"})
+        assert r.status == "error", r.content
+        assert r.error_class == "covered", r.error_class
+        assert await page.eval_on_selector('[aria-label="Month"]', "el => el.textContent") == "MM"
+        assert await page.eval_on_selector('[aria-label="Day"]', "el => el.textContent") == "DD"
 
 
 # The occluding host's shadowRoot getter throws, the same poisoning shape as

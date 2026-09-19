@@ -60,6 +60,12 @@ class CopilotProposalMetadata(BaseModel):
             return False
         return now - self.claimed_at < COPILOT_PROPOSAL_CLAIM_LEASE
 
+    def claim_expires_in(self, now: datetime) -> float | None:
+        """Seconds left on a live claim, or None when no claim holds the candidate."""
+        if self.claimed_at is None or not self.claim_is_live(now):
+            return None
+        return (self.claimed_at + COPILOT_PROPOSAL_CLAIM_LEASE - now).total_seconds()
+
 
 class CopilotProposalRunOutput(BaseModel):
     output_parameter_id: str
@@ -840,6 +846,13 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     proposed_workflow_metadata: CopilotProposalMetadata | None = None
+    proposed_claim_expires_in_seconds: float | None = Field(
+        None,
+        description=(
+            "Seconds the server's accepting claim has left. None when no live claim holds the proposal. "
+            "A duration rather than a deadline, so a client with a skewed clock still agrees with the server."
+        ),
+    )
     proposed_workflow_run: CopilotProposalRunFacts | None = None
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
 

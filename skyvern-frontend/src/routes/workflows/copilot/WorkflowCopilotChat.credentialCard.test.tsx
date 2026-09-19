@@ -59,6 +59,14 @@ const {
       workflow_copilot_chat_id: "chat-1" as string | null,
       chat_history: [] as unknown[],
       proposed_workflow: null as Record<string, unknown> | null,
+      proposed_claim_expires_in_seconds: null as number | null | undefined,
+      proposed_workflow_metadata: null as {
+        owner_turn_id: string;
+        revision: number;
+        canonical_fingerprint: string;
+        disposition: "accepting";
+        workflow_run_id: string | null;
+      } | null,
       auto_accept: false,
       pending_credential_requests:
         [] as WorkflowCopilotCredentialRequiredUpdate[],
@@ -277,7 +285,14 @@ const saveData = {
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: Object.assign(
     () => ({ getSaveData: () => saveData }),
-    { getState: () => ({ hasChanges: true }) },
+    {
+      getState: () => ({
+        hasChanges: true,
+        // The Accept fence publishes its reason here; this harness arms the fence, so the
+        // setter has to exist or the component throws on hydration.
+        setSaveBlockedReason: () => {},
+      }),
+    },
   ),
 }));
 
@@ -460,6 +475,8 @@ beforeEach(() => {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
     proposed_workflow: null,
+    proposed_claim_expires_in_seconds: null,
+    proposed_workflow_metadata: null,
     auto_accept: false,
     pending_credential_requests: [],
     question_interactions: [],
@@ -1004,6 +1021,51 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         params: { page: 1, page_size: 100, credential_type: "password" },
       }),
     );
+  });
+
+  it("does not receipt a terminal credential connect that the Accept fence blocked", async () => {
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    // A terminal credential ask recovered from history while the server still reports a live
+    // Accept claim, so the fence is already up when the card renders. Seeding from history is
+    // what makes this reachable: the fence disables the composer a turn would need.
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    // The claim has to be one the row can tie to a proposal, or it is not OUR Accept and the
+    // fence deliberately does not arm for it - a claim held by another writer holds Save, not
+    // this chat's sending. Before the server reported claim liveness independently of the
+    // proposal, a bare claim implied ours; it no longer does.
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-9",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "accepting",
+      workflow_run_id: null,
+    };
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Connect a credential to continue.",
+        created_at: new Date().toISOString(),
+        narrative_payload: terminalPromptResponse("turn-9").narrative_payload,
+      },
+    ];
+    await renderChat();
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+
+    // The fence blocked the continuation, so the card must not show a success-shaped receipt
+    // for a turn that did not move. The picker stays actionable so the user can choose again
+    // once the fence lifts, instead of holding a checkmark for a stopped step.
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Credential .*added/)).toBeNull();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    expect(await screen.findByRole("combobox")).toBeTruthy();
   });
 
   it("restores the terminal picker when the auto-continue send fails", async () => {

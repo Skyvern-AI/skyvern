@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -37,6 +38,7 @@ from skyvern.forge.taskv3.engine import (
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
+    NAV_DEAD_END_GUARD,
     LoopOutcome,
     SemanticCommitStats,
     ToolResult,
@@ -1421,6 +1423,34 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
 
 
 @pytest.mark.asyncio
+async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None:
+    # The class a guard verdict used to prefix onto the customer-facing reason lives here now, one row
+    # per run (SKY-16271): a dashboard counting how often a policy ends a run reads this field, so it
+    # has to survive the trip out of the loop.
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "never runs"})]]),
+            goal="x",
+            initial_navigation_status=404,
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert outcome.status == "terminated"
+    assert terminal[0]["status"] == "terminated"
+    assert terminal[0]["guard"] == NAV_DEAD_END_GUARD
+
+    # A model-authored verdict carries no guard, so the field partitions cleanly.
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["guard"] is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
@@ -1896,3 +1926,100 @@ async def test_engine_repairs_a_blank_page_when_the_loop_ends_without_another_to
     assert outcome.status != "completed"  # ran out of turns rather than finishing
     assert restored == [(page, before)]
     assert page.url == before
+
+
+def test_caller_level_bridge_check_denies_a_router_config_with_a_non_azure_api_base() -> None:
+    # The single-config check reads api_base off the config; a router config carries it per
+    # deployment instead, so a router pointed at OpenRouter used to slip past and report that it
+    # bridges. It does not, and the dict reasoning_effort that verdict unlocks 400s there.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _router(
+        model: str,
+        api_base: str | None,
+        fallback_model: str | None = None,
+        fallback_api_base: str | None = None,
+    ) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="group-flex-fallback-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[
+                LLMRouterModelConfig(
+                    model_name="group-flex",
+                    litellm_params={"model": model, "api_base": api_base, "service_tier": "flex"},
+                ),
+                LLMRouterModelConfig(
+                    model_name="group-fallback",
+                    litellm_params={
+                        "model": fallback_model if fallback_model is not None else model,
+                        "api_base": fallback_api_base if fallback_model is not None else api_base,
+                    },
+                ),
+            ],
+            main_model_group="group-flex",
+            fallback_model_group="group-fallback",
+        )
+
+    def _verdict(config: LLMRouterConfig) -> bool:
+        return LLMCaller.uses_openai_responses_bridge(
+            SimpleNamespace(openai_client=None, _custom_openrouter=False, llm_config=config, original_llm_key="K")
+        )
+
+    assert _verdict(_router("openrouter/openai/gpt-5.6-luna", "https://openrouter.ai/api/v1")) is False
+    # the two shapes that must keep bridging: real OpenAI needs no api_base, and Azure serves it
+    assert _verdict(_router("gpt-5.6-luna", None)) is True
+    assert _verdict(_router("azure/gpt-5.6-luna", "https://example.openai.azure.com")) is True
+
+    # A MIXED router: one deployment can serve the bridge and one cannot. This is what separates
+    # `any` from `all` — the router picks the deployment, the caller cannot, so one leg that
+    # would reject the dict form has to deny the whole config. Without this case, swapping the
+    # guard to `all` leaves the test green.
+    assert (
+        _verdict(
+            _router(
+                "gpt-5.6-luna",
+                None,
+                fallback_model="openrouter/openai/gpt-5.6-luna",
+                fallback_api_base="https://openrouter.ai/api/v1",
+            )
+        )
+        is False
+    )
+
+
+def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
+    # The bridge guard judges a router by the deployments it can actually serve a call from.
+    # No config in the repo today has a deployment outside its groups, or a list-valued fallback,
+    # so these branches are only reachable from here — and a guard that silently widens or
+    # narrows its own input would still look correct on every existing config.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import _dispatchable_deployments
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _leg(name: str) -> LLMRouterModelConfig:
+        return LLMRouterModelConfig(model_name=name, litellm_params={"model": "m"})
+
+    def _config(fallback: str | list[str] | None, names: list[str]) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[_leg(name) for name in names],
+            main_model_group="main",
+            fallback_model_group=fallback,
+        )
+
+    def _names(fallback: str | list[str] | None, names: list[str]) -> set[str]:
+        return {d.model_name for d in _dispatchable_deployments(_config(fallback, names))}
+
+    # a deployment in neither group is unreachable and must be excluded
+    assert _names("fb", ["main", "fb", "retired"]) == {"main", "fb"}
+    # every fallback shape the type allows
+    assert _names(None, ["main", "fb"]) == {"main"}
+    assert _names([], ["main", "fb"]) == {"main"}
+    assert _names(["fb1", "fb2"], ["main", "fb1", "fb2", "other"]) == {"main", "fb1", "fb2"}
+    # the main group is never dropped
+    assert "main" in _names(["fb1"], ["main", "fb1"])

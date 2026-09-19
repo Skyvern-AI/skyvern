@@ -2035,6 +2035,12 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if field_count:
             return f"Inspected the page ({field_count} form field(s))"
         return "Inspected the page"
+    if tool_name == "run_browser_code":
+        operations = result.get("operations")
+        count = len(operations) if isinstance(operations, list) else 0
+        url = result.get("current_url")
+        summary = f"Ran browser code ({count} operation(s))"
+        return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
     return "OK"
 
 

@@ -1225,6 +1225,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            pending_taint_source_urls={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
             request_policy=None,
@@ -1277,6 +1278,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            pending_taint_source_urls={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
         )
@@ -1308,6 +1310,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            pending_taint_source_urls={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
         )
@@ -1388,6 +1391,7 @@ class TestScoutedInteractionCapture:
             completion_criteria_turn_state=None,
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
+            pending_taint_source_urls={},
             prior_carried_trajectory=[],
             carried_trajectory_rebound_done=False,
             request_policy=None,
@@ -1732,10 +1736,16 @@ class TestScoutedInteractionCapture:
         capture = AsyncMock(return_value=True)
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+        # The live page the post-hook re-reads after the navigation landed.
+        monkeypatch.setattr(
+            mcp_hooks, "_live_working_page_url", AsyncMock(return_value="https://safe.example.test/start")
+        )
         ctx = self._ctx(source_url="https://private.example.test/account")
         ctx.browser_session_id = "pbs-debug"
         ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-run"}
         ctx.codeblock_redaction_parameters = {}
+        # What the pre-hook captures on a withheld page: the URL the navigation has to leave.
+        ctx.pending_taint_source_urls = {"pbs-run": "https://private.example.test/account"}
 
         with bound_call_browser_session("pbs-run"):
             result = await mcp_hooks._navigate_post_hook(

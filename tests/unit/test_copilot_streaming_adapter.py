@@ -541,22 +541,34 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
 
 
 @pytest.mark.asyncio
-async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
+@pytest.mark.parametrize("tool_name", ["get_browser_screenshot", "run_browser_code"])
+@pytest.mark.parametrize(
+    "error_json",
+    [
+        '{"ok": false, "error": "Browser session pbs_123 not found while taking screenshot (404)."}',
+        # run_browser_code names a lost browser by its typed code, in prose with no status or "not found".
+        '{"ok": false, "error": "The chat\'s browser session is no longer available.", '
+        '"error_code": "browser_session_unavailable"}',
+    ],
+    ids=["prose", "typed"],
+)
+async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error(
+    tool_name: str, error_json: str
+) -> None:
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
 
     from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError
 
-    error_text = "Browser session pbs_123 not found while taking screenshot (404)."
     events = []
     for call_id in ("c1", "c2"):
         call_item = MagicMock(spec=RunItem)
-        call_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot", "arguments": "{}"}
+        call_item.raw_item = {"call_id": call_id, "name": tool_name, "arguments": "{}"}
         events.append(RunItemStreamEvent(name="tool_called", item=call_item))
 
         output_item = MagicMock(spec=RunItem)
-        output_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot"}
-        output_item.output = [{"type": "text", "text": f'{{"ok": false, "error": "{error_text}"}}'}]
+        output_item.raw_item = {"call_id": call_id, "name": tool_name}
+        output_item.output = [{"type": "text", "text": error_json}]
         events.append(RunItemStreamEvent(name="tool_output", item=output_item))
 
     result = MagicMock()

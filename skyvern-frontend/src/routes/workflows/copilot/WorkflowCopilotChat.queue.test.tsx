@@ -173,9 +173,17 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = {
+    getSaveData: () => saveData,
+    setSaveBlockedReason: () => {},
+  };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.

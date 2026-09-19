@@ -38,6 +38,11 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
+from skyvern.forge.sdk.copilot.browser_code_contract import (
+    BrowserCodeSession,
+    BrowserCodeSessionUnavailableError,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
@@ -255,11 +260,19 @@ class CodeBlockEngineFailure:
     nav_error_code: str | None = None
 
 
+DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
+
+
 @dataclass(frozen=True)
 class CodeBlockDownloadOperationReceipt:
-    """Structured proof that the secure runner invoked the brokered download operation."""
+    """Structured proof that the secure runner invoked the brokered download operation.
+
+    ``outcome`` records how the claim resolved so settlement can tell a proven delivery from the
+    branch-5 placeholder return without string-matching the filename. ``None`` means an old producer
+    that did not record it — settlement must leave the truthful-completion verdict unarmed."""
 
     operation: Literal["click_and_claim_download", "expect_download"] = "click_and_claim_download"
+    outcome: DownloadClaimOutcome | None = None
 
 
 @dataclass
@@ -1307,6 +1320,27 @@ class AgentFunction:
     ) -> bool:
         """Base no-op; callers fail closed when worker dispatch is unavailable."""
         return False
+
+    async def copilot_browser_code_mode(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CopilotBrowserCodeMode:
+        """Whether run_browser_code joins the copilot surface, and whether it replaces the browser tools;
+        OSS has no isolated interpreter to host it."""
+        return CopilotBrowserCodeMode.OFF
+
+    async def open_copilot_browser_code_session(
+        self,
+        *,
+        page: Page,
+        lifetime_seconds: float,
+        organization_id: str,
+        chat_id: str,
+        turn_id: str,
+        browser_session_id: str | None,
+    ) -> BrowserCodeSession:
+        raise BrowserCodeSessionUnavailableError(
+            "Browser code is not available on this deployment.", error_code="unavailable"
+        )
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""

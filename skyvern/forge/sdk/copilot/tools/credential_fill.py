@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedSelectorCandidate,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
+    effective_browser_session_id,
     ensure_browser_session,
     mcp_browser_context,
     sensitive_origin_page_facts_withheld,
@@ -793,8 +794,9 @@ async def _submit_after_credential_fill(
     error_text: str | None = None
     clicked = False
     try:
-        async with mcp_browser_context(copilot_ctx):
-            page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
+        session_id = effective_browser_session_id(copilot_ctx)
+        async with mcp_browser_context(copilot_ctx, session_id_override=session_id):
+            page, _ = await get_page(session_id=session_id)
             engine_selection = page.engine_selection
             try:
                 await page.click(probe.selector, mode="direct", timeout=_CREDENTIAL_SUBMIT_TIMEOUT_MS)
@@ -901,9 +903,11 @@ async def _fill_credential_field_impl_serial(
         )
         return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id, None)})
 
-    session_error = await ensure_browser_session(copilot_ctx)
-    if session_error:
-        return finish(session_error)
+    # A fill aimed at a run's own browser must not provision the chat's; that browser is checked by the fill.
+    if effective_browser_session_id(copilot_ctx) == copilot_ctx.browser_session_id:
+        session_error = await ensure_browser_session(copilot_ctx)
+        if session_error:
+            return finish(session_error)
     if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     await _capture_scout_source_url(copilot_ctx)
@@ -942,8 +946,9 @@ async def _fill_credential_field_impl_serial(
         return finish(error_result)
     fill_outcome: ScoutReadbackOutcome | None = None
     try:
-        async with mcp_browser_context(copilot_ctx):
-            page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
+        session_id = effective_browser_session_id(copilot_ctx)
+        async with mcp_browser_context(copilot_ctx, session_id_override=session_id):
+            page, _ = await get_page(session_id=session_id)
             await page.fill(
                 selector,
                 value,

@@ -1,5 +1,9 @@
 import { ActionsApiResponse, ActionTypes } from "@/api/types";
 import { getActionDisplayKind } from "@/routes/workflows/components/actionStatus";
+import {
+  getActionInputValue,
+  getActionSummary,
+} from "@/routes/workflows/workflowBlockUtils";
 import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import { StatusPill } from "@/components/ui/status-pill";
 import {
@@ -15,6 +19,7 @@ import {
   CrossCircledIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
+import { BlockMarkdown } from "@/components/AgentMarkdown";
 import { RunCard } from "./RunCard";
 
 type Props = {
@@ -27,6 +32,7 @@ type Props = {
 
 function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
   const kind = getActionDisplayKind(action);
+  const summary = getActionSummary(action);
 
   return (
     <RunCard
@@ -75,17 +81,28 @@ function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
             )}
           </div>
         </div>
-        <div className="break-words text-xs text-neutral-600 dark:text-slate-400">
-          {action.reasoning}
-        </div>
+        {summary?.body && (
+          <div className="break-words text-xs text-neutral-600 dark:text-slate-400">
+            {summary.body.isProse ? (
+              <BlockMarkdown text={summary.body.text} />
+            ) : (
+              summary.body.text
+            )}
+          </div>
+        )}
+        {summary?.outcome && (
+          <div className="break-words text-xs text-neutral-600 dark:text-slate-400">
+            <span className="text-neutral-500 dark:text-slate-500">
+              Outcome:{" "}
+            </span>
+            {summary.outcome}
+          </div>
+        )}
         {action.action_type === ActionTypes.InputText && (
           <>
             <Separator />
             <div className="text-xs text-neutral-600 dark:text-slate-400">
-              Input:{" "}
-              {action.action_type === "input_text"
-                ? (action.text ?? action.response)
-                : action.response}
+              Input: {getActionInputValue(action)}
             </div>
           </>
         )}

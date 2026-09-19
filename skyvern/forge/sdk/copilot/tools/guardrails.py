@@ -170,6 +170,7 @@ def _authority_tool_error(
             "edit_block_and_run",
             "discover_workflow_entrypoint",
             "search_web",
+            "run_browser_code",
         }
         and isinstance(policy, RequestPolicy)
         and policy.raw_secret_detected

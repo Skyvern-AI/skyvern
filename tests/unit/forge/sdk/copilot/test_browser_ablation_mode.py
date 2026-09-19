@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     REPAIR_PROBE_TOOL,
     CopilotEvalMode,
     CopilotToolSurface,
+    CopilotToolSurfaceIdentity,
     config_for_eval_mode,
     prompt_sha256,
     prompt_template_for_mode,
@@ -27,8 +28,10 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import BROWSER_TARGET_PARAM_NAME, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.tools import (
     BROWSER_BOUND_TOOL_NAMES,
+    BROWSER_CODE_TOOL_NAME,
     NATIVE_TOOLS,
     _build_skyvern_mcp_overlays,
+    copilot_native_tools,
     get_skyvern_mcp_alias_map,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -150,6 +153,7 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
     )
 
     assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
+    assert BROWSER_CODE_TOOL_NAME not in withheld.ordered_native_names
     assert withheld.ordered_native_names
     assert withheld.ordered_mcp_names == (
         "get_workflow_knowledge",
@@ -239,9 +243,11 @@ async def _advertised_schemas(
 def _production_surfaces(registered: list[RegisteredTool]) -> tuple[CopilotToolSurface, CopilotToolSurface]:
     aliases = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
+    # The direct browser aliases this file compares live on the surface a deployment gets when the
+    # browser-code tool is not available to it; where it is, they are withdrawn.
     normal = resolve_copilot_tool_surface(
         mode=None,
-        native_tools=list(NATIVE_TOOLS),
+        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=False),
         alias_map=aliases,
         overlays=overlays,
     )
@@ -590,3 +596,23 @@ def test_the_on_arm_keeps_the_probe_tool() -> None:
     )
 
     assert surface.ordered_native_names == ("run_blocks", REPAIR_PROBE_TOOL, "update_workflow")
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_keeps_its_catalog_though_the_code_tool_is_on_the_native_list() -> None:
+    """The ablation arms measure the direct-browser surface, so the code tool being available must
+    not divert them to the required-code projection."""
+    registered = await mcp.list_tools(run_middleware=False)
+    native = list(NATIVE_TOOLS)
+    assert "run_browser_code" in {tool.name for tool in native}
+
+    surface = resolve_copilot_tool_surface(
+        mode=CopilotEvalMode.BROWSER_ABLATION,
+        native_tools=native,
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        registered_mcp_tools=registered,
+    )
+
+    assert surface.identity == CopilotToolSurfaceIdentity.BROWSER_ABLATION
+    assert surface.ordered_mcp_names == _EXPECTED_BROWSER_ABLATION_MCP_TOOLS

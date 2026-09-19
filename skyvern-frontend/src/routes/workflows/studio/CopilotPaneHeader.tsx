@@ -1,14 +1,10 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
 import { WorkflowCopilotHistory } from "../copilot/WorkflowCopilotHistory";
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
+import { ControlTooltip } from "./ControlTooltip";
 
 /**
  * Copilot pane header chrome: the History and New-chat controls the docked
@@ -29,21 +25,37 @@ export function CopilotPaneControls() {
         currentChatId={controls.currentChatId}
         onSelect={controls.onSelectChat}
         disabled={controls.disabled}
+        lockedReason={controls.navigationLockedReason ?? undefined}
         compact
       />
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            onClick={controls.onNewChat}
-            aria-label="New chat"
-            className={PANE_HEADER_ICON_BUTTON_CLASS}
-          >
-            <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">New chat</TooltipContent>
-      </Tooltip>
+      {/* Disabled buttons swallow the trigger's events, so the reason a locked control gives
+          has to hang off a focusable wrapper or a keyboard user never reaches it. */}
+      <ControlTooltip
+        content={
+          controls.navigationLockedReason ? (
+            <span className="block max-w-xs">
+              {controls.navigationLockedReason}
+            </span>
+          ) : (
+            "New chat"
+          )
+        }
+        blocked={controls.newChatDisabled}
+      >
+        <button
+          type="button"
+          onClick={controls.onNewChat}
+          disabled={controls.newChatDisabled}
+          aria-label={
+            controls.navigationLockedReason
+              ? `New chat unavailable: ${controls.navigationLockedReason}`
+              : "New chat"
+          }
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
+        >
+          <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </ControlTooltip>
     </>
   );
 }

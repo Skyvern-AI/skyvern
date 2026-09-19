@@ -3233,6 +3233,10 @@ function Workspace({
               description: "Failed to apply agent update. Please try again.",
               variant: "destructive",
             });
+            // The chat reads a clean return as "the editor now holds this workflow" and
+            // releases the Accept fence on it. Swallowing this leaves the stale draft on
+            // the canvas with the server already saved, and the next save duplicates it.
+            throw error;
           }
         }}
       />

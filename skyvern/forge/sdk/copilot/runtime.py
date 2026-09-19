@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -31,7 +32,8 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, CopilotToolSurfaceIdentity
+from skyvern.forge.sdk.copilot.browser_code_contract import BrowserCodeHost
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -412,6 +414,9 @@ class AgentContext:
     admitted_browser_operations: dict[str, set[asyncio.Task[object]]] = field(default_factory=dict)
     heal_workflow_run_id: str | None = None
     eval_mode: CopilotEvalMode | None = None
+    # The self-heal turn advertises its own browser-only surface rather than resolving one, so it
+    # names no projection; the shared agent loop still reads this to decide dispatch enforcement.
+    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
     # True only while a card is on screen. credential_pause_used stays true for the rest of the
     # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
     credential_ask_in_flight: bool = False
@@ -629,6 +634,7 @@ class AgentContext:
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
     credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    browser_code_host: BrowserCodeHost = field(default_factory=BrowserCodeHost)
     # Serializes model-visible browser evidence commits with sensitive-run custody changes. Raw
     # browser work may overlap, but a post-hook or native credential fill owns this lock while it
     # decides whether its facts are admissible, so rollback cannot erase another call's evidence.
@@ -650,6 +656,10 @@ class AgentContext:
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
+    # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
+    # call acts in so concurrent calls on different browsers cannot read each other's. Compared to
+    # the result to tell a fresh document from a fragment hop; never recorded or returned.
+    pending_taint_source_urls: dict[str, str] = field(default_factory=dict)
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
     pending_scout_input_value: str | None = None
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
@@ -1009,6 +1019,29 @@ def sensitive_origin_page_facts_withheld(ctx: AgentContext, run_id: str | None) 
     return not tainting_run_ids <= origin_runs_bound_to_scrubber(ctx)
 
 
+def navigation_document(url: str) -> str:
+    """The URL without its fragment: a fragment-only change is a same-document navigation."""
+    return urlsplit(url)._replace(fragment="").geturl()
+
+
+def navigation_replaced_document(source_url: str | None, result_url: str | None) -> bool:
+    """Whether a navigation left the document it started on. Unknown URLs never count as leaving."""
+    if not isinstance(source_url, str) or not isinstance(result_url, str) or not source_url or not result_url:
+        return False
+    return navigation_document(result_url) != navigation_document(source_url)
+
+
+def clear_sensitive_origin_page_taint_after_navigation(
+    ctx: AgentContext, *, source_url: str | None, result_url: str | None
+) -> bool:
+    """Lift the withholding only when the navigation replaced the sensitive document; fragment hops
+    and unknown URLs keep it, since the DOM that must not be read is still up."""
+    if not navigation_replaced_document(source_url, result_url):
+        return False
+    clear_sensitive_origin_page_taint(ctx)
+    return True
+
+
 def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
     session_id = effective_browser_session_id(ctx)
     active_session_ids = active_sensitive_origin_page_sessions(ctx)
@@ -1154,9 +1187,10 @@ async def close_browser_session_quietly(
     session_id: str,
     *,
     reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
-) -> None:
+) -> bool:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
-    unbounded close could hang the request."""
+    unbounded close could hang the request. Returns whether the close landed; a caller that needs
+    the browser gone, not merely asked to go, has nothing else to tell it."""
     try:
         await asyncio.wait_for(
             app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason),
@@ -1164,6 +1198,8 @@ async def close_browser_session_quietly(
         )
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
+        return False
+    return True
 
 
 def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:

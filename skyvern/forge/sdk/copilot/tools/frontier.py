@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import textwrap
 from collections import Counter
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 import structlog
@@ -651,9 +653,48 @@ def _nearest_upstream_state_establisher(
     return None
 
 
+@runtime_checkable
+class _HasCode(Protocol):
+    code: str | None
+
+
+def _code_block_opens_on_static_url(block: _HasCode) -> bool:
+    code = block.code
+    if not isinstance(code, str):
+        return False
+    try:
+        body = ast.parse(textwrap.dedent(code)).body
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    if not body:
+        return False
+    first = body[0]
+    if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Await)):
+        return False
+    call = first.value.value
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "goto"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "page"
+    ):
+        return False
+    url_node = call.args[0] if call.args else next((kw.value for kw in call.keywords if kw.arg == "url"), None)
+    if not (isinstance(url_node, ast.Constant) and isinstance(url_node.value, str)):
+        return False
+    # CodeBlock.code is Jinja-templated before it runs, so a templated literal is a parameter URL.
+    if "{{" in url_node.value or "{%" in url_node.value:
+        return False
+    return _valid_runtime_anchor_url(url_node.value) is not None
+
+
 def _block_can_start_browser_run(block: object) -> bool:
-    if _block_type_name(block) == BlockType.GOTO_URL.value:
+    block_type = _block_type_name(block)
+    if block_type == BlockType.GOTO_URL.value:
         return True
+    if block_type == BlockType.CODE.value:
+        return isinstance(block, _HasCode) and _code_block_opens_on_static_url(block)
     return _valid_runtime_anchor_url(getattr(block, "url", None)) is not None
 
 

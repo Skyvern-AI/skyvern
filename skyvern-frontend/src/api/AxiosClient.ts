@@ -57,6 +57,49 @@ const artifactApiClient = axios.create({
 
 const clients = [client, v2Client, clientSansApiV1] as const;
 
+type AttributionResolver = (
+  authorization: string | undefined,
+) => string | undefined;
+let attributionResolver: AttributionResolver | undefined;
+
+// Cloud supplies the ownership check; shared API code has no analytics dependency.
+export function setPostHogAttributionResolver(
+  resolver: AttributionResolver,
+): void {
+  attributionResolver = resolver;
+  removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
+}
+
+export function getPostHogAttributionHeaders(
+  authorization: string,
+): Record<string, string> {
+  try {
+    const value = attributionResolver?.(authorization);
+    return value ? { [POSTHOG_ATTRIBUTION_HEADER]: value } : {};
+  } catch {
+    return {};
+  }
+}
+
+clients.forEach((instance) => {
+  instance.interceptors.request.use((config) => {
+    if (attributionResolver) {
+      const authorization = config.headers.get("Authorization");
+      const attribution = getPostHogAttributionHeaders(
+        typeof authorization === "string" ? authorization : "",
+      );
+      config.headers.delete(POSTHOG_ATTRIBUTION_HEADER);
+      if (attribution[POSTHOG_ATTRIBUTION_HEADER]) {
+        config.headers.set(
+          POSTHOG_ATTRIBUTION_HEADER,
+          attribution[POSTHOG_ATTRIBUTION_HEADER],
+        );
+      }
+    }
+    return config;
+  });
+});
+
 type UISessionResponse = {
   token: string;
   expires_at: number;
@@ -296,14 +339,6 @@ function removeHeaderForAllClients(header: string) {
     delete instance.defaults.headers.common[header];
     delete (instance.defaults.headers as Record<string, unknown>)[header];
   });
-}
-
-export function setPostHogAttributionHeader(value: string | undefined) {
-  if (value) {
-    setHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER, value);
-  } else {
-    removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
-  }
 }
 
 export function setAuthorizationHeader(token: string) {

@@ -17,7 +17,10 @@ from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
-from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata
+from skyvern.forge.sdk.copilot.browser_ablation import (
+    BrowserAblationMetadata,
+    CopilotToolSurfaceIdentity,
+)
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
@@ -548,6 +551,13 @@ class StructuredContext(BaseModel):
 
             elif tool == "update_workflow":
                 self.workflow_state = summary
+
+            elif tool == "run_browser_code":
+                self.decisions_made.append(f"{tool}: {summary}")
+                if summary.startswith("Ran browser code") and " at " in summary:
+                    url = summary.rsplit(" at ", 1)[1].strip()
+                    if url and not any(v.url == url for v in self.urls_visited):
+                        self.urls_visited.append(UrlVisit(url=url, summary="browser code"))
 
             elif tool in (
                 "click",
@@ -1119,6 +1129,7 @@ class CopilotContext(AgentContext):
     human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
     eval_prompt_sha256: str | None = None
+    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
     eval_tool_surface_sha256: str | None = None
     eval_native_tool_names: tuple[str, ...] = ()
     eval_mcp_tool_names: tuple[str, ...] = ()

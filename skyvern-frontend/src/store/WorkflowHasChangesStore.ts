@@ -31,6 +31,8 @@ type WorkflowHasChangesStore = {
   getSaveData: () => SaveData | null;
   hasChanges: boolean;
   saveIsPending: boolean;
+  // Why workflow saves are held (an Accept whose server outcome is unconfirmed), or null.
+  saveBlockedReason: string | null;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
   pendingRecordingId: string | null;
@@ -41,6 +43,7 @@ type WorkflowHasChangesStore = {
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
+  setSaveBlockedReason: (reason: string | null) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
   setPendingRecording: (
@@ -66,6 +69,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
     hasChanges: false,
     saveIsPending: false,
+    saveBlockedReason: null,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
     pendingRecordingId: null,
@@ -97,6 +101,9 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     },
     setSaveIsPending: (isPending: boolean) => {
       set({ saveIsPending: isPending });
+    },
+    setSaveBlockedReason: (reason: string | null) => {
+      set({ saveBlockedReason: reason });
     },
     setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => {
       set({ saidOkToCodeCacheDeletion });
@@ -165,6 +172,18 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
 
   const saveWorkflowMutation = useMutation({
     mutationFn: async (override?: Partial<SaveData>) => {
+      // Every persist path funnels here (top bar, Cmd+S, YAML mode, nav blocker), so the
+      // hold is enforced once: a write now could duplicate or overwrite a saved Accept.
+      const blockedReason =
+        useWorkflowHasChangesStore.getState().saveBlockedReason;
+      if (blockedReason) {
+        toast({
+          title: "Save is paused",
+          description: blockedReason,
+          variant: "destructive",
+        });
+        throw new WorkflowSaveValidationError();
+      }
       const base = getSaveData();
 
       if (!base) {

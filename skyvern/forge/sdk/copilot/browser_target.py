@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 
 BROWSER_TARGET_PARAM_NAME = "target"
 
@@ -52,7 +52,7 @@ class BrowserSessionBinding:
     source_matches_target: bool
     unavailable_reason: str | None = None
 
-    def session_id_for(self, copilot_ctx: CopilotContext) -> str | None:
+    def session_id_for(self, copilot_ctx: AgentContext) -> str | None:
         return self.session_id_override or copilot_ctx.browser_session_id
 
     def provenance(self) -> dict[str, Any]:
@@ -69,7 +69,7 @@ class BrowserSessionBinding:
         return stamp
 
 
-def resolve_browser_session_binding(copilot_ctx: CopilotContext, arguments: dict[str, Any]) -> BrowserSessionBinding:
+def resolve_browser_session_binding(copilot_ctx: AgentContext, arguments: dict[str, Any]) -> BrowserSessionBinding:
     """Bind this call to the browser the model named, or report why that browser is not addressable.
 
     ``last_run`` is a promise about identity, so it is kept only against the exact recorded run

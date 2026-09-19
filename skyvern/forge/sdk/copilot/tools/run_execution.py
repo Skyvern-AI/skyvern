@@ -459,6 +459,19 @@ def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
         LOG.warning("Detached cancel fallback failed", exc_info=exc)
 
 
+def resolve_copilot_run_lane(*, rollout_dispatches: bool, inline_opt_in: bool) -> tuple[bool, bool]:
+    """Return (dispatch_to_worker, allow_inline_code_execution) for one copilot test run.
+
+    The rollout decides where a run *may* execute; an explicit inline opt-in decides where this one
+    does. Honouring the opt-in under an enrolled runner is what lets a developer stack exercise a
+    workflow whose target is host-local, which the runner's egress guard refuses. Only a developer
+    checkout reaches it: the hook returns False for cloud and packaged deployments.
+    """
+    if inline_opt_in:
+        return False, True
+    return rollout_dispatches, False
+
+
 def _copilot_sandbox_unavailable_result(*, organization_id: str, workflow_permanent_id: str) -> dict[str, Any]:
     # No repair can make the sandbox reachable, so the result carries
     # UNRECOVERABLE_TOOL_ERROR to reach the contract's STOP lane. Without it the
@@ -3239,10 +3252,11 @@ async def _run_blocks_and_collect_debug(
         organization_id=ctx.organization_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
-    # Compared against the literal True so anything other than an explicit opt-in — including a
-    # test double that auto-mocks the hook into a truthy object — still fails closed.
-    allow_inline_code_execution = (
-        app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is True if not dispatch_to_worker else False
+    dispatch_to_worker, allow_inline_code_execution = resolve_copilot_run_lane(
+        rollout_dispatches=dispatch_to_worker,
+        # Compared against the literal True so anything other than an explicit opt-in — including a
+        # test double that auto-mocks the hook into a truthy object — still fails closed.
+        inline_opt_in=app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is True,
     )
     if requires_sandbox and not dispatch_to_worker and not allow_inline_code_execution:
         return _copilot_sandbox_unavailable_result(

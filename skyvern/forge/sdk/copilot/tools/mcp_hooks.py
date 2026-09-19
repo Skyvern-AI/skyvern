@@ -21,7 +21,6 @@ from skyvern.forge.sdk.copilot.config import (
     download_scout_act_required_for_policy,
     normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -54,7 +53,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
-    clear_sensitive_origin_page_taint,
+    clear_sensitive_origin_page_taint_after_navigation,
+    effective_browser_session_id,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
@@ -114,6 +114,7 @@ from .scouting import (
     _clear_pending_scout_selector_facts,
     _close_scout_challenge_baseline,
     _consume_scout_source_url,
+    _live_working_page_url,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_challenge,
     _maybe_attach_observed_download_target,
@@ -669,25 +670,6 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     return [scrub(fact) for fact in facts]
 
 
-def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if ctx.workflow_persisted or ctx.update_workflow_called:
-        return None
-    for value in (ctx.last_run_blocks_workflow_run_id, ctx.last_successful_run_blocks_workflow_run_id):
-        if isinstance(value, str) and value:
-            return None
-    return {
-        "ok": False,
-        "error": (
-            "CODE-ONLY EXPLORATION PHASE: get_run_results is unavailable before a real workflow run exists. "
-            "Use MCP browser tools such as navigate_browser, evaluate, click, type_text, get_browser_screenshot, "
-            "console_messages, scroll, select_option, or press_key to understand the page, then call "
-            "update_and_run_blocks with real focused code blocks."
-        ),
-    }
-
-
 async def _evaluate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -889,12 +871,19 @@ async def _navigate_post_hook(
     _clear_pending_browser_interaction_observation(ctx)
     sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
     captured_source_url = _consume_scout_source_url(ctx)
+    taint_source_url = ctx.pending_taint_source_urls.pop(effective_browser_session_id(ctx) or "", None)
     source_url = None if sensitive_origin_page_was_tainted else captured_source_url
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
-        if sensitive_origin_page_was_tainted:
-            clear_sensitive_origin_page_taint(ctx)
+        # Raw against raw: `result["url"]` is already secret-scrubbed, so against the raw before-URL a
+        # fragment hop on a page whose URL holds a registered value would differ only by the redaction.
+        if sensitive_origin_page_was_tainted and not clear_sensitive_origin_page_taint_after_navigation(
+            ctx, source_url=taint_source_url, result_url=await _live_working_page_url(ctx)
+        ):
+            # Still on the withheld document, so not even its URL goes back; the code tool and the
+            # navigating inspection refuse the same way.
+            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -930,6 +919,10 @@ async def _navigate_pre_hook(
         return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     if sensitive_origin_page_is_tainted(ctx):
         ctx.pending_scout_source_url = None
+        session_id = effective_browser_session_id(ctx)
+        source_url = await _live_working_page_url(ctx)
+        if session_id and isinstance(source_url, str):
+            ctx.pending_taint_source_urls[session_id] = source_url
         return None
     await _capture_scout_source_url(ctx)
     return None

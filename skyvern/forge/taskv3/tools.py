@@ -4275,6 +4275,76 @@ _ANCHOR_LIST_SEMANTICS_JS = (
 }"""
 )
 
+# A segmented date input's group: the target must itself be a spinbutton whose own aria-label is
+# month/day/year -- not merely sitting near a group that has one, e.g. an unrelated ID spinbutton
+# sharing a fieldset with a real date group -- and its nearest fieldset/[role=group] ancestor (or,
+# failing that, its plain parent) must contain exactly one editable spinbutton per month/day/year
+# aria-label. Meaning comes from each segment's aria-label,
+# never DOM position, so a DD/MM/YYYY visual layout still resolves each component to the right
+# segment. Tags the three winning elements data-tv3-dateseg="month"/"day"/"year" so the caller can
+# address them individually; returns ok:false (and clears any stale tags) on anything short of a
+# strict bijection, so a duplicate, missing, or readonly/disabled segment falls back to today's path.
+_DATE_SEGMENT_GROUP_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const LABELS = ['month', 'day', 'year'];
+  const norm = (el) => String(el.getAttribute('aria-label') || '').trim().toLowerCase();
+  const isSpinbutton = (el) => (el.getAttribute('role') || '').trim().toLowerCase() === 'spinbutton';
+  const editable = (el) => {
+    try { if (el.disabled === true || el.readOnly === true) return false; } catch (e) { /* not a form control */ }
+    if (el.hasAttribute('disabled') || el.hasAttribute('readonly')) return false;
+    const ro = String(el.getAttribute('aria-readonly') || '').trim().toLowerCase();
+    const da = String(el.getAttribute('aria-disabled') || '').trim().toLowerCase();
+    return ro !== 'true' && da !== 'true';
+  };
+  _q.all('[data-tv3-dateseg]').forEach((e) => e.removeAttribute('data-tv3-dateseg'));
+  const target = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!target || !isSpinbutton(target)) return { ok: false, reason: 'not_spinbutton', targetLabel: null };
+  const targetLabel = norm(target) || null;
+  if (LABELS.indexOf(targetLabel) === -1) return { ok: false, reason: 'target_not_date_segment', targetLabel };
+  let group = target.parentElement;
+  let depth = 0;
+  while (
+    group && depth < 8 && group.tagName !== 'FIELDSET'
+    && !/(^|\s)group(\s|$)/i.test(group.getAttribute('role') || '')
+  ) {
+    group = group.parentElement;
+    depth++;
+  }
+  if (!group) group = target.parentElement;
+  if (!group) return { ok: false, reason: 'no_group', targetLabel };
+  const found = {};
+  // Document order as the scan actually encounters the segments -- this is the widget's own
+  // day-vs-month arrangement, and it is what a caller uses to disambiguate an ambiguous value.
+  const order = [];
+  let duplicate = false;
+  let notEditable = false;
+  Array.from(group.querySelectorAll('[role]')).forEach((el) => {
+    if (!isSpinbutton(el)) return;
+    const lab = norm(el);
+    if (LABELS.indexOf(lab) === -1) return;
+    if (found[lab]) { duplicate = true; return; }
+    if (!editable(el)) notEditable = true;
+    found[lab] = el;
+    order.push(lab);
+  });
+  if (duplicate) return { ok: false, reason: 'duplicate', targetLabel };
+  if (LABELS.some((l) => !found[l])) return { ok: false, reason: 'missing', targetLabel };
+  if (notEditable) return { ok: false, reason: 'not_editable', targetLabel };
+  LABELS.forEach((l) => found[l].setAttribute('data-tv3-dateseg', l));
+  return { ok: true, reason: null, targetLabel, order };
+}"""
+)
+
+# Both `value` and `textContent` -- some spinbutton variants drop page-level keystrokes and only
+# render the committed digits as textContent, so a check reading `value` alone reports failure on a
+# segment that actually filled.
+_DATE_SEGMENT_READBACK_JS = (
+    "el => [el.value, el.textContent].filter(v => v != null && String(v).trim() !== '').join('|')"
+)
+
 # Read back after a forced select_option so a styled proxy that silently didn't sync from its
 # native control is caught rather than reported as a successful selection.
 _SELECT_READBACK_JS = (
@@ -10800,6 +10870,164 @@ def build_browser_tools(
         except Exception:
             return "text"
 
+    _DATE_SEGMENT_ORDER: tuple[str, str, str] = ("month", "day", "year")
+    _DATE_SEGMENT_DIGITS_RE = re.compile(r"\d+")
+    # The 4-digit year's position is what disambiguates the text's ARRANGEMENT: last means the other
+    # two components are a month/day pair in some order (still ambiguous by text alone), first means
+    # year-month-day (unambiguous ISO order). A separator-less run (e.g. "09182026") carries no such
+    # signal, so it matches neither shape and falls through rather than being guessed.
+    _DATE_TEXT_YEAR_LAST_RE = re.compile(r"^(\d{1,2})[\s/\-.](\d{1,2})[\s/\-.](\d{4})$")
+    _DATE_TEXT_YEAR_FIRST_RE = re.compile(r"^(\d{4})[\s/\-.](\d{1,2})[\s/\-.](\d{1,2})$")
+
+    def _parse_typed_date_text(text: str) -> tuple[str, str, str, str] | None:
+        # Stage 1 (cheap, no DOM access): extract the three numeric components and how they're
+        # arranged in the text. For the year-last form this deliberately leaves open which of the
+        # first two is month and which is day -- stage 2 (_resolve_date_components) decides that from
+        # the widget's own segment order, not from the text.
+        stripped = text.strip()
+        if not stripped.isascii():
+            return None
+        match = _DATE_TEXT_YEAR_LAST_RE.fullmatch(stripped)
+        if match:
+            a, b, year_s = match.groups()
+            return "year_last", a, b, year_s
+        match = _DATE_TEXT_YEAR_FIRST_RE.fullmatch(stripped)
+        if match:
+            year_s, month_s, day_s = match.groups()
+            return "year_first", month_s, day_s, year_s
+        return None
+
+    def _resolve_date_components(parsed: tuple[str, str, str, str], order: Any) -> dict[str, str] | None:
+        # Stage 2: year-first is unambiguous (ISO year-month-day) regardless of the widget. Year-last
+        # is resolved from the widget's own document order -- if it renders day before month, the
+        # text's first numeric component is the day. With no usable order, default to month-first
+        # (today's historical reading) rather than guess a flip.
+        kind, a, b, year_s = parsed
+        if kind == "year_first":
+            month_s, day_s = a, b
+        else:
+            has_both = isinstance(order, list) and "day" in order and "month" in order
+            day_first = has_both and order.index("day") < order.index("month")
+            month_s, day_s = (b, a) if day_first else (a, b)
+        try:
+            month, day = int(month_s), int(day_s)
+        except ValueError:
+            return None
+        # Ranges are validated AFTER assignment, not before: a leading component over 12 is only
+        # invalid once we know it was assigned to month, and a day-first widget may assign it to day.
+        if not (1 <= month <= 12) or not (1 <= day <= 31):
+            return None
+        return {"month": f"{month:02d}", "day": f"{day:02d}", "year": year_s}
+
+    async def _date_segment_group(page: Any, selector: str) -> dict[str, Any]:
+        try:
+            probe = await page.evaluate(_DATE_SEGMENT_GROUP_JS, await _probe_arg(page, selector))
+        except Exception:
+            return {"ok": False, "reason": None, "targetLabel": None}
+        return probe if isinstance(probe, dict) else {"ok": False, "reason": None, "targetLabel": None}
+
+    async def _read_date_segment(page: Any, selector: str) -> str:
+        try:
+            raw = await page.locator(selector).first.evaluate(_DATE_SEGMENT_READBACK_JS, timeout=2000)
+        except Exception:
+            return ""
+        return str(raw) if isinstance(raw, str) else ""
+
+    def _date_segment_committed(rendered: str, expected_digits: str) -> bool:
+        match = _DATE_SEGMENT_DIGITS_RE.search(rendered)
+        if not match:
+            return False
+        digits = match.group(0)
+        # A read-back longer than the expected width means digits piled up on top of something already
+        # in the segment (an unclearer retry, a pre-filled value) -- e.g. "010" for an expected "10"
+        # normalizes to the same int but is not the same commit, so length must agree too.
+        if len(digits) > len(expected_digits):
+            return False
+        try:
+            return int(digits) == int(expected_digits)
+        except ValueError:
+            return False
+
+    async def _date_segment_holds(page: Any, selector: str, expected_digits: str) -> bool:
+        for _ in range(6):
+            if _date_segment_committed(await _read_date_segment(page, selector), expected_digits):
+                return True
+            await asyncio.sleep(0.15)
+        return False
+
+    async def _clear_date_segment(locator: Any) -> None:
+        # A spinbutton's focus does not necessarily select its contents, so without an explicit clear a
+        # retry or a pre-filled segment would have its new digits appended rather than replacing what's
+        # already there. Backspace is what a real accessible date-segment spinbutton clears itself with
+        # (a select-all chord is not universally safe here -- a real widget lost its whole render on
+        # one); four presses covers the widest (4-digit year) segment even on a widget that only
+        # deletes one character per press, and is a no-op once a segment is already empty.
+        try:
+            for _ in range(4):
+                await locator.press("Backspace")
+        except Exception:
+            pass
+
+    async def _type_one_date_segment(page: Any, selector: str, digits: str) -> bool:
+        locator = page.locator(selector).first
+        try:
+            await locator.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        try:
+            await locator.focus(timeout=2000)
+        except Exception:
+            return False
+        await _clear_date_segment(locator)
+        # locator.fill() does not commit digits into a date spinbutton segment; only real keystrokes
+        # advance it, so this and the element-focused fallback below both TYPE rather than fill.
+        try:
+            await _current_page().keyboard.type(digits, delay=40)
+        except Exception:
+            pass
+        if await _date_segment_holds(page, selector, digits):
+            return True
+        try:
+            await locator.focus(timeout=2000)
+            await _clear_date_segment(locator)
+            await locator.press_sequentially(digits, delay=40)
+        except Exception:
+            return False
+        return await _date_segment_holds(page, selector, digits)
+
+    async def _fill_date_segment_group(page: Any, selector: str, components: dict[str, str]) -> ToolResult:
+        for label in _DATE_SEGMENT_ORDER:
+            committed = await _type_one_date_segment(page, f'[data-tv3-dateseg="{label}"]', components[label])
+            LOG.info("taskv3 date segment fill", segment=label, committed=committed)
+            if not committed:
+                return ToolResult.error(
+                    f"typed a date into {selector}'s segmented date field, but the {label} segment did not "
+                    "commit its value afterward -- the field is NOT filled and may hold a partial date. "
+                    "Re-observe and retry, filling the remaining segment(s) yourself if this one held."
+                )
+        # The last segment typed still holds focus here, so a widget that normalizes or clamps a
+        # segment's value only on blur has not fired that yet -- blur it and let the widget settle
+        # briefly before the read-back that decides success, so that drift surfaces as the error below
+        # instead of a claimed success the very next click then clamps or clears.
+        try:
+            await page.evaluate("() => { const a = document.activeElement; if (a) a.blur(); }")
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
+        # A segment can also be rewritten on an EARLIER segment's blur, which fires only once focus
+        # moves to the next segment -- so this re-check catches drift there too, not just on the last one.
+        for label in _DATE_SEGMENT_ORDER:
+            rendered = await _read_date_segment(page, f'[data-tv3-dateseg="{label}"]')
+            if not _date_segment_committed(rendered, components[label]):
+                return ToolResult.error(
+                    f"typed a date into {selector}'s segmented date field; all three segments committed, but "
+                    f"the {label} segment changed afterward, so the field may now hold a different date than "
+                    "requested. The page changed it, and it was left as the page set it. Re-observe it to see "
+                    "what value the field holds.",
+                    error_class="value_changed_by_page",
+                )
+        return ToolResult.ok(f"typed into {selector}; filled its month/day/year segments from one date")
+
     async def type_text(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
@@ -10814,6 +11042,27 @@ def build_browser_tools(
         text = _resolve_text(args.get("text", ""))
         press_enter = args.get("press_enter")
         clear = args.get("clear", True)
+        # A segmented date input truncates a whole date typed into one segment at that segment's
+        # maxlength, so a confirmed month/day/year group is filled segment by segment instead. The
+        # textual shape check is free and runs first; the DOM probe only runs once the text could
+        # possibly be a date, so ordinary typing never pays for it.
+        if text and clear and not press_enter:
+            parsed_date = _parse_typed_date_text(text)
+            if parsed_date is not None:
+                group = await _date_segment_group(page, selector)
+                if group.get("ok"):
+                    date_components = _resolve_date_components(parsed_date, group.get("order"))
+                    if date_components is not None:
+                        # Mirrors the reachability/occluder guard the normal typing path below
+                        # performs -- this path types via focus()+keyboard too, so a date field under
+                        # a modal or consent wall must not silently report success either.
+                        try:
+                            reachable, _, occluder = await _reachable_for_typing(page, selector)
+                        except _FieldNotEditable as exc:
+                            return _not_editable_error(exc)
+                        if not reachable:
+                            return _covered_error(selector, occluder)
+                        return await _fill_date_segment_group(page, selector, date_components)
         # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
         # model does not reliably reach for select_combobox on its own. So after typing into a plain text
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
@@ -12156,9 +12405,17 @@ def build_browser_tools(
         _recent_nav_canonicals.append(pre_nav_canonical)
         _recent_nav_canonicals.append(landed_canonical)
         # A hard 404/410 landing is a dead/removed target: flag it so the loop ends the run as
-        # terminated (v1's behavior) rather than defaulting the outcome to failed.
+        # terminated (v1's behavior) rather than defaulting the outcome to failed. The landing URL rides
+        # along because the loop's verdict names the dead page to the customer, and only this call knows
+        # where the status came from -- after a redirect that is not the URL it was asked for.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
             data["navigation_dead_end"] = response.status
+            # The response's OWN url, not the page's: a dead document that rewrites the address bar as
+            # it loads (history.replaceState) moves `landed` off the URL the status came back on, and
+            # the verdict would name a page no response was received for. The page URL remains the
+            # fallback for an engine whose response object does not carry one.
+            response_url = getattr(response, "url", None)
+            data["navigation_dead_end_url"] = response_url if isinstance(response_url, str) and response_url else landed
         # What the persisted action row says happened. The requested URL is the model's own argument
         # (a placeholder or payload ref must not be unwrapped into a row), and the dead-end status is
         # repeated from the loop's signal above because the row never sees that one.

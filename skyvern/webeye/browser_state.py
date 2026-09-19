@@ -32,6 +32,9 @@ class BrowserState(Protocol):
     # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
     # response). The Task V3 loop reads it to classify a dead/removed starting URL.
     last_navigation_status: int | None
+    # The URL that status came back on, recorded from the same response: the verdict naming a dead page
+    # must name the page the status belongs to, not wherever the page went afterwards.
+    last_navigation_url: str | None
     # The proxy this browser was actually built with. A consumer reading a flattened failure
     # sentence cannot tell which hop it went through; this carries that fact from where it is known.
     built_with_proxy_location: ProxyLocationInput

@@ -199,6 +199,9 @@ export interface WorkflowCopilotChatHistoryResponse {
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
   proposed_workflow_metadata?: CopilotProposalMetadata | null;
+  // Seconds the server's accepting claim has left; null when no live claim holds the
+  // proposal. A duration, so a skewed client clock still agrees with the server.
+  proposed_claim_expires_in_seconds?: number | null;
   proposed_workflow_run?: CopilotProposalRunFacts | null;
   auto_accept?: boolean | null;
   work_plan?: string[];

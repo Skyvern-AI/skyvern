@@ -116,6 +116,9 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
 
 export function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (s) => s.saveBlockedReason,
+  );
   const getSaveData = useWorkflowHasChangesStore((s) => s.getSaveData);
   // contentDirty reflects real user edits vs the clean baseline snapshot, so
   // post-load canvas materialization (login autofill) doesn't light the dot.
@@ -144,12 +147,21 @@ export function SaveButton() {
 
   return (
     <>
-      <ControlTooltip content="Save workflow" blocked={isRecording}>
+      <ControlTooltip
+        content={
+          saveBlockedReason ? (
+            <span className="block max-w-xs">{saveBlockedReason}</span>
+          ) : (
+            "Save workflow"
+          )
+        }
+        blocked={isRecording || saveBlockedReason !== null}
+      >
         <Button
           variant="ghost"
           size="icon"
           className="relative h-8 w-8 text-muted-foreground"
-          disabled={isRecording}
+          disabled={isRecording || saveBlockedReason !== null}
           onClick={() => {
             // Recompute dirtiness synchronously from the same source as the
             // summary (incl. the YAML draft). contentDirty is debounced and
@@ -171,7 +183,11 @@ export function SaveButton() {
             }
           }}
           aria-label={
-            contentDirty ? "Save workflow (unsaved changes)" : "Save workflow"
+            saveBlockedReason
+              ? `Save workflow unavailable: ${saveBlockedReason}`
+              : contentDirty
+                ? "Save workflow (unsaved changes)"
+                : "Save workflow"
           }
         >
           {saving ? (
