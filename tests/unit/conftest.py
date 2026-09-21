@@ -3,6 +3,7 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import logging
 import os
@@ -24,6 +25,7 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -34,6 +36,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
@@ -404,6 +407,51 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
 
         el.get_attr = AsyncMock(side_effect=_get_attr)
     return el
+
+
+def make_claimed_download_mock(
+    *,
+    path: Path | str | None,
+    suggested_filename: str,
+    path_error: BaseException | None = None,
+    failure: str | None = None,
+    failure_error: BaseException | None = None,
+    context: object | None = None,
+) -> Download:
+    """A Playwright ``Download`` double for the value a ``page.expect_download`` claim resolves to.
+    ``spec`` is the real class so the attach guard's ``isinstance`` check sees what it does live."""
+    download = MagicMock(spec=Download)
+    if path_error is not None:
+        download.path.side_effect = path_error
+    else:
+        download.path.return_value = None if path is None else str(path)
+    if failure_error is not None:
+        download.failure.side_effect = failure_error
+    else:
+        download.failure.return_value = failure
+    download.suggested_filename = suggested_filename
+    download.page = SimpleNamespace(context=context)
+    return download
+
+
+SESSION_DOWNLOAD_BYTES = b"session-delivered certificate"
+
+
+def registered_download_row(
+    filename: str = "certificate.pdf",
+    content: bytes = SESSION_DOWNLOAD_BYTES,
+    artifact_id: str | None = "a_session",
+    checksum: str | None = None,
+    file_size: int | None = None,
+) -> FileInfo:
+    """A DOWNLOAD row as the run's registration lists it for a file a remote browser session delivered."""
+    return FileInfo(
+        url=f"https://storage.test/{filename}",
+        filename=filename,
+        checksum=hashlib.sha256(content).hexdigest() if checksum is None else checksum,
+        file_size=len(content) if file_size is None else file_size,
+        artifact_id=artifact_id,
+    )
 
 
 @dataclass

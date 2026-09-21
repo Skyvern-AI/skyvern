@@ -88,6 +88,8 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -1672,6 +1674,70 @@ async def test_page_unavailable_tool_error_still_stops_batch() -> None:
     assert len(type_calls) == 0
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_a_navigate_whose_document_never_became_ready_stops_the_batch() -> None:
+    # SKY-16278: navigate now returns ok for a document that committed without becoming ready, where it
+    # used to raise. The rest of the batch was queued against a page the model has not seen, so it must
+    # not run — and the readiness the tool reported has to reach the model before it acts again.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def partial_navigate(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "navigated to https://example.test/apply (HTTP 200); the document was not ready after 20s",
+            data={"page_state_changed": True, "readiness_incomplete": True},
+            ok_class="committed_not_loaded",
+        )
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=partial_navigate),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": "https://example.test/apply"}), ("type", {"selector": "#name"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert type_calls == []
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "had not finished loading" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_a_navigate_onto_a_ready_document_lets_the_rest_of_its_batch_run() -> None:
+    # The other side of the same rule, and the reason the batch stop is keyed on `readiness_incomplete`
+    # rather than on "navigate did not report `loaded`": a ready document is one the model may act on,
+    # so a navigate batched with a click still runs the click. Keying the stop on the ok_class instead
+    # would cost a turn on every page that has parsed but is still fetching — which is most of them.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def document_ready_navigate(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "navigated to https://example.test/apply (HTTP 200); the document is ready after 2s, but the "
+            "page is still loading its scripts and resources",
+            data={"page_state_changed": True},
+            ok_class="document_ready",
+        )
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=document_ready_navigate),
+        _recording_tool("click", click_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": "https://example.test/apply"}), ("click", {"selector": "#apply"})],
+        [("finish", {"status": "completed", "reason": "applied"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert [args["selector"] for _name, args in click_calls] == ["#apply"]
+    skipped = [m for m in outcome.messages if m.get("role") == "tool" and "skipped" in str(m.get("content"))]
+    assert skipped == []
 
 
 @pytest.mark.asyncio
@@ -6190,6 +6256,118 @@ async def test_tool_call_record_carries_a_stable_action_key_hash_and_never_the_v
 
 
 @pytest.mark.asyncio
+async def test_navigate_records_name_the_host_and_no_other_tool_does() -> None:
+    # SKY-16278: a navigate timeout was unattributable — neither the per-call record nor the raise line
+    # named the target, so a fleet read could not say which URL cost 60s. Attribution is scheme and
+    # host, never more: the record is otherwise names, sizes and booleans, and a signed or sign-in URL
+    # is a bearer secret whoever produced it — the model included, because it types back the link a
+    # page just showed it. A payload ref is the one value logged whole: it names the target without
+    # being the address. Every other tool's record keeps exactly its current fields.
+    signed = "https://files.example.test/d/a1b2c3?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.Q29ycmVjdEhvcnNl"
+    refs = mask_opaque_urls({"link": signed})
+    token = refs.masked["link"]
+
+    async def navigate_handler(args: dict[str, Any]) -> ToolResult:
+        if args["url"] == "https://dead.example.test/x":
+            raise RuntimeError("boom")
+        # Raw on purpose: the rule belongs to the record field, not to whichever caller filled it.
+        return ToolResult.ok("navigated", data={"landed_url": signed, "same_page": args["url"] == signed})
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=navigate_handler),
+        _recording_tool("click", []),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": token})],
+        [("click", {"selector": "#go"})],
+        [("navigate", {"url": signed})],
+        [("navigate", {"url": "https://dead.example.test/x"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    ctx = SkyvernContext(task_id="tsk_nav_log")
+    ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as entries:
+            outcome, _ = await _run(script, tools)
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "completed"
+    records = [entry for entry in entries if entry["event"] == "taskv3 tool call finished"]
+    navigates = [entry for entry in records if entry["tool"] == "navigate"]
+    assert navigates[0]["requested_url"] == token
+    assert navigates[0]["landed_url"] == "https://files.example.test/<redacted>"
+    # The model typed the signed URL itself and the run landed on that same URL: both are host only.
+    # RED before: a landing byte-identical to the argument was logged whole.
+    assert navigates[1]["requested_url"] == "https://files.example.test/<redacted>"
+    assert navigates[1]["landed_url"] == "https://files.example.test/<redacted>"
+    assert navigates[2]["requested_url"] == "https://dead.example.test/<redacted>"
+    # Whether the browser was already on the page it was sent to, so a post-deploy read can measure how
+    # often the model re-navigates to the page it is on. Nothing in the loop branches on it.
+    assert navigates[0]["same_page"] is False
+    assert navigates[1]["same_page"] is True
+    # A raised handler builds its result in the loop, so the url has to come from the args there too.
+    raised = [entry for entry in entries if entry["event"] == "taskv3 tool handler raised"][0]
+    assert raised["requested_url"] == "https://dead.example.test/<redacted>"
+    click = [entry for entry in records if entry["tool"] == "click"][0]
+    assert "requested_url" not in click and "landed_url" not in click and "same_page" not in click
+    dump = _record_dump([*navigates, raised])
+    assert "c2lnbmVk" not in dump and "/d/a1b2c3" not in dump
+
+
+@pytest.mark.asyncio
+async def test_a_url_the_record_cannot_parse_redacts_it_and_never_aborts_the_run() -> None:
+    # The record helper is evaluated to build the kwargs BEFORE the `taskv3 tool handler raised` call
+    # is entered, so anything it raises escapes that except block, the per-call try AND the batch loop:
+    # a model-typed URL `urlsplit` chokes on would abort the run where main produced a clean tool_error
+    # and carried on. `urlsplit` parses the port and the IPv6 brackets lazily, on attribute access, so
+    # a non-numeric port, an out-of-range one and an unclosed bracket each raise inside the scrub.
+    # The backslash URL is the other half: `urlsplit` does not treat `\` as a path separator, so it
+    # keeps `host\signin\TOKEN` whole as the "host" and the token survives the scrub into the record —
+    # while a browser normalizes the `\` to `/` and navigates there, so the model does type these.
+    token = "BEARER-TOKEN-abc123"
+    backslash_url = f"https://good.example.test\\signin\\{token}"
+    unparseable = ["http://example.com:notaport/x", "http://example.com:99999/x", "http://[oops/x"]
+
+    async def navigate_handler(args: dict[str, Any]) -> ToolResult:
+        url = args["url"]
+        if url == backslash_url:
+            # The second call site: a record built from an ERROR result, where the tool returned rather
+            # than raised and `data` still carries a landing the field has to reduce.
+            return ToolResult.error(
+                "navigation did not commit", {"landed_url": backslash_url}, error_class="navigation_failed"
+            )
+        # What production does with these three: navigate() validates the resolved URL near the top.
+        validate_fetch_url(url)
+        raise AssertionError("unreachable: validation accepts none of these")
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=navigate_handler),
+        make_finish_tool(),
+    ]
+    script = [
+        *[[("navigate", {"url": url})] for url in unparseable],
+        [("navigate", {"url": backslash_url})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as entries:
+        outcome, caller = await _run(script, tools)
+    # RED before: the ValueError escaped the batch loop and the run ended on the exception instead.
+    assert outcome.status == "completed"
+    raised = [entry for entry in entries if entry["event"] == "taskv3 tool handler raised"]
+    assert [entry["requested_url"] for entry in raised] == ["<redacted>"] * len(unparseable)
+    records = [entry for entry in entries if entry["event"] == "taskv3 tool call finished"]
+    navigates = [entry for entry in records if entry["tool"] == "navigate"]
+    assert [entry["requested_url"] for entry in navigates] == ["<redacted>"] * (len(unparseable) + 1)
+    assert navigates[-1]["landed_url"] == "<redacted>"
+    # Each call came back as a tool error the model can read and retry past, not as a dead run.
+    assert [entry["tool_status"] for entry in navigates] == ["error"] * len(navigates)
+    assert caller.calls == len(script)
+    assert token not in _record_dump([*navigates, *raised])
+
+
+@pytest.mark.asyncio
 async def test_observe_summary_cannot_shadow_the_attribution_fields() -> None:
     # A summary key named like a fixed field would otherwise raise at the log call on every observe.
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -9308,17 +9486,18 @@ async def test_selector_kind_reports_the_address_the_model_sent_not_the_one_the_
         [("click", {"selector": "ref=12"})],
         [("click", {"selector": "#plain"})],
         [("click", {"mark": 3})],
+        [("click", {"selector": "ref=7", "mark": 0})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, make_finish_tool()])
     assert outcome.status == "completed"
     records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "click"]
-    assert [e["selector_kind"] for e in records] == ["ref", "css", "mark"]
+    assert [e["selector_kind"] for e in records] == ["ref", "css", "mark", "ref"]
     # The mark call carries selector_present=True even though the model sent no selector: the wrapper
     # left its resolved selector in `args` and that field is read after dispatch. Pinned rather than
     # fixed -- the two fields describe different moments, and a reader of the data needs to know.
-    assert [e["selector_present"] for e in records] == [True, True, True]
+    assert [e["selector_present"] for e in records] == [True, True, True, True]
 
 
 @pytest.mark.asyncio
@@ -10832,3 +11011,85 @@ async def test_navigate_dead_end_verdict_names_the_place_without_its_credentials
         names="https://files.example.test/reset/step-two",
         hides=("reset:pw@", "token=", "abc123def456", "#frag"),
     )
+
+
+def _click_tool_spec() -> ToolSpec:
+    """A spec shaped like the real `click`: two properties, neither required."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("clicked")
+
+    return ToolSpec(
+        name="click",
+        description="Click an element by its observe ref, a CSS selector, or mark=N from the last look().",
+        parameters={
+            "type": "object",
+            "properties": {"selector": {"type": "string"}, "mark": {"type": "integer"}},
+            "required": [],
+        },
+        handler=handler,
+    )
+
+
+async def _no_page() -> Any:
+    """A PageProvider that satisfies the declared `Callable[[], Awaitable[Any]]`.
+
+    `lambda: None` also builds the tool set today, but only because nothing awaits the provider --
+    it would fail as a TypeError the moment building one does, and mypy does not cover tests/.
+    """
+    return None
+
+
+def _reachable_tool_specs() -> list[ToolSpec]:
+    """The tool specs a unit test can build without a Task: the browser set plus `finish`.
+
+    NOT the complete set. `build_captcha_tools` and `build_auth_tools` both require a real `Task`,
+    so their specs are not enumerated here. That gap is covered in kind rather than in list:
+    `to_openai_tool` is the only serializer in the v3 loop (one call site, loop.py, building
+    `openai_tools`), so `test_to_openai_tool_states_strict_false_explicitly` already constrains every
+    `ToolSpec` that exists, including those. This list adds the concrete check on top: it catches a
+    spec whose schema drifts, not a spec that skips the serializer.
+    """
+    return [*build_browser_tools(_no_page), make_finish_tool()]
+
+
+def test_to_openai_tool_states_strict_false_explicitly() -> None:
+    """Reds if `strict` is dropped or flipped. An unset key is not equivalent: see GOTCHAS.md "Loop"."""
+    payload = _click_tool_spec().to_openai_tool()
+    assert payload["function"]["strict"] is False, (
+        "function specs must state strict=False; leaving it unset lets an upstream fill every "
+        "optional argument with a type default"
+    )
+
+
+def test_every_reachable_tool_spec_declares_strict_false() -> None:
+    """The guarantee has to hold for every spec a test can build, not just `click`."""
+    specs = _reachable_tool_specs()
+    assert len(specs) > 10, f"expected the reachable tool set, got {len(specs)}"
+    missing = [s.name for s in specs if s.to_openai_tool()["function"].get("strict") is not False]
+    assert not missing, f"these tools do not declare strict=False: {missing}"
+
+
+def test_tool_schemas_declare_only_properties_they_have() -> None:
+    """`required` must not name a property the schema does not declare.
+
+    Deliberately NOT asserted: anything about the schema's shape relative to `strict`. `strict`
+    asks the provider whether to GUARANTEE adherence; it is not a claim that the schema fails
+    strict mode's prerequisites. A closed, fully-required schema is therefore perfectly consistent
+    with `strict: False`, and a tool may want exactly that -- reject unknown arguments, require
+    everything, and still not ask for strict enforcement. Three earlier versions of this test each
+    asserted some part of that non-invariant and each rejected legitimate schemas: that some
+    property be optional (fails `hover`, `select_combobox`, `navigate`, `file_upload`); that
+    `additionalProperties: false` never appear; that it never appear alongside all-required.
+    Nothing about shape protects the behaviour this suite guards -- an explicit `strict: False`
+    does that on its own, whatever the schema looks like.
+    """
+    specs = _reachable_tool_specs()
+    assert len(specs) > 10, f"expected the reachable tool set, got {len(specs)}"
+    for spec in specs:
+        params = spec.to_openai_tool()["function"]["parameters"]
+        declared = set(params.get("properties", {}))
+        required = set(params.get("required", []))
+        assert required <= declared, (
+            f"{spec.name}: required names {sorted(required - declared)}, which it does not declare"
+        )

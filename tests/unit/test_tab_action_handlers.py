@@ -1,6 +1,7 @@
 """Tests for the NEW_TAB / SWITCH_TAB / CLOSE_PAGE action handlers."""
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +17,7 @@ from skyvern.webeye.actions.handler import (
     handle_new_tab_action,
     handle_switch_tab_action,
 )
-from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -361,3 +362,38 @@ async def test_handle_action_retires_download_claim_for_user_close() -> None:
         await ActionHandler.handle_action(MagicMock(), task, step, dead, action)
 
     assert context.has_download_popup_claim(task.task_id, dead) is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_dispatch_preserves_late_reservation_until_release() -> None:
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), task_id="task-reserved")
+    step = make_step(now, task, step_id="step-reserved", status=StepStatus.running, order=0, output=None)
+    dead = _dead_blank_page("about:blank")
+    context = SkyvernContext(task_id=task.task_id)
+    context.record_download_popup_late_candidate(task.task_id, dead)
+    state = MagicMock()
+    state.list_valid_pages = AsyncMock(return_value=[dead, _survivor_page()])
+
+    async def dispatch(**kwargs: Any) -> list[ActionResult]:
+        return await handle_close_page_action(
+            kwargs["action"], kwargs["page"], kwargs["scraped_page"], kwargs["task"], kwargs["step"]
+        )
+
+    with (
+        patch.object(ActionHandler, "_handle_action", side_effect=dispatch),
+        patch("skyvern.webeye.actions.handler.app", _handle_action_deps(state)),
+        patch.object(skyvern_context, "current", return_value=context),
+    ):
+        result = await ActionHandler.handle_action(
+            MagicMock(), task, step, dead, actions.ClosePageAction(is_internal_recovery=True)
+        )
+        assert isinstance(result[0], ActionFailure)
+        dead.close.assert_not_awaited()
+        assert context.has_download_popup_claim(task.task_id, dead)
+        context.clear_download_popup_claims(task.task_id)
+        result = await ActionHandler.handle_action(
+            MagicMock(), task, step, dead, actions.ClosePageAction(is_internal_recovery=True)
+        )
+        assert isinstance(result[0], ActionSuccess)
+        dead.close.assert_awaited_once()

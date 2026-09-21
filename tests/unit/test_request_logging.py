@@ -39,6 +39,17 @@ from skyvern.forge.request_logging import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("path", ["/api/v1/users/me/onboarding", "/api/v1/users/me/onboarding/"])
+@pytest.mark.parametrize(
+    "body", ['{"project_owner":{"professional_email":"owner@example.com"}}', "broken owner@example.com {"]
+)
+def test_onboarding_bodies_are_opaque_even_when_malformed(method: str, path: str, body: str) -> None:
+    request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
+    assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+    assert _sanitize_response_body(request, body, "application/json") == REDACTED
+
+
 class TestClientIpFromHeaders:
     def test_extracts_first_hop_from_x_forwarded_for(self) -> None:
         headers = {"x-forwarded-for": "203.0.113.10, 10.0.0.1"}

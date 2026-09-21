@@ -375,6 +375,7 @@ def _ctx() -> MagicMock:
     ctx.turn_halt = None
     ctx.build_test_outcomes = []
     ctx.latest_recorded_build_test_outcome = None
+    ctx.credential_origin_recovery = None
     return ctx
 
 

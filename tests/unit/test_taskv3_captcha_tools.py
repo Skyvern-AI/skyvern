@@ -278,10 +278,19 @@ class _MarkerOnlyLocator:
     async def count(self) -> int:
         return self._count
 
+    def nth(self, _index: int) -> _MarkerOnlyLocator:
+        return self
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def bounding_box(self) -> dict[str, float]:
+        return {"x": 10.0, "y": 10.0, "width": 300.0, "height": 80.0}
+
 
 class _MarkerOnlyPage:
-    """Only the generic CAPTCHA marker selector matches: the real ladder detects a challenge, finds no
-    checkbox/anchor/recaptcha arm, and raises CaptchaChallengeUnsolvedError."""
+    """Only the generic CAPTCHA marker selector matches, and it is rendered: the real ladder detects a
+    challenge, finds no checkbox/anchor/recaptcha arm, and raises CaptchaChallengeUnsolvedError."""
 
     def __init__(self) -> None:
         self.url = "https://app.example/login"

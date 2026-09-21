@@ -28,6 +28,7 @@ import pytest
 # delay-specific test can exercise the real function while other upload tests skip the sleep.
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Frame, Page, Route
+from playwright.async_api import TimeoutError as _PlaywrightTimeout
 from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
@@ -40,7 +41,13 @@ from skyvern.forge.taskv3.code_surface import (
     apply_surface,
     configured_surface,
 )
-from skyvern.forge.taskv3.loop import ACTION_OUTCOME_DATA_KEY, CODE_TOOL_NAME, SemanticCommitStats, ToolSpec
+from skyvern.forge.taskv3.loop import (
+    ACTION_OUTCOME_DATA_KEY,
+    CODE_TOOL_NAME,
+    SemanticCommitStats,
+    ToolSpec,
+    _navigate_record_fields,
+)
 from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
@@ -49,6 +56,7 @@ from skyvern.forge.taskv3.tools import (
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
     _annotate_screenshot,
+    _exact_tier_key,
     _invalid_selector_result,
     _is_host_anchored_selector,
     _normalize_selector,
@@ -296,12 +304,18 @@ class _StampedRowHandle:
 
 
 class _FakePage:
+    # document.readyState, which is what navigate's readiness read asks the document. Default
+    # "complete": a page that finished loading, so the readiness note stays empty as it does live.
+    _READY_LEVELS = {"loading": 0, "interactive": 1, "complete": 2}
+    _LEVEL_WANTED = {"domcontentloaded": "interactive", "load": "complete"}
+
     def __init__(self) -> None:
         self.url = "https://example.test/apply"
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.element = _FakeElement(self)
         self._request_listeners: list[Any] = []
         self._closed = False
+        self.ready_state = "complete"
 
     def is_closed(self) -> bool:
         return self._closed
@@ -337,6 +351,8 @@ class _FakePage:
         self.calls.append(("hover", {"selector": selector}))
 
     async def evaluate(self, _js: str) -> str:
+        if "document.readyState" in _js:
+            return self.ready_state
         return json.dumps(
             {
                 "url": self.url,
@@ -408,6 +424,11 @@ class _FakePage:
 
     async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
         self.calls.append(("wait_for_selector", {"selector": selector, "state": state, "timeout": timeout}))
+
+    async def wait_for_load_state(self, state: str = "load", timeout: float | None = None) -> None:
+        self.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        if self._READY_LEVELS[self.ready_state] < self._READY_LEVELS[self._LEVEL_WANTED[state]]:
+            raise _PlaywrightTimeout(f"Timeout {timeout}ms exceeded")
 
     class _KB:
         def __init__(self, page: _FakePage) -> None:
@@ -702,6 +723,7 @@ async def test_navigate_refuses_destructive_same_url_reload_with_filled_state(
     r = await _tool(tools, "navigate").handler({"url": page.url})
     assert r.status == "error", r.content
     assert "discard" in r.content
+    assert "navigate here again to confirm" in r.content
     assert not any(c[0] == "goto" for c in page.calls)  # never reloaded
 
 
@@ -812,11 +834,13 @@ async def test_navigate_to_a_different_url_is_never_guarded(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_navigate_same_url_reload_with_no_filled_state_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Nothing to protect: a same-URL reload of a page with no filled fields proceeds normally.
+    # Nothing to protect: a same-URL reload of a page with no filled fields proceeds normally — one
+    # goto, and the record's `same_page` says the model sent the browser back where it already was.
     page, tools = _reload_guard_tools(monkeypatch, filled=0)
     r = await _tool(tools, "navigate").handler({"url": page.url})
     assert r.status == "ok", r.content
-    assert any(c[0] == "goto" for c in page.calls)
+    assert len([c for c in page.calls if c[0] == "goto"]) == 1
+    assert (r.data or {}).get("same_page") is True
 
 
 @pytest.mark.asyncio
@@ -851,8 +875,9 @@ async def test_navigate_rerefuses_when_at_risk_state_grew_after_refusal(monkeypa
     monkeypatch.setattr(tools_module, "_count_filled_fields", _filled)
     page = _FakePage()
     tools = build_browser_tools(_fixed_page_provider(page))
-    assert (await _tool(tools, "navigate").handler({"url": page.url})).status == "error"  # filled=2, refuse
-    r2 = await _tool(tools, "navigate").handler({"url": page.url})  # filled=3 > 2 → re-refuse
+    nav_args = {"url": page.url}
+    assert (await _tool(tools, "navigate").handler(nav_args)).status == "error"  # filled=2, refuse
+    r2 = await _tool(tools, "navigate").handler(nav_args)  # filled=3 > 2 → re-refuse
     assert r2.status == "error", r2.content
     assert not any(c[0] == "goto" for c in page.calls)  # never reloaded — the grown state is protected
 
@@ -873,6 +898,258 @@ async def test_filled_state_probe_counts_an_attached_file_input(tmp_path: Any) -
         assert await _count_filled_fields(page) >= 1
         await page.fill("#name", "John Doe")
         assert await _count_filled_fields(page) >= 2
+
+
+def _readiness_tools(
+    monkeypatch: pytest.MonkeyPatch, ready_state: str, status: int | None = 200, **build_kwargs: Any
+) -> tuple[Any, list[Any]]:
+    """A page whose document reaches `ready_state` and no further, recording each goto's own kwargs."""
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    page = _FakePage()
+    page.ready_state = ready_state
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.url = url
+        page.calls.append(("goto", {"url": url, "timeout": timeout, "wait_until": wait_until}))
+        return None if status is None else SimpleNamespace(status=status)
+
+    page.goto = _goto  # type: ignore[assignment]
+    return page, build_browser_tools(_fixed_page_provider(page), **build_kwargs)
+
+
+def _load_state_waits(page: Any) -> list[dict[str, Any]]:
+    return [args for name, args in page.calls if name == "wait_for_load_state"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_commits_then_waits_for_readiness_on_the_same_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-16278: one goto at wait_until="commit", then the readiness waits on THAT document — never a
+    # second goto, which refetches a partially arrived bundle from zero. A page that did load reads
+    # exactly as it did before, so the common path gains no caveat.
+    page, tools = _readiness_tools(monkeypatch, "complete")
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "ok", r.content
+    gotos = [args for name, args in page.calls if name == "goto"]
+    assert len(gotos) == 1 and gotos[0]["wait_until"] == "commit"
+    assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded", "load"]
+    assert r.content == "navigated to https://jobs.example.test/acme/123 (HTTP 200)"
+    assert r.ok_class == "loaded"
+    assert (r.data or {}).get("readiness_incomplete") is None
+    # The point of splitting the budget: commit plus readiness cannot exceed the single-attempt
+    # ceiling this call used to spend entirely on one wait_until="load" goto.
+    assert gotos[0]["timeout"] + _load_state_waits(page)[0]["timeout"] <= settings.BROWSER_LOADING_TIMEOUT_MS
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The failure this ticket exists for: the document parses in under a second and one starved asset
+    # keeps `load` from firing. The wait for load is still made — the readiness budget is the bound,
+    # not the event — and when that budget runs out the tool reports what the document actually
+    # reached instead of raising. RED with the load wait removed: one wait, and no time spent on it.
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    page, tools = _readiness_tools(monkeypatch, "interactive")
+
+    async def _load_starves(state: str = "load", timeout: float | None = None) -> None:
+        page.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        if state == "load":
+            # What the driver does: burn the timeout it was handed, then refuse.
+            await asyncio.sleep((timeout or 0) / 1000)
+            raise _PlaywrightTimeout(f"Timeout {timeout}ms exceeded")
+
+    page.wait_for_load_state = _load_starves  # type: ignore[assignment]
+    started = time.monotonic()
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    waited = time.monotonic() - started
+    assert r.status == "ok", r.content
+    assert r.ok_class == "document_ready"
+    assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded", "load"]
+    assert waited >= 0.4  # the load wait was made and spent its budget, not skipped
+    assert "https://jobs.example.test/acme/123" in r.content and "(HTTP 200)" in r.content
+    assert "the document is ready" in r.content and "still loading its scripts and resources" in r.content
+    assert "act on what has rendered, or wait for the rest" in r.content
+    assert len([name for name, _args in page.calls if name == "goto"]) == 1  # never re-navigated
+    # A ready document does NOT carry the loop's batch-stop cue: the model may act on what parsed, and
+    # the result text is what tells it the rest is still arriving.
+    assert (r.data or {}).get("readiness_incomplete") is None
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_a_document_that_never_became_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A parser-blocking entry bundle starves domcontentloaded too: the response committed and nothing
+    # else happened inside the budget. Still a page STATE the model can act on — observe or wait — not
+    # an exception with no landed URL, status or readiness in it.
+    page, tools = _readiness_tools(monkeypatch, "loading")
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "ok", r.content
+    assert r.ok_class == "committed_not_loaded"
+    assert "https://jobs.example.test/acme/123" in r.content and "(HTTP 200)" in r.content
+    assert "the document was not ready" in r.content and "still loading its scripts and resources" in r.content
+    assert "act on what has rendered, or wait for the rest" in r.content
+    assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded"]
+    assert len([name for name, _args in page.calls if name == "goto"]) == 1  # never re-navigated
+    assert (r.data or {}).get("page_state_changed") is True
+    assert (r.data or {}).get("readiness_incomplete") is True
+    # This class carries two different facts, and only this boolean separates them in the index: here
+    # the readyState read SUCCEEDED and said "loading", so a rate over the class is not a probe failure.
+    assert (r.data or {}).get("readiness_read_failed") is False
+
+
+@pytest.mark.asyncio
+async def test_navigate_that_never_commits_is_an_error_naming_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A navigation that produced no document stays a failure — but as a tool result the model can read,
+    # carrying the URL it asked for. RED before: the handler re-raised, and the loop reported a bare
+    # "tool_error: TimeoutError" with no target in it.
+    page, tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _dead(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.calls.append(("goto", {"url": url, "timeout": timeout, "wait_until": wait_until}))
+        raise _PlaywrightError(f"Page.goto: net::ERR_CONNECTION_CLOSED at {url}")
+
+    page.goto = _dead  # type: ignore[assignment]
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "error", r.content
+    assert r.content.startswith("navigation to https://jobs.example.test/acme/123")
+    assert "ERR_CONNECTION_CLOSED" in r.content
+    assert r.error_class == "navigation_failed"
+    # The driver's own code, so the loop's record still names WHY a navigation failed without the
+    # traceback the raise used to carry.
+    assert (r.data or {}).get("nav_error_code") == "net::ERR_CONNECTION_CLOSED"
+    assert not _load_state_waits(page)  # nothing committed, so nothing to wait on
+
+    # The driver names the URL that failed IN FULL, query string included, and that text is what the
+    # model reads back in its transcript. A sign-in link is a bearer secret there exactly as it is in a
+    # log line, so every URL the driver named is reduced to scheme and host. The model's own argument
+    # is still echoed whole — it typed it, and the message has to say which navigation failed.
+    signed = "https://app.example.test/session?token=SUPERSECRET123"
+    secret_page, secret_tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _dead_signed(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        raise _PlaywrightError(f"Page.goto: net::ERR_CONNECTION_CLOSED at {url}")
+
+    secret_page.goto = _dead_signed  # type: ignore[assignment]
+    secret = await _tool(secret_tools, "navigate").handler({"url": signed})
+    assert secret.status == "error", secret.content
+    assert secret.content.count("SUPERSECRET123") == 1  # the argument echo, and nothing the driver said
+    assert "net::ERR_CONNECTION_CLOSED at https://app.example.test/<redacted>" in secret.content
+
+
+@pytest.mark.asyncio
+async def test_navigate_logs_the_landing_host_only_however_the_url_was_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `landed_url` is an INDEXED log field, on a record that is otherwise names, sizes and booleans. A
+    # workflow credential placeholder is substituted into the URL at this boundary, a redirect hands
+    # the landing whatever token it likes, and a URL the MODEL typed is one it copied off the page it
+    # was shown — a signed link is a bearer secret in all three cases. So the field is scheme and host,
+    # unconditionally. RED before: the session token below reached `taskv3 tool call finished` in plain
+    # text whenever the landing was byte-identical to the argument.
+    signed = "https://app.example.test/session?token=SUPERSECRET123"
+    # The model typed the signed URL itself and landed on it verbatim — the case the byte-identical
+    # exemption used to log whole, and the commonest one: the model copies the link off the page.
+    _typed_page, typed_tools = _readiness_tools(monkeypatch, "complete")
+    typed = await _tool(typed_tools, "navigate").handler({"url": signed})
+    assert typed.status == "ok", typed.content
+    assert (typed.data or {})["landed_url"] == "https://app.example.test/<redacted>"
+    # Asserted at the boundary the rule exists for: the indexed record is built from these two fields.
+    # SKY-16374's action-row outcome carries the landing raw by a different rule — it reaches no log
+    # line, and the persistence boundary redacts it against the run's own secret values.
+    assert _navigate_record_fields("navigate", {"url": signed}, typed) == {
+        "requested_url": "https://app.example.test/<redacted>",
+        "landed_url": "https://app.example.test/<redacted>",
+        "same_page": False,
+    }
+    # And a workflow credential placeholder, substituted into the URL at this boundary, whose landing
+    # the model never typed at all.
+    _page, tools = _readiness_tools(
+        monkeypatch,
+        "complete",
+        resolve_typed_text=lambda t: signed if t == "placeholder_link" else t,
+    )
+    r = await _tool(tools, "navigate").handler({"url": "placeholder_link"})
+    assert r.status == "ok", r.content
+    assert (r.data or {})["landed_url"] == "https://app.example.test/<redacted>"
+    assert "SUPERSECRET123" not in json.dumps(_navigate_record_fields("navigate", {"url": "placeholder_link"}, r))
+
+
+@pytest.mark.asyncio
+async def test_navigate_readiness_probe_cannot_hang_on_a_wedged_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The readyState read is the one await the loop's deadline cannot interrupt, and a renderer wedged on
+    # a synchronous script never answers it. RED before: the evaluate was unbounded, so this navigate
+    # stayed pending past any ceiling it advertised.
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 10)
+    page, tools = _readiness_tools(monkeypatch, "loading")
+
+    async def _wedged(_js: str) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    page.evaluate = _wedged  # type: ignore[assignment]
+    r = await asyncio.wait_for(
+        _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"}), timeout=15
+    )
+    assert r.status == "ok", r.content
+    assert "could not be read" in r.content
+    assert r.ok_class == "committed_not_loaded"
+    # Same ok_class as a document that genuinely never became ready, so the index needs this to tell
+    # a wedged renderer from a starved bundle — a rate over the class alone silently mixes them.
+    assert (r.data or {}).get("readiness_read_failed") is True
+    assert _navigate_record_fields("navigate", {"url": "https://jobs.example.test/acme/123"}, r) == {
+        "requested_url": "https://jobs.example.test/<redacted>",
+        "landed_url": "https://jobs.example.test/<redacted>",
+        "same_page": False,
+        "readiness_read_failed": True,
+    }
+
+    # A read that RAISES is the same fact as one that never answers, and lands on the same boolean.
+    raising_page, raising_tools = _readiness_tools(monkeypatch, "loading")
+
+    async def _raises(_js: str) -> str:
+        raise _PlaywrightError("Execution context was destroyed")
+
+    raising_page.evaluate = _raises  # type: ignore[assignment]
+    raised = await _tool(raising_tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert raised.ok_class == "committed_not_loaded"
+    assert (raised.data or {}).get("readiness_read_failed") is True
+
+
+@pytest.mark.asyncio
+async def test_navigate_onto_a_page_that_closed_while_loading_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The readiness wait leaves every driver refusal to the readyState read, so a page that DIED inside
+    # it would otherwise be reported as a committed page the model can still observe — and a finish
+    # batched behind this navigate would run its settle gate against it.
+    page, tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _closing_wait(state: str = "load", timeout: float | None = None) -> None:
+        page._closed = True
+        raise _PlaywrightError("Target page, context or browser has been closed")
+
+    page.wait_for_load_state = _closing_wait  # type: ignore[assignment]
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "error", r.content
+    assert "the page closed" in r.content and r.error_class == "navigation_failed"
+
+
+@pytest.mark.asyncio
+async def test_navigate_keeps_the_traceback_for_a_failure_no_driver_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only a driver's own refusal is a navigation verdict. A defect in this repo's own navigation path
+    # raises and keeps its traceback through the loop's `taskv3 tool handler raised` line, rather than
+    # being flattened into a navigation_failed carrying no cause at all.
+    page, tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _bug(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        raise AttributeError("'NoneType' object has no attribute 'send'")
+
+    page.goto = _bug  # type: ignore[assignment]
+    with pytest.raises(AttributeError):
+        await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
 
 
 @pytest.mark.asyncio
@@ -8272,6 +8549,18 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
     [
         # Focus lands, then the widget moves the caret to the next segment: keys fill the wrong field.
         ("year.addEventListener('focus', () => document.getElementById('month').focus());", "2023"),
+        # Focus lands AND holds, but the widget routes the characters to the segment its own cursor is
+        # on. document.activeElement never stops being the target, so nothing before the read-back can
+        # tell this apart from a fill -- and the keys are already in the sibling by then.
+        (
+            "year.addEventListener('beforeinput', (e) => {"
+            "  e.preventDefault();"
+            "  const m = document.getElementById('month');"
+            "  m.value += (e.data || '');"
+            "  m.dispatchEvent(new Event('input', {bubbles: true}));"
+            "});",
+            "2023",
+        ),
         # Focus lands and stays, but the widget swallows every key.
         (
             "year.addEventListener('keydown', (e) => e.preventDefault());"
@@ -8283,7 +8572,13 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
         # The widget trims what it was given, so the field no longer holds the requested text.
         ("year.addEventListener('input', () => { year.value = year.value.trim(); });", "2023 "),
     ],
-    ids=["keys-land-in-sibling-segment", "keys-dropped", "cleared-after-typing", "trimmed"],
+    ids=[
+        "keys-land-in-sibling-segment",
+        "keys-rerouted-while-focus-holds",
+        "keys-dropped",
+        "cleared-after-typing",
+        "trimmed",
+    ],
 )
 @pytest.mark.parametrize(
     "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
@@ -8375,6 +8670,307 @@ async def test_type_date_widget_clamping_a_segment_on_blur_is_not_reported_as_fi
 
 # The same unclickable shape on a field that only commits a picked suggestion: the raw query sits in
 # the input until blur, so reading it back proves nothing.
+# A refusal only proves the target does not hold EXACTLY what was typed -- not that the keystrokes
+# never reached it. Both shapes below refuse, and in both the sibling's value is the page's own work,
+# so taking it back would destroy state no one else can recover.
+_SEGMENTED_DATE_AUTO_ADVANCE_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:240px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month" maxlength="2"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <div style="position:relative;width:60px;height:30px">
+    <input id="year" type="text" role="spinbutton" aria-label="Year" maxlength="4"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">YYYY</div>
+  </div>
+</div>
+<script>
+  const month = document.getElementById("month");
+  const year = document.getElementById("year");
+  month.addEventListener("beforeinput", (e) => {
+    if (month.value.length >= 2) { e.preventDefault(); year.value += (e.data || ""); }
+  });
+</script>
+"""
+
+
+# The widget takes the text, then cascade-fills a sibling from it and replaces the query with its own
+# label -- so the target moved, and the dial code beside it is the page's answer to a value it DID get.
+_CASCADE_SIBLING_HTML = """
+<div role="group" aria-label="Phone">
+  <div style="position:relative;width:300px;height:30px;overflow:hidden">
+    <div aria-hidden="true" style="position:absolute;inset:0;background:#fff">Country</div>
+    <input id="country" type="text" tabindex="-1" aria-label="Country"
+           style="position:absolute;left:-500px;top:0;width:200px;height:30px">
+  </div>
+  <input id="dial" type="text" aria-label="Dial code" style="width:80px">
+</div>
+<script>
+  const country = document.getElementById("country");
+  country.addEventListener("input", () => {
+    if (!country.value) return;
+    document.getElementById("dial").value = "+1";
+    // Canonicalises the query into its own label, so the field no longer holds what was typed.
+    if (country.value !== "Springfield (US)") { country.value = "Springfield (US)"; }
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("template", "selector", "text", "sibling", "expected"),
+    [
+        (_SEGMENTED_DATE_AUTO_ADVANCE_HTML, "#month", "012026", "#year", "2026"),
+        (_CASCADE_SIBLING_HTML, "#country", "Springfield", "#dial", "+1"),
+    ],
+    ids=["segment-auto-advance", "page-cascade"],
+)
+async def test_a_refusal_never_takes_back_a_sibling_the_page_itself_wrote(
+    template: str, selector: str, text: str, sibling: str, expected: str
+) -> None:
+    # The keystroke-collateral restore may only fire when the target proves it never took the keys.
+    # Widen it to "the target does not hold exactly what I typed" and it erases a correctly filled
+    # date segment, or a cascade-filled dial code -- neither of which the run can recover.
+    async with _content_page(template) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": selector, "text": text})
+        assert await page.eval_on_selector(sibling, "el => el.value") == expected
+
+
+# Two siblings the reroute moves at once, each holding a DIFFERENT prior value. Restoring "something"
+# is not enough -- each field has to get its OWN value back, which a mispaired tag would not do.
+_SEGMENTED_DATE_TWO_VICTIMS_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <input id="day" type="text" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" aria-label="Year" value="1999" style="width:60px">
+</div>
+<script>
+  const month = document.getElementById("month");
+  let n = 0;
+  month.addEventListener("beforeinput", (e) => {
+    e.preventDefault();
+    const target = (n++ < 2) ? "day" : "year";
+    document.getElementById(target).value += (e.data || "");
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_collateral_restore_hands_each_sibling_back_its_own_value() -> None:
+    # Both siblings are moved by the same refused type. Handing back the right VALUES to the wrong
+    # FIELDS repairs neither, and leaves a form that reads as filled with two values nobody entered.
+    async with _content_page(_SEGMENTED_DATE_TWO_VICTIMS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#month", "text": "2026"})
+        assert await page.eval_on_selector("#day", "el => el.value") == "07"
+        assert await page.eval_on_selector("#year", "el => el.value") == "1999"
+
+
+# The group is declared on a custom element HOST and the segments live in its open shadow root, so
+# `closest` from the field finds no scope without climbing the host chain.
+_SHADOW_GROUP_MISROUTE_HTML = """
+<x-dob id="dob" role="group" aria-label="Date of birth"></x-dob>
+<script>
+  class XDob extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: "open" });
+      root.innerHTML =
+        '<div style="position:relative;width:60px;height:30px">' +
+        '<input id="year" type="text" role="spinbutton" aria-label="Year"' +
+        ' style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">' +
+        '<div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">YYYY</div></div>' +
+        '<div style="position:relative;width:40px;height:30px">' +
+        '<input id="month" type="text" role="spinbutton" aria-label="Month"' +
+        ' style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">' +
+        '<div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div></div>';
+      const year = root.getElementById("year");
+      const month = root.getElementById("month");
+      year.addEventListener("beforeinput", (e) => {
+        e.preventDefault();
+        month.value += (e.data || "");
+      });
+    }
+  }
+  customElements.define("x-dob", XDob);
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_group_declared_on_a_shadow_host_still_bounds_the_repair() -> None:
+    # `closest` stops at the shadow boundary, so without climbing to the host no scope is found,
+    # nothing is captured, and the routed characters stay in the sibling -- the repair silently not
+    # happening for a whole class of custom element.
+    async with _content_page(_SHADOW_GROUP_MISROUTE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        held = await page.evaluate("() => document.getElementById('dob').shadowRoot.getElementById('month').value")
+        assert held == ""
+
+
+# The page's own write, resolving ASYNCHRONOUSLY. The capture sits after the focus click so that a
+# focus-driven write is already in the snapshot -- but one that resolves on a timer lands after it, in
+# the window the suggestion poll holds open, and target equality cannot tell it from our keystrokes.
+_ASYNC_PAGE_WRITE_HTML = (
+    _SEGMENTED_DATE_HTML
+    + """
+<script>
+  const _y = document.getElementById("year");
+  _y.addEventListener("keydown", (e) => e.preventDefault());
+  _y.addEventListener(
+    "focus",
+    () => { setTimeout(() => { document.getElementById("month").value = "PAGE"; }, 250); },
+    { once: true }
+  );
+</script>
+"""
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_async_page_write_after_the_keys_is_not_collateral() -> None:
+    # The target takes nothing, so `ours` is true and the restore runs -- and the sibling holds a value
+    # the PAGE wrote a quarter-second after the keys stopped. Attribution from the target alone cannot
+    # see the difference; only the timing can, so the moved set is taken the moment the keys stop.
+    async with _content_page(_ASYNC_PAGE_WRITE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
+        assert await page.eval_on_selector("#month", "el => el.value") == "PAGE"
+
+
+# A field the page owns, OUTSIDE the declared group, rewritten while the keys are being sent. The
+# capture must not see it at all: `getRootNode` on a light-DOM target is the document, so a root test
+# that does not require a shadow host puts the whole page in scope.
+_OUT_OF_GROUP_PAGE_WRITE_HTML = """
+<form id="grp">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="year" type="text" role="spinbutton" aria-label="Year"
+           style="position:absolute;left:-500px;top:0;width:60px;height:30px">
+  </div>
+</form>
+<input id="outside" type="text" aria-label="Outside" value="KEEP" style="width:80px">
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("keydown", (e) => {
+    e.preventDefault();
+    document.getElementById("outside").value = "PAGE";
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_field_outside_the_declared_group_is_never_collateral() -> None:
+    # The target drops every key, so the refusal and the restore both run -- and a field the page owns
+    # outside the group must not be reachable by that restore at all.
+    async with _content_page(_OUT_OF_GROUP_PAGE_WRITE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
+        assert await page.eval_on_selector("#outside", "el => el.value") == "PAGE"
+
+
+# The declared group is a LIGHT-dom ancestor and the segments live in a custom element beneath it, so
+# the scope is the form -- which has no shadow root of its own. Without the target's own root in the
+# set, none of its actual siblings are reachable and the repair silently does nothing.
+_LIGHT_GROUP_SHADOW_TARGET_HTML = """
+<form id="grp"><x-seg id="seg"></x-seg></form>
+<script>
+  class XSeg extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: "open" });
+      root.innerHTML =
+        '<input id="year" type="text" role="spinbutton" aria-label="Year"' +
+        ' style="position:absolute;left:-500px;top:0;width:60px;height:30px">' +
+        '<input id="month" type="text" role="spinbutton" aria-label="Month" style="width:40px">';
+      const year = root.getElementById("year");
+      const month = root.getElementById("month");
+      year.addEventListener("beforeinput", (e) => {
+        e.preventDefault();
+        month.value += (e.data || "");
+      });
+    }
+  }
+  customElements.define("x-seg", XSeg);
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_shadow_target_under_a_light_dom_group_still_reaches_its_siblings() -> None:
+    # The group resolves to the light-dom form, whose own subtree contains no inputs at all -- the
+    # siblings that took our keys are in the target's shadow root, and must be reachable from there.
+    async with _content_page(_LIGHT_GROUP_SHADOW_TARGET_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        held = await page.evaluate("() => document.getElementById('seg').shadowRoot.getElementById('month').value")
+        assert held == ""
+
+
+# The declared group lives INSIDE the component, so it already bounds the scan -- widening to the whole
+# shadow root would put the component's other fields back in range, which is the document over-reach
+# one boundary in.
+_GROUP_INSIDE_SHADOW_ROOT_HTML = """
+<x-panel id="panel"></x-panel>
+<script>
+  class XPanel extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: "open" });
+      root.innerHTML =
+        '<fieldset id="grp">' +
+        '<input id="year" type="text" role="spinbutton" aria-label="Year"' +
+        ' style="position:absolute;left:-500px;top:0;width:60px;height:30px">' +
+        '<input id="month" type="text" role="spinbutton" aria-label="Month" style="width:40px">' +
+        '</fieldset>' +
+        '<input id="elsewhere" type="text" aria-label="Elsewhere" value="KEEP" style="width:80px">';
+      const year = root.getElementById("year");
+      const month = root.getElementById("month");
+      year.addEventListener("beforeinput", (e) => {
+        e.preventDefault();
+        month.value += (e.data || "");
+        root.getElementById("elsewhere").value = "PAGE";
+      });
+    }
+  }
+  customElements.define("x-panel", XPanel);
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_group_inside_a_shadow_root_still_bounds_the_scan() -> None:
+    # The sibling INSIDE the declared fieldset is ours and comes back; the component's own field
+    # OUTSIDE it is the page's and must be out of range entirely.
+    async with _content_page(_GROUP_INSIDE_SHADOW_ROOT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with contextlib.suppress(Exception):
+            await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        root = "() => document.getElementById('panel').shadowRoot"
+        assert await page.evaluate(f"{root}.getElementById('month').value") == ""
+        assert await page.evaluate(f"{root}.getElementById('elsewhere').value") == "PAGE"
+
+
 _UNCLICKABLE_TYPEAHEAD_HTML = """
 <div style="position:relative;width:300px;height:30px;overflow:hidden">
   <div aria-hidden="true" style="position:absolute;inset:0;background:#fff">City</div>
@@ -16595,7 +17191,8 @@ async def test_navigate_derives_a_ref_only_for_a_redirect_reached_through_a_payl
     r = await _tool(tools, "navigate").handler({"url": token})
     assert r.content == "navigated to chrome-error://chromewebdata/" and len(refs.refs) == 1
     # A credential placeholder is substituted too, but it is not payload provenance: a redirect reached
-    # through one derives nothing, and its navigation failure is reported as raised.
+    # through one derives nothing, and its navigation failure leads with the placeholder. The driver's
+    # own message still follows, exactly as it did when this path raised.
     refs = _refs_for(_SIGNED_REF_URL)
     tools = build_browser_tools(
         _fixed_page_provider(_RedirectingPage()),
@@ -16606,15 +17203,16 @@ async def test_navigate_derives_a_ref_only_for_a_redirect_reached_through_a_payl
     )
     r = await _tool(tools, "navigate").handler({"url": "placeholder_sso"})
     assert landing not in refs.refs.values() and r.content == f"navigated to {landing}"
-    with pytest.raises(RuntimeError):
-        tools = build_browser_tools(
-            _fixed_page_provider(_FailingPage()),
-            resolve_typed_text=refs.chain(
-                lambda t: "https://portal.example.test/login?sso=1" if t == "placeholder_sso" else t
-            ),
-            opaque_refs=refs,
-        )
-        await _tool(tools, "navigate").handler({"url": "placeholder_sso"})
+    tools = build_browser_tools(
+        _fixed_page_provider(_FailingPage()),
+        resolve_typed_text=refs.chain(
+            lambda t: "https://portal.example.test/login?sso=1" if t == "placeholder_sso" else t
+        ),
+        opaque_refs=refs,
+    )
+    r = await _tool(tools, "navigate").handler({"url": "placeholder_sso"})
+    assert r.status == "error" and "ERR_NAME_NOT_RESOLVED" in r.content
+    assert r.content.startswith("navigation to placeholder_sso")
     # A model-chosen live URL that happens to redirect to a signed page has no payload provenance.
     refs = _refs_for(_SIGNED_REF_URL)
     tools = build_browser_tools(
@@ -17083,6 +17681,31 @@ async def test_the_not_both_guard_still_rejects_a_model_selector_but_not_a_re_di
         args: dict[str, Any] = {"mark": 1}
         assert (await _tool(tools, "click").handler(args)).status == "ok"
         assert (await _tool(tools, "click").handler(args)).status == "ok"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_zero_mark_beside_a_ref_acts_on_the_ref() -> None:
+    # A non-strict provider fills every optional slot, so a ref act arrives as {"selector": "ref=2",
+    # "mark": 0}. look() numbers from 1, so a refusal here refuses every act the model makes.
+    html = (
+        '<input id="user" oninput="document.getElementById(\'go\').disabled = !this.value.trim()">'
+        '<button id="go" disabled onclick="document.body.dataset.sent = 1">Continue</button>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        user_ref = re.search(r"^(ref=\d+) input", observed.content, re.MULTILINE).group(1)
+        go_ref = re.search(r"^(ref=\d+) button", observed.content, re.MULTILINE).group(1)
+
+        typed = await _tool(tools, "type").handler(
+            {"selector": user_ref, "mark": 0, "text": "demo_user", "clear": True, "press_enter": False}
+        )
+        clicked = await _tool(tools, "click").handler({"selector": go_ref, "mark": 0})
+
+        assert typed.status == "ok", typed.content
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => document.body.dataset.sent") == "1"
 
 
 @_skip_no_browser
@@ -19724,6 +20347,1277 @@ async def test_select_combobox_refuses_ambiguous_leading_clause_city_instead_of_
         assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None, (
             "must not silently commit an ambiguous leading-clause match"
         )
+
+
+# A server-search postal lookup that searches only the FIRST word of the query and returns at most 20
+# rows. The whole label answers with other rows for the same city, so the exact row is only reachable by
+# searching for the part that singles it out -- which only the caller can pick, whatever the separator.
+_POSTAL_FIRST_WORD_SEARCH_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="zip-list"
+         style="position:absolute;top:20px;left:20px;width:360px;height:24px">
+  <div id="zip-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:360px;background:#fff;display:none"></div>
+  <script>
+    var FMT = function (place, code) { return %s; };
+    var ROWS = [];
+    for (var i = 1; i <= 40; i++) {
+      ROWS.push(FMT('Phoenix, Maricopa, Arizona, United States', String(85000 + i)));
+    }
+    ROWS.push(FMT('Rapolla, Potenza, Basilicata, Italy', '85027'));
+    ROWS.push(FMT('Novoviktorivka, Dobropilskyi, Donetska, Ukraine', '85027'));
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    var timer = null;
+    function hide() { list.innerHTML = ''; list.style.display = 'none'; }
+    function render(rows) {
+      list.innerHTML = '';
+      if (!rows.length) { hide(); return; }
+      rows.forEach(function (text) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.height = '20px';
+        row.textContent = text;
+        row.addEventListener('click', function () {
+          input.value = text;
+          input.setAttribute('data-committed', text);
+          hide();
+        });
+        list.appendChild(row);
+      });
+      list.style.display = 'block';
+    }
+    input.addEventListener('input', function () {
+      clearTimeout(timer);
+      var word = (input.value.split(/[\\s,]+/).filter(Boolean)[0] || '').toLowerCase();
+      timer = setTimeout(function () {
+        if (!word) { hide(); return; }
+        render(ROWS.filter(function (r) { return r.toLowerCase().indexOf(word) >= 0; }).slice(0, 20));
+      }, 150);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fmt", "value"),
+    [
+        ("place + ' - ' + code", "Phoenix, Maricopa, Arizona, United States - 85027"),
+        ("place + ' (' + code + ')'", "Phoenix, Maricopa, Arizona, United States (85027)"),
+        ("place + '\u2013' + code", "Phoenix, Maricopa, Arizona, United States\u201385027"),
+        ("place + '/' + code", "Phoenix, Maricopa, Arizona, United States/85027"),
+        ("place + ' [' + code + ']'", "Phoenix, Maricopa, Arizona, United States [85027]"),
+    ],
+    ids=["spaced-dash", "parenthesized", "unspaced-en-dash", "slash", "bracketed"],
+)
+async def test_select_combobox_reaches_a_full_label_through_a_caller_chosen_search(fmt: str, value: str) -> None:
+    # The full label renders only other rows. The refusal must offer a way out other than repeating the
+    # same call, and taking it must commit exactly the requested row, whatever separates the code.
+    async with _live_page(_POSTAL_FIRST_WORD_SEARCH_HTML % fmt) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        refused = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value})
+        assert refused.status == "error", refused.content
+        assert "search" in refused.content, refused.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") is None
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+# A declared lookup that answers an exact code by writing the full label into the field itself, with no rows.
+_CODE_AUTOFILL_HTML = """
+<!doctype html><html><body>
+<input id="zip" type="text" role="combobox" aria-autocomplete="list" aria-controls="zip-list" aria-expanded="false"
+       style="position:absolute;top:20px;left:20px;width:360px;height:24px">
+<div id="zip-list" role="listbox" style="display:none"></div>
+<script>
+  var input = document.getElementById('zip');
+  input.addEventListener('input', function () {
+    if (input.value === '85027') setTimeout(function () { input.value = 'Phoenix, Maricopa, Arizona - 85027'; }, 50);
+  });
+</script></body></html>
+"""
+
+
+# Rows that declare nothing, in the shapes a row's label takes in the DOM. `%(parts)s` builds one row's
+# markup from r = [place, code]; `%(rows)s` is the row data, so identical sibling rows can be expressed.
+_POSTAL_STRUCTURED_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:360px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:360px;background:#fff;display:none"></div>
+  <script>
+    var ROWS = %(rows)s;
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      setTimeout(function () {
+        list.innerHTML = '';
+        ROWS.filter(function (r) { return input.value && r[1].indexOf(input.value) >= 0; }).forEach(function (r) {
+          var row = document.createElement('div');
+          row.style.cursor = 'pointer';
+          row.innerHTML = %(parts)s;
+          row.addEventListener('click', function () {
+            input.value = row.innerText.replace(/\\s+/g, ' ');
+            input.setAttribute('data-clicks', String(Number(input.getAttribute('data-clicks') || 0) + 1));
+            input.setAttribute('data-committed', input.value);
+          });
+          list.appendChild(row);
+        });
+        list.style.display = list.children.length ? 'block' : 'none';
+      }, 150);
+    });
+  </script>
+</body></html>
+"""
+
+
+_TWO_CODES = "[['Phoenix, Maricopa, Arizona', '85026'], ['Phoenix, Maricopa, Arizona', '85027']]"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parts", "value"),
+    [
+        ("r[0] + ' - ' + r[1]", "Phoenix, Maricopa, Arizona - 85027"),
+        ("'<span>' + r[0] + '</span> - <span>' + r[1] + '</span>'", "Phoenix, Maricopa, Arizona - 85027"),
+        ("'<div>' + r[0] + '</div><div>' + r[1] + '</div>'", "Phoenix, Maricopa, Arizona 85027"),
+        ("'<span>' + r[0] + ' - ' + r[1] + '</span>'", "Phoenix, Maricopa, Arizona - 85027"),
+        ("'<div><span>' + r[0] + ' - ' + r[1] + '</span></div>'", "Phoenix, Maricopa, Arizona - 85027"),
+        ("'<span>' + r[0] + ' - ' + r[1] + '</span><span>\\u200b</span>'", "Phoenix, Maricopa, Arizona - 85027"),
+        ("'<span>' + r[0] + '</span> - <span>' + r[1] + '\\u200b</span>'", "Phoenix, Maricopa, Arizona - 85027"),
+        (
+            "'<span>' + r[0].replace('Phoenix', 'Stra\\u00dfe') + '</span> - <span>' + r[1] + '</span>'",
+            "STRASSE, Maricopa, Arizona - 85027",
+        ),
+    ],
+    ids=[
+        "leaf-text",
+        "inline-parts",
+        "stacked-parts",
+        "single-wrapping-child",
+        "nested-wrappers",
+        "wrapping-child-with-invisible-sibling",
+        "zero-width-in-code",
+        "full-casefold",
+    ],
+)
+async def test_select_combobox_search_commits_an_undeclared_row_built_from_parts(parts: str, value: str) -> None:
+    async with _live_page(_POSTAL_STRUCTURED_ROWS_HTML % {"parts": parts, "rows": _TWO_CODES}) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "8502"})
+        assert r.status == "ok", r.content
+        committed = await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')")
+        assert _exact_tier_key(committed) == _exact_tier_key(value)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_never_guesses_between_identical_undeclared_rows() -> None:
+    # Two sibling rows with the same text and nothing else to tell them apart: which one is meant is not
+    # knowable, so neither may be clicked.
+    rows = "[['Phoenix, Maricopa, Arizona', '85027'], ['Phoenix, Maricopa, Arizona', '85027']]"
+    html = _POSTAL_STRUCTURED_ROWS_HTML % {"parts": "'<span>' + r[0] + ' - ' + r[1] + '</span>'", "rows": rows}
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#zip", "value": "Phoenix, Maricopa, Arizona - 85027", "search": "8502"}
+        )
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-clicks')") is None
+
+
+# A field that declares its list, over undeclared nodes that each commit their own text: a node holding
+# several of them reads as one row whose parts add up to the value, but a click on it commits one part.
+_POSTAL_PART_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div><input type="hidden" id="zip-value">
+  <input id="zip" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="zip-list"
+         style="position:absolute;top:20px;left:20px;width:360px;height:24px"></div>
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:360px;background:#fff;display:none"></div>
+  <script>
+    var PARTS = %s, INTO_HIDDEN = %s, GROUP_VALUE = %s;
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      setTimeout(function () {
+        list.innerHTML = '';
+        if (!input.value) { list.style.display = 'none'; return; }
+        var group = document.createElement('div');
+        if (GROUP_VALUE) group.setAttribute('data-value', GROUP_VALUE);
+        PARTS.forEach(function (text) {
+          var part = document.createElement('div');
+          part.style.height = '20px';
+          part.style.cursor = 'pointer';
+          part.textContent = text;
+          part.addEventListener('click', function () {
+            input.value = INTO_HIDDEN ? '' : text;
+            document.getElementById('zip-value').value = INTO_HIDDEN ? text : '';
+            input.setAttribute('data-committed', text);
+            list.innerHTML = '';
+            list.style.display = 'none';
+          });
+          group.appendChild(part);
+        });
+        list.appendChild(group);
+        list.style.display = 'block';
+      }, 150);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parts", "value", "search", "into_hidden", "group_value"),
+    [
+        ("['Phoenix', '85027']", "Phoenix 85027", "8502", "false", "null"),
+        ("['Phoenix', 'AZ']", "Phoenix AZ", "Phoe", "false", "null"),
+        ("['Phoenix', '85027']", "Phoenix 85027", "8502", "true", "null"),
+        ("['Phoenix', '85027']", "Phoenix 85027", "85", "false", "'85027'"),
+    ],
+    ids=["overlapping-part", "short-part", "part-into-hidden-input", "group-declares-the-part"],
+)
+async def test_select_combobox_search_never_reports_one_part_of_the_value_as_committed(
+    parts: str, value: str, search: str, into_hidden: str, group_value: str
+) -> None:
+    async with _live_page(_POSTAL_PART_ROWS_HTML % (parts, into_hidden, group_value)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": search})
+        committed = await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')")
+        assert committed is not None, "the fixture must reach the click for this to test the read-back"
+        assert r.status != "ok", (committed, r.content)
+
+
+# A declared lookup that answers only a two-letter query, where "California" commits its declared code "CA"
+# while another row is labelled "CA".
+_STATE_CODE_COLLISION_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="st" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="st-list"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="st-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:300px;background:#fff;display:none"></div>
+  <script>
+    var ROWS = [['California', 'CA'], ['CA', 'CA-OTHER']];
+    var input = document.getElementById('st');
+    var list = document.getElementById('st-list');
+    var timer = null;
+    input.addEventListener('input', function () {
+      clearTimeout(timer);
+      var q = input.value.trim().toLowerCase();
+      timer = setTimeout(function () {
+        list.innerHTML = '';
+        var hits = ROWS.filter(function (r) { return q.length && q.length <= 2 && r[0].toLowerCase().indexOf(q) === 0; });
+        hits.forEach(function (r) {
+          var row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.setAttribute('data-value', r[1]);
+          row.style.height = '20px';
+          row.textContent = r[0];
+          row.addEventListener('click', function () {
+            input.value = r[1];
+            input.setAttribute('data-committed', r[0]);
+            list.innerHTML = '';
+            list.style.display = 'none';
+          });
+          list.appendChild(row);
+        });
+        list.style.display = hits.length ? 'block' : 'none';
+      }, 150);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "Ca"], ids=["ladder", "search"])
+async def test_select_combobox_accepts_the_chosen_rows_code_that_another_row_is_labelled(search: str | None) -> None:
+    # The field holds "CA" because the California row committed it; another row wearing that label does not
+    # make the commit someone else's.
+    args = {"selector": "#st", "value": "California"} | ({"search": search} if search else {})
+    async with _live_page(_STATE_CODE_COLLISION_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert await page.eval_on_selector("#st", "el => el.getAttribute('data-committed')") == "California"
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#st", "el => el.value") == "CA"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_never_erases_what_the_widget_wrote() -> None:
+    # Only the search was typed, so a label the page wrote in answer is the page's to keep, whatever the
+    # tool then reports; neither the value's own pieces nor an empty query may be typed over it.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    async with _live_page(_CODE_AUTOFILL_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert await page.eval_on_selector("#zip", "el => el.value") == value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_the_search_it_typed_when_the_list_is_out_of_reach() -> None:
+    # Inside a component the tool cannot see the list, so its result is only a report of what it typed:
+    # that has to be the search, which is what the field now holds.
+    html = """
+    <div id="host"></div>
+    <script>
+      const root = document.getElementById('host').attachShadow({mode: 'open'});
+      root.innerHTML = '<input id="zip" type="text" style="width:300px;height:24px">';
+    </script>
+    """
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert "could not be seen" in r.content, r.content
+        assert "'85027'" in r.content and repr(value) not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_on_a_first_word_lookup_points_to_the_tool_that_takes_a_search() -> None:
+    # select_option's non-native branch lands on the same refusal but has no `search`; the way out it
+    # names has to be one this caller can take, or following it loops.
+    value = "Phoenix, Maricopa, Arizona, United States - 85027"
+    async with _live_page(_POSTAL_FIRST_WORD_SEARCH_HTML % "place + ' - ' + code") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        refused = await _tool(tools, "select_option").handler({"selector": "#zip", "value": value})
+        assert refused.status == "error", refused.content
+        assert "select_combobox" in refused.content, refused.content
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "ok", r.content
+
+
+# An async lookup that answers a city name or a code, never a full label, and shows a "Searching..." row,
+# marked as nothing but an option, before its results render.
+_POSTAL_LOADING_ROW_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="zip-list"
+         style="position:absolute;top:20px;left:20px;width:360px;height:24px">
+  <div id="zip-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:360px;background:#fff;display:none"></div>
+  <script>
+    var ROWS = [
+      ['Rapolla', 'Rapolla, Potenza, Basilicata, Italy - 85027'],
+      ['Novoviktorivka', 'Novoviktorivka, Dobropilskyi, Donetska, Ukraine - 85027'],
+      ['Rapone', 'Rapone, Potenza, Basilicata, Italy - 85020'],
+    ];
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    var timer = null;
+    input.addEventListener('input', function () {
+      clearTimeout(timer);
+      var q = input.value.trim().toLowerCase();
+      list.innerHTML = '<div role="option" style="height:20px">Searching…</div>';
+      list.style.display = 'block';
+      timer = setTimeout(function () {
+        list.innerHTML = '';
+        ROWS.filter(function (r) {
+          return q && (r[0].toLowerCase().indexOf(q) === 0 || r[1].slice(-5) === q);
+        }).forEach(function (r) {
+          var row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.style.height = '20px';
+          row.textContent = r[1];
+          row.addEventListener('click', function () {
+            input.value = r[1];
+            input.setAttribute('data-committed', r[1]);
+            list.innerHTML = '';
+            list.style.display = 'none';
+          });
+          list.appendChild(row);
+        });
+      }, 800);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "Rapolla", "85027"], ids=["ladder", "search-city", "search-code"])
+async def test_select_combobox_waits_past_a_loading_row_for_the_rows(search: str | None) -> None:
+    # The loading row is on screen before any result; taking it as the reaction ends the poll before the
+    # exact row renders, and the call refuses a row the widget does list.
+    value = "Rapolla, Potenza, Basilicata, Italy - 85027"
+    args = {"selector": "#zip", "value": value} | ({"search": search} if search else {})
+    async with _live_page(_POSTAL_LOADING_ROW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "search"])
+async def test_select_combobox_hands_the_field_back_after_an_ignored_click(search: str | None) -> None:
+    # The row click does nothing and the list stays open: the refusal must not leave our search in the field.
+    click_body = (
+        "input.value = r[1];\n"
+        "            input.setAttribute('data-committed', r[1]);\n"
+        "            list.innerHTML = '';\n"
+        "            list.style.display = 'none';\n"
+    )
+    assert click_body in _POSTAL_LOADING_ROW_HTML
+    html = _POSTAL_LOADING_ROW_HTML.replace(click_body, "")
+    value = "Rapolla, Potenza, Basilicata, Italy - 85027"
+    args = {"selector": "#zip", "value": value} | ({"search": search} if search else {})
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#zip", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_commits_a_search_hit_that_is_not_the_value() -> None:
+    # Rows that declare nothing: the finder's single best hit for the search is another place sharing the
+    # code, and a search only brings rows up -- it never names the row to commit.
+    html = (
+        (_POSTAL_FIRST_WORD_SEARCH_HTML % "place + ' - ' + code")
+        .replace("row.setAttribute('role', 'option');", "")
+        .replace(' role="listbox"', "")
+    )
+    value = "Phoenix, Maricopa, Arizona, United States - 85027"
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "Rapolla"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") is None
+        assert await page.eval_on_selector("#zip", "el => el.value") == "", "the search probe must not be left behind"
+
+
+# --- SKY-16655: gates written for the full-value path must admit the SEARCHED path ---------------
+
+# A server-search lookup whose rows carry a fully-qualified, >80-char label -- the exact shape
+# `search` exists to reach, since the long label is what the caller must commit.
+_LONG_LABEL_SEARCH_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="zip-list"
+         style="position:absolute;top:20px;left:20px;width:900px;height:24px">
+  <div id="zip-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:900px;background:#fff;display:none"></div>
+  <script>
+    var ROWS = [
+      'Phoenix, Maricopa County, Arizona, United States of America (North America) - 85027',
+      'Phoenix, Maricopa County, Arizona, United States of America (North America) - 85028',
+      'Phoenixville, Chester County, Pennsylvania, United States of America (North America) - 19460'
+    ];
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function hide() { list.innerHTML = ''; list.style.display = 'none'; }
+    input.addEventListener('input', function () {
+      var q = input.value.trim().toLowerCase();
+      if (!q) { hide(); return; }
+      var hits = ROWS.filter(function (r) { return r.toLowerCase().indexOf(q) >= 0; });
+      list.innerHTML = '';
+      if (!hits.length) { hide(); return; }
+      hits.forEach(function (text) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.height = '20px';
+        row.style.whiteSpace = 'nowrap';
+        row.textContent = text;
+        row.addEventListener('click', function () {
+          input.value = text;
+          input.setAttribute('data-committed', text);
+          hide();
+        });
+        list.appendChild(row);
+      });
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+_LONG_LABEL_VALUE = "Phoenix, Maricopa County, Arizona, United States of America (North America) - 85027"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_reaches_a_label_longer_than_the_row_text_cap() -> None:
+    # The row-text cap is sized for a pool scored by word overlap with the TYPED text. A searched pool
+    # is not scored that way and its labels are long by construction, so the cap has to be measured
+    # from the value the caller will commit -- otherwise `search` cannot reach its own use case.
+    assert len(_LONG_LABEL_VALUE) > 80
+    async with _live_page(_LONG_LABEL_SEARCH_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#zip", "value": _LONG_LABEL_VALUE, "search": "85027"}
+        )
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == _LONG_LABEL_VALUE
+
+
+# A server search that holds a bare, unclassed `<li role="option">Searching...</li>` in its list while
+# it waits, then renders the real rows past the soft deadline (0.4 * rounds = 3.2s here) but inside the
+# 8s cap. Nothing about that row is visible to a markup probe: no aria-busy, no progressbar, no class.
+_SLOW_UNCLASSED_PLACEHOLDER_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="zip-list"
+         style="position:absolute;top:20px;left:20px;width:600px;height:24px">
+  <ul id="zip-list" role="listbox" style="position:absolute;top:50px;left:20px;width:600px;background:#fff;
+      display:none;margin:0;padding:0;list-style:none"></ul>
+  <script>
+    var ROWS = ['Phoenix, Maricopa, Arizona - 85027', 'Rapolla, Potenza, Basilicata - 85027'];
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    var timer = null;
+    input.addEventListener('input', function () {
+      clearTimeout(timer);
+      if (!input.value.trim()) { list.innerHTML = ''; list.style.display = 'none'; return; }
+      list.innerHTML = '<li role="option" style="height:20px">Searching\\u2026</li>';
+      list.style.display = 'block';
+      timer = setTimeout(function () {
+        list.innerHTML = '';
+        ROWS.forEach(function (text) {
+          var row = document.createElement('li');
+          row.setAttribute('role', 'option');
+          row.style.height = '20px';
+          row.textContent = text;
+          row.addEventListener('click', function () {
+            input.value = text;
+            input.setAttribute('data-committed', text);
+            list.innerHTML = ''; list.style.display = 'none';
+          });
+          list.appendChild(row);
+        });
+      }, 4200);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_waits_out_an_unclassed_loading_row() -> None:
+    # A reaction the caller's own acceptance test REFUSED says the widget is still working -- a
+    # stronger signal than any markup probe, which this placeholder gives nothing to recognise.
+    # Ending the wait on it refuses a row that was seconds away with the cap still unspent.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    async with _live_page(_SLOW_UNCLASSED_PLACEHOLDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+# A dropdown that renders its exact hit as a bare block above a role=option result list -- so one
+# declared sibling is enough to route the whole reaction through the declared branch.
+_MIXED_DECLARED_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:600px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:600px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function mk(text, roled) {
+      var row = document.createElement('div');
+      if (roled) row.setAttribute('role', 'option');
+      row.style.height = '20px';
+      row.textContent = text;
+      row.addEventListener('click', function () {
+        input.value = text;
+        input.setAttribute('data-committed', text);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      return row;
+    }
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      list.appendChild(mk('Phoenix, Maricopa, Arizona - 85027', false));
+      list.appendChild(mk('Rapolla, Potenza, Basilicata - 85027', true));
+      list.appendChild(mk('Novoviktorivka, Dobropilskyi, Donetska - 85027', true));
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_keeps_a_roleless_match_beside_declared_rows(search: str | None) -> None:
+    # Whether a row is the unit is a per-candidate fact. Asking whether ANY candidate declared one and
+    # then routing every candidate through that branch drops the roleless match -- which is the value --
+    # before the exact matcher reads it, and reports the two rows that are not it as the only options.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_MIXED_DECLARED_ROWS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+# The same mixed pool, but the bare exact match is DEAD: its click commits nothing and only makes the
+# widget re-search, which strips the row tags while the popup stays open. `aria-haspopup` and the
+# write-back `input` dispatch supply the other two conjuncts of the verifier's declared-row exemption,
+# so the pool's declared siblings are the only thing left that could vouch for this commit.
+_MIXED_POOL_DEAD_BARE_ROW_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off" aria-haspopup="listbox"
+         style="position:absolute;top:20px;left:20px;width:600px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:600px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function mk(text, roled, dead) {
+      var row = document.createElement('div');
+      if (roled) row.setAttribute('role', 'option');
+      row.style.height = '20px';
+      row.textContent = text;
+      row.addEventListener('click', function () {
+        if (dead) {
+          window.__tv3_dead_clicked = true;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+        input.value = text;
+        input.setAttribute('data-committed', text);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      return row;
+    }
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      list.appendChild(mk('Phoenix, Maricopa, Arizona - 85027', false, true));
+      list.appendChild(mk('Rapolla, Potenza, Basilicata - 85027', true, false));
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_bare_pick_in_a_mixed_pool_earns_no_declared_row_exemption(search: str | None) -> None:
+    # The verifier's exemption -- a still-open list may read as closed when declared rows, a declared
+    # field and a write-back input event all hold -- is about the row that was CLICKED. Answering it
+    # from the POOL lets a bare pick inherit a declared sibling's standing, and the field still holding
+    # the typed text then reads as the commit: right label, wrong record, status ok.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_MIXED_POOL_DEAD_BARE_ROW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert await page.evaluate("() => !!window.__tv3_dead_clicked") is True, r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") is None, r.content
+        assert r.status == "error", r.content
+
+
+# A widget that renders each row as highlighted fragments, one child per fragment, and declares no
+# role. `%(roled)s` toggles whether the rows carry role=option -- with it, a fragment promotes to its
+# declared row; without it, the row itself has to survive the candidate gate or nothing reassembles it.
+_POSTAL_FRAGMENT_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:900px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:900px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function row(parts) {
+      var d = document.createElement('div');
+      if (%(roled)s) d.setAttribute('role', 'option');
+      d.style.whiteSpace = 'nowrap';
+      d.style.height = '20px';
+      parts.forEach(function (p) { var s = document.createElement('span'); s.textContent = p; d.appendChild(s); });
+      var full = parts.join('');
+      d.addEventListener('click', function () {
+        input.value = full;
+        input.setAttribute('data-committed', full);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      return d;
+    }
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      list.appendChild(row(['Phoenix', ', ', 'Maricopa', ', ', 'Arizona', ', ', 'United States', ' - ', '850', '27']));
+      list.appendChild(row(['Rapolla', ', ', 'Potenza', ', ', 'Basilicata', ', ', 'Italy', ' - ', '850', '27']));
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roled", ["true", "false"], ids=["declared-rows", "roleless-rows"])
+async def test_select_combobox_search_reaches_a_row_built_from_many_fragments(roled: str) -> None:
+    # A child COUNT is only a proxy for "container, not row". A searched row a widget builds from
+    # highlighted fragments has a child per fragment and trips it; where nothing declares a row, its
+    # pieces have nothing to promote onto and the label never reaches the matcher whole.
+    value = "Phoenix, Maricopa, Arizona, United States - 85027"
+    async with _live_page(_POSTAL_FRAGMENT_ROWS_HTML % {"roled": roled}) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.fill("#zip", "85027")
+        await page.dispatch_event("#zip", "input")
+        kids = await page.evaluate("() => document.querySelector('#zip-list div').children.length")
+        assert kids > 8, f"fixture must trip the child-count gate, got {kids}"
+        await page.fill("#zip", "")
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+# A real multi-row container: many children, and its whole text normalizes to the requested value.
+# Clicking it in a real widget lands on an arbitrary row, so this one commits the WRONG value.
+_POSTAL_STACKED_CONTAINER_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:900px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:900px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      // A heading so the LIST's own text is not the value too -- otherwise the wrapper, not the
+      // container under test, is what the finder would match.
+      var head = document.createElement('div');
+      head.style.height = '14px';
+      head.textContent = 'Best match';
+      list.appendChild(head);
+      var box = document.createElement('div');
+      box.addEventListener('click', function () { input.setAttribute('data-committed', 'WRONG ROW'); });
+      ['Phoenix,', 'Maricopa,', 'Arizona,', 'United', 'States', '-', '850', '2', '7'].forEach(function (p) {
+        var line = document.createElement('div');
+        line.style.height = '11px';
+        line.textContent = p;
+        box.appendChild(line);
+      });
+      list.appendChild(box);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_still_refuses_a_stacked_multi_row_container() -> None:
+    # The other side of the same discriminator: children that STACK are a container whose text is the
+    # union of its rows, and clicking one lands on an arbitrary row. Admitting fragment rows must not
+    # admit these -- so the test that matters is that nothing was clicked at all.
+    value = "Phoenix, Maricopa, Arizona, United States - 850 2 7"
+    async with _live_page(_POSTAL_STACKED_CONTAINER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") is None
+
+
+# A dropdown whose exact hit is a roleless block WRAPPING a link, beside declared rows. The candidate
+# gate's isNavRow only asks whether the node IS navigational, so the wrapper reaches the pool unflagged.
+_POSTAL_LINK_WRAPPED_HIT_HTML = """
+<!doctype html><html><body style="margin:0">
+  <form onsubmit="window.__tv3_departed = true; return false;">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:900px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:900px;background:#fff;display:none"></div>
+  </form>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var hit = document.createElement('div');
+      hit.style.height = '20px';
+      // DEPARTURE_SEL covers a typeless <button> too -- a dropdown-row idiom that SUBMITS the form.
+      var a = document.createElement(window.__tv3_departure_tag || 'a');
+      if (a.tagName === 'A') a.href = '#left-the-form';
+      a.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      a.addEventListener('click', function () { window.__tv3_departed = true; });
+      hit.addEventListener('click', function () { window.__tv3_clicked_wrapper = true; });
+      hit.appendChild(a);
+      list.appendChild(hit);
+      ['Rapolla, Potenza, Basilicata - 85027', 'Novoviktorivka, Dobropilskyi, Donetska - 85027'].forEach(function (t) {
+        var d = document.createElement('div');
+        d.setAttribute('role', 'option');
+        d.style.height = '20px';
+        d.textContent = t;
+        d.addEventListener('click', function () {
+          input.value = t; input.setAttribute('data-committed', t);
+          list.innerHTML = ''; list.style.display = 'none';
+        });
+        list.appendChild(d);
+      });
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+@pytest.mark.parametrize("departure_tag", ["a", "button"], ids=["anchor", "typeless-button"])
+async def test_select_combobox_never_clicks_a_roleless_block_wrapping_a_link(
+    search: str | None, departure_tag: str
+) -> None:
+    # Keeping roleless candidates must not smuggle one past the departure gate a promoted row clears:
+    # clicking a block that wraps an <a href> leaves the form mid-fill, which no refusal ever does.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_POSTAL_LINK_WRAPPED_HIT_HTML, f"window.__tv3_departure_tag = {departure_tag!r};") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "error", r.content
+        # The load-bearing assertion: the wrapper must never be CLICKED. Status and committed-value
+        # both read the same either way -- the click is the only thing the departure gate changes.
+        assert await page.evaluate("() => !!window.__tv3_clicked_wrapper") is False, r.content
+        assert await page.evaluate("() => !!window.__tv3_departed") is False
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") is None
+
+
+# A stale roleless copy of a row, rendered ABOVE the declared list, carrying the same label but
+# committing a different record. Identical text is exactly what the duplicate collapse reads as "one
+# candidate wearing two faces", so nothing but declaredness tells these two apart.
+_POSTAL_TWIN_IDENTITY_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function commit(code) {
+      input.value = 'Phoenix, Maricopa, Arizona - 85027';
+      input.setAttribute('data-record', code);
+      list.innerHTML = ''; list.style.display = 'none';
+    }
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var stale = document.createElement('div');
+      stale.style.height = '20px';
+      stale.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      stale.addEventListener('click', function () { commit('WRONG_RECORD'); });
+      list.appendChild(stale);
+      var declared = document.createElement('div');
+      declared.setAttribute('role', 'option');
+      declared.style.height = '20px';
+      declared.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      declared.addEventListener('click', function () { commit('CORRECT_RECORD'); });
+      list.appendChild(declared);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+# A roleless WRAPPER and the span carrying its label -- one candidate rendered as two nodes, related
+# by ancestry -- beside a declared sibling. Contrast with the two-siblings fixture below: same
+# "two bare exact matches" shape, opposite correct answer.
+_POSTAL_BARE_WRAPPER_AND_LEAF_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var wrap = document.createElement('div');
+      wrap.style.height = '20px';
+      var span = document.createElement('span');
+      span.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      wrap.appendChild(span);
+      wrap.addEventListener('click', function () {
+        input.value = span.textContent;
+        input.setAttribute('data-committed', span.textContent);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      list.appendChild(wrap);
+      var opt = document.createElement('div');
+      opt.setAttribute('role', 'option');
+      opt.style.height = '20px';
+      opt.textContent = 'Rapolla, Potenza, Basilicata - 85027';
+      list.appendChild(opt);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_commits_a_bare_wrapper_and_leaf_as_one_candidate(search: str | None) -> None:
+    # Two bare exact matches, but NESTED: a wrapper and the node carrying its label are one candidate
+    # and the innermost stands for them. Refusing every all-bare pair would lose this; collapsing
+    # every all-bare pair would commit one of two distinct records. Nesting is what separates them.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_POSTAL_BARE_WRAPPER_AND_LEAF_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+def test_shared_taskv3_js_avoids_the_click_fakes_selector_exists_idiom() -> None:
+    # _ClickFakePage.evaluate dispatches on substrings of the REAL js, and its first branch claims the
+    # double-negation return idiom for the selector-exists probe. Any blob shared into _FIND_MENU_JS
+    # that uses it is silently answered with a bool instead of a menu, so six click tests fail for a
+    # reason nothing points at. Caught exactly that way once; this fails at the source instead.
+    from skyvern.forge.taskv3 import tools as _tools  # noqa: PLC0415
+
+    idiom = "return " + "!!"
+    for name in ("_ROW_SEMANTICS_JS", "_FIND_MENU_JS", "_CLICK_PRECHECK_JS", "_MENU_AFTER_JS"):
+        blob = getattr(_tools, name)
+        assert idiom not in blob, f"{name} uses the idiom _ClickFakePage reserves for the exists probe"
+
+
+# NOTHING in the reaction declares `role=option`, so the fully-undeclared searched branch runs — the
+# one that hands every reacting node back for the caller's matcher to choose between. `%(body)s` is the
+# hazardous shape under test.
+_POSTAL_UNDECLARED_HAZARD_HTML = """
+<!doctype html><html><body style="margin:0">
+  <form>
+  <input id="other" type="text" value="KEEP" style="position:absolute;top:0;left:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  </form>
+  <script>
+    var T = 'Phoenix, Maricopa, Arizona - 85027';
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var hit = document.createElement('div');
+      hit.style.height = '20px';
+      hit.addEventListener('click', function () { window.__tv3_clicked = true; });
+      %(body)s
+      list.appendChild(hit);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+_UNDECLARED_HAZARD_BODIES = {
+    "departure-link": (
+        "var a = document.createElement('a'); a.href = '#gone'; a.textContent = T;"
+        " a.addEventListener('click', function () { window.__tv3_fired = true; }); hit.appendChild(a);"
+    ),
+    "reset-button": (
+        "var b = document.createElement('button'); b.type = 'reset'; b.textContent = T;"
+        " b.addEventListener('click', function () { window.__tv3_fired = true; }); hit.appendChild(b);"
+    ),
+    "multi-row-container": (
+        "['Phoenix,', 'Maricopa,', 'Arizona - 85027'].forEach(function (p) {"
+        " var d = document.createElement('div'); d.style.height = '18px'; d.textContent = p;"
+        " hit.appendChild(d); });"
+    ),
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_UNDECLARED_HAZARD_BODIES), ids=sorted(_UNDECLARED_HAZARD_BODIES))
+async def test_select_combobox_search_never_clicks_a_hazard_when_nothing_declares_a_row(shape: str) -> None:
+    # With nothing declaring a row there is even LESS vouching for a node than for a bare unit beside
+    # a declared sibling, so the same hazards must be refused here. Status reads error either way --
+    # the click is the channel, because each of these commits nothing and merely damages the page.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    html = _POSTAL_UNDECLARED_HAZARD_HTML % {"body": _UNDECLARED_HAZARD_BODIES[shape]}
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "error", r.content
+        assert await page.evaluate("() => !!window.__tv3_clicked") is False, r.content
+        assert await page.evaluate("() => !!window.__tv3_fired") is False, r.content
+        assert await page.eval_on_selector("#other", "el => el.value") == "KEEP"
+
+
+# A roleless wrapper holding a `<button type="reset">`, beside a declared sibling. A reset control is
+# deliberately NOT a "departure" -- it does not leave the page -- so the departure gate cannot see it.
+_POSTAL_RESET_WRAPPED_HIT_HTML = """
+<!doctype html><html><body style="margin:0">
+  <form>
+  <input id="other" type="text" value="ALREADY TYPED" style="position:absolute;top:0;left:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  </form>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var wrap = document.createElement('div');
+      wrap.style.height = '20px';
+      var b = document.createElement('button');
+      b.type = 'reset';
+      b.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      b.addEventListener('click', function () { window.__tv3_reset_fired = true; });
+      wrap.appendChild(b);
+      list.appendChild(wrap);
+      var opt = document.createElement('div');
+      opt.setAttribute('role', 'option');
+      opt.style.height = '20px';
+      opt.textContent = 'Rapolla, Potenza, Basilicata - 85027';
+      list.appendChild(opt);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_never_clicks_a_bare_wrapper_holding_a_reset_control(search: str | None) -> None:
+    # `DEPARTURE_SEL` excludes type="reset" on purpose, so the departure gate cannot catch this one --
+    # and a reset does not navigate, it ERASES every value already entered. A node admitted purely on
+    # its own text, with no declared row vouching that it is an option, must not be clicked.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_POSTAL_RESET_WRAPPED_HIT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "error", r.content
+        # The channel: nothing may be tagged or clicked. Status reads error either way.
+        assert await page.evaluate("() => !!window.__tv3_reset_fired") is False, r.content
+        assert "selected suggestion" not in r.content, r.content
+        assert await page.eval_on_selector("#other", "el => el.value") == "ALREADY TYPED"
+
+
+# A suggestion row that renders on TWO lines -- a label over a grey secondary line, an ordinary
+# dropdown layout -- with nothing declaring it, beside a declared sibling.
+_POSTAL_TWO_LINE_ROW_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var row = document.createElement('div');
+      var main = document.createElement('div');
+      main.style.height = '18px';
+      main.textContent = 'Phoenix, Maricopa, Arizona - 85027';
+      var sub = document.createElement('div');
+      sub.style.height = '14px';
+      sub.style.color = '#888';
+      sub.textContent = 'United States';
+      row.appendChild(main);
+      row.appendChild(sub);
+      row.addEventListener('click', function () {
+        input.value = 'Phoenix, Maricopa, Arizona - 85027 United States';
+        input.setAttribute('data-committed', input.value);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      list.appendChild(row);
+      var opt = document.createElement('div');
+      opt.setAttribute('role', 'option');
+      opt.style.height = '20px';
+      opt.textContent = 'Rapolla, Potenza, Basilicata - 85027';
+      list.appendChild(opt);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_search_reaches_a_two_line_suggestion_row() -> None:
+    # The container test must not treat a label-over-secondary row as a multi-row box. The row-size
+    # gate a few lines above it already allows a 2-line row; a container is three or more stacked
+    # text lines, whose text is the union of its rows.
+    value = "Phoenix, Maricopa, Arizona - 85027 United States"
+    async with _live_page(_POSTAL_TWO_LINE_ROW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#zip", "el => el.getAttribute('data-committed')") == value
+
+
+# A roleless container with only THREE stacked children -- so the child-COUNT gate never fires -- whose
+# aggregate text is the requested value, beside a declared sibling. The declared sibling is what routes
+# the whole pool through the branch where bare units live, and the searched pool keeps containers.
+_POSTAL_BARE_CONTAINER_BESIDE_DECLARED_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      var box = document.createElement('div');
+      // A container click lands on an arbitrary one of its rows.
+      box.addEventListener('click', function () { input.setAttribute('data-record', 'ARBITRARY_ROW'); });
+      // `wrapped` puts the rows one level down, so the container has a single direct child -- a walk
+      // over direct children alone then sees one line and calls the box a row.
+      var host = window.__tv3_wrapped ? document.createElement('div') : box;
+      ['Phoenix,', 'Maricopa,', 'Arizona - 85027'].forEach(function (p) {
+        var line = document.createElement('div');
+        line.style.height = '18px';
+        line.textContent = p;
+        host.appendChild(line);
+      });
+      if (host !== box) box.appendChild(host);
+      list.appendChild(box);
+      var opt = document.createElement('div');
+      opt.setAttribute('role', 'option');
+      opt.style.height = '20px';
+      opt.textContent = 'Rapolla, Potenza, Basilicata - 85027';
+      opt.addEventListener('click', function () { input.setAttribute('data-record', 'RAPOLLA'); });
+      list.appendChild(opt);
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct-children", "one-wrapper"])
+async def test_select_combobox_never_clicks_a_bare_multi_row_container(wrapped: bool) -> None:
+    # Keeping roleless candidates must not admit CONTAINERS. The searched pool keeps them on purpose
+    # so a fragment-built row survives, so the multi-row test the undeclared branch applies has to be
+    # applied here too -- a box whose aggregate text is the value is not a row, and clicking it lands
+    # on an arbitrary one. Status reads error either way; the click is the channel. The `one-wrapper`
+    # case is the one a direct-children walk misses: the rows sit one level down, so the box itself
+    # has a single child and reads as a single line.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    async with _live_page(
+        _POSTAL_BARE_CONTAINER_BESIDE_DECLARED_HTML, f"window.__tv3_wrapped = {str(wrapped).lower()};"
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#zip", "value": value, "search": "85027"})
+        record = await page.eval_on_selector("#zip", "el => el.getAttribute('data-record')")
+        assert record is None, f"clicked a multi-row container: {record}"
+        assert r.status == "error", r.content
+
+
+# Two roleless rows wearing the requested label, each a DIFFERENT record, beside one unrelated
+# declared row. Nothing declared matches, so nothing outranks either twin.
+_POSTAL_TWO_BARE_TWINS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="zip" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:700px;height:24px">
+  <div id="zip-list" style="position:absolute;top:50px;left:20px;width:700px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('zip');
+    var list = document.getElementById('zip-list');
+    function row(text, record, roled) {
+      var d = document.createElement('div');
+      if (roled) d.setAttribute('role', 'option');
+      d.style.height = '20px';
+      d.textContent = text;
+      d.addEventListener('click', function () {
+        input.value = text; input.setAttribute('data-record', record);
+        list.innerHTML = ''; list.style.display = 'none';
+      });
+      return d;
+    }
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) { list.style.display = 'none'; return; }
+      list.appendChild(row('Phoenix, Maricopa, Arizona - 85027', 'RECORD_A', false));
+      list.appendChild(row('Phoenix, Maricopa, Arizona - 85027', 'RECORD_B', false));
+      list.appendChild(row('Rapolla, Potenza, Basilicata - 85027', 'RECORD_C', true));
+      list.style.display = 'block';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_refuses_two_bare_rows_wearing_one_label(search: str | None) -> None:
+    # The duplicate collapse reads TEXT agreement and vetoes on declared identity. Bare rows carry
+    # none, so two distinct records under one label would collapse to a single candidate and commit
+    # whichever came first — reported as success. Preferring a declared row must not reach here at
+    # all: with nothing declared matching, the ambiguity IS the answer.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_POSTAL_TWO_BARE_TWINS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "error", r.content
+        record = await page.eval_on_selector("#zip", "el => el.getAttribute('data-record')")
+        assert record is None, f"committed one of two distinct records under a shared label: {record}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search", [None, "85027"], ids=["full-value", "searched"])
+async def test_select_combobox_declared_row_outranks_a_bare_twin_with_the_same_label(search: str | None) -> None:
+    # The failure this guards is silent: both units carry the requested label, so whichever is clicked
+    # the tool reports success and the field reads correctly -- only the RECORD behind it differs.
+    # Asserting the status or the committed text would pass either way; the record is the channel.
+    value = "Phoenix, Maricopa, Arizona - 85027"
+    args: dict[str, Any] = {"selector": "#zip", "value": value}
+    if search is not None:
+        args["search"] = search
+    async with _live_page(_POSTAL_TWIN_IDENTITY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(args)
+        assert r.status == "ok", r.content
+        record = await page.eval_on_selector("#zip", "el => el.getAttribute('data-record')")
+        assert record == "CORRECT_RECORD", f"committed the bare twin's record, not the declared row's: {record}"
 
 
 @_skip_no_browser

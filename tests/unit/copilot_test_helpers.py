@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint,
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -76,6 +77,48 @@ DISPATCHED_NAV_ONLY_HTML = (
     '<a href="https://example.test/support">Support</a>'
     "</main></body></html>"
 )
+
+
+def wire_credential_vault(
+    monkeypatch: pytest.MonkeyPatch,
+    secrets: PasswordCredential,
+    *,
+    credential_id: str = "cred_1",
+    name: str = "authtest simple",
+) -> Credential:
+    """Serve one saved credential from the org database and ``secrets`` from its vault."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    credential = Credential(
+        credential_id=credential_id,
+        organization_id="org-1",
+        name=name,
+        vault_type=CredentialVaultType.SKYVERN,
+        item_id="item_1",
+        credential_type=CredentialType.PASSWORD,
+        username=secrets.username,
+        card_last4=None,
+        card_brand=None,
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "credentials",
+        SimpleNamespace(
+            get_credential=AsyncMock(return_value=credential),
+            get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        ),
+        raising=False,
+    )
+    vault = SimpleNamespace(get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets)))
+    # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
+    monkeypatch.setattr(
+        object.__getattribute__(forge_app, "_inst"),
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.SKYVERN: vault},
+        raising=False,
+    )
+    return credential
 
 
 def make_stub_artifact(
