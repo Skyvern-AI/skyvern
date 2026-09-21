@@ -44,6 +44,7 @@ from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
     BlockedHost,
+    BlockedNavigationDestination,
     CaptchaSolveError,
     CardNumberInputMismatch,
     DownloadFileMaxWaitingTime,
@@ -215,7 +216,11 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
-from skyvern.webeye.navigation import reported_nav_error_code, revalidate_redirect_chain
+from skyvern.webeye.navigation import (
+    reported_nav_error_code,
+    revalidate_redirect_chain,
+    validate_navigation_destination,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -10726,6 +10731,20 @@ async def handle_go_back_action(
     except Exception as navigation_error:
         await _record_task_nav_error_code(task, navigation_error)
         raise
+
+    # History navigation is targeted by browser state, not by an action URL, so validate the URL
+    # after the browser commits it. Resetting keeps a page-initiated destination from remaining
+    # active just because its DOM is still available.
+    try:
+        await asyncio.to_thread(validate_navigation_destination, page.url)
+    except BlockedNavigationDestination as error:
+        await _record_task_nav_error_code(task, error)
+        try:
+            await page.goto("about:blank", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        except Exception:
+            LOG.exception("Failed to reset page after blocked history navigation")
+        raise
+
     _clear_task_nav_error_code(task)
     return [ActionSuccess()]
 
@@ -10742,6 +10761,17 @@ async def handle_go_forward_action(
     except Exception as navigation_error:
         await _record_task_nav_error_code(task, navigation_error)
         raise
+
+    try:
+        await asyncio.to_thread(validate_navigation_destination, page.url)
+    except BlockedNavigationDestination as error:
+        await _record_task_nav_error_code(task, error)
+        try:
+            await page.goto("about:blank", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        except Exception:
+            LOG.exception("Failed to reset page after blocked history navigation")
+        raise
+
     _clear_task_nav_error_code(task)
     return [ActionSuccess()]
 
@@ -10871,6 +10901,15 @@ async def handle_switch_tab_action(
             )
         ]
     target_page = pages[action.tab_index]
+
+    # list_valid_pages normally filters this already. The check also protects custom browser states
+    # and keeps the tab from gaining focus while its current destination is blocked.
+    try:
+        await asyncio.to_thread(validate_navigation_destination, target_page.url)
+    except BlockedNavigationDestination as error:
+        await _record_task_nav_error_code(task, error)
+        return [ActionFailure(error, stop_execution_on_failure=False)]
+
     await browser_state.set_active_page(target_page)
     try:
         await target_page.bring_to_front()
